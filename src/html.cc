@@ -34,7 +34,9 @@ auto Html::Build() -> std::string {
 
 namespace {
 
+/// Convert uint32 (network byte order on LE) to dotted string.
 auto IpStr(uint32_t addr) -> std::string {
+  if (addr == 0) return "*";
   char buf[INET_ADDRSTRLEN];
   struct in_addr in;
   in.s_addr = addr;
@@ -102,6 +104,9 @@ auto RenderRulesTable(
         R"(</tr></thead><tbody>)");
   for (size_t i = 0; i < rules.size(); i++) {
     const auto& [k, v] = rules[i];
+    auto port_str = [](uint16_t p) -> std::string {
+      return p == 0 ? "*" : std::to_string(p);
+    };
     h.Raw(std::format(
         R"(<tr><td>{}</td><td>{}</td><td>{}</td>)"
         R"(<td class="mono">{}</td>)"
@@ -112,7 +117,8 @@ auto RenderRulesTable(
         R"(hx-target="closest table" )"
         R"(hx-swap="outerHTML">Del</button></td></tr>)",
         IpStr(k.src_addr), IpStr(k.dst_addr),
-        ProtoStr(k.proto), k.src_port, k.dst_port,
+        ProtoStr(k.proto),
+        port_str(k.src_port), port_str(k.dst_port),
         ActionStr(v.action), i));
   }
   h.Raw("</tbody></table>");

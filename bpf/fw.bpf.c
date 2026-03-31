@@ -201,24 +201,45 @@ int fw_prog(struct xdp_md* ctx) {
     total_ctr->bytes += pkt_len;
   }
 
-  // Build exact-match key.
-  struct RuleKey rkey = {
-      .src_addr = ip->saddr,
+  // Try progressively looser keys until one matches.
+  // Most specific first: full 5-tuple, then wildcards.
+  // Zero = wildcard in rule key.
+  struct RuleKey keys[5];
+  // 0: full 5-tuple
+  keys[0] = (struct RuleKey){
+      .src_addr = ip->saddr, .dst_addr = ip->daddr,
+      .src_port = src_port, .dst_port = dst_port,
+      .proto = ip->protocol,
+  };
+  // 1: wildcard src_port
+  keys[1] = (struct RuleKey){
+      .src_addr = ip->saddr, .dst_addr = ip->daddr,
+      .dst_port = dst_port, .proto = ip->protocol,
+  };
+  // 2: dst + dst_port + proto only
+  keys[2] = (struct RuleKey){
       .dst_addr = ip->daddr,
-      .src_port = src_port,
-      .dst_port = dst_port,
+      .dst_port = dst_port, .proto = ip->protocol,
+  };
+  // 3: dst_port + proto only (any src/dst)
+  keys[3] = (struct RuleKey){
+      .dst_port = dst_port, .proto = ip->protocol,
+  };
+  // 4: proto only (any addr/port)
+  keys[4] = (struct RuleKey){
       .proto = ip->protocol,
   };
 
-  // Lookup in active rule table.
   struct RuleValue* val = 0;
-  if (cfg->active_table == 0) {
-    val = bpf_map_lookup_elem(&rules_a, &rkey);
-  } else {
-    val = bpf_map_lookup_elem(&rules_b, &rkey);
-  }
-  if (val) {
-    return apply_action(val, 0, pkt_len);
+  for (int k = 0; k < 5; k++) {
+    if (cfg->active_table == 0) {
+      val = bpf_map_lookup_elem(&rules_a, &keys[k]);
+    } else {
+      val = bpf_map_lookup_elem(&rules_b, &keys[k]);
+    }
+    if (val) {
+      return apply_action(val, k + 1, pkt_len);
+    }
   }
 
   // Fallback: CIDR lookup on source IP.

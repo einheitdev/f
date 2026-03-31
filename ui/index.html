@@ -302,19 +302,21 @@
   </div>
 
   <script>
-    function ipToInt(ip) {
+    // Convert dotted IP to network byte order as seen
+    // by x86 (little-endian) uint32 — matches ip->saddr.
+    function ipToNet(ip) {
       if (!ip || ip === '0.0.0.0') return 0;
-      const parts = ip.split('.');
-      if (parts.length !== 4) return 0;
-      return ((+parts[0])<<24 | (+parts[1])<<16 |
-              (+parts[2])<<8 | (+parts[3])) >>> 0;
+      const p = ip.split('.');
+      if (p.length !== 4) return 0;
+      return ((+p[0]) | (+p[1]<<8) |
+              (+p[2]<<16) | (+p[3]<<24)) >>> 0;
     }
 
     async function addRule() {
-      const rule = {
-        src_addr: ipToInt(
+      const newRule = {
+        src_addr: ipToNet(
           document.getElementById('r-src').value),
-        dst_addr: ipToInt(
+        dst_addr: ipToNet(
           document.getElementById('r-dst').value),
         src_port: +document.getElementById('r-sport').value,
         dst_port: +document.getElementById('r-dport').value,
@@ -323,18 +325,25 @@
         rate_pps: 0,
       };
       try {
+        // Get existing rules, append new one.
+        const existing = await fetch('/api/v1/rules')
+            .then(r => r.json());
+        existing.push(newRule);
         const resp = await fetch('/api/v1/rules', {
           method: 'PUT',
           headers: {'Content-Type': 'application/json'},
           body: JSON.stringify({
-            default_action: 0,
+            default_action: 1,
             conntrack_enabled: 0,
             conntrack_timeout_s: 300,
-            rules: [rule],
+            rules: existing,
           }),
         });
         if (resp.ok) {
           htmx.trigger('#rules-list', 'load');
+          document.getElementById('r-src').value = '';
+          document.getElementById('r-dst').value = '';
+          document.getElementById('r-dport').value = '';
         }
       } catch(e) { console.error(e); }
       return false;
