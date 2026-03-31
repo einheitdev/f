@@ -18,8 +18,11 @@
 #include <zmq.hpp>
 
 #include "f/bpf_loader.h"
+#include "f/conntrack_mgr.h"
 #include "f/error.h"
+#include "f/iface_mgr.h"
 #include "f/protocol.h"
+#include "f/rule_table.h"
 #include "f/slow_path.h"
 #include "f/types.h"
 
@@ -41,12 +44,6 @@ enum class EngineState : uint8_t {
   kStopping,
 };
 
-/// Attached interface record.
-struct IfAttach {
-  int ifindex;
-  char name[16];
-};
-
 /// BPF engine state — no HTTP, no Crow.
 struct Engine {
   std::atomic<EngineState> state{
@@ -63,9 +60,10 @@ struct Engine {
   // Pin path for BPF maps.
   std::string pin_path = "/sys/fs/bpf/f";
 
-  // Attached interfaces.
-  IfAttach interfaces[16];
-  uint32_t iface_count = 0;
+  // Components — each owns its state.
+  RuleTable rules;
+  IfaceMgr ifaces;
+  ConntrackMgr conntrack;
 
   // Current firewall config.
   FwConfig current_config{};
@@ -121,6 +119,10 @@ auto GetRules(const Engine& e)
 /// Read engine status.
 auto GetStatus(const Engine& e)
     -> StatusResponse;
+
+/// Aggregate state from all components.
+auto GetFullState(const Engine& e)
+    -> nlohmann::json;
 
 /// Open pinned BPF maps (for f-api read access).
 auto OpenPinnedMaps(std::string_view pin_path)

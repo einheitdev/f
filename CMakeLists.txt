@@ -118,6 +118,7 @@ add_library(libf-engine STATIC
   src/bpf_loader.cc
   src/engine.cc
   src/slow_path.cc
+  src/components.cc
 )
 
 target_include_directories(libf-engine PUBLIC

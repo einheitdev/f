@@ -77,14 +77,7 @@ auto HandleRequest(Engine& e, const std::string& req_str)
       static_cast<uint8_t>(req_str[0]));
   switch (cmd) {
     case Cmd::kGetStatus: {
-      auto s = GetStatus(e);
-      return json({
-          {"pid", s.pid},
-          {"uptime_s", s.uptime_s},
-          {"active_table", s.active_table},
-          {"rule_count", s.rule_count},
-          {"iface_count", s.iface_count},
-      }).dump();
+      return GetFullState(e).dump();
     }
     case Cmd::kStop: {
       spdlog::info("Received stop command.");
@@ -182,6 +175,13 @@ auto EngineInit(Engine& e,
     spdlog::info("Maps pinned to {}.", e.pin_path);
   }
 
+  // Populate components with map fds.
+  e.rules.rules_a_fd = e.bpf.rules_a_fd;
+  e.rules.rules_b_fd = e.bpf.rules_b_fd;
+  e.rules.config_fd = e.bpf.config_fd;
+  e.rules.counters_fd = e.bpf.counters_fd;
+  e.conntrack.map_fd = e.bpf.conntrack_fd;
+
   // Attach to interfaces.
   for (const auto& name : ifaces) {
     int idx = ResolveIfindex(name);
@@ -195,11 +195,11 @@ auto EngineInit(Engine& e,
                     name, att_res.error().message);
       continue;
     }
-    auto& entry = e.interfaces[e.iface_count];
+    auto& entry = e.ifaces.interfaces[e.ifaces.count];
     entry.ifindex = idx;
     std::strncpy(entry.name, name.c_str(),
                  sizeof(entry.name) - 1);
-    e.iface_count++;
+    e.ifaces.count++;
     spdlog::info("XDP attached to {} (ifindex={}).",
                  name, idx);
   }
@@ -236,7 +236,7 @@ auto EngineRun(Engine& e, std::stop_token stop)
     -> std::expected<void, Error<EngineError>> {
   e.state.store(EngineState::kRunning);
   spdlog::info("Engine running. {} interfaces.",
-               e.iface_count);
+               e.ifaces.count);
 
   // Start slow path thread if ring buffer available.
   if (e.bpf.events_fd >= 0) {
@@ -296,8 +296,8 @@ auto EngineStop(Engine& e) -> void {
   SlowPathStop(e.slow_path);
 
   spdlog::info("Detaching XDP.");
-  for (uint32_t i = 0; i < e.iface_count; i++) {
-    DetachXdp(e.interfaces[i].ifindex);
+  for (uint32_t i = 0; i < e.ifaces.count; i++) {
+    DetachXdp(e.ifaces.interfaces[i].ifindex);
   }
   e.ctrl_socket.reset();
   e.zmq_ctx.reset();
@@ -313,7 +313,7 @@ auto ApplyConfig(Engine& e, const ConfigMsg& msg,
                  std::span<const std::byte> rule_data)
     -> std::expected<uint32_t, Error<EngineError>> {
   uint8_t standby =
-      e.current_config.active_table == 0 ? 1 : 0;
+      e.rules.active_table == 0 ? 1 : 0;
   int rules_fd = standby == 0
                      ? e.bpf.rules_a_fd
                      : e.bpf.rules_b_fd;
@@ -341,12 +341,15 @@ auto ApplyConfig(Engine& e, const ConfigMsg& msg,
     inserted++;
   }
 
+  e.rules.active_table = standby;
   e.current_config.active_table = standby;
   e.current_config.default_action = msg.default_action;
   e.current_config.conntrack_enabled =
       msg.conntrack_enabled;
   e.current_config.conntrack_timeout_s =
       msg.conntrack_timeout_s;
+  e.conntrack.enabled = msg.conntrack_enabled != 0;
+  e.conntrack.timeout_s = msg.conntrack_timeout_s;
 
   uint32_t cfg_key = 0;
   bpf_map_update_elem(e.bpf.config_fd, &cfg_key,
@@ -380,7 +383,7 @@ auto GetRules(const Engine& e)
     -> std::expected<
         std::vector<std::pair<RuleKey, RuleValue>>,
         Error<EngineError>> {
-  int map_fd = e.current_config.active_table == 0
+  int map_fd = e.rules.active_table == 0
                    ? e.bpf.rules_a_fd
                    : e.bpf.rules_b_fd;
   std::vector<std::pair<RuleKey, RuleValue>> rules;
@@ -402,9 +405,9 @@ auto GetStatus(const Engine& e) -> StatusResponse {
   StatusResponse s{};
   s.pid = static_cast<uint32_t>(getpid());
   s.uptime_s = CurrentTimeS() - e.start_time_s;
-  s.active_table = e.current_config.active_table;
-  s.iface_count = e.iface_count;
-  int map_fd = e.current_config.active_table == 0
+  s.active_table = e.rules.active_table;
+  s.iface_count = e.ifaces.count;
+  int map_fd = e.rules.active_table == 0
                    ? e.bpf.rules_a_fd
                    : e.bpf.rules_b_fd;
   if (map_fd >= 0) {
@@ -418,6 +421,28 @@ auto GetStatus(const Engine& e) -> StatusResponse {
     s.rule_count = count;
   }
   return s;
+}
+
+auto GetFullState(const Engine& e) -> nlohmann::json {
+  json j;
+
+  // Engine metadata.
+  j["pid"] = static_cast<uint32_t>(getpid());
+  j["uptime_s"] = CurrentTimeS() - e.start_time_s;
+
+  // Each component reports its own state.
+  j["rules"] = e.rules.GetState();
+  j["interfaces"] = e.ifaces.GetState();
+  j["conntrack"] = e.conntrack.GetState();
+
+  // Slow path stats.
+  j["slow_path"] = {
+      {"events", e.slow_path.events_received},
+      {"allowed", e.slow_path.connections_allowed},
+      {"denied", e.slow_path.connections_denied},
+  };
+
+  return j;
 }
 
 auto OpenPinnedMaps(std::string_view pin_path)
