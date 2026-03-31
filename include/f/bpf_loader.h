@@ -35,6 +35,7 @@ struct BpfHandles {
   int conntrack_fd = -1;
   int counters_fd = -1;
   int config_fd = -1;
+  int events_fd = -1;
 };
 
 /// Load the BPF program and return map file descriptors.

@@ -119,9 +119,46 @@ struct {
   __type(value, struct FwConfig);
 } config SEC(".maps");
 
+struct {
+  __uint(type, BPF_MAP_TYPE_RINGBUF);
+  __uint(max_entries, 1 << 20);  // 1 MB.
+} events SEC(".maps");
+
 // ============================================================================
 // Helpers
 // ============================================================================
+
+/// Send an event to the slow path via ring buffer.
+static __always_inline void emit_event(
+    struct xdp_md* ctx, __u8 type, __u8 proto,
+    __u32 src_addr, __u32 dst_addr,
+    __u16 src_port, __u16 dst_port,
+    __u32 l4_off) {
+  struct Event* e = bpf_ringbuf_reserve(
+      &events, sizeof(struct Event), 0);
+  if (!e) return;
+
+  e->type = type;
+  e->proto = proto;
+  e->src_addr = src_addr;
+  e->dst_addr = dst_addr;
+  e->src_port = src_port;
+  e->dst_port = dst_port;
+  e->pkt_len = ((__u16)(
+      (long)ctx->data_end - (long)ctx->data));
+  e->timestamp_ns = bpf_ktime_get_ns();
+
+  // Copy first 64 bytes of L4+ payload.
+  void* data = (void*)(long)ctx->data;
+  void* data_end = (void*)(long)ctx->data_end;
+  void* ps = data + l4_off;
+  __builtin_memset(e->payload, 0, 64);
+  if (ps + 64 <= data_end) {
+    __builtin_memcpy(e->payload, ps, 64);
+  }
+
+  bpf_ringbuf_submit(e, 0);
+}
 
 static __always_inline int apply_action(
     struct RuleValue* val, __u32 rule_id, __u32 pkt_len) {
@@ -292,6 +329,11 @@ int fw_prog(struct xdp_md* ctx) {
           &conntrack, &ckey, &new_val, BPF_NOEXIST);
       return XDP_PASS;
     }
+
+    // New connection — punt to slow path for decision.
+    emit_event(ctx, EVENT_NEW_CONN, ip->protocol,
+               ip->saddr, ip->daddr,
+               src_port, dst_port, l4_off);
   }
 
   // Default action.

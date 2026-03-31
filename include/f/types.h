@@ -118,6 +118,38 @@ struct FwConfig {
   uint32_t conntrack_timeout_s;
 };
 
+// ============================================================================
+// Ring buffer event — XDP → slow path.
+// ============================================================================
+
+#ifdef __cplusplus
+enum class EventType : uint8_t {
+  kNewConn = 1,
+  kRateExceeded = 2,
+  kUnknownProto = 3,
+};
+#else
+enum EventType {
+  EVENT_NEW_CONN = 1,
+  EVENT_RATE_EXCEEDED = 2,
+  EVENT_UNKNOWN_PROTO = 3,
+};
+#endif
+
+/// Fixed-size event sent from XDP to userspace.
+struct Event {
+  uint8_t type;
+  uint8_t proto;
+  uint16_t src_port;
+  uint16_t dst_port;
+  uint16_t pkt_len;
+  uint32_t src_addr;
+  uint32_t dst_addr;
+  uint64_t timestamp_ns;
+  // First 64 bytes of L4+ payload for inspection.
+  uint8_t payload[64];
+};
+
 #ifdef __cplusplus
 }  // namespace f
 #endif

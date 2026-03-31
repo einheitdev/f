@@ -86,6 +86,7 @@ auto LoadProgram()
   h.conntrack_fd = FindMap(g_obj, "conntrack");
   h.counters_fd = FindMap(g_obj, "counters");
   h.config_fd = FindMap(g_obj, "config");
+  h.events_fd = FindMap(g_obj, "events");
 
   // Initialize config map with defaults.
   uint32_t key = 0;
@@ -143,6 +144,7 @@ auto PinMaps(const BpfHandles& h,
       {h.conntrack_fd, "conntrack"},
       {h.counters_fd, "counters"},
       {h.config_fd, "config"},
+      {h.events_fd, "events"},
   };
 
   for (const auto& p : pins) {

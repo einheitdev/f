@@ -11,6 +11,7 @@
 #include <span>
 #include <stop_token>
 #include <string>
+#include <thread>
 #include <string_view>
 #include <vector>
 
@@ -19,6 +20,7 @@
 #include "f/bpf_loader.h"
 #include "f/error.h"
 #include "f/protocol.h"
+#include "f/slow_path.h"
 #include "f/types.h"
 
 namespace f {
@@ -67,6 +69,10 @@ struct Engine {
 
   // Current firewall config.
   FwConfig current_config{};
+
+  // Slow path.
+  SlowPath slow_path;
+  std::jthread slow_path_thread;
 
   // Uptime tracking.
   uint64_t start_time_s = 0;

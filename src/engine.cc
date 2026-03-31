@@ -238,6 +238,17 @@ auto EngineRun(Engine& e, std::stop_token stop)
   spdlog::info("Engine running. {} interfaces.",
                e.iface_count);
 
+  // Start slow path thread if ring buffer available.
+  if (e.bpf.events_fd >= 0) {
+    if (SlowPathInit(
+            e.slow_path, e.bpf.events_fd, e.bpf)) {
+      e.slow_path_thread = std::jthread(
+          [&e](std::stop_token st) {
+            SlowPathRun(e.slow_path, st);
+          });
+    }
+  }
+
   while (!stop.stop_requested() &&
          e.state.load(std::memory_order_acquire) !=
              EngineState::kStopping) {
@@ -277,6 +288,13 @@ auto EngineRun(Engine& e, std::stop_token stop)
 }
 
 auto EngineStop(Engine& e) -> void {
+  // Stop slow path.
+  if (e.slow_path_thread.joinable()) {
+    e.slow_path_thread.request_stop();
+    e.slow_path_thread.join();
+  }
+  SlowPathStop(e.slow_path);
+
   spdlog::info("Detaching XDP.");
   for (uint32_t i = 0; i < e.iface_count; i++) {
     DetachXdp(e.interfaces[i].ifindex);
