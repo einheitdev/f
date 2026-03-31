@@ -112,61 +112,73 @@ include("cmake/bpf.cmake")
 add_bpf_object(fw bpf/fw.bpf.c)
 
 # ============================================================================
-# Library: libf
+# Engine library (BPF + ZMQ, no HTTP)
 # ============================================================================
-add_library(libf STATIC
+add_library(libf-engine STATIC
   src/bpf_loader.cc
-  src/daemon.cc
-  src/html.cc
-  src/api.cc
+  src/engine.cc
 )
 
-set_target_properties(libf PROPERTIES OUTPUT_NAME f)
-
-target_include_directories(libf PUBLIC
+target_include_directories(libf-engine PUBLIC
   ${PROJECT_SOURCE_DIR}/include
   ${BPF_INCLUDE_DIR}
   ${CMAKE_BINARY_DIR}
 )
 
-target_link_libraries(libf PUBLIC
+target_link_libraries(libf-engine PUBLIC
   ${BPF_LIB}
-  spdlog::spdlog
-  Crow::Crow
   nlohmann_json::nlohmann_json
   cppzmq
+  spdlog::spdlog
   pthread
 )
 
-add_dependencies(libf fw_skel)
+add_dependencies(libf-engine fw_skel)
 
 # ============================================================================
-# Executable: fd
+# API library (Crow + pinned map reads, no BPF loading)
 # ============================================================================
-add_executable(fd src/main.cc)
+add_library(libf-api STATIC
+  src/api.cc
+  src/html.cc
+)
 
-target_link_libraries(fd PRIVATE
-  libf
-  CLI11::CLI11
+target_include_directories(libf-api PUBLIC
+  ${PROJECT_SOURCE_DIR}/include
+  ${BPF_INCLUDE_DIR}
+)
+
+target_link_libraries(libf-api PUBLIC
+  ${BPF_LIB}
+  Crow::Crow
+  nlohmann_json::nlohmann_json
+  cppzmq
+  spdlog::spdlog
+  pthread
 )
 
 # ============================================================================
-# Tailwind CSS (optional)
+# fd — BPF engine daemon
 # ============================================================================
-find_program(TAILWINDCSS tailwindcss)
-if(TAILWINDCSS)
-  add_custom_command(
-    OUTPUT ${CMAKE_BINARY_DIR}/ui/style.css
-    COMMAND ${TAILWINDCSS}
-      -i ${CMAKE_SOURCE_DIR}/ui/input.css
-      -o ${CMAKE_BINARY_DIR}/ui/style.css
-      --minify
-    DEPENDS ui/input.css ui/index.html
-    COMMENT "Tailwind CSS"
-  )
-  add_custom_target(tailwind ALL
-    DEPENDS ${CMAKE_BINARY_DIR}/ui/style.css)
-endif()
+add_executable(fd cmd/fd.cc)
+target_link_libraries(fd PRIVATE
+  libf-engine CLI11::CLI11)
+
+# ============================================================================
+# fctl — engine control CLI
+# ============================================================================
+add_executable(fctl cmd/fctl.cc)
+target_include_directories(fctl PRIVATE
+  ${PROJECT_SOURCE_DIR}/include)
+target_link_libraries(fctl PRIVATE
+  libf-engine CLI11::CLI11)
+
+# ============================================================================
+# f-api — web dashboard daemon
+# ============================================================================
+add_executable(f-api cmd/f_api.cc)
+target_link_libraries(f-api PRIVATE
+  libf-api libf-engine CLI11::CLI11)
 
 # ============================================================================
 # Tests

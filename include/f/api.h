@@ -1,5 +1,6 @@
 /// @file api.h
-/// @brief Crow REST API setup and handlers.
+/// @brief Crow REST API. Reads pinned BPF maps directly,
+///        sends rule changes to engine via ZMQ.
 
 #ifndef INCLUDE_F_API_H_
 #define INCLUDE_F_API_H_
@@ -9,24 +10,25 @@
 
 #include <crow.h>
 
-#include "f/daemon.h"
+#include "f/bpf_loader.h"
 #include "f/log_sink.h"
 
 namespace f {
 
-/// Shared data passed to all API endpoint handlers.
+/// Shared data for all API handlers.
 struct ApiData {
-  Daemon* daemon;
+  BpfHandles maps;
   std::shared_ptr<RingBufferSink_mt> log_sink;
+  std::string engine_addr;
   uint16_t api_port;
   std::string static_dir;
 };
 
-/// Register all REST + HTMX routes on the Crow app.
+/// Register all REST + HTMX routes.
 auto SetupRoutes(crow::SimpleApp& app,
                  std::shared_ptr<ApiData> data) -> void;
 
-/// Run the Crow HTTP server (called on the API jthread).
+/// Run the Crow HTTP server (blocks until stop).
 auto RunApi(std::stop_token stop,
             std::shared_ptr<ApiData> data) -> void;
 

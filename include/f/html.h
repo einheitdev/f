@@ -17,6 +17,8 @@
 
 namespace f {
 
+// Forward declared — defined in engine.h.
+// For html.h we only need the layout for rendering.
 struct IfAttach;
 
 /// Inline HTML builder — appends to an internal buffer.
