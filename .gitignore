@@ -19,3 +19,8 @@ ui/style.css
 .env
 .env.*
 !.env.example
+__pycache__/
+*.pyc
+*.egg-info/
+.venv/
+.pytest_cache/

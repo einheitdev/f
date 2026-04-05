@@ -1,0 +1,121 @@
+// FWL — Firewall Language Grammar
+
+start: (_NL | stmt)*
+
+?stmt: default_stmt
+     | rule_stmt
+     | func_def
+
+// ================================================================
+// Tier 1 — Declarative rules
+// ================================================================
+
+default_stmt: "default" action_word _NL
+
+rule_stmt: action_word match_clause+ _NL
+
+match_clause: NAME match_values
+match_values: match_value ("," match_value)*
+match_value: NUMBER | NAME | cidr | ESCAPED_STRING
+
+action_word: "drop"  -> drop
+           | "allow" -> allow
+           | "pass"  -> pass_action
+
+// ================================================================
+// Tier 2 — Programmable functions
+// ================================================================
+
+func_def: decorator _NL "def" NAME "(" NAME ")" ":" _NL _INDENT body _DEDENT
+decorator: "@" NAME ("(" func_args ")")?
+func_args: NAME ("," NAME)*
+
+// Body is a sequence of statements.  Each statement ends with
+// _NL.  if_stmt already consumes its own _NL+_INDENT+_DEDENT,
+// so it doesn't need an extra _NL after it — but the _DEDENT
+// from its body will be followed by the next line's _NL.
+body: body_stmt+
+?body_stmt: if_stmt
+          | simple_stmt _NL
+?simple_stmt: action_word
+            | assign_stmt
+            | inline_c
+            | chain_stmt
+            | builtin_stmt
+
+if_stmt: "if" expr ":" _NL _INDENT body _DEDENT elif_clause* else_clause?
+elif_clause: "elif" expr ":" _NL _INDENT body _DEDENT
+else_clause: "else" ":" _NL _INDENT body _DEDENT
+
+assign_stmt: NAME "=" expr
+
+// ================================================================
+// Tier 3 — Inline C
+// ================================================================
+
+inline_c: "inline_c" TRIPLE_QUOTED
+
+// ================================================================
+// Built-in functions and chaining
+// ================================================================
+
+builtin_stmt: builtin_call
+chain_stmt: "chain" NAME
+
+builtin_call: NAME "(" call_args? ")"
+call_args: call_arg ("," call_arg)*
+call_arg: NAME "=" expr  -> kwarg
+        | expr            -> posarg
+
+// ================================================================
+// Expressions
+// ================================================================
+
+?expr: or_expr
+?or_expr: and_expr ("or" and_expr)*     -> or_expr
+?and_expr: not_expr ("and" not_expr)*   -> and_expr
+?not_expr: "not" not_expr               -> not_expr
+         | cmp_expr
+?cmp_expr: atom (comp_op atom)?         -> cmp_expr
+?atom: field_access
+     | builtin_call
+     | NUMBER
+     | ESCAPED_STRING
+     | NAME
+     | cidr
+     | "(" expr ")"
+     | list_literal
+
+comp_op: "==" -> eq
+       | "!=" -> neq
+       | ">"  -> gt
+       | "<"  -> lt
+       | ">=" -> gte
+       | "<=" -> lte
+       | "in" -> in_op
+       | "not" "in" -> not_in
+
+field_access: NAME ("." NAME)+
+list_literal: "[" (expr ("," expr)*)? "]"
+cidr: IP_ADDR "/" NUMBER
+
+// ================================================================
+// Terminals
+// ================================================================
+
+RATIO: /\d+\/\d+/
+IP_ADDR: /\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}/
+TRIPLE_QUOTED: /"{3}(?:[^"\\]|"(?!"{2})|\\[\s\S])*"{3}/s
+
+NAME: /[a-zA-Z_][a-zA-Z0-9_]*/
+NUMBER: /\d+/
+COMMENT: /#[^\n]*/
+
+_NL: /(\r?\n[\t ]*)+/
+
+%import common.ESCAPED_STRING
+%import common.WS_INLINE
+%declare _INDENT _DEDENT
+
+%ignore WS_INLINE
+%ignore COMMENT
