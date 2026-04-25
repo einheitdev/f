@@ -6,7 +6,7 @@ source spans.
 from __future__ import annotations
 import importlib.resources
 
-from lark import Lark, Transformer, Token, UnexpectedInput
+from lark import Lark, Transformer, UnexpectedInput
 
 from . import ast
 from .errors import FwlError, FwlException, Span
@@ -24,6 +24,7 @@ def _grammar_text() -> str:
 _PARSER = Lark(
   _grammar_text(),
   parser="lalr",
+  lexer="basic",
   start="program",
   propagate_positions=True,
 )
@@ -43,55 +44,77 @@ _PROTO_FROM_KEYWORD = {
 }
 
 
+def _parse_int(text: str) -> int:
+  """Decimal or hex int literal."""
+  if text.startswith("0x") or text.startswith("0X"):
+    return int(text, 16)
+  return int(text)
+
+
+def _parse_ipv4(text: str) -> int:
+  """Dotted-quad IPv4 -> 32-bit integer (network-order packed left-to-right).
+
+  Returns the address as a 32-bit unsigned integer with the leftmost
+  octet in the high byte (e.g. 192.168.0.1 -> 0xC0A80001).
+  """
+  parts = text.split(".")
+  value = 0
+  for part in parts:
+    n = int(part)
+    if not (0 <= n <= 255):
+      raise ValueError(f"IPv4 octet out of range: {part}")
+    value = (value << 8) | n
+  return value
+
+
+def _parse_cidr(text: str) -> tuple[int, int]:
+  """Dotted-quad/prefix -> (masked_prefix_int, prefix_bits)."""
+  ip_text, _, bits_text = text.partition("/")
+  bits = int(bits_text)
+  if not (0 <= bits <= 32):
+    raise ValueError(f"CIDR prefix out of range 0..32: {bits}")
+  ip_value = _parse_ipv4(ip_text)
+  if bits == 0:
+    mask = 0
+  else:
+    mask = ((1 << bits) - 1) << (32 - bits)
+  return ip_value & mask, bits
+
+
 class _ToAst(Transformer):
   """Lark Transformer: parse tree -> AST nodes."""
 
-  def IDENTIFIER(self, tok: Token) -> Token:
-    return tok
+  # --- terminals: pass through so children-lists carry tokens. ---
+  def IDENTIFIER(self, tok): return tok
+  def ALLOW(self, tok): return tok
+  def DROP(self, tok): return tok
+  def NOT(self, tok): return tok
+  def EQ(self, tok): return tok
+  def NEQ(self, tok): return tok
+  def LT(self, tok): return tok
+  def GT(self, tok): return tok
+  def LE(self, tok): return tok
+  def GE(self, tok): return tok
+  def PROTO_FIELD(self, tok): return tok
+  def IP_FIELD(self, tok): return tok
+  def PORT_FIELD(self, tok): return tok
+  def TCP_FLAG_FIELD(self, tok): return tok
+  def PROTO_KEYWORD(self, tok): return tok
+  def IPV4(self, tok): return tok
+  def CIDR(self, tok): return tok
+  def INTEGER(self, tok): return tok
 
-  def ALLOW(self, tok: Token) -> Token:
-    return tok
-
-  def DROP(self, tok: Token) -> Token:
-    return tok
-
-  def PROTO_FIELD(self, tok: Token) -> Token:
-    return tok
-
-  def PROTO_KEYWORD(self, tok: Token) -> Token:
-    return tok
+  # --- top-level structure ---
 
   def hook_decl(self, children) -> ast.Hook:
     (iface_tok,) = children
     return ast.Hook(interface=str(iface_tok), span=_span(iface_tok))
 
-  def field(self, children) -> ast.FieldRef:
-    (tok,) = children
-    return ast.FieldRef(name=str(tok), span=_span(tok))
-
-  def operand(self, children) -> ast.ProtoLiteral:
-    (tok,) = children
-    return ast.ProtoLiteral(
-      proto=_PROTO_FROM_KEYWORD[str(tok)], span=_span(tok)
-    )
-
-  def comparison(self, children) -> ast.Comparison:
-    field, operand = children
-    return ast.Comparison(
-      field=field, op="==", operand=operand, span=field.span
-    )
-
-  def condition(self, children) -> ast.Condition:
-    (cmp_node,) = children
-    return cmp_node
-
   def terminal_action(self, children) -> tuple[ast.Action, Span]:
     (tok,) = children
     if tok.type == "ALLOW":
       return ast.Action.ALLOW, _span(tok)
-    if tok.type == "DROP":
-      return ast.Action.DROP, _span(tok)
-    raise AssertionError(f"unexpected terminal_action token {tok.type}")
+    return ast.Action.DROP, _span(tok)
 
   def action(self, children) -> tuple[ast.Action, Span]:
     (action_tuple,) = children
@@ -103,8 +126,7 @@ class _ToAst(Transformer):
     return ast.DefaultRule(action=action, span=span)
 
   def rule(self, children) -> ast.Rule:
-    action_tuple = children[0]
-    action, action_span = action_tuple
+    action, action_span = children[0]
     condition = children[1] if len(children) > 1 else None
     return ast.Rule(action=action, condition=condition, span=action_span)
 
@@ -118,6 +140,127 @@ class _ToAst(Transformer):
       else:
         rules.append(child)
     return ast.Program(hook=hook, rules=rules, default=default)
+
+  # --- conditions ---
+
+  def condition(self, children) -> ast.Condition:
+    (node,) = children
+    return node
+
+  def or_expr(self, children) -> ast.Condition:
+    if len(children) == 1:
+      return children[0]
+    return ast.OrOp(operands=list(children), span=children[0].span)
+
+  def and_expr(self, children) -> ast.Condition:
+    if len(children) == 1:
+      return children[0]
+    return ast.AndOp(operands=list(children), span=children[0].span)
+
+  def not_expr(self, children) -> ast.Condition:
+    if len(children) == 1:
+      return children[0]
+    not_tok, inner = children
+    return ast.NotOp(inner=inner, span=_span(not_tok))
+
+  def primary(self, children) -> ast.Condition:
+    (node,) = children
+    return node
+
+  def bool_field(self, children) -> ast.BoolField:
+    (tok,) = children
+    return ast.BoolField(
+      field=ast.FieldRef(name=str(tok), span=_span(tok)),
+      span=_span(tok),
+    )
+
+  # --- comparisons + operands ---
+
+  def comp_op(self, children) -> str:
+    (tok,) = children
+    return str(tok)
+
+  def value_field(self, children) -> ast.FieldRef:
+    (tok,) = children
+    return ast.FieldRef(name=str(tok), span=_span(tok))
+
+  def enum_field(self, children) -> ast.FieldRef:
+    (tok,) = children
+    return ast.FieldRef(name=str(tok), span=_span(tok))
+
+  def value_compare(self, children) -> ast.Comparison:
+    """value_field comp_op operand."""
+    field, op, operand = children
+    return ast.Comparison(
+      field=field, op=op, operand=operand, span=field.span
+    )
+
+  def value_in(self, children) -> ast.Comparison:
+    """value_field 'in' set_or_range."""
+    field, operand = children
+    return ast.Comparison(
+      field=field, op="in", operand=operand, span=field.span
+    )
+
+  def enum_eq(self, children) -> ast.Comparison:
+    """enum_field '==' PROTO_KEYWORD."""
+    field, kw_tok = children
+    return ast.Comparison(
+      field=field,
+      op="==",
+      operand=ast.ProtoLiteral(
+        proto=_PROTO_FROM_KEYWORD[str(kw_tok)], span=_span(kw_tok)
+      ),
+      span=field.span,
+    )
+
+  def enum_neq(self, children) -> ast.Comparison:
+    """enum_field '!=' PROTO_KEYWORD."""
+    field, kw_tok = children
+    return ast.Comparison(
+      field=field,
+      op="!=",
+      operand=ast.ProtoLiteral(
+        proto=_PROTO_FROM_KEYWORD[str(kw_tok)], span=_span(kw_tok)
+      ),
+      span=field.span,
+    )
+
+  def operand(self, children) -> ast.Operand:
+    (tok,) = children
+    if tok.type == "INTEGER":
+      return ast.IntLiteral(value=_parse_int(str(tok)), span=_span(tok))
+    if tok.type == "IPV4":
+      return ast.IPv4Literal(value=_parse_ipv4(str(tok)), span=_span(tok))
+    raise AssertionError(f"unexpected operand token {tok.type}")
+
+  def set_or_range(self, children) -> ast.Operand:
+    (node,) = children
+    return node
+
+  def list(self, children) -> ast.ListLiteral:
+    items = list(children)
+    return ast.ListLiteral(items=items, span=items[0].span)
+
+  def cidr(self, children) -> ast.CidrLiteral:
+    (tok,) = children
+    prefix, bits = _parse_cidr(str(tok))
+    return ast.CidrLiteral(prefix=prefix, bits=bits, span=_span(tok))
+
+  def cidr_list(self, children) -> ast.CidrListLiteral:
+    items = []
+    for tok in children:
+      prefix, bits = _parse_cidr(str(tok))
+      items.append(
+        ast.CidrLiteral(prefix=prefix, bits=bits, span=_span(tok))
+      )
+    return ast.CidrListLiteral(items=items, span=items[0].span)
+
+  def range(self, children) -> ast.RangeLiteral:
+    lo_tok, hi_tok = children
+    lo = _parse_int(str(lo_tok))
+    hi = _parse_int(str(hi_tok))
+    return ast.RangeLiteral(lo=lo, hi=hi, span=_span(lo_tok))
 
 
 def parse(source: str) -> ast.Program:

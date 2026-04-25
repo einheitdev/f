@@ -1,0 +1,12 @@
+name: "drop on SYN without ACK fires for new TCP connection attempt"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.proto == tcp and pkt.tcp.syn and not pkt.tcp.ack
+  default allow
+
+test_packet:
+  builder: tcp(dst_port=22, syn=true, ack=false)
+
+expected:
+  compiles: true
+  bpf_action: drop

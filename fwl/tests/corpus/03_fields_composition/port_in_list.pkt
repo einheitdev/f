@@ -1,0 +1,12 @@
+name: "port in list of 80, 443, 8080 matches port 8080"
+source_fw: |
+  @xdp(eth0)
+  allow if pkt.proto == tcp and pkt.dst_port in [80, 443, 8080]
+  default drop
+
+test_packet:
+  builder: tcp(dst_port=8080)
+
+expected:
+  compiles: true
+  bpf_action: allow

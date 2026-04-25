@@ -1,0 +1,12 @@
+name: "or composition: drop tcp/22 OR tcp/23"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.proto == tcp and (pkt.dst_port == 22 or pkt.dst_port == 23)
+  default allow
+
+test_packet:
+  builder: tcp(dst_port=23)
+
+expected:
+  compiles: true
+  bpf_action: drop

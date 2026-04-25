@@ -9,35 +9,41 @@ Spec reference: docs/FWL_V01_SPEC.md grammar section.
 from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import Enum
+from typing import Union
 
 from .errors import Span
 
 
 class Action(Enum):
-  """Terminal and non-terminal action verbs.
+  """Terminal action verbs (FWL_V01_SPEC.md:78).
 
-  v0.1 actions per FWL_V01_SPEC.md:78. Phase 1 ships ALLOW and DROP;
-  LOG and COUNT join in later phases.
+  Phase 3 ships ALLOW and DROP; LOG and COUNT join later.
   """
   ALLOW = "allow"
   DROP = "drop"
 
 
 class Proto(Enum):
-  """Protocol keywords used as enum operands for pkt.proto.
-
-  Spec: FWL_V01_SPEC.md:140, :577.
-  """
+  """Protocol keywords used as enum operands for pkt.proto."""
   TCP = "tcp"
   UDP = "udp"
   ICMP = "icmp"
 
 
-# Field identifiers as plain strings keyed off the spec's accessor
-# names. Using a string key (rather than an enum) keeps the AST
-# extension-friendly: future field additions don't require enum
-# updates everywhere that pattern-matches on field type.
+# Field identifier strings keyed off the spec's accessor names. Using
+# strings (not enums) keeps the AST extension-friendly: future fields
+# don't require enum updates everywhere that matches on field type.
 FIELD_PROTO = "pkt.proto"
+FIELD_SRC_IP = "pkt.src_ip"
+FIELD_DST_IP = "pkt.dst_ip"
+FIELD_SRC_PORT = "pkt.src_port"
+FIELD_DST_PORT = "pkt.dst_port"
+FIELD_TCP_SYN = "pkt.tcp.syn"
+FIELD_TCP_ACK = "pkt.tcp.ack"
+
+IP_FIELDS = frozenset({FIELD_SRC_IP, FIELD_DST_IP})
+PORT_FIELDS = frozenset({FIELD_SRC_PORT, FIELD_DST_PORT})
+TCP_FLAG_FIELDS = frozenset({FIELD_TCP_SYN, FIELD_TCP_ACK})
 
 
 @dataclass(frozen=True)
@@ -55,32 +61,110 @@ class ProtoLiteral:
 
 
 @dataclass(frozen=True)
-class Comparison:
-  """A field-vs-operand comparison.
-
-  Phase 1 only models `==`; other operators (`!=`, ordered, `in`) join
-  in Phase 3. `op` is a string literal so the same node type can
-  carry every comparison operator the spec defines.
-  """
-  field: FieldRef
-  op: str
-  operand: ProtoLiteral
+class IntLiteral:
+  """An integer operand (decimal or hex)."""
+  value: int
   span: Span
 
 
-# A condition is currently just a Comparison; Phase 4 introduces
-# boolean composition (BoolOp, NotOp). Aliasing here keeps signatures
-# stable across phases.
-Condition = Comparison
+@dataclass(frozen=True)
+class IPv4Literal:
+  """An IPv4 dotted-quad operand stored as a 32-bit big-endian int."""
+  value: int
+  span: Span
+
+
+@dataclass(frozen=True)
+class CidrLiteral:
+  """An IPv4 CIDR operand: prefix bits + prefix length."""
+  prefix: int  # 32-bit, masked
+  bits: int    # 0..32
+  span: Span
+
+
+@dataclass(frozen=True)
+class ListLiteral:
+  """A `[a, b, c]` list operand. Element types must match the field."""
+  items: list[Union["IntLiteral", "IPv4Literal"]]
+  span: Span
+
+
+@dataclass(frozen=True)
+class CidrListLiteral:
+  """A `[cidr1, cidr2]` list operand for IP fields."""
+  items: list["CidrLiteral"]
+  span: Span
+
+
+@dataclass(frozen=True)
+class RangeLiteral:
+  """A `lo..hi` integer range operand (inclusive on both ends)."""
+  lo: int
+  hi: int
+  span: Span
+
+
+Operand = Union[
+  ProtoLiteral, IntLiteral, IPv4Literal, CidrLiteral,
+  ListLiteral, CidrListLiteral, RangeLiteral,
+]
+
+
+@dataclass(frozen=True)
+class Comparison:
+  """A field-vs-operand comparison.
+
+  `op` is one of: '==', '!=', '<', '>', '<=', '>=', 'in'. Type
+  compatibility between field and operand is enforced by the
+  analyzer, not the parser.
+  """
+  field: FieldRef
+  op: str
+  operand: Operand
+  span: Span
+
+
+@dataclass(frozen=True)
+class BoolField:
+  """A bool field used directly as a condition (e.g. `pkt.tcp.syn`).
+
+  Truthy when the underlying flag bit is set. `not pkt.tcp.syn` is
+  modeled as NotOp wrapping a BoolField.
+  """
+  field: FieldRef
+  span: Span
+
+
+@dataclass(frozen=True)
+class NotOp:
+  """Logical NOT of a sub-condition."""
+  inner: "Condition"
+  span: Span
+
+
+@dataclass(frozen=True)
+class AndOp:
+  """Left-to-right chain of `and` operands. Short-circuit evaluation."""
+  operands: list["Condition"]
+  span: Span
+
+
+@dataclass(frozen=True)
+class OrOp:
+  """Left-to-right chain of `or` operands. Short-circuit evaluation."""
+  operands: list["Condition"]
+  span: Span
+
+
+Condition = Union[Comparison, BoolField, NotOp, AndOp, OrOp]
 
 
 @dataclass(frozen=True)
 class Rule:
-  """A single firewall rule: action with optional condition.
+  """A single firewall rule: action + optional condition + optional modifier.
 
-  v0.1 grammar: `<action> [if <condition>] [<modifier>]`. Phase 1
-  supports `<action>` and `<action> if <condition>`. The `modifier`
-  slot lands in Phase 5 (rate_limit).
+  v0.1 grammar: `<action> [if <condition>] [<modifier>]`. The
+  modifier slot lands in Phase 5 (rate_limit).
   """
   action: Action
   condition: Condition | None
@@ -89,35 +173,21 @@ class Rule:
 
 @dataclass(frozen=True)
 class Hook:
-  """The `@xdp(<interface>)` declaration.
-
-  v0.1 requires exactly one hook declaration per program
-  (FWL_V01_SPEC.md:58).
-  """
+  """The `@xdp(<interface>)` declaration."""
   interface: str
   span: Span
 
 
 @dataclass(frozen=True)
 class DefaultRule:
-  """An explicit `default <action>` final rule.
-
-  Spec: FWL_V01_SPEC.md:105-116. Only ALLOW and DROP are valid as
-  default actions because LOG/COUNT are non-terminal — falling
-  through past them lands at the implicit allow anyway, so calling
-  that "the default" makes no sense.
-  """
+  """An explicit `default <action>` final rule (FWL_V01_SPEC.md:105)."""
   action: Action
   span: Span
 
 
 @dataclass(frozen=True)
 class Program:
-  """A complete FWL program: hook + ordered rules + optional default.
-
-  Per the spec grammar (`program = hook_decl { rule } [ default_rule ]`)
-  zero rules are valid when a `default` rule is present.
-  """
+  """A complete FWL program: hook + ordered rules + optional default."""
   hook: Hook
   rules: list[Rule] = field(default_factory=list)
   default: DefaultRule | None = None

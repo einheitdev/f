@@ -4,11 +4,11 @@ Given an analyzed AST, emits a C source string that clang compiles to
 a verifier-accepted XDP program. Bounds checks at every layer; IPv4
 IHL handled correctly; TCP/UDP ports in host byte order.
 
-Phase 1 emits packet parsing for Ethernet + IPv4 (when any pkt.* field
-is referenced) and rule-by-rule conditional dispatch. The emitter
-analyzes the program once to decide which protocol layers need
-parsing; layers not referenced are skipped to keep the BPF instruction
-budget low.
+The emitter analyzes the program once to decide which protocol layers
+need parsing. Layers not referenced are skipped to keep the BPF
+instruction budget low. Each parse step gates its pointer dereference
+with an inline bounds check; on failure, the relevant field defaults
+to 0 (or the rule's condition naturally evaluates to false).
 """
 from __future__ import annotations
 
@@ -29,67 +29,10 @@ _HEADER = """\
 #include <linux/if_ether.h>
 #include <linux/ip.h>
 #include <linux/in.h>
+#include <linux/tcp.h>
+#include <linux/udp.h>
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
-"""
-
-
-def _references_pkt(program: ast.Program) -> bool:
-  """True iff any rule mentions a pkt.* field."""
-  for rule in program.rules:
-    if rule.condition is not None:
-      return True
-  return False
-
-
-def _emit_condition(cond: ast.Condition) -> str:
-  """Emit a C expression that evaluates the condition.
-
-  Phase 1: comparisons against pkt.proto. The compiler relies on
-  earlier-emitted parse code to have set `proto` to the IPv4
-  protocol byte; comparisons resolve to integer equality against
-  IPPROTO_* constants.
-  """
-  return _emit_comparison(cond)
-
-
-def _emit_comparison(cmp: ast.Comparison) -> str:
-  """Emit a C expression for a single comparison."""
-  if cmp.field.name == ast.FIELD_PROTO and cmp.op == "==":
-    return f"proto == {_PROTO_TO_IPPROTO[cmp.operand.proto]}"
-  raise NotImplementedError(
-    f"emitter: comparison {cmp.field.name} {cmp.op} not supported yet"
-  )
-
-
-def _emit_parse_prelude(needs_pkt: bool) -> str:
-  """Emit the packet-parsing prelude.
-
-  Only emitted when at least one rule references a pkt.* field. The
-  prelude initializes `proto = 0` and only overwrites it when the
-  packet is a parseable IPv4 frame. Per FWL_V01_SPEC.md:185-191 a
-  packet that can't satisfy a pkt.* field access "falls through to
-  the next rule" — so failing parsing must NOT short-circuit the
-  whole program; the default rule (FWL_V01_SPEC.md:105-116) still
-  needs to fire. Each pointer dereference is gated by an inline
-  bounds check so the BPF verifier accepts the program.
-  """
-  if not needs_pkt:
-    return ""
-  return """\
-  __u8 proto = 0;
-  void *data = (void *)(long)ctx->data;
-  void *data_end = (void *)(long)ctx->data_end;
-  struct ethhdr *eth = data;
-  if ((void *)(eth + 1) <= data_end) {
-    if (eth->h_proto == bpf_htons(ETH_P_IP)) {
-      struct iphdr *ip = (void *)(eth + 1);
-      if ((void *)(ip + 1) <= data_end) {
-        proto = ip->protocol;
-      }
-    }
-  }
-
 """
 
 
@@ -97,6 +40,282 @@ _ACTION_TO_RETURN = {
   ast.Action.ALLOW: "XDP_PASS",
   ast.Action.DROP: "XDP_DROP",
 }
+
+
+def _walk(node) -> list:
+  """Yield all sub-conditions of `node` in pre-order."""
+  if node is None:
+    return []
+  out = [node]
+  if isinstance(node, ast.NotOp):
+    out.extend(_walk(node.inner))
+  elif isinstance(node, (ast.AndOp, ast.OrOp)):
+    for child in node.operands:
+      out.extend(_walk(child))
+  return out
+
+
+def _referenced_fields(program: ast.Program) -> set[str]:
+  """Set of pkt.* field names mentioned anywhere in the program."""
+  fields: set[str] = set()
+  for rule in program.rules:
+    for n in _walk(rule.condition):
+      if isinstance(n, ast.Comparison):
+        fields.add(n.field.name)
+      elif isinstance(n, ast.BoolField):
+        fields.add(n.field.name)
+  return fields
+
+
+def _needs_l4(fields: set[str]) -> bool:
+  """True iff any port or TCP-flag field is referenced."""
+  return bool(fields & (ast.PORT_FIELDS | ast.TCP_FLAG_FIELDS))
+
+
+def _needs_tcp(fields: set[str]) -> bool:
+  """True iff any TCP-flag field is referenced."""
+  return bool(fields & ast.TCP_FLAG_FIELDS)
+
+
+def _emit_parse_prelude(program: ast.Program) -> str:
+  """Emit the packet-parsing prelude.
+
+  Initializes all referenced fields to 0 and overwrites them only
+  when each parse step succeeds. Truncated or non-IPv4 packets fall
+  through to subsequent rules (and the default) per
+  FWL_V01_SPEC.md:185-191.
+  """
+  fields = _referenced_fields(program)
+  if not fields:
+    return ""
+
+  needs_l4 = _needs_l4(fields)
+  needs_tcp = _needs_tcp(fields)
+
+  decls: list[str] = ["__u8 proto = 0;"]
+  if ast.FIELD_SRC_IP in fields:
+    decls.append("__u32 src_ip = 0;")
+  if ast.FIELD_DST_IP in fields:
+    decls.append("__u32 dst_ip = 0;")
+  if ast.FIELD_SRC_PORT in fields:
+    decls.append("__u16 src_port = 0;")
+  if ast.FIELD_DST_PORT in fields:
+    decls.append("__u16 dst_port = 0;")
+  if ast.FIELD_TCP_SYN in fields:
+    decls.append("__u8 tcp_syn = 0;")
+  if ast.FIELD_TCP_ACK in fields:
+    decls.append("__u8 tcp_ack = 0;")
+
+  decl_block = "\n".join("  " + d for d in decls)
+
+  ip_reads = []
+  if ast.FIELD_SRC_IP in fields:
+    ip_reads.append("        src_ip = bpf_ntohl(ip->saddr);")
+  if ast.FIELD_DST_IP in fields:
+    ip_reads.append("        dst_ip = bpf_ntohl(ip->daddr);")
+  ip_read_block = "\n".join(ip_reads)
+  if ip_read_block:
+    ip_read_block = "\n" + ip_read_block
+
+  l4_block = ""
+  if needs_l4:
+    # Variable IHL: L4 starts at ip + ihl*4.
+    port_reads_tcp = []
+    port_reads_udp = []
+    if ast.FIELD_SRC_PORT in fields:
+      port_reads_tcp.append(
+        "              src_port = bpf_ntohs(tcp->source);"
+      )
+      port_reads_udp.append(
+        "              src_port = bpf_ntohs(udp->source);"
+      )
+    if ast.FIELD_DST_PORT in fields:
+      port_reads_tcp.append(
+        "              dst_port = bpf_ntohs(tcp->dest);"
+      )
+      port_reads_udp.append(
+        "              dst_port = bpf_ntohs(udp->dest);"
+      )
+    tcp_flag_reads = []
+    if needs_tcp:
+      if ast.FIELD_TCP_SYN in fields:
+        tcp_flag_reads.append("              tcp_syn = tcp->syn;")
+      if ast.FIELD_TCP_ACK in fields:
+        tcp_flag_reads.append("              tcp_ack = tcp->ack;")
+    tcp_branch = "\n".join(port_reads_tcp + tcp_flag_reads)
+    udp_branch = "\n".join(port_reads_udp)
+
+    tcp_block = ""
+    if tcp_branch:
+      tcp_block = f"""
+          if (proto == IPPROTO_TCP) {{
+            struct tcphdr *tcp = (void *)ip + ip_hlen;
+            if ((void *)(tcp + 1) <= data_end) {{
+{tcp_branch}
+            }}
+          }}"""
+
+    udp_block = ""
+    if udp_branch:
+      udp_block = f"""
+          if (proto == IPPROTO_UDP) {{
+            struct udphdr *udp = (void *)ip + ip_hlen;
+            if ((void *)(udp + 1) <= data_end) {{
+{udp_branch}
+            }}
+          }}"""
+
+    l4_block = f"""
+        __u32 ip_hlen = ip->ihl * 4;
+        if (ip_hlen >= sizeof(struct iphdr) &&
+            (void *)ip + ip_hlen <= data_end) {{{tcp_block}{udp_block}
+        }}"""
+
+  return f"""\
+{decl_block}
+  void *data = (void *)(long)ctx->data;
+  void *data_end = (void *)(long)ctx->data_end;
+  struct ethhdr *eth = data;
+  if ((void *)(eth + 1) <= data_end) {{
+    if (eth->h_proto == bpf_htons(ETH_P_IP)) {{
+      struct iphdr *ip = (void *)(eth + 1);
+      if ((void *)(ip + 1) <= data_end) {{
+        proto = ip->protocol;{ip_read_block}{l4_block}
+      }}
+    }}
+  }}
+
+"""
+
+
+def _emit_condition(node: ast.Condition) -> str:
+  """Emit a C boolean expression for `node`. Parens for safety."""
+  if isinstance(node, ast.Comparison):
+    return _emit_comparison(node)
+  if isinstance(node, ast.BoolField):
+    return _emit_bool_field(node)
+  if isinstance(node, ast.NotOp):
+    return f"!({_emit_condition(node.inner)})"
+  if isinstance(node, ast.AndOp):
+    parts = [_emit_condition(c) for c in node.operands]
+    return "(" + " && ".join(parts) + ")"
+  if isinstance(node, ast.OrOp):
+    parts = [_emit_condition(c) for c in node.operands]
+    return "(" + " || ".join(parts) + ")"
+  raise NotImplementedError(
+    f"emitter: unsupported condition {type(node).__name__}"
+  )
+
+
+def _emit_bool_field(node: ast.BoolField) -> str:
+  """Emit a C expression for a bare bool field."""
+  if node.field.name == ast.FIELD_TCP_SYN:
+    return "tcp_syn"
+  if node.field.name == ast.FIELD_TCP_ACK:
+    return "tcp_ack"
+  raise NotImplementedError(
+    f"emitter: unsupported bool field {node.field.name}"
+  )
+
+
+_FIELD_TO_C = {
+  ast.FIELD_PROTO: "proto",
+  ast.FIELD_SRC_IP: "src_ip",
+  ast.FIELD_DST_IP: "dst_ip",
+  ast.FIELD_SRC_PORT: "src_port",
+  ast.FIELD_DST_PORT: "dst_port",
+}
+
+
+def _emit_comparison(cmp: ast.Comparison) -> str:
+  """Emit a C boolean expression for a comparison."""
+  field_name = cmp.field.name
+  if field_name == ast.FIELD_PROTO:
+    return _emit_proto_compare(cmp)
+  if field_name in ast.IP_FIELDS:
+    return _emit_ip_compare(cmp)
+  if field_name in ast.PORT_FIELDS:
+    return _emit_port_compare(cmp)
+  raise NotImplementedError(
+    f"emitter: comparison on {field_name} not supported"
+  )
+
+
+def _emit_proto_compare(cmp: ast.Comparison) -> str:
+  """proto == tcp / proto != udp / etc."""
+  ipproto = _PROTO_TO_IPPROTO[cmp.operand.proto]  # type: ignore[union-attr]
+  return f"(proto {cmp.op} {ipproto})"
+
+
+def _emit_ip_compare(cmp: ast.Comparison) -> str:
+  """src_ip/dst_ip comparisons (== / != / in)."""
+  c_field = _FIELD_TO_C[cmp.field.name]
+  if cmp.op in ("==", "!="):
+    val = cmp.operand.value  # type: ignore[union-attr]
+    return f"({c_field} {cmp.op} 0x{val:08X}u)"
+  if cmp.op == "in":
+    return _emit_ip_in(c_field, cmp.operand)
+  raise NotImplementedError(
+    f"emitter: ip op {cmp.op} not supported"
+  )
+
+
+def _emit_ip_in(c_field: str, operand: ast.Operand) -> str:
+  """Emit a C expression for `<ip_field> in <operand>`."""
+  if isinstance(operand, ast.CidrLiteral):
+    return _emit_cidr_match(c_field, operand)
+  if isinstance(operand, ast.CidrListLiteral):
+    parts = [_emit_cidr_match(c_field, c) for c in operand.items]
+    return "(" + " || ".join(parts) + ")"
+  if isinstance(operand, ast.ListLiteral):
+    parts = [
+      f"({c_field} == 0x{item.value:08X}u)"
+      for item in operand.items
+      if isinstance(item, ast.IPv4Literal)
+    ]
+    return "(" + " || ".join(parts) + ")"
+  raise NotImplementedError(
+    f"emitter: ip 'in' operand {type(operand).__name__} not supported"
+  )
+
+
+def _emit_cidr_match(c_field: str, cidr: ast.CidrLiteral) -> str:
+  """Emit a C expression for a CIDR membership test."""
+  if cidr.bits == 0:
+    return "1"
+  mask = ((1 << cidr.bits) - 1) << (32 - cidr.bits)
+  return (
+    f"(({c_field} & 0x{mask:08X}u) == 0x{cidr.prefix:08X}u)"
+  )
+
+
+def _emit_port_compare(cmp: ast.Comparison) -> str:
+  """Port comparisons (== / != / < / > / <= / >= / in)."""
+  c_field = _FIELD_TO_C[cmp.field.name]
+  if cmp.op in ("==", "!=", "<", ">", "<=", ">="):
+    val = cmp.operand.value  # type: ignore[union-attr]
+    return f"({c_field} {cmp.op} {val})"
+  if cmp.op == "in":
+    return _emit_port_in(c_field, cmp.operand)
+  raise NotImplementedError(
+    f"emitter: port op {cmp.op} not supported"
+  )
+
+
+def _emit_port_in(c_field: str, operand: ast.Operand) -> str:
+  """Emit a C expression for `<port_field> in <operand>`."""
+  if isinstance(operand, ast.RangeLiteral):
+    return f"({c_field} >= {operand.lo} && {c_field} <= {operand.hi})"
+  if isinstance(operand, ast.ListLiteral):
+    parts = [
+      f"({c_field} == {item.value})"
+      for item in operand.items
+      if isinstance(item, ast.IntLiteral)
+    ]
+    return "(" + " || ".join(parts) + ")"
+  raise NotImplementedError(
+    f"emitter: port 'in' operand {type(operand).__name__} not supported"
+  )
 
 
 def _emit_rule(rule: ast.Rule) -> str:
@@ -109,13 +328,8 @@ def _emit_rule(rule: ast.Rule) -> str:
 
 
 def emit(program: ast.Program) -> str:
-  """Emit BPF C source for `program`.
-
-  Returns the source as a string. Caller is responsible for invoking
-  clang to produce object code.
-  """
-  needs_pkt = _references_pkt(program)
-  prelude = _emit_parse_prelude(needs_pkt)
+  """Emit BPF C source for `program`."""
+  prelude = _emit_parse_prelude(program)
   body = "".join(_emit_rule(r) for r in program.rules)
 
   if program.default is not None:

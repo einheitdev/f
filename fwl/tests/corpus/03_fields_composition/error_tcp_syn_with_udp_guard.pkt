@@ -1,0 +1,10 @@
+name: "pkt.tcp.syn with only udp guard is rejected (tcp required)"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.proto == udp and pkt.tcp.syn
+
+test_packet:
+  builder: udp()
+
+expected:
+  compiles: false

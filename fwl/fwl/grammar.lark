@@ -2,10 +2,6 @@
 //
 // Transcribed from the EBNF reference in docs/FWL_V01_SPEC.md.
 // Anything not listed here is a syntax error.
-//
-// Phase 2 surface: hook + zero-or-more rules + optional default rule.
-// Programs may consist solely of `@xdp(...) default <action>` per
-// the spec note at FWL_V01_SPEC.md:602.
 
 program       : hook_decl rule* default_rule?
 
@@ -19,18 +15,71 @@ action        : terminal_action
 
 terminal_action : ALLOW | DROP
 
-condition     : comparison
+condition     : or_expr
 
-comparison    : field "==" operand
+or_expr       : and_expr ("or" and_expr)*
 
-field         : PROTO_FIELD
+and_expr      : not_expr ("and" not_expr)*
 
-operand       : PROTO_KEYWORD
+not_expr      : NOT? primary
 
-PROTO_FIELD   : "pkt.proto"
-PROTO_KEYWORD : "tcp" | "udp" | "icmp"
-ALLOW         : "allow"
-DROP          : "drop"
+primary       : comparison
+              | bool_field
+              | "(" condition ")"
+
+comparison    : value_field comp_op operand   -> value_compare
+              | value_field "in" set_or_range -> value_in
+              | enum_field "==" PROTO_KEYWORD -> enum_eq
+              | enum_field "!=" PROTO_KEYWORD -> enum_neq
+
+comp_op       : EQ | NEQ | LT | GT | LE | GE
+
+value_field   : IP_FIELD | PORT_FIELD
+
+enum_field    : PROTO_FIELD
+
+bool_field    : TCP_FLAG_FIELD
+
+operand       : INTEGER | IPV4
+
+set_or_range  : list | range | cidr | cidr_list
+
+list          : "[" operand ("," operand)* "]"
+
+cidr          : CIDR
+
+cidr_list     : "[" CIDR ("," CIDR)* "]"
+
+range         : INTEGER ".." INTEGER
+
+EQ            : "=="
+NEQ           : "!="
+LT            : "<"
+GT            : ">"
+LE            : "<="
+GE            : ">="
+NOT           : "not"
+
+// Multi-segment field terminals get explicit priority above IDENTIFIER
+// because Lark's basic lexer would otherwise tokenize "pkt" as an
+// identifier and stop there, never trying the longer match.
+PROTO_FIELD.10     : "pkt.proto"
+IP_FIELD.10        : "pkt.src_ip" | "pkt.dst_ip"
+PORT_FIELD.10      : "pkt.src_port" | "pkt.dst_port"
+TCP_FLAG_FIELD.10  : "pkt.tcp.syn" | "pkt.tcp.ack"
+
+// Keyword terminals get priority above IDENTIFIER too — otherwise
+// `tcp`, `udp`, `allow`, etc. would be lexed as identifiers.
+PROTO_KEYWORD.10 : "tcp" | "udp" | "icmp"
+ALLOW.10         : "allow"
+DROP.10          : "drop"
+
+// CIDR and IPV4 share a prefix with INTEGER; explicit priorities
+// ensure the lexer prefers the longer dotted forms even when scanning
+// at a position where INTEGER would also match.
+CIDR.5        : /\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\/\d{1,2}/
+IPV4.4        : /\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}/
+INTEGER       : /0x[0-9a-fA-F]+/ | /\d+/
 
 IDENTIFIER    : /[a-z_][a-z0-9_]*/
 

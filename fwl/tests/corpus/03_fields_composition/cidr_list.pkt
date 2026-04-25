@@ -1,0 +1,12 @@
+name: "src_ip in CIDR list (RFC1918) drops private addresses"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.src_ip in [10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16]
+  default allow
+
+test_packet:
+  builder: tcp(src_ip="172.20.5.5")
+
+expected:
+  compiles: true
+  bpf_action: drop
