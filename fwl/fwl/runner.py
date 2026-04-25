@@ -8,11 +8,13 @@ pass/fail with diffs.
 Methodology reference: docs/F_DEVELOPMENT_METHODOLOGY.md:132-181.
 """
 from __future__ import annotations
+import struct
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
-from . import analyzer, bpf_runner, emitter, interpreter, parser, pkt
+from . import analyzer, ast, bpf_runner, emitter, interpreter, parser, pkt
 from .errors import FwlException
 
 
@@ -136,25 +138,10 @@ def _bpf_oracle(
     )
 
   c_source = emitter.emit(program)
-
-  if case.state:
-    # Verify the C compiles, then skip the actual run.
-    try:
-      bpf_runner.compile_c(c_source)
-    except subprocess.CalledProcessError as cexc:
-      stderr = cexc.stderr.decode("utf-8", "replace")
-      return OracleResult(
-        "bpf", "fail",
-        f"clang failed to compile emitter output:\n{stderr}",
-      )
-    return OracleResult(
-      "bpf", "skip",
-      ".pkt declares state: — BPF map pre-population not implemented "
-      "(would run with empty maps and disagree silently); clang ok",
-    )
+  map_init = _build_map_init(program, case.state)
 
   try:
-    got = bpf_runner.run(c_source, case.packet.raw)
+    got = bpf_runner.run(c_source, case.packet.raw, map_init)
   except bpf_runner.BpfUnavailable as exc:
     # Still try to compile, so we catch structural emitter errors.
     try:
@@ -206,6 +193,77 @@ def run_case(case: pkt.PktCase) -> CaseResult:
       _bpf_oracle(case, expected),
     ],
   )
+
+
+def _build_map_init(
+  program: ast.Program,
+  state: dict[int, dict[Any, int]],
+) -> dict[str, dict[bytes, bytes]]:
+  """Translate .pkt state into the {map_name: {key: value}} layout.
+
+  The emitter names rate_limit maps fwl_rl_map_<rule_idx>; the value
+  is `struct fwl_rl_state { __u64 ts; __u32 count; }` packed to 16
+  bytes by the C compiler. For per-CPU maps the kernel expects the
+  value buffer to be nr_possible_cpus * sizeof(struct).
+  """
+  if not state:
+    return {}
+  result: dict[str, dict[bytes, bytes]] = {}
+  try:
+    nr_cpus = bpf_runner.num_possible_cpus()
+  except OSError:
+    nr_cpus = 1
+  for rule_idx, buckets in state.items():
+    if rule_idx >= len(program.rules):
+      continue
+    rule = program.rules[rule_idx]
+    if rule.modifier is None:
+      continue
+    map_name = f"fwl_rl_map_{rule_idx}"
+    entries: dict[bytes, bytes] = {}
+    for raw_key, count in buckets.items():
+      key_bytes = _encode_rl_key(rule.modifier.per_field, raw_key)
+      value_bytes = _encode_rl_value_per_cpu(count, nr_cpus)
+      entries[key_bytes] = value_bytes
+    if entries:
+      result[map_name] = entries
+  return result
+
+
+def _encode_rl_key(per_field: str, raw_key: Any) -> bytes:
+  """Pack a .pkt state bucket key into the BPF map's key bytes (u32 LE).
+
+  The emitter casts both ip and port fields to __u32 before lookup
+  (see emitter._emit_rate_limit_gate); IP fields use bpf_ntohl so
+  src_ip in the BPF program is in host byte order. Match that here:
+  pack as little-endian u32 with the high octet first in the
+  dotted-quad value.
+  """
+  if per_field in ("src_ip", "dst_ip"):
+    if isinstance(raw_key, int):
+      value = raw_key
+    else:
+      parts = raw_key.split(".")
+      value = 0
+      for part in parts:
+        value = (value << 8) | int(part)
+  else:
+    value = int(raw_key)
+  return struct.pack("<I", value & 0xFFFFFFFF)
+
+
+def _encode_rl_value_per_cpu(count: int, nr_cpus: int) -> bytes:
+  """Pack a count value into per-CPU buffer bytes for fwl_rl_state.
+
+  Each per-CPU slot is `__u64 ts; __u32 count;` plus 4 bytes of
+  trailing padding (16 bytes total). ts is set to the current
+  monotonic ns so the sliding window doesn't immediately reset the
+  count to 0.
+  """
+  import time
+  now_ns = time.monotonic_ns()
+  per_cpu_value = struct.pack("<QI4x", now_ns, count)
+  return per_cpu_value * nr_cpus
 
 
 def discover(directory: Path) -> list[Path]:

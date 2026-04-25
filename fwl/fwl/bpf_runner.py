@@ -107,7 +107,11 @@ def _can_load_bpf() -> bool:
   return False
 
 
-def run(c_source: str, packet: bytes) -> XdpAction:
+def run(
+  c_source: str,
+  packet: bytes,
+  map_init: dict[str, dict[bytes, bytes]] | None = None,
+) -> XdpAction:
   """Compile, load, and run `c_source` against `packet`.
 
   Returns the XDP action the kernel verifier-accepted program
@@ -115,6 +119,11 @@ def run(c_source: str, packet: bytes) -> XdpAction:
   BPF programs at all (so the runner can skip the oracle cleanly).
   Raises subprocess.CalledProcessError on clang errors and OSError
   on bpf() syscall errors.
+
+  `map_init`, when provided, is a `{map_name: {key_bytes: value_bytes}}`
+  dict applied via bpf_map_update_elem after load and before
+  BPF_PROG_TEST_RUN. For per-CPU maps the caller should size
+  value_bytes as `nr_possible_cpus * per_cpu_value_size`.
   """
   if not _can_load_bpf():
     raise BpfUnavailable(
@@ -123,10 +132,33 @@ def run(c_source: str, packet: bytes) -> XdpAction:
     )
 
   result = compile_c(c_source)
-  return _load_and_run(result.obj_path, packet)
+  return _load_and_run(result.obj_path, packet, map_init or {})
 
 
-def _load_and_run(obj_path: Path, packet: bytes) -> XdpAction:
+def num_possible_cpus() -> int:
+  """Return the kernel's nr_cpus_possible (per-CPU map sizing key).
+
+  Reads /sys/devices/system/cpu/possible (e.g. "0-3") rather than
+  taking online cpu count — per-CPU BPF maps allocate by *possible*
+  not online.
+  """
+  with open("/sys/devices/system/cpu/possible", encoding="utf-8") as f:
+    text = f.read().strip()
+  count = 0
+  for part in text.split(","):
+    if "-" in part:
+      lo, hi = part.split("-")
+      count += int(hi) - int(lo) + 1
+    else:
+      count += 1
+  return count
+
+
+def _load_and_run(
+  obj_path: Path,
+  packet: bytes,
+  map_init: dict[str, dict[bytes, bytes]],
+) -> XdpAction:
   """Load `obj_path` via libbpf and BPF_PROG_RUN against `packet`.
 
   Implementation note: this is the part of the harness that needs
@@ -143,20 +175,26 @@ def _load_and_run(obj_path: Path, packet: bytes) -> XdpAction:
   libbpf.bpf_object__open_file.argtypes = [
     ctypes.c_char_p, ctypes.c_void_p
   ]
-  # bpf_object__load(obj) -> int
   libbpf.bpf_object__load.restype = ctypes.c_int
   libbpf.bpf_object__load.argtypes = [ctypes.c_void_p]
-  # bpf_object__close(obj) -> void
   libbpf.bpf_object__close.restype = None
   libbpf.bpf_object__close.argtypes = [ctypes.c_void_p]
-  # bpf_object__find_program_by_name(obj, name) -> struct bpf_program *
   libbpf.bpf_object__find_program_by_name.restype = ctypes.c_void_p
   libbpf.bpf_object__find_program_by_name.argtypes = [
     ctypes.c_void_p, ctypes.c_char_p
   ]
-  # bpf_program__fd(prog) -> int
   libbpf.bpf_program__fd.restype = ctypes.c_int
   libbpf.bpf_program__fd.argtypes = [ctypes.c_void_p]
+  libbpf.bpf_object__find_map_by_name.restype = ctypes.c_void_p
+  libbpf.bpf_object__find_map_by_name.argtypes = [
+    ctypes.c_void_p, ctypes.c_char_p
+  ]
+  libbpf.bpf_map__fd.restype = ctypes.c_int
+  libbpf.bpf_map__fd.argtypes = [ctypes.c_void_p]
+  libbpf.bpf_map_update_elem.restype = ctypes.c_int
+  libbpf.bpf_map_update_elem.argtypes = [
+    ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint64
+  ]
 
   obj = libbpf.bpf_object__open_file(
     str(obj_path).encode("utf-8"), None
@@ -168,6 +206,10 @@ def _load_and_run(obj_path: Path, packet: bytes) -> XdpAction:
   try:
     if libbpf.bpf_object__load(obj) != 0:
       raise OSError(ctypes.get_errno(), "bpf_object__load failed")
+
+    for map_name, entries in map_init.items():
+      _populate_map(libbpf, obj, map_name, entries)
+
     prog = libbpf.bpf_object__find_program_by_name(
       obj, b"fwl_prog"
     )
@@ -178,6 +220,31 @@ def _load_and_run(obj_path: Path, packet: bytes) -> XdpAction:
     return _bpf_prog_test_run(prog_fd, packet)
   finally:
     libbpf.bpf_object__close(obj)
+
+
+def _populate_map(
+  libbpf, obj, map_name: str, entries: dict[bytes, bytes]
+) -> None:
+  """Write `entries` into the named BPF map via bpf_map_update_elem."""
+  bpf_map = libbpf.bpf_object__find_map_by_name(
+    obj, map_name.encode("utf-8")
+  )
+  if not bpf_map:
+    raise RuntimeError(
+      f"BPF map '{map_name}' not found in object"
+    )
+  fd = libbpf.bpf_map__fd(bpf_map)
+  for key, value in entries.items():
+    key_buf = (ctypes.c_ubyte * len(key)).from_buffer_copy(key)
+    val_buf = (ctypes.c_ubyte * len(value)).from_buffer_copy(value)
+    BPF_ANY = 0
+    rc = libbpf.bpf_map_update_elem(fd, key_buf, val_buf, BPF_ANY)
+    if rc != 0:
+      err = ctypes.get_errno()
+      raise OSError(
+        err,
+        f"bpf_map_update_elem failed on {map_name}: errno={err}",
+      )
 
 
 # union bpf_attr layout for BPF_PROG_TEST_RUN — minimal fields
