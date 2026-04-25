@@ -143,12 +143,30 @@ _IPPROTO_UDP = 17
 _IPPROTO_ICMP = 1
 
 
-def _ipv4_to_bytes(addr: str) -> bytes:
-  """Pack a dotted-quad IPv4 string as 4 big-endian bytes."""
+def _ipv4_to_bytes(addr: Any, field: str = "ip") -> bytes:
+  """Pack a dotted-quad IPv4 string as 4 big-endian bytes.
+
+  Raises ValueError with the offending field name when `addr` isn't
+  a dotted-quad string. Without this, an int passed for `src_ip`
+  (e.g. `tcp(src_ip=16909060)`) crashes with an opaque AttributeError
+  deep in the builder — surfaced by the explore-mode bug hunter.
+  """
+  if not isinstance(addr, str):
+    raise ValueError(
+      f"{field}: expected dotted-quad string, got "
+      f"{type(addr).__name__} ({addr!r})"
+    )
   parts = addr.split(".")
   if len(parts) != 4:
-    raise ValueError(f"not an IPv4 dotted quad: {addr!r}")
-  return bytes(int(p) for p in parts)
+    raise ValueError(f"{field}: not an IPv4 dotted quad: {addr!r}")
+  try:
+    octets = [int(p) for p in parts]
+  except ValueError:
+    raise ValueError(f"{field}: not an IPv4 dotted quad: {addr!r}")
+  for octet in octets:
+    if not (0 <= octet <= 255):
+      raise ValueError(f"{field}: IPv4 octet out of range 0..255: {octet}")
+  return bytes(octets)
 
 
 def _ipv4_checksum(header: bytes) -> int:
@@ -236,8 +254,8 @@ def build_packet(fields: dict[str, Any]) -> Packet:
     64,                           # TTL
     proto_num,
     0,                            # checksum placeholder
-    _ipv4_to_bytes(src_ip),
-    _ipv4_to_bytes(dst_ip),
+    _ipv4_to_bytes(src_ip, "src_ip"),
+    _ipv4_to_bytes(dst_ip, "dst_ip"),
   )
   checksum = _ipv4_checksum(ip_header)
   ip_header = ip_header[:10] + struct.pack(">H", checksum) + ip_header[12:]

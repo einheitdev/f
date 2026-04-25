@@ -208,13 +208,36 @@ def _check_comparison_types(cmp: ast.Comparison) -> None:
     raise _type_error(field_label, op, operand, span)
 
 
+_MAX_RL_THRESHOLD = (1 << 32) - 1
+
+
 def _check_modifier(mod: ast.RateLimit) -> None:
-  """Validate a rate_limit modifier."""
+  """Validate a rate_limit modifier.
+
+  Threshold is bounded to u32 max because the emitted BPF C stores
+  bucket counts as `__u32` (see emitter.py's fwl_rl_state struct).
+  Without this bound, large literals like 10**40 are accepted by the
+  analyzer and emitted as bare decimals into the C source, where
+  clang rejects them with "integer literal is too large to be
+  represented in any integer type" — a soundness gap discovered by
+  the explore-mode bug hunter.
+  """
   if mod.threshold <= 0:
     raise FwlException(
       FwlError(
         category="semantic",
         message="rate_limit threshold must be > 0",
+        span=mod.span,
+      )
+    )
+  if mod.threshold > _MAX_RL_THRESHOLD:
+    raise FwlException(
+      FwlError(
+        category="semantic",
+        message=(
+          f"rate_limit threshold {mod.threshold} exceeds "
+          f"u32 max ({_MAX_RL_THRESHOLD}); the BPF counter is __u32"
+        ),
         span=mod.span,
       )
     )

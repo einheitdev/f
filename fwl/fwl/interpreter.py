@@ -71,14 +71,35 @@ def _rate_limit_allows(
   The bucket key is the runtime value of mod.per_field. Buckets in
   `state` carry the count "so far" within the current 1-second window;
   the rule fires when count < threshold.
+
+  Lookups try the raw key first (matching the .pkt spec, which says
+  IP buckets are dotted-quad strings and port buckets are integers).
+  If that misses, IP keys are renormalized to integer form so the
+  interpreter and the BPF runner cannot silently disagree on which
+  bucket "1.2.3.4" and 16909060 refer to — surfaced by the
+  explore-mode bug hunter (Finding 2).
   """
   bucket_key = packet.get(mod.per_field)
   if bucket_key is None:
     # The per= field isn't available on this packet (e.g. src_port
     # for an ICMP packet). Treat as bucket count = 0.
     bucket_key = 0
-  current = state.get(rule_idx, {}).get(bucket_key, 0)
-  return current < mod.threshold
+  buckets = state.get(rule_idx, {})
+  if bucket_key in buckets:
+    return buckets[bucket_key] < mod.threshold
+  if mod.per_field in ("src_ip", "dst_ip") and isinstance(bucket_key, str):
+    int_key = _ipv4_str_to_int(bucket_key)
+    if int_key in buckets:
+      return buckets[int_key] < mod.threshold
+  return 0 < mod.threshold
+
+
+def _ipv4_str_to_int(addr: str) -> int:
+  """Dotted-quad to host-order u32, matching runner._encode_rl_key."""
+  value = 0
+  for part in addr.split("."):
+    value = (value << 8) | int(part)
+  return value & 0xFFFFFFFF
 
 
 def _eval(node: ast.Condition, packet: dict[str, Any]) -> bool:

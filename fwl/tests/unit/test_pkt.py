@@ -4,6 +4,31 @@ import pytest
 from fwl import pkt
 
 
+class TestIPv4Validation:
+  """Finding 3: builder must reject non-string IPv4 args cleanly."""
+
+  def test_int_for_src_ip_rejected_with_clear_error(self):
+    fields = pkt.parse_builder("tcp(src_ip=16909060, dst_port=80)")
+    with pytest.raises(ValueError, match="src_ip"):
+      pkt.build_packet(fields)
+
+  def test_invalid_dotted_quad_rejected(self):
+    fields = pkt.parse_builder('tcp(src_ip="not.an.ip.address")')
+    with pytest.raises(ValueError, match="src_ip"):
+      pkt.build_packet(fields)
+
+  def test_octet_out_of_range_rejected(self):
+    fields = pkt.parse_builder('tcp(src_ip="1.2.3.999")')
+    with pytest.raises(ValueError, match="src_ip"):
+      pkt.build_packet(fields)
+
+  def test_well_formed_dotted_quad_passes(self):
+    fields = pkt.parse_builder('tcp(src_ip="10.20.30.40")')
+    packet = pkt.build_packet(fields)
+    # IP source addr at offset 14+12 = 26
+    assert packet.raw[26:30] == bytes([10, 20, 30, 40])
+
+
 class TestBuilderParser:
   def test_tcp_with_kwargs(self):
     fields = pkt.parse_builder(

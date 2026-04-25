@@ -161,6 +161,20 @@ class TestRateLimit:
       src, {"proto": "tcp", "src_ip": "1.2.3.4"}, state
     ) == DROP
 
+  def test_int_state_key_for_ip_bucket_normalizes(self):
+    """Finding 2: int and string keys for IP buckets must look up the
+    same bucket so the interpreter and the BPF runner cannot diverge."""
+    src = (
+      "@xdp(eth0)\n"
+      "drop if pkt.proto == tcp limited by rate_limit(3, per=src_ip)\n"
+      "default allow\n"
+    )
+    # 16909060 == 0x01020304 == "1.2.3.4" in host-order u32
+    state = {0: {16909060: 5}}
+    assert evaluate(
+      src, {"proto": "tcp", "src_ip": "1.2.3.4"}, state
+    ) == PASS
+
   def test_independent_buckets(self):
     src = (
       "@xdp(eth0)\n"

@@ -169,6 +169,32 @@ class TestPortRangeOrder:
     )
 
 
+class TestRateLimitThresholdRange:
+  """Finding 1: rate_limit threshold must fit in u32."""
+
+  def test_threshold_above_u32_rejected(self):
+    with pytest.raises(FwlException) as exc:
+      analyze(
+        "@xdp(eth0)\n"
+        "drop limited by rate_limit(99999999999999999999999999999999, "
+        "per=src_ip)\n"
+      )
+    assert "u32" in str(exc.value)
+
+  def test_threshold_at_u32_max_passes(self):
+    analyze(
+      "@xdp(eth0)\n"
+      "drop limited by rate_limit(4294967295, per=src_ip)\n"
+    )
+
+  def test_threshold_at_u32_max_plus_one_rejected(self):
+    with pytest.raises(FwlException):
+      analyze(
+        "@xdp(eth0)\n"
+        "drop limited by rate_limit(4294967296, per=src_ip)\n"
+      )
+
+
 class TestCidrPrefixRange:
   """Spec error #6: CIDR prefix length must be 0..32."""
 

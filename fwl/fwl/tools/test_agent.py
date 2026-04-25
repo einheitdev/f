@@ -865,6 +865,136 @@ def run_auto_test(output_dir: Path) -> None:
 
 
 # ---------------------------------------------------------------------
+# Explore mode — agentic bug hunter (multi-turn, tools enabled)
+# ---------------------------------------------------------------------
+
+
+_EXPLORE_PROMPT = """You are adversarially bug-hunting the FWL v0.1
+compiler. Your goal: find programs where any two of (1) the spec,
+(2) the AST interpreter, (3) the BPF C emitter would disagree on
+what a given packet should produce.
+
+You're running with full tool access from the fwl/ working directory.
+
+The implementation:
+  fwl/parser.py       Lark + transformer to AST
+  fwl/analyzer.py     Semantic checks (guards, types, ranges)
+  fwl/interpreter.py  AST oracle
+  fwl/emitter.py      BPF C generator
+  fwl/grammar.lark    v0.1 grammar
+  fwl/runner.py       Three-oracle test harness
+
+The specs:
+  ../docs/FWL_V01_SPEC.md      Language semantics (authoritative)
+  ../docs/PKT_V01_SPEC.md      Test case format
+  ../docs/F_DEVELOPMENT_METHODOLOGY.md  How verification works
+
+Existing tests:
+  tests/corpus/<phase>/        Hand-written canonical regression suite
+  tests/generated/<category>/  Agent-generated cases (passed verification)
+
+Workflow per hypothesis:
+1. Form a hypothesis. Look for thin abstractions, recent fixes
+   (git log -20), corner cases the existing corpus doesn't cover,
+   places where parser/analyzer/interpreter/emitter make independent
+   decisions that could drift.
+2. Write a candidate .pkt to tests/explored/<descriptive_name>.pkt.
+   Compute expected.bpf_action from the spec — not from what you
+   think the implementation does.
+3. Run: `.venv/bin/fwl test tests/explored/<name>.pkt`
+   - PASS = no bug visible here, try another hypothesis
+   - interpreter fail = your computed expected differs from interpreter
+   - bpf fail = clang or BPF disagrees
+   - oracle disagreement = REAL BUG
+4. For deeper investigation:
+   - `.venv/bin/fwl interpret tests/explored/<name>.fw <name>.pkt`
+   - `.venv/bin/fwl compile tests/explored/<name>.fw` to inspect BPF C
+   - `.venv/bin/fwl parse tests/explored/<name>.fw` to inspect AST
+5. Document every real bug AND every spec inconsistency in
+   tests/explored/_findings.md with this template:
+
+   ## Finding N: <short title>
+   **Case:** tests/explored/<file>.pkt
+   **Spec ref:** docs/FWL_V01_SPEC.md:<lines>
+   **What the spec says:** <quote or paraphrase>
+   **What the implementation does:** <observed behavior>
+   **Hypothesis:** <root cause guess>
+   **Severity:** critical | medium | low
+
+Stopping criteria:
+- You have found at least 3 real bugs, OR
+- You have made at least 30 iterations without a new finding, OR
+- You judge that further exploration has diminishing returns.
+
+When you stop, summarize what you found and what surfaces of the
+language you explored. Even null findings are useful — they tell us
+the corpus already covers that area.
+
+Be deliberate. Don't shotgun cases — each one should test a specific
+hypothesis you can articulate.
+
+Begin by reading the recent git log (`git log -10 --oneline`) and
+the four implementation files to orient yourself."""
+
+
+async def _run_explore(args: argparse.Namespace) -> None:
+  """Agentic bug-hunting mode: Claude drives Read/Bash/Write in a loop."""
+  output_dir: Path = args.output
+  output_dir.mkdir(parents=True, exist_ok=True)
+  (output_dir / "_findings.md").touch(exist_ok=True)
+
+  fwl_dir = _FWL_DIR
+
+  options = ClaudeCodeOptions(
+    system_prompt=_EXPLORE_PROMPT,
+    model=args.model,
+    max_turns=args.max_turns,
+    cwd=str(fwl_dir),
+    permission_mode="bypassPermissions",
+    allowed_tools=["Read", "Bash", "Write", "Edit", "Grep", "Glob"],
+    settings='{"sandbox":{"enabled":false}}',
+  )
+
+  user_prompt = (
+    f"Hunt for bugs in the FWL v0.1 compiler. Output dir: "
+    f"{output_dir.relative_to(fwl_dir)}/. Budget: {args.max_turns} "
+    f"turns. Begin."
+  )
+
+  print("=" * 70)
+  print("Explore mode — agentic bug hunter")
+  print("=" * 70)
+  print(f"  Working dir: {fwl_dir}")
+  print(f"  Output dir:  {output_dir}")
+  print(f"  Max turns:   {args.max_turns}")
+  print(f"  Model:       {args.model}")
+  print()
+
+  total_cost = 0.0
+  turn_count = 0
+  async for msg in query(prompt=user_prompt, options=options):
+    if isinstance(msg, AssistantMessage):
+      turn_count += 1
+      for block in msg.content:
+        if isinstance(block, TextBlock):
+          # Truncate very long messages so the console output is
+          # navigable; the agent's full reasoning is still in the
+          # claude session log if needed.
+          text = block.text.strip()
+          if text:
+            preview = text if len(text) < 800 else text[:800] + "..."
+            print(f"\n[turn {turn_count}]\n{preview}\n")
+    elif isinstance(msg, ResultMessage):
+      if msg.total_cost_usd is not None:
+        total_cost = msg.total_cost_usd
+
+  print("=" * 70)
+  print(f"Explore complete. Total cost: ${total_cost:.4f}")
+  print(f"Findings: {output_dir}/_findings.md")
+  print(f"Cases:    {output_dir}/")
+
+
+# ---------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------
 
@@ -1011,6 +1141,19 @@ def main() -> None:
       "which agent-generated cases all three oracles agree on"
     ),
   )
+  parser.add_argument(
+    "--explore", action="store_true",
+    help=(
+      "Agentic mode: Claude gets Read/Bash/Write tools and drives a "
+      "hypothesis -> test -> iterate loop instead of single-shot batch "
+      "generation. Use --max-turns to bound the budget. Findings land "
+      "in --output / _findings.md."
+    ),
+  )
+  parser.add_argument(
+    "--max-turns", type=int, default=80,
+    help="Turn limit for --explore mode (default: 80)",
+  )
 
   args = parser.parse_args()
 
@@ -1019,6 +1162,12 @@ def main() -> None:
     for name, info in CATEGORIES.items():
       print(f"  {name:25s} {info['description']}")
     print(f"\n  {'all':25s} Run all categories sequentially")
+    return
+
+  if args.explore:
+    if not args.output or args.output == DEFAULT_OUTPUT_DIR:
+      args.output = _FWL_DIR / "tests" / "explored"
+    asyncio.run(_run_explore(args))
     return
 
   if not args.category:

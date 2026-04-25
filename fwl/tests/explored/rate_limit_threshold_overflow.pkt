@@ -1,0 +1,12 @@
+name: "rate_limit threshold larger than u64 max produces uncompilable BPF C"
+source_fw: |
+  @xdp(eth0)
+  drop limited by rate_limit(99999999999999999999999999999999, per=src_ip)
+  allow
+
+test_packet:
+  builder: tcp(src_ip="1.2.3.4", dst_port=80)
+
+expected:
+  compiles: true
+  bpf_action: drop
