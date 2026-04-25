@@ -272,12 +272,82 @@ def discover(directory: Path) -> list[Path]:
 
 
 def run_directory(directory: Path) -> list[CaseResult]:
-  """Run every .pkt under `directory` and return per-case results."""
+  """Run every .pkt under `directory` and return per-case results.
+
+  A .pkt may declare `expected.loads: false` to assert that the
+  loader rejects it (PoC for a loader bug, kept as anti-regression
+  once the bug is fixed). When `loads` is omitted it defaults to
+  true and a load-time exception is reported as a runner error.
+  """
+  import yaml as _yaml
   results = []
   for path in discover(directory):
-    case = pkt.load(path)
+    expects_load = _peek_expects_load(path, _yaml)
+    try:
+      case = pkt.load(path)
+    except (ValueError, KeyError) as exc:
+      results.append(_load_failure_result(path, exc, expects_load))
+      continue
+    if not expects_load:
+      results.append(_unexpected_load_success_result(path, case))
+      continue
     results.append(run_case(case))
   return results
+
+
+def _peek_expects_load(path: Path, _yaml) -> bool:
+  """Extract `expected.loads` from a .pkt without invoking pkt.load,
+  so we can interpret a load-time exception as expected-vs-genuine."""
+  try:
+    doc = _yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    return bool(doc.get("expected", {}).get("loads", True))
+  except Exception:
+    return True
+
+
+def _load_failure_result(
+  path: Path, exc: Exception, expects_load: bool,
+) -> CaseResult:
+  """Synthesize a CaseResult for a .pkt that errored during pkt.load."""
+  stub = pkt.PktCase(
+    name=path.stem,
+    source_fw="",
+    packet=pkt.Packet(raw=b"", fields={}),
+    expected={},
+    state={},
+    path=path,
+  )
+  if expects_load:
+    return CaseResult(
+      case=stub,
+      oracles=[OracleResult("loader", "error", f"{exc}")],
+    )
+  return CaseResult(
+    case=stub,
+    oracles=[
+      OracleResult(
+        "loader", "pass",
+        f"load rejected as expected: {exc}",
+      )
+    ],
+  )
+
+
+def _unexpected_load_success_result(
+  path: Path, case: pkt.PktCase,
+) -> CaseResult:
+  """Caller declared expected.loads=false but the loader accepted the
+  file — the loader bug this PoC was guarding against has come back."""
+  return CaseResult(
+    case=case,
+    oracles=[
+      OracleResult(
+        "loader", "fail",
+        "expected load failure but pkt.load accepted the file — "
+        "loader regression",
+      )
+    ],
+  )
 
 
 def format_results(results: list[CaseResult]) -> str:

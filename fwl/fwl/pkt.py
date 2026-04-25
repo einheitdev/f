@@ -120,17 +120,30 @@ def _split_args(args_text: str) -> list[tuple[str, str]]:
   return result
 
 
+_BUILDER_FIELD_TABLE: dict[str, frozenset[str]] = {
+  "tcp": frozenset({"src_ip", "dst_ip", "src_port", "dst_port",
+                    "syn", "ack"}),
+  "udp": frozenset({"src_ip", "dst_ip", "src_port", "dst_port"}),
+  "icmp": frozenset({"src_ip", "dst_ip"}),
+}
+
+
 def parse_builder(text: str) -> dict[str, Any]:
   """Parse a builder expression into a dict of decoded fields.
 
   Returns a dict containing at least `proto`. Other keys depend on
-  the builder used.
+  the builder used; per PKT_V01_SPEC.md:253, names not in the
+  proto's field table are rejected at load time.
   """
   match = _BUILDER_RE.match(text)
   if not match:
     raise ValueError(f"unrecognized builder expression: {text!r}")
-  fields: dict[str, Any] = {"proto": match.group("proto")}
+  proto = match.group("proto")
+  allowed = _BUILDER_FIELD_TABLE[proto]
+  fields: dict[str, Any] = {"proto": proto}
   for name, raw_value in _split_args(match.group("args")):
+    if name not in allowed:
+      raise ValueError(f"unknown {proto} field {name!r}")
     fields[name] = _parse_value(raw_value)
   return fields
 
@@ -266,7 +279,13 @@ def build_packet(fields: dict[str, Any]) -> Packet:
 
 
 def load(path: Path) -> PktCase:
-  """Load a `.pkt` YAML file from disk."""
+  """Load a `.pkt` YAML file from disk.
+
+  Per PKT_V01_SPEC.md:256, every key under `state.rate_limit` must
+  reference a rule index that exists AND carries a rate_limit
+  modifier; otherwise the loader rejects the file rather than
+  silently discarding the bucket data.
+  """
   text = path.read_text(encoding="utf-8")
   doc = yaml.safe_load(text)
 
@@ -276,8 +295,16 @@ def load(path: Path) -> PktCase:
 
   raw_state = (doc.get("state") or {}).get("rate_limit", {})
   state: dict[int, dict[Any, int]] = {}
-  for rule_idx, buckets in raw_state.items():
-    state[int(rule_idx)] = dict(buckets)
+  if raw_state:
+    valid = _rate_limit_rule_indices(doc["source_fw"])
+    for rule_idx, buckets in raw_state.items():
+      idx = int(rule_idx)
+      if idx not in valid:
+        raise ValueError(
+          f"state.rate_limit references rule index {idx} without a "
+          f"rate_limit modifier"
+        )
+      state[idx] = dict(buckets)
 
   return PktCase(
     name=doc["name"],
@@ -286,4 +313,18 @@ def load(path: Path) -> PktCase:
     expected=doc["expected"],
     state=state,
     path=path,
+  )
+
+
+def _rate_limit_rule_indices(source_fw: str) -> frozenset[int]:
+  """Indices of rules in `source_fw` that carry a rate_limit modifier.
+
+  Imported lazily to avoid an import cycle if the parser module ever
+  grows a dependency on this one.
+  """
+  from . import analyzer, ast, parser
+  program = analyzer.analyze(parser.parse(source_fw))
+  return frozenset(
+    idx for idx, rule in enumerate(program.rules)
+    if isinstance(rule.modifier, ast.RateLimit)
   )
