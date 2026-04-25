@@ -62,17 +62,16 @@ def _spec_oracle(case: pkt.PktCase) -> OracleResult:
   authoring time (per F_DEVELOPMENT_METHODOLOGY.md:170). This oracle
   ensures the file at least has the fields the runner needs.
   """
+  if case.expected.get("compiles", True) is False:
+    # Compile-failure cases need no bpf_action — the interpreter and
+    # bpf oracles verify that compilation actually fails.
+    return OracleResult(
+      "spec", "pass", "compile-failure case (no action)"
+    )
   if "bpf_action" not in case.expected:
     return OracleResult(
       "spec", "fail",
       "expected.bpf_action missing — cannot verify",
-    )
-  if case.expected.get("compiles", True) is False:
-    # No expected action when the program is supposed to fail to
-    # compile. The interpreter and bpf oracles will then check the
-    # compile-fail behavior.
-    return OracleResult(
-      "spec", "pass", "compile-failure case (no action)"
     )
   return OracleResult("spec", "pass", "")
 

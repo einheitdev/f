@@ -1,0 +1,11 @@
+name: "drop if proto==tcp does not match udp packet (implicit allow)"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.proto == tcp
+
+test_packet:
+  builder: udp(dst_port=53)
+
+expected:
+  compiles: true
+  bpf_action: allow

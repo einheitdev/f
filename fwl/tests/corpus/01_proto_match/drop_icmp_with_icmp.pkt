@@ -1,0 +1,11 @@
+name: "drop if proto==icmp + icmp packet matches and drops"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.proto == icmp
+
+test_packet:
+  builder: icmp()
+
+expected:
+  compiles: true
+  bpf_action: drop

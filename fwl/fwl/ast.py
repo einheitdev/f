@@ -5,10 +5,6 @@ contract between the parser, the analyzer, the interpreter, and the
 emitter — change cautiously.
 
 Spec reference: docs/FWL_V01_SPEC.md grammar section.
-
-Phase 0 covers only the smallest possible surface: a hook declaration
-followed by a single unconditional `allow` rule. New node types and
-fields land per construct as the language grows.
 """
 from __future__ import annotations
 from dataclasses import dataclass, field
@@ -20,22 +16,74 @@ from .errors import Span
 class Action(Enum):
   """Terminal and non-terminal action verbs.
 
-  v0.1 actions per FWL_V01_SPEC.md:78. Phase 0 ships only ALLOW and
-  DROP; LOG and COUNT are reserved enum members but not yet wired
-  through parser/interpreter/emitter.
+  v0.1 actions per FWL_V01_SPEC.md:78. Phase 1 ships ALLOW and DROP;
+  LOG and COUNT join in later phases.
   """
   ALLOW = "allow"
   DROP = "drop"
 
 
+class Proto(Enum):
+  """Protocol keywords used as enum operands for pkt.proto.
+
+  Spec: FWL_V01_SPEC.md:140, :577.
+  """
+  TCP = "tcp"
+  UDP = "udp"
+  ICMP = "icmp"
+
+
+# Field identifiers as plain strings keyed off the spec's accessor
+# names. Using a string key (rather than an enum) keeps the AST
+# extension-friendly: future field additions don't require enum
+# updates everywhere that pattern-matches on field type.
+FIELD_PROTO = "pkt.proto"
+
+
+@dataclass(frozen=True)
+class FieldRef:
+  """A reference to a packet field, e.g. pkt.proto."""
+  name: str
+  span: Span
+
+
+@dataclass(frozen=True)
+class ProtoLiteral:
+  """A bare protocol keyword (tcp, udp, icmp) as an operand."""
+  proto: Proto
+  span: Span
+
+
+@dataclass(frozen=True)
+class Comparison:
+  """A field-vs-operand comparison.
+
+  Phase 1 only models `==`; other operators (`!=`, ordered, `in`) join
+  in Phase 3. `op` is a string literal so the same node type can
+  carry every comparison operator the spec defines.
+  """
+  field: FieldRef
+  op: str
+  operand: ProtoLiteral
+  span: Span
+
+
+# A condition is currently just a Comparison; Phase 4 introduces
+# boolean composition (BoolOp, NotOp). Aliasing here keeps signatures
+# stable across phases.
+Condition = Comparison
+
+
 @dataclass(frozen=True)
 class Rule:
-  """A single firewall rule.
+  """A single firewall rule: action with optional condition.
 
-  v0.1 grammar: `<action> [if <condition>] [<modifier>]`. Phase 0
-  supports only the bare `<action>` form — no condition, no modifier.
+  v0.1 grammar: `<action> [if <condition>] [<modifier>]`. Phase 1
+  supports `<action>` and `<action> if <condition>`. The `modifier`
+  slot lands in Phase 5 (rate_limit).
   """
   action: Action
+  condition: Condition | None
   span: Span
 
 
@@ -55,8 +103,8 @@ class Program:
   """A complete FWL program: hook + ordered rules.
 
   Per the spec grammar (`program = hook_decl { rule } [ default_rule ]`)
-  zero rules are valid when a `default` rule is present; Phase 0
-  doesn't model default rules yet.
+  zero rules are valid when a `default` rule is present; default
+  rules land in Phase 2.
   """
   hook: Hook
   rules: list[Rule] = field(default_factory=list)

@@ -36,6 +36,13 @@ def _span(token_or_tree) -> Span:
   return Span(line=line, column=column)
 
 
+_PROTO_FROM_KEYWORD = {
+  "tcp": ast.Proto.TCP,
+  "udp": ast.Proto.UDP,
+  "icmp": ast.Proto.ICMP,
+}
+
+
 class _ToAst(Transformer):
   """Lark Transformer: parse tree -> AST nodes."""
 
@@ -48,9 +55,35 @@ class _ToAst(Transformer):
   def DROP(self, tok: Token) -> Token:
     return tok
 
+  def PROTO_FIELD(self, tok: Token) -> Token:
+    return tok
+
+  def PROTO_KEYWORD(self, tok: Token) -> Token:
+    return tok
+
   def hook_decl(self, children) -> ast.Hook:
     (iface_tok,) = children
     return ast.Hook(interface=str(iface_tok), span=_span(iface_tok))
+
+  def field(self, children) -> ast.FieldRef:
+    (tok,) = children
+    return ast.FieldRef(name=str(tok), span=_span(tok))
+
+  def operand(self, children) -> ast.ProtoLiteral:
+    (tok,) = children
+    return ast.ProtoLiteral(
+      proto=_PROTO_FROM_KEYWORD[str(tok)], span=_span(tok)
+    )
+
+  def comparison(self, children) -> ast.Comparison:
+    field, operand = children
+    return ast.Comparison(
+      field=field, op="==", operand=operand, span=field.span
+    )
+
+  def condition(self, children) -> ast.Condition:
+    (cmp_node,) = children
+    return cmp_node
 
   def action(self, children) -> tuple[ast.Action, Span]:
     (tok,) = children
@@ -58,13 +91,13 @@ class _ToAst(Transformer):
       return ast.Action.ALLOW, _span(tok)
     if tok.type == "DROP":
       return ast.Action.DROP, _span(tok)
-    # Grammar restricts action to ALLOW | DROP, so this is unreachable.
     raise AssertionError(f"unexpected action token {tok.type}")
 
   def rule(self, children) -> ast.Rule:
-    (action_tuple,) = children
-    action, span = action_tuple
-    return ast.Rule(action=action, span=span)
+    action_tuple = children[0]
+    action, action_span = action_tuple
+    condition = children[1] if len(children) > 1 else None
+    return ast.Rule(action=action, condition=condition, span=action_span)
 
   def program(self, children) -> ast.Program:
     hook = children[0]
