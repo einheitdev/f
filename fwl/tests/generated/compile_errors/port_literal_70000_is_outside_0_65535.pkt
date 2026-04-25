@@ -1,0 +1,10 @@
+name: "port literal 70000 is outside 0..65535"
+source_fw: |
+  @xdp(eth0)
+  allow if pkt.proto == tcp and pkt.dst_port == 70000
+
+test_packet:
+  builder: tcp()
+
+expected:
+  compiles: false

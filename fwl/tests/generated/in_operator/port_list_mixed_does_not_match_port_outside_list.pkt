@@ -1,0 +1,12 @@
+name: "port list mixed does not match port outside list"
+source_fw: |
+  @xdp(eth0)
+  allow if pkt.proto == tcp and pkt.dst_port in [22, 80, 443, 8080]
+  default drop
+
+test_packet:
+  builder: tcp(src_ip="1.2.3.4", dst_port=8443)
+
+expected:
+  compiles: true
+  bpf_action: drop

@@ -1,0 +1,13 @@
+name: "v0.2+ feature 'inline_c' is rejected"
+source_fw: |
+  @xdp(eth0)
+  inline_c {
+      return XDP_PASS;
+  }
+  allow
+
+test_packet:
+  builder: tcp()
+
+expected:
+  compiles: false

@@ -1,0 +1,10 @@
+name: "tcp.ack with no guard is rejected"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.tcp.ack
+
+test_packet:
+  builder: tcp()
+
+expected:
+  compiles: false

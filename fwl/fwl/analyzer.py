@@ -77,6 +77,137 @@ def analyze(program: ast.Program) -> ast.Program:
   return program
 
 
+_FIELD_TYPE_LABEL = {
+  ast.FIELD_PROTO: "proto enum",
+  ast.FIELD_SRC_IP: "ipv4",
+  ast.FIELD_DST_IP: "ipv4",
+  ast.FIELD_SRC_PORT: "port (u16)",
+  ast.FIELD_DST_PORT: "port (u16)",
+  ast.FIELD_TCP_SYN: "bool",
+  ast.FIELD_TCP_ACK: "bool",
+}
+
+
+def _operand_label(operand) -> str:
+  """Human-readable type tag for a comparison operand."""
+  if isinstance(operand, ast.ProtoLiteral):
+    return f"proto keyword '{operand.proto.value}'"
+  if isinstance(operand, ast.IntLiteral):
+    return f"integer {operand.value}"
+  if isinstance(operand, ast.IPv4Literal):
+    return "ipv4 literal"
+  if isinstance(operand, ast.CidrLiteral):
+    return "cidr"
+  if isinstance(operand, ast.CidrListLiteral):
+    return "cidr list"
+  if isinstance(operand, ast.RangeLiteral):
+    return "integer range"
+  if isinstance(operand, ast.ListLiteral):
+    return "list"
+  return type(operand).__name__
+
+
+def _check_port_int(value: int, span) -> None:
+  """Spec error #7: port literal must be in 0..65535."""
+  if not (0 <= value <= 65535):
+    raise FwlException(
+      FwlError(
+        category="semantic",
+        message=(
+          f"port value {value} outside valid range 0..65535"
+        ),
+        span=span,
+      )
+    )
+
+
+def _type_error(field_label: str, op: str, operand, span) -> FwlException:
+  """Spec error #3: type mismatch in comparison."""
+  return FwlException(
+    FwlError(
+      category="semantic",
+      message=(
+        f"cannot apply '{op}' to {field_label} with "
+        f"{_operand_label(operand)}"
+      ),
+      span=span,
+    )
+  )
+
+
+def _check_comparison_types(cmp: ast.Comparison) -> None:
+  """Enforce the spec's comparison-operand type rules.
+
+  Covers spec error #3 (type mismatch), #7 (port literal outside
+  0..65535), #8 (range with lo > hi).
+  """
+  field_name = cmp.field.name
+  op = cmp.op
+  operand = cmp.operand
+  span = cmp.span
+  field_label = _FIELD_TYPE_LABEL.get(field_name, field_name)
+
+  if field_name == ast.FIELD_PROTO:
+    # Grammar restricts proto comparisons to ProtoLiteral via the
+    # enum_eq / enum_neq aliases, so no further type check needed.
+    if op not in ("==", "!="):
+      raise _type_error(field_label, op, operand, span)
+    return
+
+  if field_name in ast.IP_FIELDS:
+    if op in ("==", "!="):
+      if not isinstance(operand, ast.IPv4Literal):
+        raise _type_error(field_label, op, operand, span)
+    elif op == "in":
+      if not isinstance(
+        operand, (ast.CidrLiteral, ast.CidrListLiteral, ast.ListLiteral)
+      ):
+        raise _type_error(field_label, op, operand, span)
+      if isinstance(operand, ast.ListLiteral):
+        for item in operand.items:
+          if not isinstance(item, ast.IPv4Literal):
+            raise _type_error(field_label, op, item, item.span)
+    else:
+      raise _type_error(field_label, op, operand, span)
+    return
+
+  if field_name in ast.PORT_FIELDS:
+    if op in ("==", "!=", "<", ">", "<=", ">="):
+      if not isinstance(operand, ast.IntLiteral):
+        raise _type_error(field_label, op, operand, span)
+      _check_port_int(operand.value, operand.span)
+    elif op == "in":
+      if isinstance(operand, ast.RangeLiteral):
+        _check_port_int(operand.lo, operand.span)
+        _check_port_int(operand.hi, operand.span)
+        if operand.lo > operand.hi:
+          raise FwlException(
+            FwlError(
+              category="semantic",
+              message=(
+                f"range lower bound ({operand.lo}) exceeds upper "
+                f"bound ({operand.hi})"
+              ),
+              span=operand.span,
+            )
+          )
+      elif isinstance(operand, ast.ListLiteral):
+        for item in operand.items:
+          if not isinstance(item, ast.IntLiteral):
+            raise _type_error(field_label, op, item, item.span)
+          _check_port_int(item.value, item.span)
+      else:
+        raise _type_error(field_label, op, operand, span)
+    else:
+      raise _type_error(field_label, op, operand, span)
+    return
+
+  # Bool fields shouldn't appear in a Comparison node — the grammar
+  # routes them through bool_field/primary instead. Defensive check.
+  if field_name in ast.TCP_FLAG_FIELDS:
+    raise _type_error(field_label, op, operand, span)
+
+
 def _check_modifier(mod: ast.RateLimit) -> None:
   """Validate a rate_limit modifier."""
   if mod.threshold <= 0:
@@ -99,6 +230,7 @@ def _check(node: ast.Condition, possible: Possible) -> Possible:
   """
   if isinstance(node, ast.Comparison):
     _require_guard(node.field, possible)
+    _check_comparison_types(node)
     if (
       node.field.name == ast.FIELD_PROTO
       and node.op == "=="

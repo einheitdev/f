@@ -1,0 +1,14 @@
+name: "log then count then drop all execute on tcp/23 packet"
+source_fw: |
+  @xdp(eth0)
+  log if pkt.proto == tcp and pkt.dst_port == 23
+  count telnet_attempts if pkt.proto == tcp and pkt.dst_port == 23
+  drop if pkt.proto == tcp and pkt.dst_port == 23
+  default allow
+
+test_packet:
+  builder: tcp(src_ip="192.0.2.50", dst_port=23, syn=true)
+
+expected:
+  compiles: true
+  bpf_action: drop

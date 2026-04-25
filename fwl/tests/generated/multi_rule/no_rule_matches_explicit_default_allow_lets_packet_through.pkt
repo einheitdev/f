@@ -1,0 +1,13 @@
+name: "no rule matches; explicit default allow lets packet through"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.proto == tcp and pkt.dst_port == 22
+  drop if pkt.proto == udp and pkt.dst_port == 53
+  default allow
+
+test_packet:
+  builder: tcp(src_ip="5.5.5.5", dst_port=8080)
+
+expected:
+  compiles: true
+  bpf_action: allow

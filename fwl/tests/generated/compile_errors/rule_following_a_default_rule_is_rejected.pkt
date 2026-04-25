@@ -1,0 +1,12 @@
+name: "rule following a default rule is rejected"
+source_fw: |
+  @xdp(eth0)
+  allow if pkt.proto == tcp
+  default drop
+  allow if pkt.proto == udp
+
+test_packet:
+  builder: tcp()
+
+expected:
+  compiles: false

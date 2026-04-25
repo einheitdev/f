@@ -1,0 +1,17 @@
+name: "rate_limit without if clause applies to every packet and drops"
+source_fw: |
+  @xdp(eth0)
+  drop limited by rate_limit(1000, per=src_ip)
+  default allow
+
+state:
+  rate_limit:
+    0:
+      "1.2.3.4": 500
+
+test_packet:
+  builder: tcp(src_ip="1.2.3.4", dst_port=80)
+
+expected:
+  compiles: true
+  bpf_action: drop

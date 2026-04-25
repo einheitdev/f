@@ -1,0 +1,13 @@
+name: "count fires then drop on tcp/22 packet"
+source_fw: |
+  @xdp(eth0)
+  count blocked_ssh if pkt.proto == tcp and pkt.dst_port == 22
+  drop if pkt.proto == tcp and pkt.dst_port == 22
+  default allow
+
+test_packet:
+  builder: tcp(src_ip="198.51.100.7", dst_port=22, syn=true)
+
+expected:
+  compiles: true
+  bpf_action: drop

@@ -1,0 +1,12 @@
+name: "drop if dst_port > 49152 matches boundary port 65535"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.proto == tcp and pkt.dst_port > 49152
+  default allow
+
+test_packet:
+  builder: tcp(src_port=12345, dst_port=65535)
+
+expected:
+  compiles: true
+  bpf_action: drop

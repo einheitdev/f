@@ -1,0 +1,18 @@
+name: "rate_limit per=dst_ip with count N-1 still fires the action"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.proto == tcp and pkt.dst_port == 80
+       limited by rate_limit(5, per=dst_ip)
+  default allow
+
+state:
+  rate_limit:
+    0:
+      "9.9.9.9": 4
+
+test_packet:
+  builder: tcp(src_ip="1.2.3.4", dst_ip="9.9.9.9", dst_port=80)
+
+expected:
+  compiles: true
+  bpf_action: drop

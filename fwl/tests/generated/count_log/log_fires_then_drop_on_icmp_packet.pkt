@@ -1,0 +1,13 @@
+name: "log fires then drop on icmp packet"
+source_fw: |
+  @xdp(eth0)
+  log if pkt.proto == icmp
+  drop if pkt.proto == icmp
+  default allow
+
+test_packet:
+  builder: icmp(src_ip="203.0.113.10")
+
+expected:
+  compiles: true
+  bpf_action: drop

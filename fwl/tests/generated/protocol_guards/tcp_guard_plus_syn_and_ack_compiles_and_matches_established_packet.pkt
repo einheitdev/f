@@ -1,0 +1,12 @@
+name: "tcp guard plus syn and ack compiles and matches established packet"
+source_fw: |
+  @xdp(eth0)
+  allow if pkt.proto == tcp and pkt.tcp.syn and pkt.tcp.ack
+  default drop
+
+test_packet:
+  builder: tcp(src_port=12345, dst_port=443, syn=true, ack=true)
+
+expected:
+  compiles: true
+  bpf_action: allow

@@ -1,0 +1,10 @@
+name: "pkt.dst_port without any proto guard is rejected"
+source_fw: |
+  @xdp(eth0)
+  allow if pkt.dst_port == 80
+
+test_packet:
+  builder: tcp()
+
+expected:
+  compiles: false

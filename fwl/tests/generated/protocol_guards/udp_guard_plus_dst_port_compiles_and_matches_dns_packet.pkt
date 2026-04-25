@@ -1,0 +1,12 @@
+name: "udp guard plus dst_port compiles and matches dns packet"
+source_fw: |
+  @xdp(eth0)
+  allow if pkt.proto == udp and pkt.dst_port == 53
+  default drop
+
+test_packet:
+  builder: udp(src_port=12345, dst_port=53)
+
+expected:
+  compiles: true
+  bpf_action: allow

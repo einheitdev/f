@@ -1,0 +1,14 @@
+name: "two count rules fall through to terminal allow"
+source_fw: |
+  @xdp(eth0)
+  count tcp_total if pkt.proto == tcp
+  count https_total if pkt.proto == tcp and pkt.dst_port == 443
+  allow if pkt.proto == tcp and pkt.dst_port == 443
+  default drop
+
+test_packet:
+  builder: tcp(src_ip="4.4.4.4", dst_port=443)
+
+expected:
+  compiles: true
+  bpf_action: allow

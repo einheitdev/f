@@ -1,0 +1,16 @@
+name: "not_tcp_ack_with_port_and_proto_guard_pure_syn_drops"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.proto == tcp
+         and pkt.dst_port == 22
+         and pkt.tcp.syn
+         and not pkt.tcp.ack
+  allow if pkt.proto == tcp and pkt.dst_port == 22
+  default drop
+
+test_packet:
+  builder: tcp(dst_port=22, syn=true, ack=false)
+
+expected:
+  compiles: true
+  bpf_action: drop

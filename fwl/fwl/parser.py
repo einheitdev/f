@@ -7,6 +7,7 @@ from __future__ import annotations
 import importlib.resources
 
 from lark import Lark, Transformer, UnexpectedInput
+from lark.exceptions import VisitError
 
 from . import ast
 from .errors import FwlError, FwlException, Span
@@ -67,12 +68,23 @@ def _parse_ipv4(text: str) -> int:
   return value
 
 
-def _parse_cidr(text: str) -> tuple[int, int]:
-  """Dotted-quad/prefix -> (masked_prefix_int, prefix_bits)."""
+def _parse_cidr(text: str, span: Span) -> tuple[int, int]:
+  """Dotted-quad/prefix -> (masked_prefix_int, prefix_bits).
+
+  Raises FwlException with the spec's wording for invalid prefix
+  lengths instead of a Python ValueError so the analyzer/runner
+  surface a clean compile error.
+  """
   ip_text, _, bits_text = text.partition("/")
   bits = int(bits_text)
   if not (0 <= bits <= 32):
-    raise ValueError(f"CIDR prefix out of range 0..32: {bits}")
+    raise FwlException(
+      FwlError(
+        category="semantic",
+        message=f"CIDR prefix must be 0..32 for IPv4 (got {bits})",
+        span=span,
+      )
+    )
   ip_value = _parse_ipv4(ip_text)
   if bits == 0:
     mask = 0
@@ -282,16 +294,16 @@ class _ToAst(Transformer):
 
   def cidr(self, children) -> ast.CidrLiteral:
     (tok,) = children
-    prefix, bits = _parse_cidr(str(tok))
-    return ast.CidrLiteral(prefix=prefix, bits=bits, span=_span(tok))
+    span = _span(tok)
+    prefix, bits = _parse_cidr(str(tok), span)
+    return ast.CidrLiteral(prefix=prefix, bits=bits, span=span)
 
   def cidr_list(self, children) -> ast.CidrListLiteral:
     items = []
     for tok in children:
-      prefix, bits = _parse_cidr(str(tok))
-      items.append(
-        ast.CidrLiteral(prefix=prefix, bits=bits, span=_span(tok))
-      )
+      span = _span(tok)
+      prefix, bits = _parse_cidr(str(tok), span)
+      items.append(ast.CidrLiteral(prefix=prefix, bits=bits, span=span))
     return ast.CidrListLiteral(items=items, span=items[0].span)
 
   def range(self, children) -> ast.RangeLiteral:
@@ -304,7 +316,10 @@ class _ToAst(Transformer):
 def parse(source: str) -> ast.Program:
   """Parse FWL source into an AST.
 
-  Raises FwlException with category="syntax" on any parse error.
+  Raises FwlException on any parse error. Lark's VisitError wrapper
+  is unwrapped so structural-validation failures from the
+  transformer (out-of-range CIDR prefix, malformed IPv4 octet, etc.)
+  surface as clean compile errors instead of crashing the runner.
   """
   try:
     tree = _PARSER.parse(source)
@@ -313,4 +328,12 @@ def parse(source: str) -> ast.Program:
     raise FwlException(
       FwlError(category="syntax", message=str(exc), span=span)
     ) from exc
-  return _ToAst().transform(tree)
+  try:
+    return _ToAst().transform(tree)
+  except VisitError as exc:
+    inner = exc.orig_exc
+    if isinstance(inner, FwlException):
+      raise inner from exc
+    raise FwlException(
+      FwlError(category="semantic", message=str(inner), span=None)
+    ) from exc

@@ -1,0 +1,12 @@
+name: "drop if src_port < 1024 matches boundary port 0"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.proto == udp and pkt.src_port < 1024
+  default allow
+
+test_packet:
+  builder: udp(src_port=0, dst_port=53)
+
+expected:
+  compiles: true
+  bpf_action: drop

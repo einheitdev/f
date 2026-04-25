@@ -1,0 +1,12 @@
+name: "cidr /32 exact host match drops"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.src_ip in 198.51.100.50/32
+  default allow
+
+test_packet:
+  builder: tcp(src_ip="198.51.100.50", dst_port=80)
+
+expected:
+  compiles: true
+  bpf_action: drop

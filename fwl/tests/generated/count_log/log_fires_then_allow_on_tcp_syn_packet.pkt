@@ -1,0 +1,13 @@
+name: "log fires then allow on tcp syn packet"
+source_fw: |
+  @xdp(eth0)
+  log if pkt.proto == tcp and pkt.tcp.syn
+  allow if pkt.proto == tcp
+  default drop
+
+test_packet:
+  builder: tcp(src_ip="1.2.3.4", dst_port=443, syn=true)
+
+expected:
+  compiles: true
+  bpf_action: allow

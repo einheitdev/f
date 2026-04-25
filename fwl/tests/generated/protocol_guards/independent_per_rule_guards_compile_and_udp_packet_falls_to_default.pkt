@@ -1,0 +1,13 @@
+name: "independent per-rule guards compile and udp packet falls to default"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.proto == tcp and pkt.dst_port == 22
+  allow if pkt.proto == udp and pkt.dst_port == 53
+  default drop
+
+test_packet:
+  builder: udp(src_port=12345, dst_port=53)
+
+expected:
+  compiles: true
+  bpf_action: allow

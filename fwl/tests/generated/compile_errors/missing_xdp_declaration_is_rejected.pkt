@@ -1,0 +1,9 @@
+name: "missing @xdp declaration is rejected"
+source_fw: |
+  allow if pkt.proto == tcp
+
+test_packet:
+  builder: tcp()
+
+expected:
+  compiles: false

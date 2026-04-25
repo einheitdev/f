@@ -1,0 +1,12 @@
+name: "allow if proto==tcp and not pkt.tcp.ack matches packet with ack clear"
+source_fw: |
+  @xdp(eth0)
+  allow if pkt.proto == tcp and not pkt.tcp.ack
+  default drop
+
+test_packet:
+  builder: tcp(src_port=12345, dst_port=80, syn=true, ack=false)
+
+expected:
+  compiles: true
+  bpf_action: allow

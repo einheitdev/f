@@ -1,0 +1,12 @@
+name: "deeply nested parens 3 levels - tcp dst_port 22 matches inner branch"
+source_fw: |
+  @xdp(eth0)
+  allow if ((pkt.proto == tcp and (pkt.dst_port == 22 or pkt.dst_port == 80)) or (pkt.proto == udp and pkt.dst_port == 53))
+  default drop
+
+test_packet:
+  builder: tcp(src_ip="3.3.3.3", dst_port=22)
+
+expected:
+  compiles: true
+  bpf_action: allow

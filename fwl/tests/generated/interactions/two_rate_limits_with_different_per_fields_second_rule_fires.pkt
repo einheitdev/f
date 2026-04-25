@@ -1,0 +1,22 @@
+name: "two_rate_limits_with_different_per_fields_second_rule_fires"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.proto == tcp and pkt.tcp.syn
+         limited by rate_limit(1000, per=src_ip)
+  drop if pkt.proto == udp and pkt.dst_port == 53
+         limited by rate_limit(50, per=dst_port)
+  default allow
+
+state:
+  rate_limit:
+    0:
+      "1.2.3.4": 1000
+    1:
+      53: 10
+
+test_packet:
+  builder: udp(src_ip="1.2.3.4", dst_port=53)
+
+expected:
+  compiles: true
+  bpf_action: drop

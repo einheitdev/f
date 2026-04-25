@@ -1,0 +1,12 @@
+name: "port range 1..1023 lower boundary matches port 1"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.proto == tcp and pkt.dst_port in 1..1023
+  default allow
+
+test_packet:
+  builder: tcp(src_ip="1.2.3.4", dst_port=1)
+
+expected:
+  compiles: true
+  bpf_action: drop

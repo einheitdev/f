@@ -88,7 +88,9 @@ class TestPortRangeAndList:
       "drop if pkt.proto == tcp and pkt.dst_port in 5000..6000\n"
       "default allow\n"
     )
-    pkt = lambda p: {"proto": "tcp", "dst_port": p}
+
+    def pkt(p):
+      return {"proto": "tcp", "dst_port": p}
     assert evaluate(src, pkt(5000)) == DROP
     assert evaluate(src, pkt(6000)) == DROP
     assert evaluate(src, pkt(4999)) == PASS
@@ -100,7 +102,9 @@ class TestPortRangeAndList:
       "drop if pkt.proto == tcp and pkt.dst_port in [22, 80, 443]\n"
       "default allow\n"
     )
-    pkt = lambda p: {"proto": "tcp", "dst_port": p}
+
+    def pkt(p):
+      return {"proto": "tcp", "dst_port": p}
     assert evaluate(src, pkt(22)) == DROP
     assert evaluate(src, pkt(80)) == DROP
     assert evaluate(src, pkt(81)) == PASS

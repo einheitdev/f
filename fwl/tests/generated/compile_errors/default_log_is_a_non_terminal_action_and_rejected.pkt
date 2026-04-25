@@ -1,0 +1,11 @@
+name: "default log is a non-terminal action and rejected"
+source_fw: |
+  @xdp(eth0)
+  allow if pkt.proto == tcp
+  default log
+
+test_packet:
+  builder: tcp()
+
+expected:
+  compiles: false

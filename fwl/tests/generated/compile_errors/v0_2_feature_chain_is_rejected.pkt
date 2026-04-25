@@ -1,0 +1,11 @@
+name: "v0.2+ feature 'chain' is rejected"
+source_fw: |
+  @xdp(eth0)
+  chain stage_two
+  allow
+
+test_packet:
+  builder: tcp()
+
+expected:
+  compiles: false

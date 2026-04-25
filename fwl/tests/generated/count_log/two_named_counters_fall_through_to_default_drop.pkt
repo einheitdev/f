@@ -1,0 +1,13 @@
+name: "two named counters fall through to default drop"
+source_fw: |
+  @xdp(eth0)
+  count tcp_total if pkt.proto == tcp
+  count tcp_https if pkt.proto == tcp and pkt.dst_port == 443
+  default drop
+
+test_packet:
+  builder: tcp(src_ip="172.16.0.1", dst_port=443)
+
+expected:
+  compiles: true
+  bpf_action: drop

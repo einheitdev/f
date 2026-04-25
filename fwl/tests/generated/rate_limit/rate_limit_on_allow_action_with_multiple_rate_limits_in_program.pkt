@@ -1,0 +1,22 @@
+name: "rate_limit on allow action with multiple rate_limits in program"
+source_fw: |
+  @xdp(eth0)
+  allow if pkt.proto == tcp and pkt.dst_port == 80
+        limited by rate_limit(100, per=src_ip)
+  drop if pkt.proto == tcp and pkt.dst_port == 80
+       limited by rate_limit(50, per=dst_ip)
+  default drop
+
+state:
+  rate_limit:
+    0:
+      "5.5.5.5": 50
+    1:
+      "2.2.2.2": 200
+
+test_packet:
+  builder: tcp(src_ip="5.5.5.5", dst_ip="2.2.2.2", dst_port=80)
+
+expected:
+  compiles: true
+  bpf_action: allow
