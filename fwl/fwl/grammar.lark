@@ -2,3 +2,25 @@
 //
 // Transcribed from the EBNF reference in docs/FWL_V01_SPEC.md.
 // Anything not listed here is a syntax error.
+//
+// Phase 0 surface: hook declaration + zero or more bare `allow` rules.
+// New productions land per construct as the language grows.
+
+program       : hook_decl rule*
+
+hook_decl     : "@xdp" "(" IDENTIFIER ")"
+
+rule          : action
+
+action        : ALLOW | DROP
+
+ALLOW         : "allow"
+DROP          : "drop"
+
+IDENTIFIER    : /[a-z_][a-z0-9_]*/
+
+COMMENT       : /#[^\n]*/
+
+%import common.WS
+%ignore WS
+%ignore COMMENT
