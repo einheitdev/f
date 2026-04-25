@@ -1,0 +1,12 @@
+name: "!= operator on proto compares for non-equality"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.proto != tcp
+  default allow
+
+test_packet:
+  builder: udp()
+
+expected:
+  compiles: true
+  bpf_action: drop

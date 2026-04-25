@@ -1,0 +1,12 @@
+name: "ordered comparisons <= and >= bound an exact range"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.proto == tcp and pkt.dst_port >= 8000 and pkt.dst_port <= 8999
+  default allow
+
+test_packet:
+  builder: tcp(dst_port=8500)
+
+expected:
+  compiles: true
+  bpf_action: drop

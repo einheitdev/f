@@ -1,0 +1,12 @@
+name: "hex integer literal works as a port comparison value"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.proto == tcp and pkt.dst_port == 0xff
+  default allow
+
+test_packet:
+  builder: tcp(dst_port=255)
+
+expected:
+  compiles: true
+  bpf_action: drop

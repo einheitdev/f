@@ -1,0 +1,12 @@
+name: "port 65535 is a valid comparand"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.proto == udp and pkt.dst_port == 65535
+  default allow
+
+test_packet:
+  builder: udp(dst_port=65535)
+
+expected:
+  compiles: true
+  bpf_action: drop
