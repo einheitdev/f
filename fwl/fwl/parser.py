@@ -127,8 +127,30 @@ class _ToAst(Transformer):
 
   def rule(self, children) -> ast.Rule:
     action, action_span = children[0]
-    condition = children[1] if len(children) > 1 else None
-    return ast.Rule(action=action, condition=condition, span=action_span)
+    condition: ast.Condition | None = None
+    modifier: ast.RateLimit | None = None
+    for child in children[1:]:
+      if isinstance(child, ast.RateLimit):
+        modifier = child
+      else:
+        condition = child
+    return ast.Rule(
+      action=action,
+      condition=condition,
+      modifier=modifier,
+      span=action_span,
+    )
+
+  def modifier(self, children) -> ast.RateLimit:
+    threshold_tok, field_tok = children
+    return ast.RateLimit(
+      threshold=_parse_int(str(threshold_tok)),
+      per_field=str(field_tok),
+      span=_span(threshold_tok),
+    )
+
+  def RL_FIELD(self, tok):
+    return tok
 
   def program(self, children) -> ast.Program:
     hook = children[0]

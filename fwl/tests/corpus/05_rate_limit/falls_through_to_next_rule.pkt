@@ -1,0 +1,19 @@
+name: "when rate_limit blocks, evaluation continues to next rule"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.proto == tcp and pkt.dst_port == 22
+       limited by rate_limit(3, per=src_ip)
+  allow if pkt.proto == tcp and pkt.dst_port == 22
+  default drop
+
+state:
+  rate_limit:
+    0:
+      "1.2.3.4": 3
+
+test_packet:
+  builder: tcp(src_ip="1.2.3.4", dst_port=22)
+
+expected:
+  compiles: true
+  bpf_action: allow

@@ -27,19 +27,54 @@ _ACTION_TO_XDP = {
 }
 
 
-def evaluate(program: ast.Program, packet: dict[str, Any]) -> XdpAction:
+def evaluate(
+  program: ast.Program,
+  packet: dict[str, Any],
+  state: dict[int, dict[Any, int]] | None = None,
+) -> XdpAction:
   """Run `program` against `packet` and return the resulting XDP action.
 
-  Rules execute top to bottom; first matching rule's action wins.
+  Rules execute top to bottom; first matching rule's action wins,
+  modulo rate-limit gating. The optional `state` argument supplies
+  pre-existing rate-limit bucket counts keyed by the rule's index in
+  the program; absent buckets are treated as count=0. State is read
+  but not mutated — the test harness compares the action only.
+
   After all rules, the explicit default (if present) fires; otherwise
   the implicit XDP_PASS per FWL_V01_SPEC.md:70 / :116.
   """
-  for rule in program.rules:
-    if rule.condition is None or _eval(rule.condition, packet):
-      return _ACTION_TO_XDP[rule.action]
+  state = state or {}
+  for idx, rule in enumerate(program.rules):
+    if rule.condition is not None and not _eval(rule.condition, packet):
+      continue
+    if rule.modifier is not None:
+      if not _rate_limit_allows(rule.modifier, idx, packet, state):
+        continue
+    return _ACTION_TO_XDP[rule.action]
   if program.default is not None:
     return _ACTION_TO_XDP[program.default.action]
   return XdpAction.PASS
+
+
+def _rate_limit_allows(
+  mod: ast.RateLimit,
+  rule_idx: int,
+  packet: dict[str, Any],
+  state: dict[int, dict[Any, int]],
+) -> bool:
+  """True iff the rate_limit gate would let the rule fire for this packet.
+
+  The bucket key is the runtime value of mod.per_field. Buckets in
+  `state` carry the count "so far" within the current 1-second window;
+  the rule fires when count < threshold.
+  """
+  bucket_key = packet.get(mod.per_field)
+  if bucket_key is None:
+    # The per= field isn't available on this packet (e.g. src_port
+    # for an ICMP packet). Treat as bucket count = 0.
+    bucket_key = 0
+  current = state.get(rule_idx, {}).get(bucket_key, 0)
+  return current < mod.threshold
 
 
 def _eval(node: ast.Condition, packet: dict[str, Any]) -> bool:

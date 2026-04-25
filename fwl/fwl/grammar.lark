@@ -7,7 +7,11 @@ program       : hook_decl rule* default_rule?
 
 hook_decl     : "@xdp" "(" IDENTIFIER ")"
 
-rule          : action ("if" condition)?
+rule          : action ("if" condition)? modifier?
+
+modifier      : "limited" "by" "rate_limit" "(" INTEGER "," "per" "=" RL_FIELD ")"
+
+RL_FIELD.10   : "src_ip" | "dst_ip" | "src_port" | "dst_port"
 
 default_rule  : "default" terminal_action
 

@@ -33,7 +33,30 @@ _HEADER = """\
 #include <linux/udp.h>
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
+
+struct fwl_rl_state {
+  __u64 ts;
+  __u32 count;
+};
 """
+
+
+_RL_FIELD_TO_C = {
+  "src_ip": "src_ip",
+  "dst_ip": "dst_ip",
+  "src_port": "src_port",
+  "dst_port": "dst_port",
+}
+
+
+# Map the per= field name to the AST field name so _referenced_fields
+# can include modifier-keyed fields in its parse-prelude analysis.
+_RL_FIELD_TO_AST = {
+  "src_ip": ast.FIELD_SRC_IP,
+  "dst_ip": ast.FIELD_DST_IP,
+  "src_port": ast.FIELD_SRC_PORT,
+  "dst_port": ast.FIELD_DST_PORT,
+}
 
 
 _ACTION_TO_RETURN = {
@@ -56,7 +79,12 @@ def _walk(node) -> list:
 
 
 def _referenced_fields(program: ast.Program) -> set[str]:
-  """Set of pkt.* field names mentioned anywhere in the program."""
+  """Set of pkt.* field names mentioned anywhere in the program.
+
+  Includes both fields used in conditions and fields used as
+  rate_limit bucket keys — both require the parse prelude to extract
+  the field at runtime.
+  """
   fields: set[str] = set()
   for rule in program.rules:
     for n in _walk(rule.condition):
@@ -64,6 +92,8 @@ def _referenced_fields(program: ast.Program) -> set[str]:
         fields.add(n.field.name)
       elif isinstance(n, ast.BoolField):
         fields.add(n.field.name)
+    if rule.modifier is not None:
+      fields.add(_RL_FIELD_TO_AST[rule.modifier.per_field])
   return fields
 
 
@@ -318,19 +348,72 @@ def _emit_port_in(c_field: str, operand: ast.Operand) -> str:
   )
 
 
-def _emit_rule(rule: ast.Rule) -> str:
-  """Emit C statements for one rule."""
+def _emit_rule(rule: ast.Rule, idx: int) -> str:
+  """Emit C statements for one rule.
+
+  When a rate_limit modifier is present, the rule body wraps the
+  return in a rate-limit gate that consults the per-CPU map.
+  """
   ret = _ACTION_TO_RETURN[rule.action]
+
+  if rule.modifier is not None:
+    fire_block = _emit_rate_limit_gate(rule.modifier, idx, ret)
+  else:
+    fire_block = f"return {ret};"
+
   if rule.condition is None:
-    return f"  return {ret};\n"
+    return f"  {{\n    {fire_block}\n  }}\n"
   expr = _emit_condition(rule.condition)
-  return f"  if ({expr})\n    return {ret};\n"
+  return f"  if ({expr}) {{\n    {fire_block}\n  }}\n"
+
+
+def _emit_rate_limit_gate(mod: ast.RateLimit, idx: int, ret: str) -> str:
+  """Emit a rate-limit gate that returns `ret` only if under threshold.
+
+  Reads the bucket counter from the per-CPU map; if (now - ts) >= 1s
+  the counter resets. The rule fires when the post-window count is
+  strictly less than the threshold and the count is then incremented.
+  """
+  c_field = _RL_FIELD_TO_C[mod.per_field]
+  return f"""__u32 rl_key = (__u32){c_field};
+    __u64 now = bpf_ktime_get_ns();
+    struct fwl_rl_state *st =
+      bpf_map_lookup_elem(&fwl_rl_map_{idx}, &rl_key);
+    __u32 cur = 0;
+    __u64 cur_ts = now;
+    if (st && now - st->ts < 1000000000ULL) {{
+      cur = st->count;
+      cur_ts = st->ts;
+    }}
+    if (cur < {mod.threshold}) {{
+      struct fwl_rl_state new_st = {{ .ts = cur_ts, .count = cur + 1 }};
+      bpf_map_update_elem(&fwl_rl_map_{idx}, &rl_key, &new_st, BPF_ANY);
+      return {ret};
+    }}"""
+
+
+def _emit_rl_maps(program: ast.Program) -> str:
+  """Emit per-CPU hash map declarations for each rate_limit modifier."""
+  blocks: list[str] = []
+  for idx, rule in enumerate(program.rules):
+    if rule.modifier is None:
+      continue
+    blocks.append(f"""\
+struct {{
+  __uint(type, BPF_MAP_TYPE_PERCPU_HASH);
+  __type(key, __u32);
+  __type(value, struct fwl_rl_state);
+  __uint(max_entries, 4096);
+}} fwl_rl_map_{idx} SEC(".maps");
+""")
+  return "\n".join(blocks)
 
 
 def emit(program: ast.Program) -> str:
   """Emit BPF C source for `program`."""
   prelude = _emit_parse_prelude(program)
-  body = "".join(_emit_rule(r) for r in program.rules)
+  rl_maps = _emit_rl_maps(program)
+  body = "".join(_emit_rule(r, i) for i, r in enumerate(program.rules))
 
   if program.default is not None:
     final_return = _ACTION_TO_RETURN[program.default.action]
@@ -338,6 +421,7 @@ def emit(program: ast.Program) -> str:
     final_return = "XDP_PASS"
 
   return f"""{_HEADER}
+{rl_maps}
 SEC("xdp")
 int fwl_prog(struct xdp_md *ctx) {{
 {prelude}{body}  return {final_return};

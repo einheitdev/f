@@ -40,11 +40,22 @@ class Packet:
 
 @dataclass(frozen=True)
 class PktCase:
-  """A loaded `.pkt` test case."""
+  """A loaded `.pkt` test case.
+
+  `state` carries pre-existing rate-limit bucket counts keyed by
+  rule index. Format in the .pkt file:
+
+    state:
+      rate_limit:
+        0: { "1.2.3.4": 5 }    # rule index 0, bucket "1.2.3.4" = 5
+
+  Empty dict when the file omits a `state:` block.
+  """
   name: str
   source_fw: str
   packet: Packet
   expected: dict[str, Any]
+  state: dict[int, dict[Any, int]]
   path: Path
 
 
@@ -245,10 +256,16 @@ def load(path: Path) -> PktCase:
   fields = parse_builder(builder_text)
   packet = build_packet(fields)
 
+  raw_state = (doc.get("state") or {}).get("rate_limit", {})
+  state: dict[int, dict[Any, int]] = {}
+  for rule_idx, buckets in raw_state.items():
+    state[int(rule_idx)] = dict(buckets)
+
   return PktCase(
     name=doc["name"],
     source_fw=doc["source_fw"],
     packet=packet,
     expected=doc["expected"],
+    state=state,
     path=path,
   )

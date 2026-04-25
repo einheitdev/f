@@ -48,7 +48,23 @@ def analyze(program: ast.Program) -> ast.Program:
   for rule in program.rules:
     if rule.condition is not None:
       _check(rule.condition, possible=None)
+    if rule.modifier is not None:
+      _check_modifier(rule.modifier)
   return program
+
+
+def _check_modifier(mod: ast.RateLimit) -> None:
+  """Validate a rate_limit modifier."""
+  if mod.threshold <= 0:
+    raise FwlException(
+      FwlError(
+        category="semantic",
+        message="rate_limit threshold must be > 0",
+        span=mod.span,
+      )
+    )
+  # Grammar already restricts per_field to one of the four valid
+  # values, so no field-name check is needed here.
 
 
 def _check(node: ast.Condition, possible: Possible) -> Possible:

@@ -160,14 +160,30 @@ Condition = Union[Comparison, BoolField, NotOp, AndOp, OrOp]
 
 
 @dataclass(frozen=True)
+class RateLimit:
+  """`rate_limit(<N>, per=<field>)` modifier (FWL_V01_SPEC.md:266).
+
+  per_field is the bare bucket key name: src_ip, dst_ip, src_port,
+  dst_port. The grammar restricts it to those four; the analyzer
+  enforces threshold > 0.
+  """
+  threshold: int
+  per_field: str
+  span: Span
+
+
+@dataclass(frozen=True)
 class Rule:
   """A single firewall rule: action + optional condition + optional modifier.
 
   v0.1 grammar: `<action> [if <condition>] [<modifier>]`. The
-  modifier slot lands in Phase 5 (rate_limit).
+  `if` clause and the modifier are independently optional, so a rule
+  may consist of just `<action>`, `<action> if <cond>`,
+  `<action> limited by ...`, or all three together.
   """
   action: Action
   condition: Condition | None
+  modifier: RateLimit | None
   span: Span
 
 

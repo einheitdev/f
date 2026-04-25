@@ -98,7 +98,7 @@ def _interpreter_oracle(
       "expected compile failure but program parsed cleanly",
     )
 
-  got = interpreter.evaluate(program, case.packet.fields)
+  got = interpreter.evaluate(program, case.packet.fields, case.state)
   if got == expected:
     return OracleResult("interpreter", "pass", "")
   return OracleResult(
