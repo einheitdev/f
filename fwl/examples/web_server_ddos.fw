@@ -1,0 +1,21 @@
+# Web server with basic DDoS rate limit.
+#
+# Drops any source IP exceeding 1000 packets/second. Allows HTTP/HTTPS
+# inbound and counts both ports separately for traffic dashboards.
+# Allows established outbound TCP via the SYN-absent heuristic.
+
+@xdp(eth0)
+
+# Per-source flood guard
+drop limited by rate_limit(1000, per=src_ip)
+
+# Per-port traffic counters
+count http_traffic  if pkt.proto == tcp and pkt.dst_port == 80
+count https_traffic if pkt.proto == tcp and pkt.dst_port == 443
+
+allow if pkt.proto == tcp and pkt.dst_port in [80, 443]
+
+# Allow established outbound (TCP without SYN — heuristic)
+allow if pkt.proto == tcp and not pkt.tcp.syn
+
+default drop

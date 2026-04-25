@@ -15,7 +15,9 @@ from pathlib import Path
 
 import click
 
-from . import __version__, analyzer, emitter, interpreter, parser, pkt, runner
+from . import (
+  __version__, analyzer, ast, emitter, interpreter, parser, pkt, runner
+)
 from .errors import FwlException
 
 
@@ -34,7 +36,70 @@ def parse(source: Path) -> None:
   except FwlException as exc:
     click.echo(exc.error.format(), err=True)
     sys.exit(1)
-  click.echo(program)
+  click.echo(_format_program(program))
+
+
+def _format_program(p: ast.Program) -> str:
+  """One-rule-per-line summary of an AST. Easier to scan than dataclass repr."""
+  lines = [f"@xdp({p.hook.interface})"]
+  for i, rule in enumerate(p.rules):
+    parts = [rule.action.value]
+    if rule.action == ast.Action.COUNT and rule.counter_name:
+      parts.append(rule.counter_name)
+    if rule.condition is not None:
+      parts.append(f"if {_format_condition(rule.condition)}")
+    if rule.modifier is not None:
+      parts.append(
+        f"limited by rate_limit({rule.modifier.threshold}, "
+        f"per={rule.modifier.per_field})"
+      )
+    lines.append(f"  [{i}] {' '.join(parts)}")
+  if p.default is not None:
+    lines.append(f"  default {p.default.action.value}")
+  return "\n".join(lines)
+
+
+def _format_condition(node: ast.Condition) -> str:
+  """Pretty-print a condition AST as the source-form expression."""
+  if isinstance(node, ast.Comparison):
+    return f"{node.field.name} {node.op} {_format_operand(node.operand)}"
+  if isinstance(node, ast.BoolField):
+    return node.field.name
+  if isinstance(node, ast.NotOp):
+    return f"not ({_format_condition(node.inner)})"
+  if isinstance(node, ast.AndOp):
+    return "(" + " and ".join(
+      _format_condition(c) for c in node.operands
+    ) + ")"
+  if isinstance(node, ast.OrOp):
+    return "(" + " or ".join(
+      _format_condition(c) for c in node.operands
+    ) + ")"
+  return repr(node)
+
+
+def _format_operand(op: ast.Operand) -> str:
+  """Pretty-print an operand AST as the source-form literal."""
+  if isinstance(op, ast.ProtoLiteral):
+    return op.proto.value
+  if isinstance(op, ast.IntLiteral):
+    return str(op.value)
+  if isinstance(op, ast.IPv4Literal):
+    return _ipv4_str(op.value)
+  if isinstance(op, ast.CidrLiteral):
+    return f"{_ipv4_str(op.prefix)}/{op.bits}"
+  if isinstance(op, ast.RangeLiteral):
+    return f"{op.lo}..{op.hi}"
+  if isinstance(op, ast.ListLiteral):
+    return "[" + ", ".join(_format_operand(i) for i in op.items) + "]"
+  if isinstance(op, ast.CidrListLiteral):
+    return "[" + ", ".join(_format_operand(i) for i in op.items) + "]"
+  return repr(op)
+
+
+def _ipv4_str(value: int) -> str:
+  """32-bit int back to dotted-quad."""
+  return ".".join(str((value >> shift) & 0xFF) for shift in (24, 16, 8, 0))
 
 
 @main.command()
@@ -83,8 +148,37 @@ def interpret(source: Path, pkt_file: Path) -> None:
     click.echo(exc.error.format(), err=True)
     sys.exit(1)
   case = pkt.load(pkt_file)
-  action = interpreter.evaluate(program, case.packet.fields)
-  click.echo(action.value)
+  action = interpreter.evaluate(
+    program, case.packet.fields, case.state
+  )
+  fired = _which_rule_fired(program, case.packet.fields, case.state)
+  click.echo(f"{action.value} ({fired})")
+
+
+def _which_rule_fired(
+  program, packet, state
+) -> str:
+  """Return a human-readable label for which rule produced the action.
+
+  Mirrors the interpreter's match logic — kept separate so the
+  interpreter doesn't carry diagnostic responsibilities into its
+  oracle role.
+  """
+  state = state or {}
+  for idx, rule in enumerate(program.rules):
+    if (rule.condition is not None
+        and not interpreter._eval(rule.condition, packet)):
+      continue
+    if rule.modifier is not None:
+      if not interpreter._rate_limit_allows(
+        rule.modifier, idx, packet, state
+      ):
+        continue
+    if rule.action in interpreter._TERMINAL_ACTION_TO_XDP:
+      return f"rule {idx}: {rule.action.value}"
+  if program.default is not None:
+    return f"default: {program.default.action.value}"
+  return "no rule matched (implicit allow)"
 
 
 @main.command()
