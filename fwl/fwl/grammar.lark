@@ -1,0 +1,4 @@
+// FWL v0.1 grammar for Lark.
+//
+// Transcribed from the EBNF reference in docs/FWL_V01_SPEC.md.
+// Anything not listed here is a syntax error.
