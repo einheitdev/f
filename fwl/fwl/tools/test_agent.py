@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
-"""FWL test corpus generator via Claude.
+"""FWL test corpus generator via Claude Code.
 
-Generates `.pkt` test files by calling Claude with structured prompts.
+Generates `.pkt` test files by calling Claude through the
+claude-code-sdk, which authenticates via the user's existing
+Claude Code session (subscription) — no API key required.
+
 Each category targets a specific area of the FWL v0.1 spec.
 
 Usage examples:
@@ -11,16 +14,13 @@ Usage examples:
   fwl-test-agent --category compile_errors --count 15 --output tests/generated/
   fwl-test-agent --category protocol_guards --count 12 --auto-test
 
-Cost note: each --category run sends ~50K tokens of spec + examples to
-Claude. The spec injection is prompt-cached (5-minute TTL), so a
---category all run pays the cache write once and reads on the
-remaining 8 categories. Generated cases land in --output (default
-tests/generated/) for human review per the methodology — they do NOT
-go straight into the regression corpus.
+Generated cases land in --output (default tests/generated/) for
+human review per the methodology — they do NOT go straight into
+the regression corpus.
 """
 from __future__ import annotations
 import argparse
-import os
+import asyncio
 import re
 import subprocess
 import sys
@@ -30,13 +30,48 @@ from pathlib import Path
 from typing import Callable
 
 try:
-  import anthropic
+  from claude_code_sdk import (
+    AssistantMessage,
+    ClaudeCodeOptions,
+    ResultMessage,
+    TextBlock,
+    query,
+  )
+  from claude_code_sdk._internal import client as _sdk_client
+  from claude_code_sdk._internal import message_parser
+  from claude_code_sdk._internal.message_parser import MessageParseError
+  from claude_code_sdk.types import StreamEvent
 except ImportError:
   print(
-    "anthropic package not installed. Run: pip install anthropic",
+    "claude-code-sdk not installed. Run: pip install claude-code-sdk",
     file=sys.stderr,
   )
   sys.exit(1)
+
+
+# Patch the SDK message parser to swallow unknown event types
+# (rate_limit_event, etc.) instead of crashing the stream. Same
+# workaround takt uses — these informational events leak from the
+# claude CLI's protocol but the SDK doesn't model them. Only catches
+# MessageParseError so real bugs still propagate.
+_original_parse = message_parser.parse_message
+
+
+def _patched_parse(data):
+  """Wrap parse_message to return StreamEvent for unknown types."""
+  try:
+    return _original_parse(data)
+  except MessageParseError:
+    return StreamEvent(
+      uuid=data.get("uuid", ""),
+      session_id=data.get("session_id", ""),
+      event=data,
+      parent_tool_use_id=data.get("parent_tool_use_id"),
+    )
+
+
+message_parser.parse_message = _patched_parse
+_sdk_client.parse_message = _patched_parse
 
 try:
   import yaml
@@ -45,13 +80,12 @@ except ImportError:
   sys.exit(1)
 
 
-# Use Opus 4.7 with adaptive thinking + high effort. This is intelligence-
-# sensitive work — generating spec-conforming test cases that exercise
-# subtle protocol-guard semantics, edge cases, and correct expected
-# actions. A weaker model produces cases that look right but have wrong
-# bpf_action values or invalid syntax, which the user then has to triage.
-MODEL = "claude-opus-4-7"
-MAX_TOKENS = 64000
+# Default to Opus for intelligence-sensitive work — generating
+# spec-conforming cases that exercise subtle protocol-guard semantics
+# and compute correct expected.bpf_action values requires the strongest
+# model the user's subscription provides. Override with --model if you
+# want to trade quality for quota.
+DEFAULT_MODEL = "claude-opus-4-7"
 
 
 # Path defaults resolved from this script's location so the agent works
@@ -67,9 +101,8 @@ DEFAULT_OUTPUT_DIR = _FWL_DIR / "tests" / "generated"
 
 
 # Brief format reminder injected into every prompt. The authoritative
-# .pkt spec is also included in full as part of the cached system
-# prompt; this block summarizes the surface for the model and pins
-# the v0.1 implementation defaults.
+# .pkt spec is the system prompt; this block summarizes the surface
+# for the model and pins the v0.1 implementation defaults.
 PKT_FORMAT_REMINDER = textwrap.dedent("""\
   Each test case is a YAML document in a .pkt file. Required fields:
     name (string), source_fw (string), test_packet (mapping with
@@ -118,8 +151,8 @@ def category(name: str, description: str):
 
 # ---------------------------------------------------------------------
 # Prompt builders — one per category. Each returns the user-message
-# string only; the cached system prompt (FWL spec + PKT spec) is added
-# by call_claude().
+# string only; the system prompt (FWL spec + PKT spec) is added by
+# call_claude().
 # ---------------------------------------------------------------------
 
 
@@ -426,9 +459,9 @@ EXISTING EXAMPLES:
 def load_text(path: Path, label: str) -> str:
   """Load a text file from disk; exit with a helpful error if missing."""
   if not path.exists():
+    flag = "--" + label.lower().replace(" ", "-")
     print(
-      f"{label} not found at {path}. Pass --{label.lower().replace(' ', '-')} "
-      f"to override.",
+      f"{label} not found at {path}. Pass {flag} to override.",
       file=sys.stderr,
     )
     sys.exit(1)
@@ -450,7 +483,7 @@ def load_examples(corpus_dir: Path, max_examples: int = 6) -> str:
 
 
 def build_system_prompt(fwl_spec: str, pkt_spec: str) -> str:
-  """Assemble the cached system prompt that's reused across categories."""
+  """Assemble the system prompt that's reused across categories."""
   return f"""You are generating .pkt test cases for FWL v0.1, a
 firewall DSL that compiles to eBPF/XDP. The two authoritative
 specifications follow. Anything not in these specs is out of scope —
@@ -492,61 +525,58 @@ class _GenResult:
   """Outcome of one category generation request."""
   category: str
   raw: str
-  cache_creation: int
-  cache_read: int
+  cost_usd: float
 
 
-def call_claude(
-  client: anthropic.Anthropic,
+async def call_claude(
   system_prompt: str,
   user_prompt: str,
   category: str,
+  model: str,
   dry_run: bool,
 ) -> _GenResult:
-  """Send the prompt to Claude and return the raw text response.
+  """Run one query() call and collect the assistant's text response.
 
-  Streaming is used because the response can be 20K+ tokens; the SDK
-  refuses non-streaming requests it estimates will exceed ~10 minutes
-  of wall time.
+  Authentication piggybacks on the user's existing Claude Code
+  session — no API key needed. Each call spawns a `claude` subprocess
+  via the SDK; we collect AssistantMessage TextBlocks until
+  ResultMessage signals completion.
 
-  The system prompt carries cache_control so the spec injection is
-  reused across category requests within a single run (5-minute TTL).
+  Tools are disabled (max_turns=1, allowed_tools=[]) — the agent
+  should produce text only, no file edits or shell calls.
   """
   if dry_run:
     print("=" * 70)
     print(f"PROMPT for category: {category}")
     print("=" * 70)
-    print("[system, ~", len(system_prompt), "chars, cached]")
+    print(f"[system_prompt, ~{len(system_prompt)} chars]")
     print(user_prompt[:2000])
     if len(user_prompt) > 2000:
       print("... (truncated)")
-    return _GenResult(
-      category=category, raw="", cache_creation=0, cache_read=0
-    )
+    return _GenResult(category=category, raw="", cost_usd=0.0)
 
-  with client.messages.stream(
-    model=MODEL,
-    max_tokens=MAX_TOKENS,
-    thinking={"type": "adaptive"},
-    output_config={"effort": "high"},
-    system=[
-      {
-        "type": "text",
-        "text": system_prompt,
-        "cache_control": {"type": "ephemeral"},
-      }
-    ],
-    messages=[{"role": "user", "content": user_prompt}],
-  ) as stream:
-    final = stream.get_final_message()
+  options = ClaudeCodeOptions(
+    system_prompt=system_prompt,
+    model=model,
+    max_turns=1,
+    allowed_tools=[],
+    permission_mode="bypassPermissions",
+    settings='{"sandbox":{"enabled":false}}',
+  )
 
-  text_parts = [b.text for b in final.content if b.type == "text"]
-  raw = "".join(text_parts)
+  text_parts: list[str] = []
+  cost: float = 0.0
+  async for msg in query(prompt=user_prompt, options=options):
+    if isinstance(msg, AssistantMessage):
+      for block in msg.content:
+        if isinstance(block, TextBlock):
+          text_parts.append(block.text)
+    elif isinstance(msg, ResultMessage):
+      if msg.total_cost_usd is not None:
+        cost = msg.total_cost_usd
+
   return _GenResult(
-    category=category,
-    raw=raw,
-    cache_creation=final.usage.cache_creation_input_tokens or 0,
-    cache_read=final.usage.cache_read_input_tokens or 0,
+    category=category, raw="".join(text_parts), cost_usd=cost
   )
 
 
@@ -652,11 +682,88 @@ def run_auto_test(output_dir: Path) -> None:
 # ---------------------------------------------------------------------
 
 
+async def _run(args: argparse.Namespace) -> None:
+  """Async core of main(): builds prompts and dispatches to call_claude."""
+  fwl_spec = load_text(args.fwl_spec, "FWL spec")
+  pkt_spec = load_text(args.pkt_spec, "PKT spec")
+  examples = load_examples(args.corpus, args.max_examples)
+  system_prompt = build_system_prompt(fwl_spec, pkt_spec)
+
+  cats = (
+    list(CATEGORIES.keys()) if args.category == "all" else [args.category]
+  )
+
+  total_generated = 0
+  total_warnings = 0
+  total_cost_usd = 0.0
+
+  for cat_name in cats:
+    cat = CATEGORIES[cat_name]
+    print(f"\n{'=' * 70}")
+    print(f"Category: {cat_name}")
+    print(f"  {cat['description']}")
+    print(f"  Requesting {args.count} cases...")
+
+    user_prompt = cat["build_prompt"](examples, args.count)
+
+    result = await call_claude(
+      system_prompt, user_prompt, cat_name, args.model, args.dry_run
+    )
+    if args.dry_run:
+      continue
+
+    total_cost_usd += result.cost_usd
+
+    docs = parse_pkt_documents(result.raw)
+    print(f"  Parsed {len(docs)} cases from response")
+    if result.cost_usd:
+      print(f"  Cost: ${result.cost_usd:.4f}")
+
+    if not docs:
+      print("  WARN: no valid test cases parsed", file=sys.stderr)
+      continue
+
+    for raw_yaml, doc in docs:
+      warns = validate_pkt_doc(doc)
+      if warns:
+        name = doc.get("name", "(unnamed)")
+        for w in warns:
+          print(f"  WARN [{name}]: {w}", file=sys.stderr)
+          total_warnings += 1
+
+    written = write_pkt_files(docs, args.output, cat_name)
+    print(f"  Wrote {len(written)} files to {args.output}/{cat_name}/")
+    total_generated += len(written)
+
+  if args.dry_run:
+    return
+
+  print(f"\n{'=' * 70}")
+  print(
+    f"Total: {total_generated} test cases generated, "
+    f"{total_warnings} warnings"
+  )
+  if total_cost_usd:
+    print(f"Total cost: ${total_cost_usd:.4f}")
+
+  if args.auto_test and total_generated > 0:
+    run_auto_test(args.output)
+  else:
+    print("\nNext steps:")
+    print(f"  1. Review generated files in {args.output}/")
+    print(f"  2. fwl test {args.output}/  (or rerun with --auto-test)")
+    print(f"  3. For passing cases: move to {args.corpus}/<phase>/")
+    print("  4. For failures: investigate spec/compiler/test bug")
+
+
 def main() -> None:
   """CLI entry point. Run `fwl-test-agent --help` for usage."""
   parser = argparse.ArgumentParser(
     prog="fwl-test-agent",
-    description="Generate FWL test corpus cases via Claude.",
+    description=(
+      "Generate FWL test corpus cases via Claude Code "
+      "(uses your existing Claude session, no API key required)."
+    ),
     formatter_class=argparse.RawDescriptionHelpFormatter,
     epilog=__doc__,
   )
@@ -692,12 +799,19 @@ def main() -> None:
     ),
   )
   parser.add_argument(
+    "--model", default=DEFAULT_MODEL,
+    help=(
+      f"Claude model to use (default: {DEFAULT_MODEL}). Override with "
+      "e.g. claude-sonnet-4-6 to trade quality for quota."
+    ),
+  )
+  parser.add_argument(
     "--list-categories", "-l", action="store_true",
     help="List available categories and exit",
   )
   parser.add_argument(
     "--dry-run", action="store_true",
-    help="Print prompts without calling the API",
+    help="Print prompts without calling Claude",
   )
   parser.add_argument(
     "--max-examples", type=int, default=6,
@@ -724,92 +838,7 @@ def main() -> None:
     parser.print_help()
     sys.exit(1)
 
-  if not args.dry_run and not os.environ.get("ANTHROPIC_API_KEY"):
-    print(
-      "ANTHROPIC_API_KEY not set. Use --dry-run to preview prompts "
-      "without calling the API.",
-      file=sys.stderr,
-    )
-    sys.exit(1)
-
-  fwl_spec = load_text(args.fwl_spec, "FWL spec")
-  pkt_spec = load_text(args.pkt_spec, "PKT spec")
-  examples = load_examples(args.corpus, args.max_examples)
-  system_prompt = build_system_prompt(fwl_spec, pkt_spec)
-
-  cats = (
-    list(CATEGORIES.keys()) if args.category == "all" else [args.category]
-  )
-
-  client = None if args.dry_run else anthropic.Anthropic()
-
-  total_generated = 0
-  total_warnings = 0
-  cache_writes_total = 0
-  cache_reads_total = 0
-
-  for cat_name in cats:
-    cat = CATEGORIES[cat_name]
-    print(f"\n{'=' * 70}")
-    print(f"Category: {cat_name}")
-    print(f"  {cat['description']}")
-    print(f"  Requesting {args.count} cases...")
-
-    user_prompt = cat["build_prompt"](examples, args.count)
-
-    result = call_claude(
-      client, system_prompt, user_prompt, cat_name, args.dry_run
-    )
-    if args.dry_run:
-      continue
-
-    cache_writes_total += result.cache_creation
-    cache_reads_total += result.cache_read
-
-    docs = parse_pkt_documents(result.raw)
-    print(f"  Parsed {len(docs)} cases from response")
-    print(
-      f"  Cache: {result.cache_creation} written, "
-      f"{result.cache_read} read"
-    )
-
-    if not docs:
-      print("  WARN: no valid test cases parsed", file=sys.stderr)
-      continue
-
-    for raw_yaml, doc in docs:
-      warns = validate_pkt_doc(doc)
-      if warns:
-        name = doc.get("name", "(unnamed)")
-        for w in warns:
-          print(f"  WARN [{name}]: {w}", file=sys.stderr)
-          total_warnings += 1
-
-    written = write_pkt_files(docs, args.output, cat_name)
-    print(f"  Wrote {len(written)} files to {args.output}/{cat_name}/")
-    total_generated += len(written)
-
-  if args.dry_run:
-    return
-
-  print(f"\n{'=' * 70}")
-  print(
-    f"Total: {total_generated} test cases generated, "
-    f"{total_warnings} warnings"
-  )
-  print(
-    f"Cache totals: {cache_writes_total} written, "
-    f"{cache_reads_total} read"
-  )
-
-  if args.auto_test and total_generated > 0:
-    run_auto_test(args.output)
-  else:
-    print("\nNext steps:")
-    print(f"  1. Review generated files in {args.output}/")
-    print(f"  2. fwl test {args.output}/  (or rerun with --auto-test)")
-    print(f"  3. For passing cases: move to {args.corpus}/<phase>/")
-    print("  4. For failures: investigate spec/compiler/test bug")
+  asyncio.run(_run(args))
 
 
 if __name__ == "__main__":

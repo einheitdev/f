@@ -20,7 +20,7 @@ dev = [
   "flake8>=7.0",
 ]
 agent = [
-  "anthropic>=0.40",
+  "claude-code-sdk>=0.0.25",
 ]
 
 [project.scripts]
