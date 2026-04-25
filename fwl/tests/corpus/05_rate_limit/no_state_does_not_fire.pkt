@@ -1,4 +1,4 @@
-name: "rate_limit fires when bucket has no prior state (treated as count=0)"
+name: "rate_limit does not fire when bucket has no prior state (treated as count=0)"
 source_fw: |
   @xdp(eth0)
   drop if pkt.proto == tcp and pkt.dst_port == 22
@@ -10,4 +10,4 @@ test_packet:
 
 expected:
   compiles: true
-  bpf_action: drop
+  bpf_action: allow

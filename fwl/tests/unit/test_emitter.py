@@ -86,7 +86,10 @@ class TestRateLimit:
 
   def test_threshold_appears_in_gate(self):
     src = emit("@xdp(eth0)\ndrop limited by rate_limit(42, per=src_ip)\n")
-    assert "cur < 42" in src
+    # Action fires when the (pre-increment) bucket count has reached
+    # the threshold — matches the user-facing reading of "drop traffic
+    # exceeding N per second".
+    assert "cur >= 42" in src
 
 
 class TestLogAndCount:

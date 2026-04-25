@@ -1,4 +1,4 @@
-name: "rate_limit blocks rule when bucket count equals threshold (10 < 10 is false)"
+name: "rate_limit fires when bucket has reached the threshold (count=10, N=10)"
 source_fw: |
   @xdp(eth0)
   drop if pkt.proto == tcp and pkt.dst_port == 22
@@ -11,8 +11,8 @@ state:
       "1.2.3.4": 10
 
 test_packet:
-  builder: tcp(src_ip="1.2.3.4", dst_port=22)
+  builder: tcp(src_ip="1.2.3.4", dst_port=22, syn=true)
 
 expected:
   compiles: true
-  bpf_action: allow
+  bpf_action: drop

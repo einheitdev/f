@@ -285,10 +285,13 @@ v0.1 has exactly one stateful primitive: `rate_limit`. It applies to a rule via 
 
 ### Semantics
 
-The rule's action takes effect only when the rate of matching packets, bucketed by the `per` field's current value, is at or below `<N>` per second.
+The rule's action takes effect only when the rate of matching packets, bucketed by the `per` field's current value, has reached `<N>` per second within the current one-second window. Every matching packet increments the bucket counter, but the action only fires once the bucket has accumulated `<N>` matches.
 
-- If a packet matches the rule's condition AND the current rate for that bucket is below the threshold: the action applies (the rule is "active") and the rate counter for that bucket is incremented.
-- If a packet matches the condition AND the current rate is at or above the threshold: the rule does not apply. Evaluation continues to the next rule.
+- If a packet matches the rule's condition: the rate counter for its bucket is incremented.
+- If the post-increment count is BELOW the threshold: the rule does not apply this packet. Evaluation continues to the next rule.
+- If the post-increment count is AT OR ABOVE the threshold: the action applies (the rule is "active") for this packet.
+
+In `drop limited by rate_limit(N)` form: the first `N` matching packets per bucket per second are NOT dropped by this rule; the (N+1)-th and beyond ARE dropped. This matches the user-facing reading of "drop traffic that exceeds N per second".
 
 Implementation: the compiler emits a per-CPU hash map keyed by the `per` field. Each entry is a sliding-window counter. Token-bucket-style behavior with one-second window granularity.
 

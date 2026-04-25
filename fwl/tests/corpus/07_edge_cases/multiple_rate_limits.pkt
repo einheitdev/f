@@ -17,4 +17,7 @@ test_packet:
 
 expected:
   compiles: true
-  bpf_action: allow
+  # Rule 1's bucket (1.2.3.4) has count=5 == N=5; under count >=
+  # threshold semantics it fires the drop. Rule 0's bucket is
+  # untouched, proving each rate_limit map is independent.
+  bpf_action: drop

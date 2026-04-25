@@ -131,15 +131,17 @@ class TestNonTerminalActions:
 
 
 class TestRateLimit:
-  def test_no_state_means_count_zero(self):
+  def test_no_state_means_count_zero_does_not_fire(self):
+    # Fresh source, count=0; 0 >= 3 is false → drop does not fire.
     src = (
       "@xdp(eth0)\n"
       "drop if pkt.proto == tcp limited by rate_limit(3, per=src_ip)\n"
       "default allow\n"
     )
-    assert evaluate(src, {"proto": "tcp", "src_ip": "1.2.3.4"}) == DROP
+    assert evaluate(src, {"proto": "tcp", "src_ip": "1.2.3.4"}) == PASS
 
-  def test_at_threshold_blocks(self):
+  def test_at_threshold_fires(self):
+    # count=3, N=3; 3 >= 3 → drop fires.
     src = (
       "@xdp(eth0)\n"
       "drop if pkt.proto == tcp limited by rate_limit(3, per=src_ip)\n"
@@ -148,9 +150,10 @@ class TestRateLimit:
     state = {0: {"1.2.3.4": 3}}
     assert evaluate(
       src, {"proto": "tcp", "src_ip": "1.2.3.4"}, state
-    ) == PASS
+    ) == DROP
 
-  def test_under_threshold_fires(self):
+  def test_under_threshold_does_not_fire(self):
+    # count=2 < 3 → drop blocked, falls through to default allow.
     src = (
       "@xdp(eth0)\n"
       "drop if pkt.proto == tcp limited by rate_limit(3, per=src_ip)\n"
@@ -159,7 +162,7 @@ class TestRateLimit:
     state = {0: {"1.2.3.4": 2}}
     assert evaluate(
       src, {"proto": "tcp", "src_ip": "1.2.3.4"}, state
-    ) == DROP
+    ) == PASS
 
   def test_int_state_key_for_ip_bucket_normalizes(self):
     """Finding 2: int and string keys for IP buckets must look up the
@@ -170,19 +173,21 @@ class TestRateLimit:
       "default allow\n"
     )
     # 16909060 == 0x01020304 == "1.2.3.4" in host-order u32
+    # count=5 >= 3 → drop fires regardless of int-vs-string key form.
     state = {0: {16909060: 5}}
     assert evaluate(
       src, {"proto": "tcp", "src_ip": "1.2.3.4"}, state
-    ) == PASS
+    ) == DROP
 
   def test_independent_buckets(self):
+    # 1.2.3.4 is saturated at 100; 5.6.7.8 is fresh (count=0).
+    # Independent buckets means 5.6.7.8 sees count=0 < 3 → no drop.
     src = (
       "@xdp(eth0)\n"
       "drop if pkt.proto == tcp limited by rate_limit(3, per=src_ip)\n"
       "default allow\n"
     )
     state = {0: {"1.2.3.4": 100}}
-    # Different bucket key, fresh count.
     assert evaluate(
       src, {"proto": "tcp", "src_ip": "5.6.7.8"}, state
-    ) == DROP
+    ) == PASS

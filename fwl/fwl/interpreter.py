@@ -70,7 +70,9 @@ def _rate_limit_allows(
 
   The bucket key is the runtime value of mod.per_field. Buckets in
   `state` carry the count "so far" within the current 1-second window;
-  the rule fires when count < threshold.
+  the rule fires when count >= threshold (i.e., the rate has been
+  exceeded — `drop ... limited by rate_limit(N)` drops once traffic
+  passes N/sec).
 
   Lookups try the raw key first (matching the .pkt spec, which says
   IP buckets are dotted-quad strings and port buckets are integers).
@@ -86,12 +88,12 @@ def _rate_limit_allows(
     bucket_key = 0
   buckets = state.get(rule_idx, {})
   if bucket_key in buckets:
-    return buckets[bucket_key] < mod.threshold
+    return buckets[bucket_key] >= mod.threshold
   if mod.per_field in ("src_ip", "dst_ip") and isinstance(bucket_key, str):
     int_key = _ipv4_str_to_int(bucket_key)
     if int_key in buckets:
-      return buckets[int_key] < mod.threshold
-  return 0 < mod.threshold
+      return buckets[int_key] >= mod.threshold
+  return 0 >= mod.threshold
 
 
 def _ipv4_str_to_int(addr: str) -> int:

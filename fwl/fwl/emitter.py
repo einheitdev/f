@@ -455,31 +455,10 @@ def _emit_count(slot: int) -> str:
 def _emit_rate_limit_side_effect(
   mod: ast.RateLimit, idx: int, side_effect: str
 ) -> str:
-  """Wrap a non-terminal side effect with rate_limit gating."""
-  c_field = _RL_FIELD_TO_C[mod.per_field]
-  return f"""__u32 rl_key = (__u32){c_field};
-    __u64 now = bpf_ktime_get_ns();
-    struct fwl_rl_state *st =
-      bpf_map_lookup_elem(&fwl_rl_map_{idx}, &rl_key);
-    __u32 cur = 0;
-    __u64 cur_ts = now;
-    if (st && now - st->ts < 1000000000ULL) {{
-      cur = st->count;
-      cur_ts = st->ts;
-    }}
-    if (cur < {mod.threshold}) {{
-      struct fwl_rl_state new_st = {{ .ts = cur_ts, .count = cur + 1 }};
-      bpf_map_update_elem(&fwl_rl_map_{idx}, &rl_key, &new_st, BPF_ANY);
-      {side_effect}
-    }}"""
+  """Wrap a non-terminal side effect with rate_limit gating.
 
-
-def _emit_rate_limit_gate(mod: ast.RateLimit, idx: int, ret: str) -> str:
-  """Emit a rate-limit gate that returns `ret` only if under threshold.
-
-  Reads the bucket counter from the per-CPU map; if (now - ts) >= 1s
-  the counter resets. The rule fires when the post-window count is
-  strictly less than the threshold and the count is then incremented.
+  Counts every matching packet in the bucket; the side effect fires
+  only once the bucket count reaches the threshold (rate exceeded).
   """
   c_field = _RL_FIELD_TO_C[mod.per_field]
   return f"""__u32 rl_key = (__u32){c_field};
@@ -492,9 +471,36 @@ def _emit_rate_limit_gate(mod: ast.RateLimit, idx: int, ret: str) -> str:
       cur = st->count;
       cur_ts = st->ts;
     }}
-    if (cur < {mod.threshold}) {{
-      struct fwl_rl_state new_st = {{ .ts = cur_ts, .count = cur + 1 }};
-      bpf_map_update_elem(&fwl_rl_map_{idx}, &rl_key, &new_st, BPF_ANY);
+    struct fwl_rl_state new_st = {{ .ts = cur_ts, .count = cur + 1 }};
+    bpf_map_update_elem(&fwl_rl_map_{idx}, &rl_key, &new_st, BPF_ANY);
+    if (cur >= {mod.threshold}) {{
+      {side_effect}
+    }}"""
+
+
+def _emit_rate_limit_gate(mod: ast.RateLimit, idx: int, ret: str) -> str:
+  """Emit a rate-limit gate that returns `ret` only when rate exceeded.
+
+  Reads the bucket counter from the per-CPU map; if (now - ts) >= 1s
+  the counter resets. Every matching packet bumps the counter; the
+  rule fires once the count has reached the threshold (matching the
+  user-facing reading: `drop ... limited by rate_limit(N)` drops the
+  N+1-th packet onward, not the first N).
+  """
+  c_field = _RL_FIELD_TO_C[mod.per_field]
+  return f"""__u32 rl_key = (__u32){c_field};
+    __u64 now = bpf_ktime_get_ns();
+    struct fwl_rl_state *st =
+      bpf_map_lookup_elem(&fwl_rl_map_{idx}, &rl_key);
+    __u32 cur = 0;
+    __u64 cur_ts = now;
+    if (st && now - st->ts < 1000000000ULL) {{
+      cur = st->count;
+      cur_ts = st->ts;
+    }}
+    struct fwl_rl_state new_st = {{ .ts = cur_ts, .count = cur + 1 }};
+    bpf_map_update_elem(&fwl_rl_map_{idx}, &rl_key, &new_st, BPF_ANY);
+    if (cur >= {mod.threshold}) {{
       return {ret};
     }}"""
 

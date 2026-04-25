@@ -15,4 +15,6 @@ test_packet:
 
 expected:
   compiles: true
-  bpf_action: drop
+  # 5.6.7.8 has its own bucket; count=0 < 3 means the drop rule does
+  # not fire for it, regardless of 1.2.3.4's saturated bucket.
+  bpf_action: allow

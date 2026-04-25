@@ -9,11 +9,13 @@ source_fw: |
 state:
   rate_limit:
     0:
-      "1.2.3.4": 3
+      "1.2.3.4": 2
 
 test_packet:
   builder: tcp(src_ip="1.2.3.4", dst_port=22)
 
 expected:
   compiles: true
+  # count=2 < 3 → drop does NOT fire → falls through to the explicit
+  # allow rule on the same condition.
   bpf_action: allow
