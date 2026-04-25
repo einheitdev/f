@@ -1,0 +1,12 @@
+name: "parens override and>or precedence"
+source_fw: |
+  @xdp(eth0)
+  drop if (pkt.proto == tcp or pkt.proto == udp) and pkt.dst_port == 53
+  default allow
+
+test_packet:
+  builder: udp(dst_port=53)
+
+expected:
+  compiles: true
+  bpf_action: drop

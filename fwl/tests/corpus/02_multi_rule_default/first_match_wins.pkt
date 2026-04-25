@@ -1,0 +1,12 @@
+name: "first matching rule wins (drop before allow for tcp)"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.proto == tcp
+  allow if pkt.proto == tcp
+
+test_packet:
+  builder: tcp(dst_port=80)
+
+expected:
+  compiles: true
+  bpf_action: drop

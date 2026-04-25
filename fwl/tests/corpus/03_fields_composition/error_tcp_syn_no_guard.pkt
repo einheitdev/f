@@ -1,0 +1,10 @@
+name: "pkt.tcp.syn without any guard is rejected"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.tcp.syn
+
+test_packet:
+  builder: tcp(syn=true)
+
+expected:
+  compiles: false

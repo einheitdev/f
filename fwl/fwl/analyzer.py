@@ -1,296 +1,185 @@
-"""Semantic analyzer for FWL AST.
+"""Semantic analysis: protocol guards, types, default placement.
 
-Resolves which protocol layers each function needs, checks
-protocol guard correctness, and allocates BPF maps.
+Walks the AST and rejects programs that parse but violate v0.1
+semantics. Per spec FWL_V01_SPEC.md:382-400, errors are fatal — first
+error encountered is reported and analysis stops.
+
+Protocol guard model: at every point in a condition we track the set
+of protocols the packet *might* be (`possible`), starting as None
+(unconstrained). A `pkt.proto == X` comparison constrains `possible`
+to {X} for the rest of the AND chain. AND propagates the constraint
+forward; OR unions branch-exit constraints; NOT discards them. When
+a port/flag field is accessed, `possible` must be a subset of the
+field's allowed protocol set — None (unconstrained) does not satisfy
+any guard requirement.
 """
+from __future__ import annotations
 
-from dataclasses import dataclass, field
-
-from fwl.ast_nodes import (
-  Action,
-  ActionType,
-  AssignStmt,
-  BuiltinCall,
-  ChainStmt,
-  Compare,
-  BinOp,
-  DefaultStmt,
-  FieldAccess,
-  FuncDef,
-  IfStmt,
-  InlineC,
-  NameRef,
-  Program,
-  RuleStmt,
-  UnaryOp,
-)
+from . import ast
+from .errors import FwlError, FwlException
 
 
-# Which protocol layer each pkt field requires.
-_FIELD_LAYERS = {
-  # L3 fields — need Ethernet + IP parse.
-  "src_ip": "ip",
-  "dst_ip": "ip",
-  "proto": "ip",
-  "ttl": "ip",
-  # L4 fields — need Ethernet + IP + TCP/UDP parse.
-  "src_port": "l4",
-  "dst_port": "l4",
-  # TCP-specific — need full TCP parse.
-  "tcp": "tcp",
-  # UDP-specific.
-  "udp": "udp",
-}
+_ALL_PROTOS = frozenset({ast.Proto.TCP, ast.Proto.UDP, ast.Proto.ICMP})
 
-# Protocol names mapped to IP protocol numbers.
-PROTO_NUMBERS = {
-  "tcp": 6,
-  "udp": 17,
-  "icmp": 1,
+
+# Allowed protocols per field. Empty set => no guard required.
+_ALLOWED_PROTOS: dict[str, frozenset[ast.Proto]] = {
+  ast.FIELD_PROTO: _ALL_PROTOS,
+  ast.FIELD_SRC_IP: _ALL_PROTOS,
+  ast.FIELD_DST_IP: _ALL_PROTOS,
+  ast.FIELD_SRC_PORT: frozenset({ast.Proto.TCP, ast.Proto.UDP}),
+  ast.FIELD_DST_PORT: frozenset({ast.Proto.TCP, ast.Proto.UDP}),
+  ast.FIELD_TCP_SYN: frozenset({ast.Proto.TCP}),
+  ast.FIELD_TCP_ACK: frozenset({ast.Proto.TCP}),
 }
 
 
-class AnalysisError(Exception):
-  """Raised on semantic errors in FWL source."""
-
-  def __init__(self, message: str, line: int = 0):
-    self.line = line
-    super().__init__(f"line {line}: {message}" if line else message)
+# A `Possible` value is either None (no constraint, packet could be
+# any protocol) or a frozenset of protos the packet must be one of.
+Possible = frozenset[ast.Proto] | None
 
 
-@dataclass
-class MapInfo:
-  """Metadata for a BPF map the compiler needs to generate."""
-  name: str
-  map_type: str
-  key_type: str
-  value_type: str
-  max_entries: int = 1024
+_MAX_COUNTERS = 256  # FWL_V01_SPEC.md:329
 
 
-@dataclass
-class CounterInfo:
-  """Named counter allocated in the counters array."""
-  name: str
-  index: int
+def analyze(program: ast.Program) -> ast.Program:
+  """Run the semantic pass.
 
-
-@dataclass
-class AnalyzedFunc:
-  """Analysis result for a single @xdp / @tc function."""
-  func: FuncDef
-  needs_eth: bool = True
-  needs_ip: bool = False
-  needs_l4: bool = False
-  needs_tcp: bool = False
-  needs_udp: bool = False
-  needs_inline_c: bool = False
-  maps: list[MapInfo] = field(default_factory=list)
-  counters: list[CounterInfo] = field(default_factory=list)
-  tail_calls: list[str] = field(default_factory=list)
-
-  @property
-  def needs_any_l4(self) -> bool:
-    """True if any L4 parsing is needed."""
-    return self.needs_l4 or self.needs_tcp or self.needs_udp
-
-
-@dataclass
-class AnalysisResult:
-  """Full analysis result for a .fw file."""
-  funcs: list[AnalyzedFunc] = field(default_factory=list)
-  rules: list[RuleStmt] = field(default_factory=list)
-  default_action: ActionType = ActionType.PASS
-  maps: list[MapInfo] = field(default_factory=list)
-  errors: list[str] = field(default_factory=list)
-
-
-def _collect_field_accesses(node, accesses: list[FieldAccess]):
-  """Walk an expression tree collecting FieldAccess nodes."""
-  if isinstance(node, FieldAccess):
-    accesses.append(node)
-  elif isinstance(node, Compare):
-    _collect_field_accesses(node.left, accesses)
-    _collect_field_accesses(node.right, accesses)
-  elif isinstance(node, BinOp):
-    _collect_field_accesses(node.left, accesses)
-    _collect_field_accesses(node.right, accesses)
-  elif isinstance(node, UnaryOp):
-    _collect_field_accesses(node.operand, accesses)
-  elif isinstance(node, BuiltinCall):
-    for arg in node.args:
-      _collect_field_accesses(arg, accesses)
-    for val in node.kwargs.values():
-      _collect_field_accesses(val, accesses)
-
-
-def _collect_from_body(body: list, accesses: list[FieldAccess]):
-  """Walk a function body collecting all field accesses."""
-  for stmt in body:
-    if isinstance(stmt, IfStmt):
-      _collect_field_accesses(stmt.condition, accesses)
-      _collect_from_body(stmt.body, accesses)
-      for elif_cond, elif_body in stmt.elifs:
-        _collect_field_accesses(elif_cond, accesses)
-        _collect_from_body(elif_body, accesses)
-      if stmt.else_body:
-        _collect_from_body(stmt.else_body, accesses)
-    elif isinstance(stmt, BuiltinCall):
-      _collect_field_accesses(stmt, accesses)
-    elif isinstance(stmt, Action):
-      pass
-    elif isinstance(stmt, AssignStmt):
-      _collect_field_accesses(stmt.value, accesses)
-
-
-def _resolve_layers(accesses: list[FieldAccess], af: AnalyzedFunc):
-  """Determine which protocol layers to parse from field accesses."""
-  for fa in accesses:
-    if fa.root != "pkt" and fa.root != "msg":
-      continue
-    for part in fa.chain:
-      layer = _FIELD_LAYERS.get(part)
-      if layer == "ip":
-        af.needs_ip = True
-      elif layer == "l4":
-        af.needs_ip = True
-        af.needs_l4 = True
-      elif layer == "tcp":
-        af.needs_ip = True
-        af.needs_l4 = True
-        af.needs_tcp = True
-      elif layer == "udp":
-        af.needs_ip = True
-        af.needs_l4 = True
-        af.needs_udp = True
-
-
-def _collect_builtins_from_expr(node, af: AnalyzedFunc,
-                               counter_idx: list[int]):
-  """Walk an expression tree collecting built-in calls."""
-  if isinstance(node, BuiltinCall):
-    _handle_builtin(node, af, counter_idx)
-  elif isinstance(node, Compare):
-    _collect_builtins_from_expr(node.left, af, counter_idx)
-    _collect_builtins_from_expr(node.right, af, counter_idx)
-  elif isinstance(node, BinOp):
-    _collect_builtins_from_expr(node.left, af, counter_idx)
-    _collect_builtins_from_expr(node.right, af, counter_idx)
-  elif isinstance(node, UnaryOp):
-    _collect_builtins_from_expr(node.operand, af, counter_idx)
-
-
-def _collect_builtins(body: list, af: AnalyzedFunc, counter_idx: list[int]):
-  """Walk body collecting built-in calls and allocating maps."""
-  for stmt in body:
-    if isinstance(stmt, BuiltinCall):
-      _handle_builtin(stmt, af, counter_idx)
-    elif isinstance(stmt, IfStmt):
-      _collect_builtins_from_expr(stmt.condition, af, counter_idx)
-      _collect_builtins(stmt.body, af, counter_idx)
-      for elif_cond, elif_body in stmt.elifs:
-        _collect_builtins_from_expr(elif_cond, af, counter_idx)
-        _collect_builtins(elif_body, af, counter_idx)
-      if stmt.else_body:
-        _collect_builtins(stmt.else_body, af, counter_idx)
-    elif isinstance(stmt, InlineC):
-      af.needs_inline_c = True
-    elif isinstance(stmt, ChainStmt):
-      af.tail_calls.append(stmt.target)
-    elif isinstance(stmt, RuleStmt):
-      for opt in stmt.options:
-        if opt.kind == "count" and opt.args:
-          name = opt.args[0]
-          af.counters.append(CounterInfo(name, counter_idx[0]))
-          counter_idx[0] += 1
-
-
-def _handle_builtin(call: BuiltinCall, af: AnalyzedFunc,
-                    counter_idx: list[int]):
-  """Process a built-in function call, allocating maps as needed."""
-  if call.name == "rate_limit":
-    per_field = call.kwargs.get("per")
-    key_type = "__u32"
-    if isinstance(per_field, NameRef) and per_field.name == "src_ip":
-      key_type = "__u32"
-    af.maps.append(MapInfo(
-      name=f"rate_{call.name}_{len(af.maps)}",
-      map_type="BPF_MAP_TYPE_HASH",
-      key_type=key_type,
-      value_type="struct RateState",
-      max_entries=65536,
-    ))
-  elif call.name == "count":
-    if call.args and isinstance(call.args[0], NameRef):
-      name = call.args[0].name
-    else:
-      name = f"counter_{counter_idx[0]}"
-    af.counters.append(CounterInfo(name, counter_idx[0]))
-    counter_idx[0] += 1
-  elif call.name == "geoip":
-    af.maps.append(MapInfo(
-      name="geoip",
-      map_type="BPF_MAP_TYPE_HASH",
-      key_type="__u32",
-      value_type="struct GeoValue",
-      max_entries=1000000,
-    ))
-  elif call.name == "conntrack":
-    af.maps.append(MapInfo(
-      name="conntrack",
-      map_type="BPF_MAP_TYPE_HASH",
-      key_type="struct ConnKey",
-      value_type="struct ConnValue",
-      max_entries=65536,
-    ))
-
-
-def _analyze_func(func: FuncDef) -> AnalyzedFunc:
-  """Analyze a single function definition."""
-  af = AnalyzedFunc(func=func)
-
-  # Collect all pkt field accesses.
-  accesses: list[FieldAccess] = []
-  _collect_from_body(func.body, accesses)
-  # Also check conditions for field accesses.
-  _resolve_layers(accesses, af)
-
-  # Collect built-in calls and allocate maps/counters.
-  counter_idx = [1]  # 0 reserved for total.
-  _collect_builtins(func.body, af, counter_idx)
-
-  # If any tail calls, need a prog array map.
-  if af.tail_calls:
-    af.maps.append(MapInfo(
-      name="prog_array",
-      map_type="BPF_MAP_TYPE_PROG_ARRAY",
-      key_type="__u32",
-      value_type="__u32",
-      max_entries=32,
-    ))
-
-  return af
-
-
-def analyze(program: Program) -> AnalysisResult:
-  """Run semantic analysis on a parsed FWL program.
-
-  Args:
-    program: Parsed AST.
-
-  Returns:
-    AnalysisResult with resolved layers, maps, and counters.
+  Returns the same program object on success. Raises FwlException
+  with category="semantic" on the first violation.
   """
-  result = AnalysisResult()
+  counter_names: set[str] = set()
+  for rule in program.rules:
+    if rule.condition is not None:
+      _check(rule.condition, possible=None)
+    if rule.modifier is not None:
+      _check_modifier(rule.modifier)
+    if rule.action == ast.Action.COUNT and rule.counter_name is not None:
+      counter_names.add(rule.counter_name)
 
-  for stmt in program.stmts:
-    if isinstance(stmt, FuncDef):
-      af = _analyze_func(stmt)
-      result.funcs.append(af)
-      result.maps.extend(af.maps)
-    elif isinstance(stmt, RuleStmt):
-      result.rules.append(stmt)
-    elif isinstance(stmt, DefaultStmt):
-      result.default_action = stmt.action
+  if len(counter_names) > _MAX_COUNTERS:
+    # Find the rule that pushed us over so we can point at a span.
+    span = next(
+      (r.span for r in program.rules
+       if r.action == ast.Action.COUNT),
+      None,
+    )
+    raise FwlException(
+      FwlError(
+        category="semantic",
+        message=(
+          f"program declares {len(counter_names)} counters; "
+          f"v0.1 limit is {_MAX_COUNTERS}"
+        ),
+        span=span,
+      )
+    )
+  return program
 
+
+def _check_modifier(mod: ast.RateLimit) -> None:
+  """Validate a rate_limit modifier."""
+  if mod.threshold <= 0:
+    raise FwlException(
+      FwlError(
+        category="semantic",
+        message="rate_limit threshold must be > 0",
+        span=mod.span,
+      )
+    )
+  # Grammar already restricts per_field to one of the four valid
+  # values, so no field-name check is needed here.
+
+
+def _check(node: ast.Condition, possible: Possible) -> Possible:
+  """Walk a condition node enforcing protocol guards.
+
+  Returns the constraint set after this node evaluates true, for use
+  by subsequent siblings in an AND chain.
+  """
+  if isinstance(node, ast.Comparison):
+    _require_guard(node.field, possible)
+    if (
+      node.field.name == ast.FIELD_PROTO
+      and node.op == "=="
+      and isinstance(node.operand, ast.ProtoLiteral)
+    ):
+      return _intersect(possible, frozenset({node.operand.proto}))
+    return possible
+
+  if isinstance(node, ast.BoolField):
+    _require_guard(node.field, possible)
+    return possible
+
+  if isinstance(node, ast.NotOp):
+    # `not X` doesn't tell us anything definite about X's
+    # constraints. Walk the inner to enforce its required guards
+    # but discard its returned constraint set.
+    _check(node.inner, possible)
+    return possible
+
+  if isinstance(node, ast.AndOp):
+    scope = possible
+    for child in node.operands:
+      scope = _check(child, scope)
+    return scope
+
+  if isinstance(node, ast.OrOp):
+    # Each branch starts with the outer scope; the branches' exits
+    # union into "the packet is one of these alternatives."
+    branch_exits: list[Possible] = []
+    for child in node.operands:
+      branch_exits.append(_check(child, possible))
+    return _union_exits(branch_exits)
+
+  raise NotImplementedError(
+    f"analyzer: unsupported node {type(node).__name__}"
+  )
+
+
+def _intersect(a: Possible, b: frozenset[ast.Proto]) -> Possible:
+  """Intersect a possibility set with a new constraint."""
+  if a is None:
+    return frozenset(b)
+  return a & b
+
+
+def _union_exits(branches: list[Possible]) -> Possible:
+  """Union of branch-exit possibility sets (OR semantics).
+
+  If any branch is unconstrained (None), the union is unconstrained:
+  the packet could be anything that branch allows.
+  """
+  result: frozenset[ast.Proto] = frozenset()
+  for b in branches:
+    if b is None:
+      return None
+    result = result | b
   return result
+
+
+def _require_guard(field: ast.FieldRef, possible: Possible) -> None:
+  """Raise FwlException if `field`'s required guard isn't satisfied."""
+  allowed = _ALLOWED_PROTOS.get(field.name)
+  if allowed is None:
+    raise FwlException(
+      FwlError(
+        category="semantic",
+        message=f"unknown field '{field.name}'",
+        span=field.span,
+      )
+    )
+  if allowed == _ALL_PROTOS:
+    return
+  if possible is not None and possible <= allowed:
+    return
+  options = " or ".join(sorted(p.value for p in allowed))
+  raise FwlException(
+    FwlError(
+      category="semantic",
+      message=(
+        f"{field.name} requires 'pkt.proto == {options}' guard"
+      ),
+      span=field.span,
+    )
+  )

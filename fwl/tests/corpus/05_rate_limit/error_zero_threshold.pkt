@@ -1,0 +1,10 @@
+name: "rate_limit threshold of 0 is rejected"
+source_fw: |
+  @xdp(eth0)
+  drop limited by rate_limit(0, per=src_ip)
+
+test_packet:
+  builder: tcp()
+
+expected:
+  compiles: false

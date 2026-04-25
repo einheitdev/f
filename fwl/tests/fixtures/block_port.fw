@@ -1,5 +1,0 @@
-@xdp(eth0)
-def block_port(pkt):
-  if pkt.proto == tcp and pkt.dst_port == 8080:
-    drop
-  allow

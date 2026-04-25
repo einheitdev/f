@@ -1,121 +1,99 @@
-// FWL — Firewall Language Grammar
+// FWL v0.1 grammar for Lark.
+//
+// Transcribed from the EBNF reference in docs/FWL_V01_SPEC.md.
+// Anything not listed here is a syntax error.
 
-start: (_NL | stmt)*
+program       : hook_decl rule* default_rule?
 
-?stmt: default_stmt
-     | rule_stmt
-     | func_def
+hook_decl     : "@xdp" "(" IDENTIFIER ")"
 
-// ================================================================
-// Tier 1 — Declarative rules
-// ================================================================
+rule          : action ("if" condition)? modifier?
 
-default_stmt: "default" action_word _NL
+modifier      : "limited" "by" "rate_limit" "(" INTEGER "," "per" "=" RL_FIELD ")"
 
-rule_stmt: action_word match_clause+ _NL
+RL_FIELD.10   : "src_ip" | "dst_ip" | "src_port" | "dst_port"
 
-match_clause: NAME match_values
-match_values: match_value ("," match_value)*
-match_value: NUMBER | NAME | cidr | ESCAPED_STRING
+default_rule  : "default" terminal_action
 
-action_word: "drop"  -> drop
-           | "allow" -> allow
-           | "pass"  -> pass_action
+action        : terminal_action | nonterminal_action
 
-// ================================================================
-// Tier 2 — Programmable functions
-// ================================================================
+terminal_action    : ALLOW | DROP
+nonterminal_action : LOG | COUNT IDENTIFIER
 
-func_def: decorator _NL "def" NAME "(" NAME ")" ":" _NL _INDENT body _DEDENT
-decorator: "@" NAME ("(" func_args ")")?
-func_args: NAME ("," NAME)*
+condition     : or_expr
 
-// Body is a sequence of statements.  Each statement ends with
-// _NL.  if_stmt already consumes its own _NL+_INDENT+_DEDENT,
-// so it doesn't need an extra _NL after it — but the _DEDENT
-// from its body will be followed by the next line's _NL.
-body: body_stmt+
-?body_stmt: if_stmt
-          | simple_stmt _NL
-?simple_stmt: action_word
-            | assign_stmt
-            | inline_c
-            | chain_stmt
-            | builtin_stmt
+or_expr       : and_expr ("or" and_expr)*
 
-if_stmt: "if" expr ":" _NL _INDENT body _DEDENT elif_clause* else_clause?
-elif_clause: "elif" expr ":" _NL _INDENT body _DEDENT
-else_clause: "else" ":" _NL _INDENT body _DEDENT
+and_expr      : not_expr ("and" not_expr)*
 
-assign_stmt: NAME "=" expr
+not_expr      : NOT? primary
 
-// ================================================================
-// Tier 3 — Inline C
-// ================================================================
+primary       : comparison
+              | bool_field
+              | "(" condition ")"
 
-inline_c: "inline_c" TRIPLE_QUOTED
+comparison    : value_field comp_op operand   -> value_compare
+              | value_field "in" set_or_range -> value_in
+              | enum_field "==" PROTO_KEYWORD -> enum_eq
+              | enum_field "!=" PROTO_KEYWORD -> enum_neq
 
-// ================================================================
-// Built-in functions and chaining
-// ================================================================
+comp_op       : EQ | NEQ | LT | GT | LE | GE
 
-builtin_stmt: builtin_call
-chain_stmt: "chain" NAME
+value_field   : IP_FIELD | PORT_FIELD
 
-builtin_call: NAME "(" call_args? ")"
-call_args: call_arg ("," call_arg)*
-call_arg: NAME "=" expr  -> kwarg
-        | expr            -> posarg
+enum_field    : PROTO_FIELD
 
-// ================================================================
-// Expressions
-// ================================================================
+bool_field    : TCP_FLAG_FIELD
 
-?expr: or_expr
-?or_expr: and_expr ("or" and_expr)*     -> or_expr
-?and_expr: not_expr ("and" not_expr)*   -> and_expr
-?not_expr: "not" not_expr               -> not_expr
-         | cmp_expr
-?cmp_expr: atom (comp_op atom)?         -> cmp_expr
-?atom: field_access
-     | builtin_call
-     | NUMBER
-     | ESCAPED_STRING
-     | NAME
-     | cidr
-     | "(" expr ")"
-     | list_literal
+operand       : INTEGER | IPV4
 
-comp_op: "==" -> eq
-       | "!=" -> neq
-       | ">"  -> gt
-       | "<"  -> lt
-       | ">=" -> gte
-       | "<=" -> lte
-       | "in" -> in_op
-       | "not" "in" -> not_in
+set_or_range  : list | range | cidr | cidr_list
 
-field_access: NAME ("." NAME)+
-list_literal: "[" (expr ("," expr)*)? "]"
-cidr: IP_ADDR "/" NUMBER
+list          : "[" operand ("," operand)* "]"
 
-// ================================================================
-// Terminals
-// ================================================================
+cidr          : CIDR
 
-RATIO: /\d+\/\d+/
-IP_ADDR: /\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}/
-TRIPLE_QUOTED: /"{3}(?:[^"\\]|"(?!"{2})|\\[\s\S])*"{3}/s
+cidr_list     : "[" CIDR ("," CIDR)* "]"
 
-NAME: /[a-zA-Z_][a-zA-Z0-9_]*/
-NUMBER: /\d+/
-COMMENT: /#[^\n]*/
+range         : INTEGER ".." INTEGER
 
-_NL: /(\r?\n[\t ]*)+/
+EQ            : "=="
+NEQ           : "!="
+LT            : "<"
+GT            : ">"
+LE            : "<="
+GE            : ">="
+NOT           : "not"
 
-%import common.ESCAPED_STRING
-%import common.WS_INLINE
-%declare _INDENT _DEDENT
+// Multi-segment field terminals get explicit priority above IDENTIFIER
+// because Lark's basic lexer would otherwise tokenize "pkt" as an
+// identifier and stop there, never trying the longer match.
+PROTO_FIELD.10     : "pkt.proto"
+IP_FIELD.10        : "pkt.src_ip" | "pkt.dst_ip"
+PORT_FIELD.10      : "pkt.src_port" | "pkt.dst_port"
+TCP_FLAG_FIELD.10  : "pkt.tcp.syn" | "pkt.tcp.ack"
 
-%ignore WS_INLINE
+// Keywords use a negative-lookahead so they only match when not
+// followed by an identifier character — `tcp_traffic` lexes as
+// IDENTIFIER, bare `tcp ` lexes as PROTO_KEYWORD. Higher priority
+// then breaks the tie against IDENTIFIER for the same length.
+PROTO_KEYWORD.10 : /(tcp|udp|icmp)(?![a-z0-9_])/
+ALLOW.10         : /allow(?![a-z0-9_])/
+DROP.10          : /drop(?![a-z0-9_])/
+LOG.10           : /log(?![a-z0-9_])/
+COUNT.10         : /count(?![a-z0-9_])/
+
+// CIDR and IPV4 share a prefix with INTEGER; explicit priorities
+// ensure the lexer prefers the longer dotted forms even when scanning
+// at a position where INTEGER would also match.
+CIDR.5        : /\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\/\d{1,2}/
+IPV4.4        : /\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}/
+INTEGER       : /0x[0-9a-fA-F]+/ | /\d+/
+
+IDENTIFIER    : /[a-z_][a-z0-9_]*/
+
+COMMENT       : /#[^\n]*/
+
+%import common.WS
+%ignore WS
 %ignore COMMENT

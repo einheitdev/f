@@ -1,0 +1,13 @@
+name: "rate_limit fires when bucket has no prior state (treated as count=0)"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.proto == tcp and pkt.dst_port == 22
+       limited by rate_limit(3, per=src_ip)
+  default allow
+
+test_packet:
+  builder: tcp(src_ip="9.9.9.9", dst_port=22)
+
+expected:
+  compiles: true
+  bpf_action: drop

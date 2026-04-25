@@ -1,0 +1,10 @@
+name: "rate_limit per= must be one of src_ip|dst_ip|src_port|dst_port"
+source_fw: |
+  @xdp(eth0)
+  drop limited by rate_limit(10, per=src_mac)
+
+test_packet:
+  builder: tcp()
+
+expected:
+  compiles: false

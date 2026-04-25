@@ -1,0 +1,11 @@
+name: "always-allow program returns XDP_PASS"
+source_fw: |
+  @xdp(eth0)
+  allow
+
+test_packet:
+  builder: tcp(src_ip="1.2.3.4", dst_ip="5.6.7.8", src_port=12345, dst_port=80, syn=true, ack=false)
+
+expected:
+  compiles: true
+  bpf_action: allow

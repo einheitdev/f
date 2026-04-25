@@ -1,0 +1,10 @@
+name: "comparison missing right-hand operand is rejected"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.proto ==
+
+test_packet:
+  builder: tcp()
+
+expected:
+  compiles: false

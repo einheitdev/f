@@ -1,0 +1,11 @@
+name: "drop if proto==tcp + tcp packet matches and drops"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.proto == tcp
+
+test_packet:
+  builder: tcp(src_port=12345, dst_port=80)
+
+expected:
+  compiles: true
+  bpf_action: drop

@@ -1,0 +1,11 @@
+name: "drop if proto==udp does not match icmp packet (implicit allow)"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.proto == udp
+
+test_packet:
+  builder: icmp()
+
+expected:
+  compiles: true
+  bpf_action: allow

@@ -1,0 +1,12 @@
+name: "CIDR /0 matches every IPv4 address"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.src_ip in 0.0.0.0/0
+  default allow
+
+test_packet:
+  builder: tcp(src_ip="123.45.67.89")
+
+expected:
+  compiles: true
+  bpf_action: drop

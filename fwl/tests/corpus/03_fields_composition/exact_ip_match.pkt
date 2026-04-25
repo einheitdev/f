@@ -1,0 +1,12 @@
+name: "drop on exact src_ip equality"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.src_ip == 198.51.100.50
+  default allow
+
+test_packet:
+  builder: tcp(src_ip="198.51.100.50")
+
+expected:
+  compiles: true
+  bpf_action: drop

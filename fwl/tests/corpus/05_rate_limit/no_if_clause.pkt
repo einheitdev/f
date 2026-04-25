@@ -1,0 +1,17 @@
+name: "rate_limit modifier may stand without an if clause"
+source_fw: |
+  @xdp(eth0)
+  drop limited by rate_limit(5000, per=src_ip)
+  default allow
+
+state:
+  rate_limit:
+    0:
+      "1.2.3.4": 5000
+
+test_packet:
+  builder: tcp(src_ip="1.2.3.4")
+
+expected:
+  compiles: true
+  bpf_action: allow

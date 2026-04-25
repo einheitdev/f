@@ -1,0 +1,18 @@
+name: "rate_limit does not fire when bucket is at threshold (count=10, N=10)"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.proto == tcp and pkt.dst_port == 22
+       limited by rate_limit(10, per=src_ip)
+  default allow
+
+state:
+  rate_limit:
+    0:
+      "1.2.3.4": 10
+
+test_packet:
+  builder: tcp(src_ip="1.2.3.4", dst_port=22, syn=true)
+
+expected:
+  compiles: true
+  bpf_action: allow

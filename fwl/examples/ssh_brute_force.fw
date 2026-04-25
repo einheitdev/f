@@ -1,0 +1,23 @@
+# SSH brute force protection.
+#
+# Each source IP gets up to 3 new SSH connection attempts per second.
+# Beyond that, additional SYNs are dropped. Established SSH traffic
+# (TCP without SYN) is unaffected.
+#
+# Pair with `count ssh_allowed` to track the throttled-allow rate
+# from userspace.
+
+@xdp(eth0)
+
+# Drop new SSH connections beyond 3 per second per source IP
+drop if pkt.proto == tcp
+       and pkt.dst_port == 22
+       and pkt.tcp.syn and not pkt.tcp.ack
+       limited by rate_limit(3, per=src_ip)
+
+# Track allowed SSH attempts so userspace can chart them
+count ssh_allowed if pkt.proto == tcp and pkt.dst_port == 22
+
+allow if pkt.proto == tcp and pkt.dst_port == 22
+
+default allow

@@ -1,0 +1,16 @@
+name: "comments after a rule and on their own lines are stripped"
+source_fw: |
+  # this program drops port 22 from internal IPs
+  @xdp(eth0)
+  drop if pkt.proto == tcp     # comment after the rule
+       and pkt.dst_port == 22
+       and pkt.src_ip in 10.0.0.0/8
+  # default below
+  default allow
+
+test_packet:
+  builder: tcp(src_ip="10.5.5.5", dst_port=22)
+
+expected:
+  compiles: true
+  bpf_action: drop

@@ -1,0 +1,12 @@
+name: "allow tcp dst_port 22 (with proto guard) matches ssh"
+source_fw: |
+  @xdp(eth0)
+  allow if pkt.proto == tcp and pkt.dst_port == 22
+  default drop
+
+test_packet:
+  builder: tcp(src_port=12345, dst_port=22)
+
+expected:
+  compiles: true
+  bpf_action: allow

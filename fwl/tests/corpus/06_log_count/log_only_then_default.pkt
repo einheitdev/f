@@ -1,0 +1,12 @@
+name: "log only program: log fires (side effect), then default applies"
+source_fw: |
+  @xdp(eth0)
+  log if pkt.proto == tcp
+  default allow
+
+test_packet:
+  builder: tcp()
+
+expected:
+  compiles: true
+  bpf_action: allow

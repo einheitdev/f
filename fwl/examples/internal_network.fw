@@ -1,0 +1,19 @@
+# Internal network policy.
+#
+# Trusts the RFC1918 ranges, allows the standard service ports for
+# everyone, logs unsolicited TCP SYNs from the outside, and denies
+# everything else by default.
+
+@xdp(eth0)
+
+# Trust internal traffic
+allow if pkt.src_ip in [10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16]
+
+# Standard inbound services
+allow if pkt.proto == tcp and pkt.dst_port in [80, 443, 22]
+allow if pkt.proto == udp and pkt.dst_port == 53
+
+# Visibility into unexpected SYNs from outside
+log if pkt.proto == tcp and pkt.tcp.syn and not pkt.tcp.ack
+
+default drop

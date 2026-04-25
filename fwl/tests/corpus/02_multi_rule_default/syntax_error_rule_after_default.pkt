@@ -1,0 +1,11 @@
+name: "rule placed after default is rejected (default must be last)"
+source_fw: |
+  @xdp(eth0)
+  default drop
+  allow if pkt.proto == tcp
+
+test_packet:
+  builder: tcp()
+
+expected:
+  compiles: false

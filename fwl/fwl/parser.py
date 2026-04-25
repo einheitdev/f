@@ -1,293 +1,316 @@
-"""FWL parser — Lark grammar to typed AST."""
+"""Lark parser + transformer: .fw source -> typed AST.
 
-from pathlib import Path
+Produces ast.Program; raises FwlException on syntax errors with
+source spans.
+"""
+from __future__ import annotations
+import importlib.resources
 
-from lark import Lark, Transformer, v_args
+from lark import Lark, Transformer, UnexpectedInput
 
-from fwl.ast_nodes import (
-  Action,
-  ActionType,
-  AssignStmt,
-  BinOp,
-  BuiltinCall,
-  ChainStmt,
-  Cidr,
-  Compare,
-  CompOp,
-  DefaultStmt,
-  FieldAccess,
-  FuncDef,
-  IfStmt,
-  InlineC,
-  ListLit,
-  MatchClause,
-  NameRef,
-  NumberLit,
-  Program,
-  RuleOption,
-  RuleStmt,
-  StringLit,
-  UnaryOp,
-)
-from fwl.indent import FwlIndenter
-
-_GRAMMAR_PATH = Path(__file__).parent / "grammar.lark"
-
-_COMP_OPS = {
-  "eq": CompOp.EQ,
-  "neq": CompOp.NEQ,
-  "gt": CompOp.GT,
-  "lt": CompOp.LT,
-  "gte": CompOp.GTE,
-  "lte": CompOp.LTE,
-  "in_op": CompOp.IN,
-  "not_in": CompOp.NOT_IN,
-}
+from . import ast
+from .errors import FwlError, FwlException, Span
 
 
-@v_args(meta=True)
-class FwlTransformer(Transformer):
-  """Transform Lark parse tree into FWL AST nodes."""
-
-  def start(self, meta, items):
-    stmts = [i for i in items if i is not None]
-    return Program(stmts=stmts)
-
-  # Actions.
-  def action_word(self, meta, items):
-    return items[0]
-
-  def drop(self, meta, _):
-    return Action(ActionType.DROP, line=meta.line)
-
-  def allow(self, meta, _):
-    return Action(ActionType.ALLOW, line=meta.line)
-
-  def pass_action(self, meta, _):
-    return Action(ActionType.PASS, line=meta.line)
-
-  # Tier 1 — declarative rules.
-  def rule_stmt(self, meta, items):
-    action = items[0].action
-    matches = [i for i in items[1:] if isinstance(i, MatchClause)]
-    return RuleStmt(action, matches, line=meta.line)
-
-  def default_stmt(self, meta, items):
-    return DefaultStmt(items[0].action, line=meta.line)
-
-  def match_clause(self, meta, items):
-    field_name = items[0].name if isinstance(items[0], NameRef) else str(items[0])
-    values = items[1]
-    return MatchClause(field_name, CompOp.EQ, values, line=meta.line)
-
-  def match_values(self, meta, items):
-    return list(items)
-
-  def match_value(self, meta, items):
-    return items[0]
-
-  # Tier 2 — function definitions.
-  def _name_str(self, item):
-    """Extract plain string from a NameRef or Token."""
-    if isinstance(item, NameRef):
-      return item.name
-    return str(item)
-
-  def func_def(self, meta, items):
-    decorator = items[0]
-    name = self._name_str(items[1])
-    param = self._name_str(items[2])
-    body = items[3]
-    hook = decorator[0]
-    hook_args = decorator[1] if len(decorator) > 1 else []
-    return FuncDef(
-      name=name,
-      param=param,
-      hook=hook,
-      hook_args=hook_args,
-      body=body,
-      line=meta.line,
-    )
-
-  def decorator(self, meta, items):
-    name = self._name_str(items[0])
-    args = items[1] if len(items) > 1 else []
-    return (name, args)
-
-  def func_args(self, meta, items):
-    return [self._name_str(i) for i in items]
-
-  def body(self, meta, items):
-    # Flatten — if_stmt returns directly, simple_stmt may be
-    # wrapped, filter out None and _NL artifacts.
-    return [i for i in items if i is not None]
-
-  def simple_stmt(self, meta, items):
-    return items[0]
-
-  # If/elif/else.
-  def if_stmt(self, meta, items):
-    condition = items[0]
-    body = items[1]
-    elifs = []
-    else_body = None
-    for item in items[2:]:
-      if isinstance(item, tuple) and item[0] == "elif":
-        elifs.append((item[1], item[2]))
-      elif isinstance(item, list):
-        else_body = item
-    return IfStmt(condition, body, elifs, else_body, line=meta.line)
-
-  def elif_clause(self, meta, items):
-    return ("elif", items[0], items[1])
-
-  def else_clause(self, meta, items):
-    return items[0]
-
-  def assign_stmt(self, meta, items):
-    return AssignStmt(str(items[0]), items[1], line=meta.line)
-
-  # Tier 3 — inline C.
-  def inline_c(self, meta, items):
-    raw = str(items[0])
-    # Strip triple quotes.
-    code = raw[3:-3]
-    return InlineC(code, line=meta.line)
-
-  # Chain.
-  def chain_stmt(self, meta, items):
-    return ChainStmt(self._name_str(items[0]), line=meta.line)
-
-  # Built-in calls.
-  def builtin_call(self, meta, items):
-    name = self._name_str(items[0])
-    args = []
-    kwargs = {}
-    if len(items) > 1 and items[1] is not None:
-      for item in items[1]:
-        if isinstance(item, tuple):
-          kwargs[item[0]] = item[1]
-        else:
-          args.append(item)
-    return BuiltinCall(name, args, kwargs, line=meta.line)
-
-  def builtin_stmt(self, meta, items):
-    return items[0]
-
-  def call_args(self, meta, items):
-    return list(items)
-
-  def kwarg(self, meta, items):
-    return (str(items[0]), items[1])
-
-  def posarg(self, meta, items):
-    return items[0]
-
-  # Expressions.
-  def or_expr(self, meta, items):
-    result = items[0]
-    for item in items[1:]:
-      result = BinOp("or", result, item, line=meta.line)
-    return result
-
-  def and_expr(self, meta, items):
-    result = items[0]
-    for item in items[1:]:
-      result = BinOp("and", result, item, line=meta.line)
-    return result
-
-  def not_expr(self, meta, items):
-    return UnaryOp("not", items[0], line=meta.line)
-
-  def cmp_expr(self, meta, items):
-    if len(items) == 1:
-      return items[0]
-    left, op, right = items[0], items[1], items[2]
-    return Compare(op, left, right, line=meta.line)
-
-  def comp_op(self, meta, items):
-    return _COMP_OPS[items[0].data]
-
-  def eq(self, meta, _):
-    return CompOp.EQ
-
-  def neq(self, meta, _):
-    return CompOp.NEQ
-
-  def gt(self, meta, _):
-    return CompOp.GT
-
-  def lt(self, meta, _):
-    return CompOp.LT
-
-  def gte(self, meta, _):
-    return CompOp.GTE
-
-  def lte(self, meta, _):
-    return CompOp.LTE
-
-  def in_op(self, meta, _):
-    return CompOp.IN
-
-  def not_in(self, meta, _):
-    return CompOp.NOT_IN
-
-  # Atoms.
-  def field_access(self, meta, items):
-    parts = [self._name_str(i) for i in items]
-    return FieldAccess(parts, line=meta.line)
-
-  def list_literal(self, meta, items):
-    return ListLit(list(items), line=meta.line)
-
-  def cidr(self, meta, items):
-    return Cidr(str(items[0]), int(items[1]), line=meta.line)
-
-  def NUMBER(self, token):
-    return NumberLit(int(token), line=token.line)
-
-  def ESCAPED_STRING(self, token):
-    return StringLit(str(token)[1:-1], line=token.line)
-
-  def NAME(self, token):
-    return NameRef(str(token), line=token.line)
-
-  def IP_ADDR(self, token):
-    return str(token)
-
-  def RATIO(self, token):
-    return str(token)
-
-
-def _build_parser() -> Lark:
-  """Build the Lark parser from the grammar file."""
-  grammar_text = _GRAMMAR_PATH.read_text()
-  return Lark(
-    grammar_text,
-    parser="earley",
-    postlex=FwlIndenter(),
-    propagate_positions=True,
-    ambiguity="resolve",
+def _grammar_text() -> str:
+  """Read the Lark grammar from the package."""
+  return (
+    importlib.resources.files("fwl")
+    .joinpath("grammar.lark")
+    .read_text(encoding="utf-8")
   )
 
 
-_parser = None
+_PARSER = Lark(
+  _grammar_text(),
+  parser="lalr",
+  lexer="basic",
+  start="program",
+  propagate_positions=True,
+)
 
 
-def parse(source: str) -> Program:
-  """Parse FWL source code into an AST.
+def _span(token_or_tree) -> Span:
+  """Extract a (line, column) span from a Lark token or tree."""
+  line = getattr(token_or_tree, "line", None) or 1
+  column = getattr(token_or_tree, "column", None) or 1
+  return Span(line=line, column=column)
 
-  Args:
-    source: FWL source code string.
 
-  Returns:
-    Program AST node.
+_PROTO_FROM_KEYWORD = {
+  "tcp": ast.Proto.TCP,
+  "udp": ast.Proto.UDP,
+  "icmp": ast.Proto.ICMP,
+}
+
+
+def _parse_int(text: str) -> int:
+  """Decimal or hex int literal."""
+  if text.startswith("0x") or text.startswith("0X"):
+    return int(text, 16)
+  return int(text)
+
+
+def _parse_ipv4(text: str) -> int:
+  """Dotted-quad IPv4 -> 32-bit integer (network-order packed left-to-right).
+
+  Returns the address as a 32-bit unsigned integer with the leftmost
+  octet in the high byte (e.g. 192.168.0.1 -> 0xC0A80001).
   """
-  global _parser
-  if _parser is None:
-    _parser = _build_parser()
-  # Ensure trailing newline for indenter.
-  if not source.endswith("\n"):
-    source += "\n"
-  tree = _parser.parse(source)
-  return FwlTransformer().transform(tree)
+  parts = text.split(".")
+  value = 0
+  for part in parts:
+    n = int(part)
+    if not (0 <= n <= 255):
+      raise ValueError(f"IPv4 octet out of range: {part}")
+    value = (value << 8) | n
+  return value
+
+
+def _parse_cidr(text: str) -> tuple[int, int]:
+  """Dotted-quad/prefix -> (masked_prefix_int, prefix_bits)."""
+  ip_text, _, bits_text = text.partition("/")
+  bits = int(bits_text)
+  if not (0 <= bits <= 32):
+    raise ValueError(f"CIDR prefix out of range 0..32: {bits}")
+  ip_value = _parse_ipv4(ip_text)
+  if bits == 0:
+    mask = 0
+  else:
+    mask = ((1 << bits) - 1) << (32 - bits)
+  return ip_value & mask, bits
+
+
+class _ToAst(Transformer):
+  """Lark Transformer: parse tree -> AST nodes."""
+
+  # --- terminals: pass through so children-lists carry tokens. ---
+  def IDENTIFIER(self, tok): return tok
+  def ALLOW(self, tok): return tok
+  def DROP(self, tok): return tok
+  def LOG(self, tok): return tok
+  def COUNT(self, tok): return tok
+  def NOT(self, tok): return tok
+  def EQ(self, tok): return tok
+  def NEQ(self, tok): return tok
+  def LT(self, tok): return tok
+  def GT(self, tok): return tok
+  def LE(self, tok): return tok
+  def GE(self, tok): return tok
+  def PROTO_FIELD(self, tok): return tok
+  def IP_FIELD(self, tok): return tok
+  def PORT_FIELD(self, tok): return tok
+  def TCP_FLAG_FIELD(self, tok): return tok
+  def PROTO_KEYWORD(self, tok): return tok
+  def IPV4(self, tok): return tok
+  def CIDR(self, tok): return tok
+  def INTEGER(self, tok): return tok
+
+  # --- top-level structure ---
+
+  def hook_decl(self, children) -> ast.Hook:
+    (iface_tok,) = children
+    return ast.Hook(interface=str(iface_tok), span=_span(iface_tok))
+
+  def terminal_action(
+    self, children
+  ) -> tuple[ast.Action, Span, str | None]:
+    (tok,) = children
+    if tok.type == "ALLOW":
+      return ast.Action.ALLOW, _span(tok), None
+    return ast.Action.DROP, _span(tok), None
+
+  def nonterminal_action(
+    self, children
+  ) -> tuple[ast.Action, Span, str | None]:
+    if children[0].type == "LOG":
+      return ast.Action.LOG, _span(children[0]), None
+    # COUNT IDENTIFIER
+    count_tok, name_tok = children
+    return ast.Action.COUNT, _span(count_tok), str(name_tok)
+
+  def action(
+    self, children
+  ) -> tuple[ast.Action, Span, str | None]:
+    (action_tuple,) = children
+    return action_tuple
+
+  def default_rule(self, children) -> ast.DefaultRule:
+    (action_tuple,) = children
+    action, span, _ = action_tuple
+    return ast.DefaultRule(action=action, span=span)
+
+  def rule(self, children) -> ast.Rule:
+    action, action_span, counter_name = children[0]
+    condition: ast.Condition | None = None
+    modifier: ast.RateLimit | None = None
+    for child in children[1:]:
+      if isinstance(child, ast.RateLimit):
+        modifier = child
+      else:
+        condition = child
+    return ast.Rule(
+      action=action,
+      condition=condition,
+      modifier=modifier,
+      span=action_span,
+      counter_name=counter_name,
+    )
+
+  def modifier(self, children) -> ast.RateLimit:
+    threshold_tok, field_tok = children
+    return ast.RateLimit(
+      threshold=_parse_int(str(threshold_tok)),
+      per_field=str(field_tok),
+      span=_span(threshold_tok),
+    )
+
+  def RL_FIELD(self, tok):
+    return tok
+
+  def program(self, children) -> ast.Program:
+    hook = children[0]
+    default = None
+    rules: list[ast.Rule] = []
+    for child in children[1:]:
+      if isinstance(child, ast.DefaultRule):
+        default = child
+      else:
+        rules.append(child)
+    return ast.Program(hook=hook, rules=rules, default=default)
+
+  # --- conditions ---
+
+  def condition(self, children) -> ast.Condition:
+    (node,) = children
+    return node
+
+  def or_expr(self, children) -> ast.Condition:
+    if len(children) == 1:
+      return children[0]
+    return ast.OrOp(operands=list(children), span=children[0].span)
+
+  def and_expr(self, children) -> ast.Condition:
+    if len(children) == 1:
+      return children[0]
+    return ast.AndOp(operands=list(children), span=children[0].span)
+
+  def not_expr(self, children) -> ast.Condition:
+    if len(children) == 1:
+      return children[0]
+    not_tok, inner = children
+    return ast.NotOp(inner=inner, span=_span(not_tok))
+
+  def primary(self, children) -> ast.Condition:
+    (node,) = children
+    return node
+
+  def bool_field(self, children) -> ast.BoolField:
+    (tok,) = children
+    return ast.BoolField(
+      field=ast.FieldRef(name=str(tok), span=_span(tok)),
+      span=_span(tok),
+    )
+
+  # --- comparisons + operands ---
+
+  def comp_op(self, children) -> str:
+    (tok,) = children
+    return str(tok)
+
+  def value_field(self, children) -> ast.FieldRef:
+    (tok,) = children
+    return ast.FieldRef(name=str(tok), span=_span(tok))
+
+  def enum_field(self, children) -> ast.FieldRef:
+    (tok,) = children
+    return ast.FieldRef(name=str(tok), span=_span(tok))
+
+  def value_compare(self, children) -> ast.Comparison:
+    """value_field comp_op operand."""
+    field, op, operand = children
+    return ast.Comparison(
+      field=field, op=op, operand=operand, span=field.span
+    )
+
+  def value_in(self, children) -> ast.Comparison:
+    """value_field 'in' set_or_range."""
+    field, operand = children
+    return ast.Comparison(
+      field=field, op="in", operand=operand, span=field.span
+    )
+
+  def enum_eq(self, children) -> ast.Comparison:
+    """enum_field '==' PROTO_KEYWORD."""
+    field, kw_tok = children
+    return ast.Comparison(
+      field=field,
+      op="==",
+      operand=ast.ProtoLiteral(
+        proto=_PROTO_FROM_KEYWORD[str(kw_tok)], span=_span(kw_tok)
+      ),
+      span=field.span,
+    )
+
+  def enum_neq(self, children) -> ast.Comparison:
+    """enum_field '!=' PROTO_KEYWORD."""
+    field, kw_tok = children
+    return ast.Comparison(
+      field=field,
+      op="!=",
+      operand=ast.ProtoLiteral(
+        proto=_PROTO_FROM_KEYWORD[str(kw_tok)], span=_span(kw_tok)
+      ),
+      span=field.span,
+    )
+
+  def operand(self, children) -> ast.Operand:
+    (tok,) = children
+    if tok.type == "INTEGER":
+      return ast.IntLiteral(value=_parse_int(str(tok)), span=_span(tok))
+    if tok.type == "IPV4":
+      return ast.IPv4Literal(value=_parse_ipv4(str(tok)), span=_span(tok))
+    raise AssertionError(f"unexpected operand token {tok.type}")
+
+  def set_or_range(self, children) -> ast.Operand:
+    (node,) = children
+    return node
+
+  def list(self, children) -> ast.ListLiteral:
+    items = list(children)
+    return ast.ListLiteral(items=items, span=items[0].span)
+
+  def cidr(self, children) -> ast.CidrLiteral:
+    (tok,) = children
+    prefix, bits = _parse_cidr(str(tok))
+    return ast.CidrLiteral(prefix=prefix, bits=bits, span=_span(tok))
+
+  def cidr_list(self, children) -> ast.CidrListLiteral:
+    items = []
+    for tok in children:
+      prefix, bits = _parse_cidr(str(tok))
+      items.append(
+        ast.CidrLiteral(prefix=prefix, bits=bits, span=_span(tok))
+      )
+    return ast.CidrListLiteral(items=items, span=items[0].span)
+
+  def range(self, children) -> ast.RangeLiteral:
+    lo_tok, hi_tok = children
+    lo = _parse_int(str(lo_tok))
+    hi = _parse_int(str(hi_tok))
+    return ast.RangeLiteral(lo=lo, hi=hi, span=_span(lo_tok))
+
+
+def parse(source: str) -> ast.Program:
+  """Parse FWL source into an AST.
+
+  Raises FwlException with category="syntax" on any parse error.
+  """
+  try:
+    tree = _PARSER.parse(source)
+  except UnexpectedInput as exc:
+    span = Span(line=exc.line, column=exc.column)
+    raise FwlException(
+      FwlError(category="syntax", message=str(exc), span=span)
+    ) from exc
+  return _ToAst().transform(tree)

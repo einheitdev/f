@@ -46,7 +46,7 @@ Rules live in BPF maps. Updates go to a standby table while the active table con
 - **Binary control protocol** — flat struct serialization over Unix socket, no parsing overhead
 - **REST API** — JSON and HTMX fragment endpoints for rules, counters, conntrack, interfaces
 - **Web dashboard** — HTMX + Tailwind CSS + Plotly.js, no build tooling required
-- **FWL compiler** — domain-specific language that compiles declarative rules and Python-syntax logic to BPF C
+- **FWL compiler** — small declarative language that compiles to verifier-accepted BPF C, verified construct-by-construct against three independent oracles
 
 ## Requirements
 
@@ -106,49 +106,34 @@ Run a single test:
 
 ## FWL — Firewall Language
 
-FWL compiles firewall rules to BPF. It has three tiers:
+FWL is a small declarative language that compiles to XDP/eBPF. The v0.1
+surface is one hook + a sequence of rules + an optional default:
 
-**Tier 1** — declarative rules that compile to map entries:
+```
+@xdp(eth0)
 
-```python
-allow dst_port 80, 443 proto tcp
-  count web_traffic
+# Drop new SSH connections beyond 3 per second per source IP.
+drop if pkt.proto == tcp
+       and pkt.dst_port == 22
+       and pkt.tcp.syn and not pkt.tcp.ack
+       limited by rate_limit(3, per=src_ip)
 
-block src_net 10.0.0.0/8
+# Track allowed SSH attempts so userspace can chart them.
+count ssh_allowed if pkt.proto == tcp and pkt.dst_port == 22
+
+allow if pkt.proto == tcp and pkt.dst_port in [22, 80, 443]
+allow if pkt.proto == udp and pkt.dst_port == 53
 
 default drop
 ```
 
-**Tier 2** — Python-syntax functions that compile to BPF C:
-
-```python
-@xdp(eth0)
-def firewall(pkt):
-  if pkt.proto == tcp and pkt.dst_port == 22:
-    if pkt.tcp.syn and not pkt.tcp.ack:
-      rate_limit(10, per=src_ip)
-    allow
-
-  if conntrack(pkt).state == established:
-    allow
-
-  drop
-```
-
-**Tier 3** — raw C escape hatch for custom protocol parsing:
-
-```python
-@xdp(eth0)
-def deep_inspect(pkt):
-  if pkt.dst_port == 53:
-    inline_c """
-      __u8* dns = pkt->l4_payload;
-      if (dns[2] & 0x80) {
-        return XDP_DROP;
-      }
-    """
-  allow
-```
+What v0.1 covers: `allow|drop|log|count <name>` actions, `default
+allow|drop`, the seven `pkt.*` fields above plus `pkt.{src,dst}_ip`, all
+the usual comparison operators including `in` (lists, port ranges, CIDR,
+CIDR lists), `and`/`or`/`not`/parens with correct precedence and
+short-circuit, and the `rate_limit(N, per=<field>)` modifier as the one
+stateful primitive. Tier 2 functions, Tier 3 inline C, IPv6, geoip, and
+conntrack are explicitly deferred — see the spec for the full list.
 
 Install and use:
 
@@ -156,7 +141,15 @@ Install and use:
 cd fwl
 pip install -e ".[dev]"
 fwl compile rules.fw -o rules.bpf.c
+fwl test tests/corpus/                # interpreter + clang-compile
+sudo .venv/bin/fwl test tests/corpus/ # add live BPF_PROG_TEST_RUN
 ```
+
+See [`fwl/README.md`](fwl/README.md) for the compiler architecture and
+the `.pkt` test format; the language reference is in
+[`docs/FWL_V01_SPEC.md`](docs/FWL_V01_SPEC.md); the methodology that
+gates each construct on three-oracle agreement is in
+[`docs/F_DEVELOPMENT_METHODOLOGY.md`](docs/F_DEVELOPMENT_METHODOLOGY.md).
 
 ## REST API
 
@@ -178,5 +171,6 @@ All endpoints return JSON by default. When called with `HX-Request: true`, they 
 
 ## Documentation
 
-- [Architecture and design](doc/design.md)
-- [FWL language reference](doc/fwl.md)
+- [FWL v0.1 language reference](docs/FWL_V01_SPEC.md)
+- [FWL development methodology](docs/F_DEVELOPMENT_METHODOLOGY.md)
+- [FWL compiler README](fwl/README.md)

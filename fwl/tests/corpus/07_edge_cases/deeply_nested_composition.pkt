@@ -1,0 +1,13 @@
+name: "deeply nested AND/OR/NOT with parens evaluates correctly"
+source_fw: |
+  @xdp(eth0)
+  drop if (pkt.proto == tcp and not (pkt.dst_port == 22 or pkt.dst_port == 80))
+       or pkt.proto == icmp
+  default allow
+
+test_packet:
+  builder: tcp(dst_port=443)
+
+expected:
+  compiles: true
+  bpf_action: drop

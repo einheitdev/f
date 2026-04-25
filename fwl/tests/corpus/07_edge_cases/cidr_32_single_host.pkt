@@ -1,0 +1,12 @@
+name: "CIDR /32 matches only the single host"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.src_ip in 198.51.100.42/32
+  default allow
+
+test_packet:
+  builder: tcp(src_ip="198.51.100.43")
+
+expected:
+  compiles: true
+  bpf_action: allow

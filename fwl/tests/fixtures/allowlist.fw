@@ -1,9 +1,0 @@
-@xdp(eth0)
-def allowlist(pkt):
-  if pkt.src_ip in geoip("US", "DE"):
-    allow
-  if pkt.proto == tcp and pkt.dst_port == 443:
-    allow
-  if pkt.proto == udp and pkt.dst_port == 53:
-    allow
-  drop

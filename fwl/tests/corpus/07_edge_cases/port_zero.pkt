@@ -1,0 +1,12 @@
+name: "port 0 is a valid comparand"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.proto == tcp and pkt.dst_port == 0
+  default allow
+
+test_packet:
+  builder: tcp(dst_port=0)
+
+expected:
+  compiles: true
+  bpf_action: drop

@@ -1,0 +1,12 @@
+name: "drop on src_ip in 10.0.0.0/8 fires for 10.1.2.3"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.src_ip in 10.0.0.0/8
+  default allow
+
+test_packet:
+  builder: tcp(src_ip="10.1.2.3", dst_port=443)
+
+expected:
+  compiles: true
+  bpf_action: drop
