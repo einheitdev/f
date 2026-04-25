@@ -115,6 +115,12 @@ def _bpf_oracle(
   Skips with a clear message when CAP_BPF is unavailable, so the
   runner remains useful in development environments without root.
   Compilation alone still runs and catches structural emitter bugs.
+
+  When a .pkt declares state: the BPF run is skipped because
+  pre-populating BPF maps from .pkt state isn't implemented yet —
+  running anyway would silently report a different action than the
+  interpreter (which respects the state) and create false agreement
+  for the wrong reason.
   """
   try:
     program = analyzer.analyze(parser.parse(case.source_fw))
@@ -130,6 +136,22 @@ def _bpf_oracle(
     )
 
   c_source = emitter.emit(program)
+
+  if case.state:
+    # Verify the C compiles, then skip the actual run.
+    try:
+      bpf_runner.compile_c(c_source)
+    except subprocess.CalledProcessError as cexc:
+      stderr = cexc.stderr.decode("utf-8", "replace")
+      return OracleResult(
+        "bpf", "fail",
+        f"clang failed to compile emitter output:\n{stderr}",
+      )
+    return OracleResult(
+      "bpf", "skip",
+      ".pkt declares state: — BPF map pre-population not implemented "
+      "(would run with empty maps and disagree silently); clang ok",
+    )
 
   try:
     got = bpf_runner.run(c_source, case.packet.raw)
