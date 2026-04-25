@@ -1,0 +1,12 @@
+name: "CIDR /23 — 10.0.1.250 matches 10.0.0.0/23 (mask 0xFFFFFE00)"
+source_fw: |
+  @xdp(eth0)
+  allow if pkt.src_ip in 10.0.0.0/23
+  default drop
+
+test_packet:
+  builder: tcp(src_ip="10.0.1.250", dst_port=80)
+
+expected:
+  compiles: true
+  bpf_action: allow

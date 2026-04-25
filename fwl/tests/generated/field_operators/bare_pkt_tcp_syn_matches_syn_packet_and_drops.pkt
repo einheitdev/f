@@ -1,0 +1,12 @@
+name: "bare pkt.tcp.syn matches syn packet and drops"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.proto == tcp and pkt.tcp.syn
+  default allow
+
+test_packet:
+  builder: tcp(dst_port=22, syn=true, ack=false)
+
+expected:
+  compiles: true
+  bpf_action: drop

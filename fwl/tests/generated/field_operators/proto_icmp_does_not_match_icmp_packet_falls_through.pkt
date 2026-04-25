@@ -1,0 +1,12 @@
+name: "proto != icmp does not match icmp packet falls through"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.proto != icmp
+  default allow
+
+test_packet:
+  builder: icmp()
+
+expected:
+  compiles: true
+  bpf_action: allow

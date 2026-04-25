@@ -1,0 +1,11 @@
+name: "default-only program: default allow lets all traffic through"
+source_fw: |
+  @xdp(eth0)
+  default allow
+
+test_packet:
+  builder: udp(dst_port=53)
+
+expected:
+  compiles: true
+  bpf_action: allow

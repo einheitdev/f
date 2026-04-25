@@ -1,0 +1,10 @@
+name: "tcp guard + dst_port in list matches 8080 and drops"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.proto == tcp and pkt.dst_port in [80, 443, 8080]
+  default allow
+test_packet:
+  builder: tcp(dst_port=8080)
+expected:
+  compiles: true
+  bpf_action: drop

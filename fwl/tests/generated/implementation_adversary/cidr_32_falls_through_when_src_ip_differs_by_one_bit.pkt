@@ -1,0 +1,12 @@
+name: "CIDR /32 falls through when src_ip differs by one bit"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.src_ip in 10.20.30.40/32
+  default allow
+
+test_packet:
+  builder: tcp(src_ip="10.20.30.41")
+
+expected:
+  compiles: true
+  bpf_action: allow

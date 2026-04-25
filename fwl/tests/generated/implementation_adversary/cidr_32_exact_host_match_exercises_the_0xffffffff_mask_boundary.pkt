@@ -1,0 +1,12 @@
+name: "CIDR /32 exact-host match exercises the 0xFFFFFFFF mask boundary"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.src_ip in 10.20.30.40/32
+  default allow
+
+test_packet:
+  builder: tcp(src_ip="10.20.30.40")
+
+expected:
+  compiles: true
+  bpf_action: drop

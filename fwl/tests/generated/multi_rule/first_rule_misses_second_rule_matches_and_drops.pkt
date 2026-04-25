@@ -1,0 +1,13 @@
+name: "first rule misses, second rule matches and drops"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.src_ip in 10.0.0.0/8
+  drop if pkt.proto == icmp
+  default allow
+
+test_packet:
+  builder: icmp(src_ip="8.8.8.8")
+
+expected:
+  compiles: true
+  bpf_action: drop

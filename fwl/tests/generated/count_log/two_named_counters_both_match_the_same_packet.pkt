@@ -1,0 +1,13 @@
+name: "two named counters both match the same packet"
+source_fw: |
+  @xdp(eth0)
+  count tcp_total if pkt.proto == tcp
+  count web_traffic if pkt.proto == tcp and pkt.dst_port in [80, 443]
+  allow
+
+test_packet:
+  builder: tcp(dst_port=443)
+
+expected:
+  compiles: true
+  bpf_action: allow

@@ -1,0 +1,10 @@
+name: "type mismatch: dst_port compared to ipv4 literal"
+source_fw: |
+  @xdp(eth0)
+  allow if pkt.proto == tcp and pkt.dst_port == 192.168.1.1
+
+test_packet:
+  builder: tcp()
+
+expected:
+  compiles: false

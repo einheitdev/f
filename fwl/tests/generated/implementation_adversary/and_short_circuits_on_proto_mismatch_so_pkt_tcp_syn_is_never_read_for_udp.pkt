@@ -1,0 +1,12 @@
+name: "AND short-circuits on proto mismatch so pkt.tcp.syn is never read for udp"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.proto == tcp and pkt.tcp.syn
+  default allow
+
+test_packet:
+  builder: udp(dst_port=53)
+
+expected:
+  compiles: true
+  bpf_action: allow

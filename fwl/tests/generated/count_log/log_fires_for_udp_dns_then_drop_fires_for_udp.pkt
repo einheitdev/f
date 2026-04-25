@@ -1,0 +1,12 @@
+name: "log fires for udp dns, then drop fires for udp"
+source_fw: |
+  @xdp(eth0)
+  log if pkt.proto == udp and pkt.dst_port == 53
+  drop if pkt.proto == udp
+
+test_packet:
+  builder: udp(dst_port=53)
+
+expected:
+  compiles: true
+  bpf_action: drop

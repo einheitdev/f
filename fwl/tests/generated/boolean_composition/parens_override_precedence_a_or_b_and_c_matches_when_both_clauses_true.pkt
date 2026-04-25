@@ -1,0 +1,12 @@
+name: "parens override precedence: '(a or b) and c' matches when both clauses true"
+source_fw: |
+  @xdp(eth0)
+  allow if (pkt.proto == tcp or pkt.proto == udp) and pkt.src_ip == 9.9.9.9
+  default drop
+
+test_packet:
+  builder: tcp(src_ip="9.9.9.9", dst_port=80)
+
+expected:
+  compiles: true
+  bpf_action: allow

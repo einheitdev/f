@@ -1,0 +1,10 @@
+name: "port literal 65536 just past the boundary"
+source_fw: |
+  @xdp(eth0)
+  allow if pkt.proto == udp and pkt.src_port == 65536
+
+test_packet:
+  builder: tcp()
+
+expected:
+  compiles: false

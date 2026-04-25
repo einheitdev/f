@@ -1,0 +1,8 @@
+name: "pkt.tcp.syn after 'not pkt.proto == tcp' has no guard"
+source_fw: |
+  @xdp(eth0)
+  drop if not pkt.proto == tcp and pkt.tcp.syn
+test_packet:
+  builder: tcp()
+expected:
+  compiles: false

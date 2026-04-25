@@ -1,0 +1,8 @@
+name: "pkt.tcp.syn under udp guard fails to compile"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.proto == udp and pkt.tcp.syn
+test_packet:
+  builder: tcp()
+expected:
+  compiles: false

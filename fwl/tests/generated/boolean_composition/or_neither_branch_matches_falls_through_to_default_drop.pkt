@@ -1,0 +1,12 @@
+name: "or: neither branch matches falls through to default drop"
+source_fw: |
+  @xdp(eth0)
+  allow if pkt.src_ip in 10.0.0.0/8 or pkt.src_ip in 192.168.0.0/16
+  default drop
+
+test_packet:
+  builder: tcp(src_ip="8.8.8.8", dst_port=80)
+
+expected:
+  compiles: true
+  bpf_action: drop

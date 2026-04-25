@@ -1,0 +1,12 @@
+name: "default after log — spec calls default 'syntactic sugar for unconditional rule at end' so log falls through to default"
+source_fw: |
+  @xdp(eth0)
+  log if pkt.proto == tcp
+  default drop
+
+test_packet:
+  builder: tcp(src_port=12345, dst_port=80)
+
+expected:
+  compiles: true
+  bpf_action: drop

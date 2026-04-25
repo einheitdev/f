@@ -174,12 +174,20 @@ drop if pkt.tcp.syn
 # error: pkt.tcp.syn requires pkt.proto == tcp guard
 #        (pkt.proto == udp does not satisfy the requirement)
 drop if pkt.proto == udp and pkt.tcp.syn
-
-# error: protocol guard via 'or' does not apply to all branches
-allow if pkt.proto == tcp or pkt.proto == udp and pkt.dst_port == 443
-# (precedence: 'and' binds tighter than 'or'. The dst_port access
-#  is only guarded for the udp branch, not the tcp branch.)
 ```
+
+The constraint-set rule is union-of-branches across `or`. So
+`(pkt.proto == tcp or pkt.proto == udp) and pkt.dst_port == 443`
+is well-formed: each `or` branch contributes a guard, the union
+satisfies `tcp|udp`, and `dst_port` access is allowed.
+
+By precedence (`and` binds tighter than `or`),
+`pkt.proto == tcp or pkt.proto == udp and pkt.dst_port == 443`
+parses as `tcp or (udp and dst_port == 443)`. The `dst_port` access
+sits inside the second branch, where the AND already establishes a
+`udp` guard — the constraint-set rule allows it. (If a reader
+expected the access to apply to both branches, parens make that
+intent explicit.)
 
 ### Bounds Checks and Truncated Packets
 

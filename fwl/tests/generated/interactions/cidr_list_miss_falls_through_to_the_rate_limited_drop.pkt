@@ -1,0 +1,14 @@
+name: "CIDR list miss falls through to the rate-limited drop"
+source_fw: |
+  @xdp(eth0)
+  allow if pkt.src_ip in [10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16]
+  drop if pkt.proto == tcp
+         limited by rate_limit(100, per=src_ip)
+  default allow
+
+test_packet:
+  builder: tcp(src_ip="8.8.8.8", dst_port=80)
+
+expected:
+  compiles: true
+  bpf_action: drop

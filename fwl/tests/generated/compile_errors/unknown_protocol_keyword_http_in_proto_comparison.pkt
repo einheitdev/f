@@ -1,0 +1,10 @@
+name: "unknown protocol keyword 'http' in proto comparison"
+source_fw: |
+  @xdp(eth0)
+  allow if pkt.proto == http
+
+test_packet:
+  builder: tcp()
+
+expected:
+  compiles: false

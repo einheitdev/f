@@ -1,0 +1,12 @@
+name: "rate_limit per=dst_ip with empty bucket fires drop"
+source_fw: |
+  @xdp(eth0)
+  drop limited by rate_limit(5, per=dst_ip)
+  default allow
+
+test_packet:
+  builder: tcp(src_ip="10.0.0.1", dst_ip="192.168.1.1", dst_port=80)
+
+expected:
+  compiles: true
+  bpf_action: drop

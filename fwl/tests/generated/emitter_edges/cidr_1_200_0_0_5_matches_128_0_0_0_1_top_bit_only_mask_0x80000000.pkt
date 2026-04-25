@@ -1,0 +1,12 @@
+name: "CIDR /1 — 200.0.0.5 matches 128.0.0.0/1 (top-bit-only mask 0x80000000)"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.src_ip in 128.0.0.0/1
+  default allow
+
+test_packet:
+  builder: tcp(src_ip="200.0.0.5", dst_port=80)
+
+expected:
+  compiles: true
+  bpf_action: drop

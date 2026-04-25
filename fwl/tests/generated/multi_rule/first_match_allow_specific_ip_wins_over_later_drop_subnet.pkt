@@ -1,0 +1,13 @@
+name: "first-match: allow specific ip wins over later drop subnet"
+source_fw: |
+  @xdp(eth0)
+  allow if pkt.src_ip == 10.1.2.3
+  drop if pkt.src_ip in 10.0.0.0/8
+  default allow
+
+test_packet:
+  builder: tcp(src_ip="10.1.2.3", dst_port=80)
+
+expected:
+  compiles: true
+  bpf_action: allow

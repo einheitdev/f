@@ -1,0 +1,10 @@
+name: "type mismatch: src_ip in port range"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.src_ip in 1000..2000
+
+test_packet:
+  builder: tcp()
+
+expected:
+  compiles: false

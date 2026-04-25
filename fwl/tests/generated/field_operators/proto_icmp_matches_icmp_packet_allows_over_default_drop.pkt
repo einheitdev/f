@@ -1,0 +1,12 @@
+name: "proto == icmp matches icmp packet allows over default drop"
+source_fw: |
+  @xdp(eth0)
+  allow if pkt.proto == icmp
+  default drop
+
+test_packet:
+  builder: icmp()
+
+expected:
+  compiles: true
+  bpf_action: allow

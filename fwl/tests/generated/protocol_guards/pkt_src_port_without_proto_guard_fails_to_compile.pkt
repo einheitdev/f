@@ -1,0 +1,8 @@
+name: "pkt.src_port without proto guard fails to compile"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.src_port == 1234
+test_packet:
+  builder: tcp()
+expected:
+  compiles: false

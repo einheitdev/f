@@ -1,0 +1,10 @@
+name: "tcp guard + tcp.syn matches SYN packet and drops"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.proto == tcp and pkt.tcp.syn
+  default allow
+test_packet:
+  builder: tcp(syn=true)
+expected:
+  compiles: true
+  bpf_action: drop

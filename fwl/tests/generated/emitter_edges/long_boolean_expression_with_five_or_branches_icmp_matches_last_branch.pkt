@@ -1,0 +1,16 @@
+name: "long boolean expression with five OR branches — ICMP matches last branch"
+source_fw: |
+  @xdp(eth0)
+  allow if (pkt.proto == tcp and pkt.dst_port == 22)
+         or (pkt.proto == tcp and pkt.dst_port == 80)
+         or (pkt.proto == tcp and pkt.dst_port == 443)
+         or (pkt.proto == udp and pkt.dst_port == 53)
+         or (pkt.proto == icmp)
+  default drop
+
+test_packet:
+  builder: icmp(src_ip="9.9.9.9")
+
+expected:
+  compiles: true
+  bpf_action: allow

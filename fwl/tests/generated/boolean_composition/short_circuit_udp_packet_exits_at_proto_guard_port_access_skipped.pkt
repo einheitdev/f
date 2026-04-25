@@ -1,0 +1,11 @@
+name: "short-circuit: udp packet exits at proto guard, port access skipped"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.proto == tcp and pkt.dst_port == 22
+
+test_packet:
+  builder: udp(dst_port=22)
+
+expected:
+  compiles: true
+  bpf_action: allow

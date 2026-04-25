@@ -1,0 +1,20 @@
+name: "blocked allow rate_limit falls through to a drop rate_limit that fires"
+source_fw: |
+  @xdp(eth0)
+  allow if pkt.proto == tcp and pkt.dst_port == 80
+       limited by rate_limit(5, per=src_ip)
+  drop if pkt.proto == tcp and pkt.dst_port == 80
+       limited by rate_limit(10, per=dst_ip)
+  default allow
+
+state:
+  rate_limit:
+    0:
+      "7.7.7.7": 5
+
+test_packet:
+  builder: tcp(src_ip="7.7.7.7", dst_ip="8.8.8.8", dst_port=80)
+
+expected:
+  compiles: true
+  bpf_action: drop

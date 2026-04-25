@@ -1,0 +1,13 @@
+name: "OR of two protocol-guarded branches: udp/53 takes the udp branch"
+source_fw: |
+  @xdp(eth0)
+  allow if (pkt.proto == tcp and pkt.dst_port == 80)
+         or (pkt.proto == udp and pkt.dst_port == 53)
+  default drop
+
+test_packet:
+  builder: udp(src_ip="1.1.1.1", dst_port=53)
+
+expected:
+  compiles: true
+  bpf_action: allow

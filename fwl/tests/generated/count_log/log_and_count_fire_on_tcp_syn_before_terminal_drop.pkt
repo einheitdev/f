@@ -1,0 +1,13 @@
+name: "log and count fire on tcp syn before terminal drop"
+source_fw: |
+  @xdp(eth0)
+  log if pkt.proto == tcp and pkt.tcp.syn
+  count syn_drops if pkt.proto == tcp and pkt.tcp.syn
+  drop if pkt.proto == tcp and pkt.tcp.syn
+
+test_packet:
+  builder: tcp(dst_port=22, syn=true)
+
+expected:
+  compiles: true
+  bpf_action: drop

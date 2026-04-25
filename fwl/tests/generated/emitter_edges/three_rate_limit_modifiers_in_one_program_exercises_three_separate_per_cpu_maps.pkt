@@ -1,0 +1,16 @@
+name: "three rate_limit modifiers in one program — exercises three separate per-CPU maps"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.proto == tcp and pkt.dst_port == 22
+         limited by rate_limit(5, per=src_ip)
+  drop if pkt.proto == tcp and pkt.dst_port == 80
+         limited by rate_limit(100, per=dst_ip)
+  drop limited by rate_limit(1000, per=src_port)
+  allow
+
+test_packet:
+  builder: tcp(src_ip="1.2.3.4", dst_ip="2.2.2.2", src_port=12345, dst_port=80)
+
+expected:
+  compiles: true
+  bpf_action: drop

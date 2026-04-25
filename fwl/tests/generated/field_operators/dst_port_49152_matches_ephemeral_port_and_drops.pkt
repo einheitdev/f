@@ -1,0 +1,12 @@
+name: "dst_port > 49152 matches ephemeral port and drops"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.proto == tcp and pkt.dst_port > 49152
+  default allow
+
+test_packet:
+  builder: tcp(dst_port=50000)
+
+expected:
+  compiles: true
+  bpf_action: drop

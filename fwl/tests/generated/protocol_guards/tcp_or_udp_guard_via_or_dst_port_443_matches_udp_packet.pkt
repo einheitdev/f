@@ -1,0 +1,10 @@
+name: "(tcp or udp) guard via OR + dst_port==443 matches udp packet"
+source_fw: |
+  @xdp(eth0)
+  allow if (pkt.proto == tcp or pkt.proto == udp) and pkt.dst_port == 443
+  default drop
+test_packet:
+  builder: udp(dst_port=443)
+expected:
+  compiles: true
+  bpf_action: allow

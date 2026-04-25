@@ -1,0 +1,12 @@
+name: "log fires and packet is allowed"
+source_fw: |
+  @xdp(eth0)
+  log if pkt.proto == tcp and pkt.dst_port == 22
+  allow
+
+test_packet:
+  builder: tcp(dst_port=22, syn=true)
+
+expected:
+  compiles: true
+  bpf_action: allow

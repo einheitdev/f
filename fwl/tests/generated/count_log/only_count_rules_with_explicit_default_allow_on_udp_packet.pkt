@@ -1,0 +1,13 @@
+name: "only count rules with explicit default allow on udp packet"
+source_fw: |
+  @xdp(eth0)
+  count all_seen
+  count tcp_seen if pkt.proto == tcp
+  default allow
+
+test_packet:
+  builder: udp(dst_port=53)
+
+expected:
+  compiles: true
+  bpf_action: allow

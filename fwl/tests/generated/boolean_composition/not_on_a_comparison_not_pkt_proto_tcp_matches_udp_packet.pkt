@@ -1,0 +1,11 @@
+name: "not on a comparison: 'not pkt.proto == tcp' matches udp packet"
+source_fw: |
+  @xdp(eth0)
+  drop if not pkt.proto == tcp
+
+test_packet:
+  builder: udp(dst_port=53)
+
+expected:
+  compiles: true
+  bpf_action: drop

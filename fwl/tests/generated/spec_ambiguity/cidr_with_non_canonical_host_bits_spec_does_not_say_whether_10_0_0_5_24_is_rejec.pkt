@@ -1,0 +1,12 @@
+name: "CIDR with non-canonical host bits — spec does not say whether 10.0.0.5/24 is rejected or masked to 10.0.0.0/24"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.src_ip in 10.0.0.5/24
+  default allow
+
+test_packet:
+  builder: tcp(src_ip="10.0.0.99")
+
+expected:
+  compiles: true
+  bpf_action: drop

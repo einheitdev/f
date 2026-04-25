@@ -1,0 +1,12 @@
+name: "not pkt.tcp.ack matches packet without ack flag and drops"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.proto == tcp and not pkt.tcp.ack
+  default allow
+
+test_packet:
+  builder: tcp(dst_port=80, syn=true, ack=false)
+
+expected:
+  compiles: true
+  bpf_action: drop

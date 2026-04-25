@@ -1,0 +1,26 @@
+name: "15-rule program — TCP/8443 matches the 5th allow, late rule index"
+source_fw: |
+  @xdp(eth0)
+  allow if pkt.proto == tcp and pkt.dst_port == 22
+  allow if pkt.proto == tcp and pkt.dst_port == 80
+  allow if pkt.proto == tcp and pkt.dst_port == 443
+  allow if pkt.proto == tcp and pkt.dst_port == 8080
+  allow if pkt.proto == tcp and pkt.dst_port == 8443
+  allow if pkt.proto == udp and pkt.dst_port == 53
+  allow if pkt.proto == udp and pkt.dst_port == 67
+  allow if pkt.proto == udp and pkt.dst_port == 123
+  allow if pkt.proto == udp and pkt.dst_port == 514
+  drop  if pkt.src_ip in 10.0.0.0/8
+  drop  if pkt.src_ip in 172.16.0.0/12
+  drop  if pkt.src_ip in 192.168.0.0/16
+  drop  if pkt.src_ip in 169.254.0.0/16
+  log   if pkt.proto == tcp and pkt.tcp.syn
+  log   if pkt.proto == icmp
+  default drop
+
+test_packet:
+  builder: tcp(src_ip="8.8.8.8", dst_port=8443)
+
+expected:
+  compiles: true
+  bpf_action: allow

@@ -1,0 +1,10 @@
+name: "tcp guard + dst_port==22 matches tcp packet and drops"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.proto == tcp and pkt.dst_port == 22
+  default allow
+test_packet:
+  builder: tcp(dst_port=22)
+expected:
+  compiles: true
+  bpf_action: drop

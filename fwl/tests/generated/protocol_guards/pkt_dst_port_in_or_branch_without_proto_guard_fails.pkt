@@ -1,0 +1,8 @@
+name: "pkt.dst_port in OR branch without proto guard fails"
+source_fw: |
+  @xdp(eth0)
+  allow if pkt.proto == icmp or pkt.dst_port == 80
+test_packet:
+  builder: tcp()
+expected:
+  compiles: false

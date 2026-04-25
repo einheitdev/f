@@ -1,0 +1,14 @@
+name: "CIDR + port range + proto guard: external source falls to default drop"
+source_fw: |
+  @xdp(eth0)
+  allow if pkt.src_ip in 10.0.0.0/8
+         and pkt.proto == tcp
+         and pkt.dst_port in 1024..65535
+  default drop
+
+test_packet:
+  builder: tcp(src_ip="8.8.8.8", dst_port=8080)
+
+expected:
+  compiles: true
+  bpf_action: drop

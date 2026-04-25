@@ -1,0 +1,10 @@
+name: "pkt.proto != tcp then pkt.tcp.syn — spec only describes == as a guard; != is silent so guard not satisfied"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.proto != tcp and pkt.tcp.syn
+
+test_packet:
+  builder: tcp(syn=true)
+
+expected:
+  compiles: false

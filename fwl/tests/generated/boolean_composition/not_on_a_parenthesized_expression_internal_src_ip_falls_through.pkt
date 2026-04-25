@@ -1,0 +1,11 @@
+name: "not on a parenthesized expression: internal src_ip falls through"
+source_fw: |
+  @xdp(eth0)
+  drop if not (pkt.src_ip in 10.0.0.0/8 or pkt.src_ip in 192.168.0.0/16)
+
+test_packet:
+  builder: tcp(src_ip="10.0.0.1", dst_port=80)
+
+expected:
+  compiles: true
+  bpf_action: allow

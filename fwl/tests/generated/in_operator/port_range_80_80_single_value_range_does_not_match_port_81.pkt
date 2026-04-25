@@ -1,0 +1,12 @@
+name: "port range 80..80 single-value range does not match port 81"
+source_fw: |
+  @xdp(eth0)
+  allow if pkt.proto == tcp and pkt.dst_port in 80..80
+  default drop
+
+test_packet:
+  builder: tcp(dst_port=81)
+
+expected:
+  compiles: true
+  bpf_action: drop

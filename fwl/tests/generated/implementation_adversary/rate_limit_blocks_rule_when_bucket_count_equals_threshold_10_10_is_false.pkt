@@ -1,12 +1,17 @@
-name: "rate_limit gate is not consulted when if condition is false"
+name: "rate_limit blocks rule when bucket count equals threshold (10 < 10 is false)"
 source_fw: |
   @xdp(eth0)
   drop if pkt.proto == tcp and pkt.dst_port == 22
        limited by rate_limit(10, per=src_ip)
   default allow
 
+state:
+  rate_limit:
+    0:
+      "1.2.3.4": 10
+
 test_packet:
-  builder: udp(src_ip="1.2.3.4", dst_port=53)
+  builder: tcp(src_ip="1.2.3.4", dst_port=22)
 
 expected:
   compiles: true

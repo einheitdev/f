@@ -1,0 +1,11 @@
+name: "default count is non-terminal and not allowed as default"
+source_fw: |
+  @xdp(eth0)
+  allow if pkt.proto == tcp
+  default count fallthrough
+
+test_packet:
+  builder: tcp()
+
+expected:
+  compiles: false

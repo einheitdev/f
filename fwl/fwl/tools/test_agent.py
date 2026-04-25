@@ -451,6 +451,139 @@ EXISTING EXAMPLES:
 {PKT_FORMAT_REMINDER}"""
 
 
+@category(
+  "implementation_adversary",
+  "Read parser/analyzer/interpreter/emitter and try to break them",
+)
+def prompt_implementation_adversary(examples: str, count: int) -> str:
+  return f"""You are doing adversarial review of the FWL v0.1
+compiler. The implementation source is in your system prompt
+(fwl/parser.py, analyzer.py, interpreter.py, emitter.py,
+grammar.lark). Your job is to generate {count} .pkt test cases
+that maximize the chance of catching real bugs.
+
+For each case, pick a target — one of:
+
+A. **Interpreter / emitter disagreement.** Find a packet shape and
+   program where _eval(condition, packet) and the emitted BPF C
+   could plausibly produce different XDP actions. Look at what each
+   path does and where the abstractions are thin. Especially look at
+   short-circuit evaluation in conditions, integer-vs-string keys in
+   rate_limit state, fall-through behavior on bounds-check failure,
+   and casting (e.g. CIDR mask shifts at boundary widths).
+
+B. **Spec/analyzer drift.** The spec defines compile errors in its
+   error table. Find one the analyzer doesn't enforce, or a check
+   the analyzer makes that the spec doesn't authorize. Generate a
+   case that exercises the gap. (We just fixed type-mismatch, port
+   range, range order, and CIDR prefix — but there may be more.)
+
+C. **Parser/grammar corner.** Find a syntactic construct that the
+   spec's EBNF allows but the Lark grammar rejects (or vice versa).
+   Look at lexer ambiguities (identifiers that share prefixes with
+   keywords, e.g. tcp_traffic), comment placement, hex literals in
+   unusual positions, deeply nested expressions, repeated empty
+   structures.
+
+D. **Constraint-set guard analysis.** The analyzer tracks `Possible`
+   protocol constraints through AND/OR/NOT trees. The model has
+   explicit rules — find a tree shape where the actual constraint
+   propagation differs from what a careful reader of the spec would
+   compute.
+
+E. **Per-CPU + sliding-window rate_limit edge.** The state encoding
+   is tied to specific BPF map types and value layouts. Look for
+   places where the interpreter's view of state could differ from
+   what the BPF runtime computes given the same `state:` block.
+
+For each case:
+- Include a one-sentence rationale in the `name` (e.g.
+  "tcp_traffic identifier should not lex as keyword tcp + _traffic").
+- Make expected.bpf_action correct per the spec — if you think the
+  implementation produces a different result, that IS the bug; the
+  spec wins.
+
+EXISTING EXAMPLES (style reference):
+{examples}
+
+{PKT_FORMAT_REMINDER}"""
+
+
+@category(
+  "spec_ambiguity",
+  "Cases where the spec text is ambiguous or under-specified",
+)
+def prompt_spec_ambiguity(examples: str, count: int) -> str:
+  return f"""You are auditing the FWL v0.1 spec
+(docs/FWL_V01_SPEC.md) for ambiguity. Generate exactly {count} .pkt
+test cases at points where the spec text is unclear, contradictory,
+or leaves behavior up to the implementer.
+
+For each case, the value comes from the act of writing it down: if
+the spec is genuinely ambiguous, two compliant implementations could
+disagree on this packet, and the spec needs a clarifying edit.
+
+Look for:
+- Operator behavior on edge cases the spec doesn't explicitly enumerate
+  (e.g. != on a CIDR list — does it mean "in none of these"?)
+- Default rule semantics when log/count appear before it
+- Rate_limit semantics at exact-threshold boundaries (the spec uses
+  both "at or below" and "below" wording in different paragraphs)
+- Protocol guard analysis through OR composition (spec example at
+  FWL_V01_SPEC.md:179-183 has internally inconsistent rationale)
+- Lexer ambiguity around `not in` vs `in` with negation
+- The interaction of truncated packets with rate_limit state
+
+For each case:
+- Pick the interpretation that matches the *spec's semantics
+  section* (not a stray example).
+- Add a comment in the `name` describing the ambiguity.
+- If the implementation happens to behave differently, that
+  surfaces the spec gap.
+
+EXISTING EXAMPLES:
+{examples}
+
+{PKT_FORMAT_REMINDER}"""
+
+
+@category(
+  "emitter_edges",
+  "BPF emission edge cases — verifier challenges, layout corners",
+)
+def prompt_emitter_edges(examples: str, count: int) -> str:
+  return f"""Generate exactly {count} .pkt test cases that target
+edge cases in BPF emission (the C generator in emitter.py and the
+verifier-accepted output it produces).
+
+Cover:
+- Programs with many rules (10+) that stress the verifier's
+  instruction count limit
+- Deeply nested conditions (5+ levels of and/or/not) that produce
+  long boolean expressions in C
+- Rate_limit gates that allocate per-CPU maps — multiple in the
+  same program, all four per= field types
+- Bounds-check fall-through: packets where the bounds check fails
+  AND the program has an explicit default — the default MUST fire,
+  not the implicit allow (we just fixed this; verify it stays fixed)
+- IPv4 packets with IHL options (the emitter computes ip_hlen
+  dynamically, but the test packet builder always emits IHL=5; this
+  category surfaces cases where IHL=5 is actually load-bearing)
+- The emitter reads CIDR masks at specific bit widths — test /1,
+  /7, /15, /23, /31 (off-by-one boundary widths)
+- Programs with only non-terminal rules + default — log+log+default
+- count + log + rate_limit + condition all stacked on one rule
+
+For each case, walk through what BPF C the emitter would produce
+(the source is in your system prompt), then write the .pkt that
+exercises that path.
+
+EXISTING EXAMPLES:
+{examples}
+
+{PKT_FORMAT_REMINDER}"""
+
+
 # ---------------------------------------------------------------------
 # Agent runner
 # ---------------------------------------------------------------------
@@ -482,12 +615,47 @@ def load_examples(corpus_dir: Path, max_examples: int = 6) -> str:
   return "\n\n".join(parts)
 
 
+# Source files injected into the system prompt so adversarial
+# categories can target spec/implementation drift directly.
+_SOURCE_MODULES = (
+  "parser.py",
+  "analyzer.py",
+  "interpreter.py",
+  "emitter.py",
+  "grammar.lark",
+)
+
+
+def _load_source_modules() -> str:
+  """Read the implementation modules verbatim from the package dir."""
+  pkg_dir = _SCRIPT_DIR.parent
+  parts: list[str] = []
+  for name in _SOURCE_MODULES:
+    path = pkg_dir / name
+    if not path.exists():
+      continue
+    parts.append(f"--- fwl/{name} ---\n")
+    parts.append(path.read_text(encoding="utf-8"))
+    parts.append("\n")
+  return "".join(parts)
+
+
 def build_system_prompt(fwl_spec: str, pkt_spec: str) -> str:
-  """Assemble the system prompt that's reused across categories."""
+  """Assemble the system prompt that's reused across categories.
+
+  Includes both authoritative specs AND the implementation source
+  modules, so adversarial categories can spot spec/code drift
+  directly. Cost is higher per call (~80K tokens of context vs ~50K
+  spec-only) but the user has prioritized bug-finding over budget.
+  """
+  source = _load_source_modules()
   return f"""You are generating .pkt test cases for FWL v0.1, a
-firewall DSL that compiles to eBPF/XDP. The two authoritative
-specifications follow. Anything not in these specs is out of scope —
-do not reference language features marked deferred to v0.2+.
+firewall DSL that compiles to eBPF/XDP. The authoritative specs and
+the current implementation source follow. Anything not in the specs
+is out of scope; the implementation source is provided so adversarial
+categories can spot places where the code might disagree with the
+spec, with itself (interpreter vs emitter), or with reasonable
+expectations.
 
 ================================================================
 FWL v0.1 LANGUAGE SPECIFICATION (docs/FWL_V01_SPEC.md)
@@ -500,6 +668,12 @@ FWL v0.1 LANGUAGE SPECIFICATION (docs/FWL_V01_SPEC.md)
 ================================================================
 
 {pkt_spec}
+
+================================================================
+IMPLEMENTATION SOURCE (fwl/fwl/*.py + grammar.lark)
+================================================================
+
+{source}
 
 ================================================================
 
@@ -517,7 +691,20 @@ For each test case you generate:
    add stray guards; do not omit required ones.
 3. Names should be descriptive (slug-able). Snake_case.
 4. Output ONLY the YAML documents, separated by a `---` line. No
-   markdown fences, no commentary."""
+   markdown fences, no commentary.
+
+When generating adversarial cases against the implementation:
+- The interpreter (interpreter.py) and the emitter (emitter.py) MUST
+  agree on every packet. If you find a case where the spec is silent
+  but the interpreter and emitter could plausibly disagree, generate
+  it — disagreement is a real bug.
+- The analyzer (analyzer.py) enforces compile errors. Any spec error
+  not enforced is a real bug. Any compile error the analyzer raises
+  that the spec doesn't authorize is also a bug.
+- The parser (parser.py) and grammar.lark together define the
+  surface. Look for edge cases in lexing (keywords vs identifiers
+  with shared prefixes, hex literals, comment placement) and parsing
+  (precedence corners, empty constructs, max-rule programs)."""
 
 
 @dataclass

@@ -1,0 +1,17 @@
+name: "count with rate_limit under threshold falls through to allow"
+source_fw: |
+  @xdp(eth0)
+  count rate_limited_count if pkt.proto == tcp limited by rate_limit(10, per=src_ip)
+  allow
+
+test_packet:
+  builder: tcp(src_ip="1.2.3.4", dst_port=80)
+
+state:
+  rate_limit:
+    0:
+      "1.2.3.4": 5
+
+expected:
+  compiles: true
+  bpf_action: allow

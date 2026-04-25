@@ -1,0 +1,12 @@
+name: "port range 1..1023 does not match port 1024 just beyond upper bound"
+source_fw: |
+  @xdp(eth0)
+  allow if pkt.proto == tcp and pkt.dst_port in 1..1023
+  default drop
+
+test_packet:
+  builder: tcp(dst_port=1024)
+
+expected:
+  compiles: true
+  bpf_action: drop

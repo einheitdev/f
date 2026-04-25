@@ -1,0 +1,12 @@
+name: "hex port literal 0xFFFF (65535) sits at the valid u16 boundary"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.proto == tcp and pkt.dst_port == 0xFFFF
+  default allow
+
+test_packet:
+  builder: tcp(dst_port=65535)
+
+expected:
+  compiles: true
+  bpf_action: drop

@@ -1,0 +1,12 @@
+name: "CIDR 10.0.0.0/8 does not match 11.0.0.1 outside the block"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.src_ip in 10.0.0.0/8
+  default allow
+
+test_packet:
+  builder: tcp(src_ip="11.0.0.1")
+
+expected:
+  compiles: true
+  bpf_action: allow

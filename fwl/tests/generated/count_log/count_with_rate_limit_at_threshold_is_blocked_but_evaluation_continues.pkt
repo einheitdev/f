@@ -1,0 +1,17 @@
+name: "count with rate_limit at threshold is blocked but evaluation continues"
+source_fw: |
+  @xdp(eth0)
+  count noisy_src if pkt.proto == tcp limited by rate_limit(10, per=src_ip)
+  allow
+
+test_packet:
+  builder: tcp(src_ip="9.8.7.6", dst_port=80)
+
+state:
+  rate_limit:
+    0:
+      "9.8.7.6": 10
+
+expected:
+  compiles: true
+  bpf_action: allow

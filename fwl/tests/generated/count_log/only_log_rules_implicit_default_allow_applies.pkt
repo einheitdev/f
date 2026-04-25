@@ -1,0 +1,12 @@
+name: "only log rules, implicit default allow applies"
+source_fw: |
+  @xdp(eth0)
+  log if pkt.proto == tcp
+  log if pkt.proto == udp
+
+test_packet:
+  builder: udp(dst_port=53)
+
+expected:
+  compiles: true
+  bpf_action: allow

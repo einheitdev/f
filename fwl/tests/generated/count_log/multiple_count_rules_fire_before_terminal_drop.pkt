@@ -1,0 +1,13 @@
+name: "multiple count rules fire before terminal drop"
+source_fw: |
+  @xdp(eth0)
+  count attempts
+  count icmp_attempts if pkt.proto == icmp
+  drop if pkt.proto == icmp
+
+test_packet:
+  builder: icmp()
+
+expected:
+  compiles: true
+  bpf_action: drop

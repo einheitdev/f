@@ -1,0 +1,12 @@
+name: "6-level nested condition with double-negation — TCP/80 no flags drops"
+source_fw: |
+  @xdp(eth0)
+  drop if not (not (pkt.proto == tcp and (not (pkt.tcp.syn and not pkt.tcp.ack) or pkt.dst_port == 80)))
+  default allow
+
+test_packet:
+  builder: tcp(dst_port=80, syn=false, ack=false)
+
+expected:
+  compiles: true
+  bpf_action: drop

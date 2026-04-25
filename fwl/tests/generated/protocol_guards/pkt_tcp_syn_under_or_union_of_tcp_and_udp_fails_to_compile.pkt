@@ -1,0 +1,8 @@
+name: "pkt.tcp.syn under OR-union of tcp and udp fails to compile"
+source_fw: |
+  @xdp(eth0)
+  drop if (pkt.proto == tcp or pkt.proto == udp) and pkt.tcp.syn
+test_packet:
+  builder: tcp()
+expected:
+  compiles: false

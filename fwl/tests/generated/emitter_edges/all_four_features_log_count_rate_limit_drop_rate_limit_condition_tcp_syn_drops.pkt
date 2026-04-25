@@ -1,0 +1,16 @@
+name: "all four features — log, count+rate_limit, drop+rate_limit, condition — TCP SYN drops"
+source_fw: |
+  @xdp(eth0)
+  log if pkt.proto == tcp and pkt.dst_port == 22 and pkt.tcp.syn
+  count ssh_syn if pkt.proto == tcp and pkt.dst_port == 22 and pkt.tcp.syn
+         limited by rate_limit(100, per=src_ip)
+  drop if pkt.proto == tcp and pkt.dst_port == 22 and pkt.tcp.syn
+         limited by rate_limit(3, per=src_ip)
+  allow
+
+test_packet:
+  builder: tcp(src_ip="1.2.3.4", dst_port=22, syn=true)
+
+expected:
+  compiles: true
+  bpf_action: drop

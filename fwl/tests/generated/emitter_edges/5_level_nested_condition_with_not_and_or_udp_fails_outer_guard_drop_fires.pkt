@@ -1,0 +1,12 @@
+name: "5-level nested condition with not/and/or — UDP fails outer guard, drop fires"
+source_fw: |
+  @xdp(eth0)
+  drop if not (pkt.proto == tcp and (pkt.dst_port == 22 or (pkt.src_ip in 10.0.0.0/8 and not pkt.tcp.syn)))
+  default allow
+
+test_packet:
+  builder: udp(src_ip="8.8.8.8", dst_port=53)
+
+expected:
+  compiles: true
+  bpf_action: drop

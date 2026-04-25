@@ -1,0 +1,11 @@
+name: "not (proto==tcp) does not propagate a guard so dst_port access is unguarded"
+source_fw: |
+  @xdp(eth0)
+  drop if not (pkt.proto == tcp) and pkt.dst_port == 80
+  default allow
+
+test_packet:
+  builder: udp(dst_port=80)
+
+expected:
+  compiles: false

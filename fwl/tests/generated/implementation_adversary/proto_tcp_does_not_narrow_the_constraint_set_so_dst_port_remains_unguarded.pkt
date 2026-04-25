@@ -1,0 +1,11 @@
+name: "proto != tcp does not narrow the constraint set so dst_port remains unguarded"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.proto != tcp and pkt.dst_port == 80
+  default allow
+
+test_packet:
+  builder: udp(dst_port=80)
+
+expected:
+  compiles: false

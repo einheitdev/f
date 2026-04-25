@@ -1,0 +1,12 @@
+name: "CIDR /32 matches exact host address"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.src_ip in 10.0.0.5/32
+  default allow
+
+test_packet:
+  builder: tcp(src_ip="10.0.0.5")
+
+expected:
+  compiles: true
+  bpf_action: drop

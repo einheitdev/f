@@ -1,0 +1,17 @@
+name: "rate-limited log blocked, falls through to allow"
+source_fw: |
+  @xdp(eth0)
+  log if pkt.proto == tcp limited by rate_limit(3, per=src_ip)
+  allow
+
+test_packet:
+  builder: tcp(src_ip="1.1.1.1", dst_port=22)
+
+state:
+  rate_limit:
+    0:
+      "1.1.1.1": 3
+
+expected:
+  compiles: true
+  bpf_action: allow

@@ -1,0 +1,13 @@
+name: "allow with rate_limit fires when bucket below threshold"
+source_fw: |
+  @xdp(eth0)
+  allow if pkt.proto == tcp and pkt.dst_port == 80
+       limited by rate_limit(50, per=src_ip)
+  default drop
+
+test_packet:
+  builder: tcp(src_ip="1.2.3.4", dst_port=80)
+
+expected:
+  compiles: true
+  bpf_action: allow

@@ -1,0 +1,17 @@
+name: "rate_limit per=src_port for icmp packet uses bucket key 0 (no L4 port available)"
+source_fw: |
+  @xdp(eth0)
+  drop limited by rate_limit(10, per=src_port)
+  default allow
+
+state:
+  rate_limit:
+    0:
+      0: 5
+
+test_packet:
+  builder: icmp(src_ip="9.9.9.9")
+
+expected:
+  compiles: true
+  bpf_action: drop

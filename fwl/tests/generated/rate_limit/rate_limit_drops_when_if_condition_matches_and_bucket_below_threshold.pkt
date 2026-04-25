@@ -1,0 +1,15 @@
+name: "rate_limit drops when if condition matches and bucket below threshold"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.proto == tcp and pkt.dst_port == 22
+       and pkt.tcp.syn and not pkt.tcp.ack
+       limited by rate_limit(3, per=src_ip)
+  allow if pkt.proto == tcp and pkt.dst_port == 22
+  default drop
+
+test_packet:
+  builder: tcp(src_ip="5.5.5.5", dst_port=22, syn=true)
+
+expected:
+  compiles: true
+  bpf_action: drop

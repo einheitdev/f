@@ -1,0 +1,21 @@
+name: "10-rule chain — packet matches rule 5 (allow), exercises long emitted rule body"
+source_fw: |
+  @xdp(eth0)
+  drop  if pkt.src_ip == 192.168.1.1
+  drop  if pkt.src_ip == 192.168.1.2
+  drop  if pkt.src_ip == 192.168.1.3
+  drop  if pkt.src_ip == 192.168.1.4
+  allow if pkt.src_ip == 192.168.1.5
+  allow if pkt.src_ip == 192.168.1.6
+  allow if pkt.src_ip == 192.168.1.7
+  allow if pkt.src_ip == 192.168.1.8
+  allow if pkt.src_ip == 192.168.1.9
+  drop  if pkt.src_ip == 192.168.1.10
+  default drop
+
+test_packet:
+  builder: tcp(src_ip="192.168.1.5", dst_port=80)
+
+expected:
+  compiles: true
+  bpf_action: allow

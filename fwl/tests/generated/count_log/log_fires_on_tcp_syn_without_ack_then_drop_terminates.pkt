@@ -1,0 +1,12 @@
+name: "log fires on TCP SYN without ACK, then drop terminates"
+source_fw: |
+  @xdp(eth0)
+  log if pkt.proto == tcp and pkt.tcp.syn and not pkt.tcp.ack
+  drop if pkt.proto == tcp and pkt.tcp.syn
+
+test_packet:
+  builder: tcp(dst_port=443, syn=true, ack=false)
+
+expected:
+  compiles: true
+  bpf_action: drop

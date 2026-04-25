@@ -1,0 +1,12 @@
+name: "CIDR /31 — 10.0.0.1 matches 10.0.0.0/31 (mask 0xFFFFFFFE, narrowest non-/32)"
+source_fw: |
+  @xdp(eth0)
+  allow if pkt.src_ip in 10.0.0.0/31
+  default drop
+
+test_packet:
+  builder: tcp(src_ip="10.0.0.1", dst_port=80)
+
+expected:
+  compiles: true
+  bpf_action: allow

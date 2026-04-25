@@ -1,0 +1,10 @@
+name: "type mismatch: src_ip compared to integer literal"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.src_ip == 80
+
+test_packet:
+  builder: tcp()
+
+expected:
+  compiles: false

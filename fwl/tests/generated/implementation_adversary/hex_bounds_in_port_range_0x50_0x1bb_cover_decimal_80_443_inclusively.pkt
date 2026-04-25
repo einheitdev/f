@@ -1,0 +1,12 @@
+name: "hex bounds in port range 0x50..0x1BB cover decimal 80..443 inclusively"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.proto == tcp and pkt.dst_port in 0x50..0x1BB
+  default allow
+
+test_packet:
+  builder: tcp(dst_port=80)
+
+expected:
+  compiles: true
+  bpf_action: drop

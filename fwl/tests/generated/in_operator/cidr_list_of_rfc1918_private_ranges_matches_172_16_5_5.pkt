@@ -1,0 +1,12 @@
+name: "CIDR list of RFC1918 private ranges matches 172.16.5.5"
+source_fw: |
+  @xdp(eth0)
+  allow if pkt.src_ip in [10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16]
+  default drop
+
+test_packet:
+  builder: tcp(src_ip="172.16.5.5")
+
+expected:
+  compiles: true
+  bpf_action: allow

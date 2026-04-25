@@ -1,0 +1,10 @@
+name: "OR-branch guard does not protect dst_port access"
+source_fw: |
+  @xdp(eth0)
+  allow if pkt.proto == tcp or pkt.proto == icmp and pkt.dst_port == 443
+
+test_packet:
+  builder: tcp()
+
+expected:
+  compiles: false

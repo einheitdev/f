@@ -1,0 +1,8 @@
+name: "pkt.tcp.ack in OR branch without tcp guard fails"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.proto == tcp or pkt.tcp.ack
+test_packet:
+  builder: tcp()
+expected:
+  compiles: false

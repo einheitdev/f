@@ -1,0 +1,10 @@
+name: "pkt.dst_port behind icmp guard is rejected"
+source_fw: |
+  @xdp(eth0)
+  allow if pkt.proto == icmp and pkt.dst_port == 0
+
+test_packet:
+  builder: tcp()
+
+expected:
+  compiles: false

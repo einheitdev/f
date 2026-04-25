@@ -1,0 +1,13 @@
+name: "drop does not match, count fires, terminal allow follows"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.proto == icmp
+  count tcp_seen if pkt.proto == tcp
+  allow
+
+test_packet:
+  builder: tcp(dst_port=80)
+
+expected:
+  compiles: true
+  bpf_action: allow

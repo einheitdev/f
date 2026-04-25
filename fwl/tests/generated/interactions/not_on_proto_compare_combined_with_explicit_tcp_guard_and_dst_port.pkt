@@ -1,0 +1,14 @@
+name: "not on proto compare combined with explicit tcp guard and dst_port"
+source_fw: |
+  @xdp(eth0)
+  drop if not pkt.proto == icmp
+         and pkt.proto == tcp
+         and pkt.dst_port == 22
+  default allow
+
+test_packet:
+  builder: tcp(src_ip="6.6.6.6", dst_port=22)
+
+expected:
+  compiles: true
+  bpf_action: drop

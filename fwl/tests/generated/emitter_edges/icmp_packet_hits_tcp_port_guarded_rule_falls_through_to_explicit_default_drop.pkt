@@ -1,0 +1,12 @@
+name: "ICMP packet hits TCP+port-guarded rule — falls through to explicit default drop"
+source_fw: |
+  @xdp(eth0)
+  allow if pkt.proto == tcp and pkt.dst_port == 22
+  default drop
+
+test_packet:
+  builder: icmp(src_ip="3.3.3.3")
+
+expected:
+  compiles: true
+  bpf_action: drop

@@ -1,0 +1,12 @@
+name: "CIDR /7 — 11.5.5.5 matches 10.0.0.0/7 (mask 0xFE000000, off-by-one boundary)"
+source_fw: |
+  @xdp(eth0)
+  allow if pkt.src_ip in 10.0.0.0/7
+  default drop
+
+test_packet:
+  builder: tcp(src_ip="11.5.5.5", dst_port=80)
+
+expected:
+  compiles: true
+  bpf_action: allow

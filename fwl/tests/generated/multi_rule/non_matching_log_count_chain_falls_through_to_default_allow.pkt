@@ -1,0 +1,14 @@
+name: "non-matching log+count chain falls through to default allow"
+source_fw: |
+  @xdp(eth0)
+  log if pkt.proto == tcp and pkt.tcp.syn
+  count syn_count if pkt.proto == tcp and pkt.tcp.syn
+  drop if pkt.proto == tcp and pkt.tcp.syn and not pkt.tcp.ack
+  default allow
+
+test_packet:
+  builder: tcp(dst_port=443, syn=false, ack=true)
+
+expected:
+  compiles: true
+  bpf_action: allow

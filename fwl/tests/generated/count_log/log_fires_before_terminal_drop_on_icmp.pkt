@@ -1,0 +1,12 @@
+name: "log fires before terminal drop on icmp"
+source_fw: |
+  @xdp(eth0)
+  log if pkt.proto == icmp
+  drop if pkt.proto == icmp
+
+test_packet:
+  builder: icmp(src_ip="9.9.9.9")
+
+expected:
+  compiles: true
+  bpf_action: drop

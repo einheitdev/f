@@ -1,0 +1,12 @@
+name: "trailing comment on the same line as a rule is ignored to end-of-line"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.proto == tcp and pkt.dst_port == 22  # block ssh
+  default allow
+
+test_packet:
+  builder: tcp(dst_port=22)
+
+expected:
+  compiles: true
+  bpf_action: drop

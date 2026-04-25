@@ -1,0 +1,12 @@
+name: "CIDR 192.168.1.0/24 matches at first address 192.168.1.0"
+source_fw: |
+  @xdp(eth0)
+  allow if pkt.src_ip in 192.168.1.0/24
+  default drop
+
+test_packet:
+  builder: tcp(src_ip="192.168.1.0")
+
+expected:
+  compiles: true
+  bpf_action: allow

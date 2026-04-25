@@ -1,0 +1,12 @@
+name: "src_port != literal does not match same value falls through"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.proto == tcp and pkt.src_port != 12345
+  default allow
+
+test_packet:
+  builder: tcp(src_port=12345, dst_port=80)
+
+expected:
+  compiles: true
+  bpf_action: allow

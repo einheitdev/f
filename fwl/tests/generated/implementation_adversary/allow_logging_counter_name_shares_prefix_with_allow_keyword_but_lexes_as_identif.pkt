@@ -1,0 +1,12 @@
+name: "allow_logging counter name shares prefix with allow keyword but lexes as identifier"
+source_fw: |
+  @xdp(eth0)
+  count allow_logging if pkt.proto == udp
+  default allow
+
+test_packet:
+  builder: udp(dst_port=53)
+
+expected:
+  compiles: true
+  bpf_action: allow

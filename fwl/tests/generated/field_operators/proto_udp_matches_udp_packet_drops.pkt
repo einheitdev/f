@@ -1,0 +1,12 @@
+name: "proto == udp matches udp packet drops"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.proto == udp
+  default allow
+
+test_packet:
+  builder: udp(dst_port=53)
+
+expected:
+  compiles: true
+  bpf_action: drop

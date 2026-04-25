@@ -1,0 +1,12 @@
+name: "dst_ip in IPv4 list matches middle entry and drops"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.dst_ip in [1.1.1.1, 2.2.2.2, 3.3.3.3]
+  default allow
+
+test_packet:
+  builder: tcp(dst_ip="2.2.2.2", dst_port=80)
+
+expected:
+  compiles: true
+  bpf_action: drop

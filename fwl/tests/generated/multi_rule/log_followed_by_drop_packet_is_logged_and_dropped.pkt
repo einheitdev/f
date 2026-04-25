@@ -1,0 +1,12 @@
+name: "log followed by drop: packet is logged AND dropped"
+source_fw: |
+  @xdp(eth0)
+  log if pkt.src_ip == 198.51.100.5
+  drop if pkt.src_ip == 198.51.100.5
+
+test_packet:
+  builder: tcp(src_ip="198.51.100.5", dst_port=80)
+
+expected:
+  compiles: true
+  bpf_action: drop

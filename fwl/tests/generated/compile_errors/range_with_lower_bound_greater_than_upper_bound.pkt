@@ -1,0 +1,11 @@
+name: "range with lower bound greater than upper bound"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.proto == tcp and pkt.dst_port in 2000..1000
+  allow
+
+test_packet:
+  builder: tcp()
+
+expected:
+  compiles: false

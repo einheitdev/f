@@ -1,0 +1,10 @@
+name: "proto != udp does not establish a tcp/udp guard"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.proto != udp and pkt.dst_port == 80
+
+test_packet:
+  builder: tcp()
+
+expected:
+  compiles: false

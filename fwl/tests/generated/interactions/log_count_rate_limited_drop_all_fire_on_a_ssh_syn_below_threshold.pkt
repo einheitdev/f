@@ -1,0 +1,16 @@
+name: "log + count + rate-limited drop all fire on a SSH SYN below threshold"
+source_fw: |
+  @xdp(eth0)
+  log if pkt.proto == tcp and pkt.tcp.syn
+  count syn_count if pkt.proto == tcp and pkt.tcp.syn
+  drop if pkt.proto == tcp and pkt.dst_port == 22
+         limited by rate_limit(5, per=src_ip)
+  allow if pkt.proto == tcp
+  default drop
+
+test_packet:
+  builder: tcp(src_ip="1.2.3.4", dst_port=22, syn=true)
+
+expected:
+  compiles: true
+  bpf_action: drop

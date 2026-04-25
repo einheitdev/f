@@ -1,0 +1,10 @@
+name: "tcp guard + tcp.ack matches ACK packet and allows"
+source_fw: |
+  @xdp(eth0)
+  allow if pkt.proto == tcp and pkt.tcp.ack
+  default drop
+test_packet:
+  builder: tcp(ack=true)
+expected:
+  compiles: true
+  bpf_action: allow

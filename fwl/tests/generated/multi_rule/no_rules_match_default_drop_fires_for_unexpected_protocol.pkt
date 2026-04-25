@@ -1,0 +1,13 @@
+name: "no rules match, default drop fires for unexpected protocol"
+source_fw: |
+  @xdp(eth0)
+  allow if pkt.proto == tcp and pkt.dst_port in [80, 443]
+  allow if pkt.proto == udp and pkt.dst_port == 53
+  default drop
+
+test_packet:
+  builder: icmp()
+
+expected:
+  compiles: true
+  bpf_action: drop

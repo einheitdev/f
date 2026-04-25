@@ -1,0 +1,13 @@
+name: "log+log+default allow — both logs match TCP SYN, default allow fires"
+source_fw: |
+  @xdp(eth0)
+  log if pkt.proto == tcp
+  log if pkt.proto == tcp and pkt.tcp.syn
+  default allow
+
+test_packet:
+  builder: tcp(src_ip="4.4.4.4", dst_port=22, syn=true)
+
+expected:
+  compiles: true
+  bpf_action: allow

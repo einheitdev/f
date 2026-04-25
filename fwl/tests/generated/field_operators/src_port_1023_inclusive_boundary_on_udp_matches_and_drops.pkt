@@ -1,0 +1,12 @@
+name: "src_port <= 1023 inclusive boundary on udp matches and drops"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.proto == udp and pkt.src_port <= 1023
+  default allow
+
+test_packet:
+  builder: udp(src_port=1023, dst_port=53)
+
+expected:
+  compiles: true
+  bpf_action: drop

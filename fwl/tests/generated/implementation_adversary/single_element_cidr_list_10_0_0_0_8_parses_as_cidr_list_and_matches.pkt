@@ -1,0 +1,12 @@
+name: "single-element CIDR list [10.0.0.0/8] parses as cidr_list and matches"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.src_ip in [10.0.0.0/8]
+  default allow
+
+test_packet:
+  builder: tcp(src_ip="10.5.5.5")
+
+expected:
+  compiles: true
+  bpf_action: drop

@@ -1,0 +1,15 @@
+name: "rate_limit gates a parenthesized OR-of-ports with syn flag"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.proto == tcp
+         and (pkt.dst_port == 22 or pkt.dst_port == 23)
+         and pkt.tcp.syn
+         limited by rate_limit(2, per=src_ip)
+  default allow
+
+test_packet:
+  builder: tcp(src_ip="5.5.5.5", dst_port=23, syn=true)
+
+expected:
+  compiles: true
+  bpf_action: drop

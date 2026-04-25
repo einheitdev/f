@@ -1,0 +1,12 @@
+name: "CIDR /0 matches every IP (interpreter shortcuts to True, emitter to literal 1)"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.src_ip in 192.168.1.1/0
+  default allow
+
+test_packet:
+  builder: tcp(src_ip="8.8.8.8")
+
+expected:
+  compiles: true
+  bpf_action: drop

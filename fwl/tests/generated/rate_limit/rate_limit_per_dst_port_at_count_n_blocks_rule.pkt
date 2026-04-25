@@ -1,0 +1,18 @@
+name: "rate_limit per=dst_port at count==N blocks rule"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.proto == tcp
+       limited by rate_limit(7, per=dst_port)
+  default allow
+
+state:
+  rate_limit:
+    0:
+      22: 7
+
+test_packet:
+  builder: tcp(dst_port=22)
+
+expected:
+  compiles: true
+  bpf_action: allow

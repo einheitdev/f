@@ -1,4 +1,4 @@
-name: "rate_limit gate is not consulted when if condition is false"
+name: "rate_limit per=src_ip with empty bucket fires drop"
 source_fw: |
   @xdp(eth0)
   drop if pkt.proto == tcp and pkt.dst_port == 22
@@ -6,8 +6,8 @@ source_fw: |
   default allow
 
 test_packet:
-  builder: udp(src_ip="1.2.3.4", dst_port=53)
+  builder: tcp(src_ip="1.2.3.4", dst_port=22)
 
 expected:
   compiles: true
-  bpf_action: allow
+  bpf_action: drop

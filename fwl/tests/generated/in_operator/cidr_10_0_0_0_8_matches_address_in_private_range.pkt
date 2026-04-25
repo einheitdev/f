@@ -1,0 +1,12 @@
+name: "CIDR 10.0.0.0/8 matches address in private range"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.src_ip in 10.0.0.0/8
+  default allow
+
+test_packet:
+  builder: tcp(src_ip="10.5.5.5")
+
+expected:
+  compiles: true
+  bpf_action: drop

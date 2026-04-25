@@ -1,0 +1,11 @@
+name: "CIDR prefix /33 exceeds IPv4 maximum"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.src_ip in 10.0.0.0/33
+  allow
+
+test_packet:
+  builder: tcp()
+
+expected:
+  compiles: false

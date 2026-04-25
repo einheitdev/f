@@ -1,0 +1,13 @@
+name: "log falls through to subsequent drop rule (logged and dropped)"
+source_fw: |
+  @xdp(eth0)
+  log if pkt.proto == tcp and pkt.tcp.syn
+  drop if pkt.proto == tcp and pkt.tcp.syn
+  default allow
+
+test_packet:
+  builder: tcp(dst_port=22, syn=true)
+
+expected:
+  compiles: true
+  bpf_action: drop

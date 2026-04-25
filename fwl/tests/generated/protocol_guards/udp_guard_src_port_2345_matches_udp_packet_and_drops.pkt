@@ -1,0 +1,10 @@
+name: "udp guard + src_port==2345 matches udp packet and drops"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.proto == udp and pkt.src_port == 2345
+  default allow
+test_packet:
+  builder: udp(src_port=2345)
+expected:
+  compiles: true
+  bpf_action: drop

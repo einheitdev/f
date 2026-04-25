@@ -1,0 +1,12 @@
+name: "port range 0..65535 covers entire u16 space"
+source_fw: |
+  @xdp(eth0)
+  allow if pkt.proto == tcp and pkt.dst_port in 0..65535
+  default drop
+
+test_packet:
+  builder: tcp(dst_port=12345)
+
+expected:
+  compiles: true
+  bpf_action: allow

@@ -1,0 +1,10 @@
+name: "tcp guard + src_port==1234 matches tcp packet and allows"
+source_fw: |
+  @xdp(eth0)
+  allow if pkt.proto == tcp and pkt.src_port == 1234
+  default drop
+test_packet:
+  builder: tcp(src_port=1234)
+expected:
+  compiles: true
+  bpf_action: allow

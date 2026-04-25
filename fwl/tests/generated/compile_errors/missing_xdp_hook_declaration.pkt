@@ -1,0 +1,10 @@
+name: "missing @xdp hook declaration"
+source_fw: |
+  allow if pkt.proto == tcp
+  drop
+
+test_packet:
+  builder: tcp()
+
+expected:
+  compiles: false

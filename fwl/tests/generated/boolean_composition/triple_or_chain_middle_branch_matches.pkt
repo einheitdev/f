@@ -1,0 +1,12 @@
+name: "triple-or chain: middle branch matches"
+source_fw: |
+  @xdp(eth0)
+  allow if pkt.src_ip == 1.1.1.1 or pkt.src_ip == 2.2.2.2 or pkt.src_ip == 3.3.3.3
+  default drop
+
+test_packet:
+  builder: tcp(src_ip="2.2.2.2", dst_port=80)
+
+expected:
+  compiles: true
+  bpf_action: allow

@@ -1,0 +1,10 @@
+name: "reversed AND order dst_port before proto guard — spec says guard 'must precede' the access in AND order"
+source_fw: |
+  @xdp(eth0)
+  allow if pkt.dst_port == 22 and pkt.proto == tcp
+
+test_packet:
+  builder: tcp(dst_port=22)
+
+expected:
+  compiles: false

@@ -1,0 +1,12 @@
+name: "tcp_traffic identifier should not lex as keyword tcp + suffix (counter name)"
+source_fw: |
+  @xdp(eth0)
+  count tcp_traffic if pkt.proto == tcp
+  allow
+
+test_packet:
+  builder: tcp(src_port=12345, dst_port=80)
+
+expected:
+  compiles: true
+  bpf_action: allow

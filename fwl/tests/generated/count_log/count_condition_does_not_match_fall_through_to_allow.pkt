@@ -1,0 +1,12 @@
+name: "count condition does not match, fall through to allow"
+source_fw: |
+  @xdp(eth0)
+  count udp_only if pkt.proto == udp
+  allow
+
+test_packet:
+  builder: tcp(dst_port=443)
+
+expected:
+  compiles: true
+  bpf_action: allow
