@@ -1,0 +1,12 @@
+name: "default allow fires when no rule matches"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.proto == tcp
+  default allow
+
+test_packet:
+  builder: udp(dst_port=53)
+
+expected:
+  compiles: true
+  bpf_action: allow

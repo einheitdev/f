@@ -3,17 +3,21 @@
 // Transcribed from the EBNF reference in docs/FWL_V01_SPEC.md.
 // Anything not listed here is a syntax error.
 //
-// Phase 1 surface: hook + rules of the form `<action> [if <comparison>]`
-// where the only field is pkt.proto and the only operand is a proto
-// keyword. Multi-rule sequencing and default land in Phase 2.
+// Phase 2 surface: hook + zero-or-more rules + optional default rule.
+// Programs may consist solely of `@xdp(...) default <action>` per
+// the spec note at FWL_V01_SPEC.md:602.
 
-program       : hook_decl rule*
+program       : hook_decl rule* default_rule?
 
 hook_decl     : "@xdp" "(" IDENTIFIER ")"
 
 rule          : action ("if" condition)?
 
-action        : ALLOW | DROP
+default_rule  : "default" terminal_action
+
+action        : terminal_action
+
+terminal_action : ALLOW | DROP
 
 condition     : comparison
 

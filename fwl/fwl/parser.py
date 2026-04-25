@@ -85,13 +85,22 @@ class _ToAst(Transformer):
     (cmp_node,) = children
     return cmp_node
 
-  def action(self, children) -> tuple[ast.Action, Span]:
+  def terminal_action(self, children) -> tuple[ast.Action, Span]:
     (tok,) = children
     if tok.type == "ALLOW":
       return ast.Action.ALLOW, _span(tok)
     if tok.type == "DROP":
       return ast.Action.DROP, _span(tok)
-    raise AssertionError(f"unexpected action token {tok.type}")
+    raise AssertionError(f"unexpected terminal_action token {tok.type}")
+
+  def action(self, children) -> tuple[ast.Action, Span]:
+    (action_tuple,) = children
+    return action_tuple
+
+  def default_rule(self, children) -> ast.DefaultRule:
+    (action_tuple,) = children
+    action, span = action_tuple
+    return ast.DefaultRule(action=action, span=span)
 
   def rule(self, children) -> ast.Rule:
     action_tuple = children[0]
@@ -101,8 +110,14 @@ class _ToAst(Transformer):
 
   def program(self, children) -> ast.Program:
     hook = children[0]
-    rules = list(children[1:])
-    return ast.Program(hook=hook, rules=rules)
+    default = None
+    rules: list[ast.Rule] = []
+    for child in children[1:]:
+      if isinstance(child, ast.DefaultRule):
+        default = child
+      else:
+        rules.append(child)
+    return ast.Program(hook=hook, rules=rules, default=default)
 
 
 def parse(source: str) -> ast.Program:

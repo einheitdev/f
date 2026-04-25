@@ -1,0 +1,12 @@
+name: "matching rule overrides the default rule"
+source_fw: |
+  @xdp(eth0)
+  allow if pkt.proto == tcp
+  default drop
+
+test_packet:
+  builder: tcp(dst_port=80)
+
+expected:
+  compiles: true
+  bpf_action: allow

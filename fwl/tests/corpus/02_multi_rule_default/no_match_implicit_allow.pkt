@@ -1,0 +1,12 @@
+name: "no rule matches and no default => implicit allow"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.proto == tcp
+  drop if pkt.proto == udp
+
+test_packet:
+  builder: icmp()
+
+expected:
+  compiles: true
+  bpf_action: allow

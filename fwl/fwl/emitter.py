@@ -65,35 +65,31 @@ def _emit_comparison(cmp: ast.Comparison) -> str:
 def _emit_parse_prelude(needs_pkt: bool) -> str:
   """Emit the packet-parsing prelude.
 
-  Only emitted when at least one rule references a pkt.* field. Reads
-  ctx->data, bounds-checks the Ethernet header, requires EtherType
-  IPv4, bounds-checks the IPv4 base header, and exposes `proto` to
-  the rule body. Truncated or non-IPv4 packets fall through with
-  XDP_PASS per FWL_V01_SPEC.md:185-191.
-
-  Note: bounds checks return XDP_PASS rather than continuing to
-  evaluate later rules. This is the spec's "rule does not match"
-  behavior, applied to whole packets that can't satisfy any pkt.*
-  guard. Future phases that introduce conditions independent of
-  protocol parsing may need a more nuanced fall-through model.
+  Only emitted when at least one rule references a pkt.* field. The
+  prelude initializes `proto = 0` and only overwrites it when the
+  packet is a parseable IPv4 frame. Per FWL_V01_SPEC.md:185-191 a
+  packet that can't satisfy a pkt.* field access "falls through to
+  the next rule" — so failing parsing must NOT short-circuit the
+  whole program; the default rule (FWL_V01_SPEC.md:105-116) still
+  needs to fire. Each pointer dereference is gated by an inline
+  bounds check so the BPF verifier accepts the program.
   """
   if not needs_pkt:
     return ""
   return """\
+  __u8 proto = 0;
   void *data = (void *)(long)ctx->data;
   void *data_end = (void *)(long)ctx->data_end;
-
   struct ethhdr *eth = data;
-  if ((void *)(eth + 1) > data_end)
-    return XDP_PASS;
-  if (eth->h_proto != bpf_htons(ETH_P_IP))
-    return XDP_PASS;
+  if ((void *)(eth + 1) <= data_end) {
+    if (eth->h_proto == bpf_htons(ETH_P_IP)) {
+      struct iphdr *ip = (void *)(eth + 1);
+      if ((void *)(ip + 1) <= data_end) {
+        proto = ip->protocol;
+      }
+    }
+  }
 
-  struct iphdr *ip = (void *)(eth + 1);
-  if ((void *)(ip + 1) > data_end)
-    return XDP_PASS;
-
-  __u8 proto = ip->protocol;
 """
 
 
@@ -122,10 +118,15 @@ def emit(program: ast.Program) -> str:
   prelude = _emit_parse_prelude(needs_pkt)
   body = "".join(_emit_rule(r) for r in program.rules)
 
+  if program.default is not None:
+    final_return = _ACTION_TO_RETURN[program.default.action]
+  else:
+    final_return = "XDP_PASS"
+
   return f"""{_HEADER}
 SEC("xdp")
 int fwl_prog(struct xdp_md *ctx) {{
-{prelude}{body}  return XDP_PASS;
+{prelude}{body}  return {final_return};
 }}
 
 char _license[] SEC("license") = "GPL";

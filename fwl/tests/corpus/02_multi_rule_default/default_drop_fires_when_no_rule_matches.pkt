@@ -1,0 +1,12 @@
+name: "default drop fires when no rule matches"
+source_fw: |
+  @xdp(eth0)
+  allow if pkt.proto == tcp
+  default drop
+
+test_packet:
+  builder: udp(dst_port=53)
+
+expected:
+  compiles: true
+  bpf_action: drop

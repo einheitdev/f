@@ -36,11 +36,14 @@ def evaluate(program: ast.Program, packet: dict[str, Any]) -> XdpAction:
 
   `packet` is a decoded-fields dict produced by pkt.parse_packet().
   Rules execute top to bottom; first matching rule's action wins.
-  No matching rule => implicit XDP_PASS per FWL_V01_SPEC.md:70.
+  After all rules, the explicit `default <action>` (if present) fires;
+  otherwise the implicit XDP_PASS per FWL_V01_SPEC.md:70 / :116.
   """
   for rule in program.rules:
     if rule.condition is None or _eval_condition(rule.condition, packet):
       return _ACTION_TO_XDP[rule.action]
+  if program.default is not None:
+    return _ACTION_TO_XDP[program.default.action]
   return XdpAction.PASS
 
 

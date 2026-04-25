@@ -99,12 +99,25 @@ class Hook:
 
 
 @dataclass(frozen=True)
+class DefaultRule:
+  """An explicit `default <action>` final rule.
+
+  Spec: FWL_V01_SPEC.md:105-116. Only ALLOW and DROP are valid as
+  default actions because LOG/COUNT are non-terminal — falling
+  through past them lands at the implicit allow anyway, so calling
+  that "the default" makes no sense.
+  """
+  action: Action
+  span: Span
+
+
+@dataclass(frozen=True)
 class Program:
-  """A complete FWL program: hook + ordered rules.
+  """A complete FWL program: hook + ordered rules + optional default.
 
   Per the spec grammar (`program = hook_decl { rule } [ default_rule ]`)
-  zero rules are valid when a `default` rule is present; default
-  rules land in Phase 2.
+  zero rules are valid when a `default` rule is present.
   """
   hook: Hook
   rules: list[Rule] = field(default_factory=list)
+  default: DefaultRule | None = None
