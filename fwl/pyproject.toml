@@ -19,9 +19,13 @@ dev = [
   "pytest-snapshot>=0.9",
   "flake8>=7.0",
 ]
+agent = [
+  "anthropic>=0.40",
+]
 
 [project.scripts]
 fwl = "fwl.cli:main"
+fwl-test-agent = "fwl.tools.test_agent:main"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
