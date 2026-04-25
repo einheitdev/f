@@ -1,0 +1,17 @@
+name: "log + rate_limit: gate suppresses log when bucket full"
+source_fw: |
+  @xdp(eth0)
+  log if pkt.proto == tcp limited by rate_limit(5, per=src_ip)
+  default allow
+
+state:
+  rate_limit:
+    0:
+      "1.2.3.4": 5
+
+test_packet:
+  builder: tcp(src_ip="1.2.3.4")
+
+expected:
+  compiles: true
+  bpf_action: allow

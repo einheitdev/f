@@ -1,0 +1,10 @@
+name: "default log is rejected (only allow|drop are valid as defaults)"
+source_fw: |
+  @xdp(eth0)
+  default log
+
+test_packet:
+  builder: tcp()
+
+expected:
+  compiles: false

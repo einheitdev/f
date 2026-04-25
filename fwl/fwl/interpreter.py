@@ -21,7 +21,7 @@ class XdpAction(Enum):
   DROP = "XDP_DROP"
 
 
-_ACTION_TO_XDP = {
+_TERMINAL_ACTION_TO_XDP = {
   ast.Action.ALLOW: XdpAction.PASS,
   ast.Action.DROP: XdpAction.DROP,
 }
@@ -50,9 +50,13 @@ def evaluate(
     if rule.modifier is not None:
       if not _rate_limit_allows(rule.modifier, idx, packet, state):
         continue
-    return _ACTION_TO_XDP[rule.action]
+    if rule.action in _TERMINAL_ACTION_TO_XDP:
+      return _TERMINAL_ACTION_TO_XDP[rule.action]
+    # LOG and COUNT are non-terminal: side effects happen here in a
+    # real run, but the test verification only inspects the final XDP
+    # action, so just continue to the next rule.
   if program.default is not None:
-    return _ACTION_TO_XDP[program.default.action]
+    return _TERMINAL_ACTION_TO_XDP[program.default.action]
   return XdpAction.PASS
 
 

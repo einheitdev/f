@@ -88,6 +88,8 @@ class _ToAst(Transformer):
   def IDENTIFIER(self, tok): return tok
   def ALLOW(self, tok): return tok
   def DROP(self, tok): return tok
+  def LOG(self, tok): return tok
+  def COUNT(self, tok): return tok
   def NOT(self, tok): return tok
   def EQ(self, tok): return tok
   def NEQ(self, tok): return tok
@@ -110,23 +112,36 @@ class _ToAst(Transformer):
     (iface_tok,) = children
     return ast.Hook(interface=str(iface_tok), span=_span(iface_tok))
 
-  def terminal_action(self, children) -> tuple[ast.Action, Span]:
+  def terminal_action(
+    self, children
+  ) -> tuple[ast.Action, Span, str | None]:
     (tok,) = children
     if tok.type == "ALLOW":
-      return ast.Action.ALLOW, _span(tok)
-    return ast.Action.DROP, _span(tok)
+      return ast.Action.ALLOW, _span(tok), None
+    return ast.Action.DROP, _span(tok), None
 
-  def action(self, children) -> tuple[ast.Action, Span]:
+  def nonterminal_action(
+    self, children
+  ) -> tuple[ast.Action, Span, str | None]:
+    if children[0].type == "LOG":
+      return ast.Action.LOG, _span(children[0]), None
+    # COUNT IDENTIFIER
+    count_tok, name_tok = children
+    return ast.Action.COUNT, _span(count_tok), str(name_tok)
+
+  def action(
+    self, children
+  ) -> tuple[ast.Action, Span, str | None]:
     (action_tuple,) = children
     return action_tuple
 
   def default_rule(self, children) -> ast.DefaultRule:
     (action_tuple,) = children
-    action, span = action_tuple
+    action, span, _ = action_tuple
     return ast.DefaultRule(action=action, span=span)
 
   def rule(self, children) -> ast.Rule:
-    action, action_span = children[0]
+    action, action_span, counter_name = children[0]
     condition: ast.Condition | None = None
     modifier: ast.RateLimit | None = None
     for child in children[1:]:
@@ -139,6 +154,7 @@ class _ToAst(Transformer):
       condition=condition,
       modifier=modifier,
       span=action_span,
+      counter_name=counter_name,
     )
 
   def modifier(self, children) -> ast.RateLimit:

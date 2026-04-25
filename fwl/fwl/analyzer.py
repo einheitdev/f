@@ -39,17 +39,41 @@ _ALLOWED_PROTOS: dict[str, frozenset[ast.Proto]] = {
 Possible = frozenset[ast.Proto] | None
 
 
+_MAX_COUNTERS = 256  # FWL_V01_SPEC.md:329
+
+
 def analyze(program: ast.Program) -> ast.Program:
   """Run the semantic pass.
 
   Returns the same program object on success. Raises FwlException
   with category="semantic" on the first violation.
   """
+  counter_names: set[str] = set()
   for rule in program.rules:
     if rule.condition is not None:
       _check(rule.condition, possible=None)
     if rule.modifier is not None:
       _check_modifier(rule.modifier)
+    if rule.action == ast.Action.COUNT and rule.counter_name is not None:
+      counter_names.add(rule.counter_name)
+
+  if len(counter_names) > _MAX_COUNTERS:
+    # Find the rule that pushed us over so we can point at a span.
+    span = next(
+      (r.span for r in program.rules
+       if r.action == ast.Action.COUNT),
+      None,
+    )
+    raise FwlException(
+      FwlError(
+        category="semantic",
+        message=(
+          f"program declares {len(counter_names)} counters; "
+          f"v0.1 limit is {_MAX_COUNTERS}"
+        ),
+        span=span,
+      )
+    )
   return program
 
 

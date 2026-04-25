@@ -59,10 +59,39 @@ _RL_FIELD_TO_AST = {
 }
 
 
-_ACTION_TO_RETURN = {
+_TERMINAL_ACTION_TO_RETURN = {
   ast.Action.ALLOW: "XDP_PASS",
   ast.Action.DROP: "XDP_DROP",
 }
+
+
+_LOG_EVENT_DECL = """\
+struct fwl_log_event {
+  __u64 timestamp_ns;
+  __u32 src_ip;
+  __u32 dst_ip;
+  __u16 src_port;
+  __u16 dst_port;
+  __u8  proto;
+  __u8  flags;
+  __u32 rule_index;
+};
+
+struct {
+  __uint(type, BPF_MAP_TYPE_RINGBUF);
+  __uint(max_entries, 1 << 20);
+} fwl_log_events SEC(".maps");
+"""
+
+
+_COUNTER_MAP_DECL_TEMPLATE = """\
+struct {{
+  __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+  __type(key, __u32);
+  __type(value, __u64);
+  __uint(max_entries, {n_slots});
+}} fwl_counters SEC(".maps");
+"""
 
 
 def _walk(node) -> list:
@@ -81,11 +110,12 @@ def _walk(node) -> list:
 def _referenced_fields(program: ast.Program) -> set[str]:
   """Set of pkt.* field names mentioned anywhere in the program.
 
-  Includes both fields used in conditions and fields used as
-  rate_limit bucket keys — both require the parse prelude to extract
-  the field at runtime.
+  Includes fields used in conditions, rate_limit bucket keys, AND log
+  events (the log_event struct carries every L4 field). Any program
+  with a `log` rule needs the full prelude.
   """
   fields: set[str] = set()
+  has_log = False
   for rule in program.rules:
     for n in _walk(rule.condition):
       if isinstance(n, ast.Comparison):
@@ -94,6 +124,14 @@ def _referenced_fields(program: ast.Program) -> set[str]:
         fields.add(n.field.name)
     if rule.modifier is not None:
       fields.add(_RL_FIELD_TO_AST[rule.modifier.per_field])
+    if rule.action == ast.Action.LOG:
+      has_log = True
+  if has_log:
+    fields.update({
+      ast.FIELD_SRC_IP, ast.FIELD_DST_IP,
+      ast.FIELD_SRC_PORT, ast.FIELD_DST_PORT,
+      ast.FIELD_TCP_SYN, ast.FIELD_TCP_ACK,
+    })
   return fields
 
 
@@ -348,23 +386,92 @@ def _emit_port_in(c_field: str, operand: ast.Operand) -> str:
   )
 
 
-def _emit_rule(rule: ast.Rule, idx: int) -> str:
+def _emit_rule(
+  rule: ast.Rule, idx: int, counter_slots: dict[str, int]
+) -> str:
   """Emit C statements for one rule.
 
-  When a rate_limit modifier is present, the rule body wraps the
-  return in a rate-limit gate that consults the per-CPU map.
+  Terminal actions return; non-terminal actions execute their side
+  effect and fall through to the next rule. A rate_limit modifier
+  gates the entire rule body — when blocked, neither the action's
+  side effect nor return fires.
   """
-  ret = _ACTION_TO_RETURN[rule.action]
-
-  if rule.modifier is not None:
-    fire_block = _emit_rate_limit_gate(rule.modifier, idx, ret)
+  if rule.action in _TERMINAL_ACTION_TO_RETURN:
+    ret = _TERMINAL_ACTION_TO_RETURN[rule.action]
+    if rule.modifier is not None:
+      fire_block = _emit_rate_limit_gate(rule.modifier, idx, ret)
+    else:
+      fire_block = f"return {ret};"
   else:
-    fire_block = f"return {ret};"
+    # Non-terminal: emit the side effect, no return.
+    if rule.action == ast.Action.LOG:
+      side_effect = _emit_log(idx)
+    elif rule.action == ast.Action.COUNT:
+      slot = counter_slots[rule.counter_name]  # type: ignore[index]
+      side_effect = _emit_count(slot)
+    else:
+      raise NotImplementedError(
+        f"emitter: unsupported action {rule.action}"
+      )
+    if rule.modifier is not None:
+      fire_block = _emit_rate_limit_side_effect(
+        rule.modifier, idx, side_effect
+      )
+    else:
+      fire_block = side_effect
 
   if rule.condition is None:
     return f"  {{\n    {fire_block}\n  }}\n"
   expr = _emit_condition(rule.condition)
   return f"  if ({expr}) {{\n    {fire_block}\n  }}\n"
+
+
+def _emit_log(rule_idx: int) -> str:
+  """Emit code that submits a log_event for rule `rule_idx`."""
+  return f"""struct fwl_log_event *ev =
+      bpf_ringbuf_reserve(&fwl_log_events, sizeof(*ev), 0);
+    if (ev) {{
+      ev->timestamp_ns = bpf_ktime_get_ns();
+      ev->src_ip = src_ip;
+      ev->dst_ip = dst_ip;
+      ev->src_port = src_port;
+      ev->dst_port = dst_port;
+      ev->proto = proto;
+      ev->flags = (tcp_syn ? 0x01 : 0) | (tcp_ack ? 0x02 : 0);
+      ev->rule_index = {rule_idx};
+      bpf_ringbuf_submit(ev, 0);
+    }}"""
+
+
+def _emit_count(slot: int) -> str:
+  """Emit code that bumps the counter at `slot`."""
+  return f"""__u32 ck = {slot};
+    __u64 *cnt = bpf_map_lookup_elem(&fwl_counters, &ck);
+    if (cnt) {{
+      __sync_fetch_and_add(cnt, 1);
+    }}"""
+
+
+def _emit_rate_limit_side_effect(
+  mod: ast.RateLimit, idx: int, side_effect: str
+) -> str:
+  """Wrap a non-terminal side effect with rate_limit gating."""
+  c_field = _RL_FIELD_TO_C[mod.per_field]
+  return f"""__u32 rl_key = (__u32){c_field};
+    __u64 now = bpf_ktime_get_ns();
+    struct fwl_rl_state *st =
+      bpf_map_lookup_elem(&fwl_rl_map_{idx}, &rl_key);
+    __u32 cur = 0;
+    __u64 cur_ts = now;
+    if (st && now - st->ts < 1000000000ULL) {{
+      cur = st->count;
+      cur_ts = st->ts;
+    }}
+    if (cur < {mod.threshold}) {{
+      struct fwl_rl_state new_st = {{ .ts = cur_ts, .count = cur + 1 }};
+      bpf_map_update_elem(&fwl_rl_map_{idx}, &rl_key, &new_st, BPF_ANY);
+      {side_effect}
+    }}"""
 
 
 def _emit_rate_limit_gate(mod: ast.RateLimit, idx: int, ret: str) -> str:
@@ -413,19 +520,66 @@ def emit(program: ast.Program) -> str:
   """Emit BPF C source for `program`."""
   prelude = _emit_parse_prelude(program)
   rl_maps = _emit_rl_maps(program)
-  body = "".join(_emit_rule(r, i) for i, r in enumerate(program.rules))
+
+  counter_slots = _allocate_counter_slots(program)
+  has_log = any(r.action == ast.Action.LOG for r in program.rules)
+
+  log_decl = _LOG_EVENT_DECL if has_log else ""
+  if counter_slots:
+    counter_decl = _COUNTER_MAP_DECL_TEMPLATE.format(
+      n_slots=max(len(counter_slots), 1)
+    )
+    counter_table = _emit_counter_table(counter_slots)
+  else:
+    counter_decl = ""
+    counter_table = ""
+
+  body = "".join(
+    _emit_rule(r, i, counter_slots) for i, r in enumerate(program.rules)
+  )
 
   if program.default is not None:
-    final_return = _ACTION_TO_RETURN[program.default.action]
+    final_return = _TERMINAL_ACTION_TO_RETURN[program.default.action]
   else:
     final_return = "XDP_PASS"
 
   return f"""{_HEADER}
-{rl_maps}
+{log_decl}{counter_decl}{rl_maps}
 SEC("xdp")
 int fwl_prog(struct xdp_md *ctx) {{
 {prelude}{body}  return {final_return};
 }}
 
 char _license[] SEC("license") = "GPL";
-"""
+{counter_table}"""
+
+
+def _allocate_counter_slots(program: ast.Program) -> dict[str, int]:
+  """Assign a stable per-CPU array slot to each named counter.
+
+  Slots are allocated in order of first appearance in the program;
+  userspace tools read the name->slot mapping from the emitted
+  fwl_counter_table comment block.
+  """
+  slots: dict[str, int] = {}
+  for rule in program.rules:
+    if rule.action != ast.Action.COUNT:
+      continue
+    name = rule.counter_name
+    if name is None:
+      continue
+    if name not in slots:
+      slots[name] = len(slots)
+  return slots
+
+
+def _emit_counter_table(slots: dict[str, int]) -> str:
+  """Emit a comment block mapping counter names to their slot indices.
+
+  Userspace tools parse this to look up counters by their declared
+  identifier without needing the .fw source.
+  """
+  lines = ["// fwl_counter_table:"]
+  for name, slot in slots.items():
+    lines.append(f"//   {slot}\t{name}")
+  return "\n".join(lines) + "\n"

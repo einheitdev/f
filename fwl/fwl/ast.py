@@ -15,12 +15,22 @@ from .errors import Span
 
 
 class Action(Enum):
-  """Terminal action verbs (FWL_V01_SPEC.md:78).
+  """Action verbs (FWL_V01_SPEC.md:78).
 
-  Phase 3 ships ALLOW and DROP; LOG and COUNT join later.
+  ALLOW and DROP are terminal — once a packet matches, evaluation
+  stops and the action takes effect.
+
+  LOG and COUNT are non-terminal — they record the event but do not
+  affect packet disposition; evaluation continues to the next rule
+  (FWL_V01_SPEC.md:92).
   """
   ALLOW = "allow"
   DROP = "drop"
+  LOG = "log"
+  COUNT = "count"
+
+
+TERMINAL_ACTIONS = frozenset({Action.ALLOW, Action.DROP})
 
 
 class Proto(Enum):
@@ -180,11 +190,15 @@ class Rule:
   `if` clause and the modifier are independently optional, so a rule
   may consist of just `<action>`, `<action> if <cond>`,
   `<action> limited by ...`, or all three together.
+
+  `counter_name` is set only for COUNT actions and names the per-CPU
+  counter to bump.
   """
   action: Action
   condition: Condition | None
   modifier: RateLimit | None
   span: Span
+  counter_name: str | None = None
 
 
 @dataclass(frozen=True)

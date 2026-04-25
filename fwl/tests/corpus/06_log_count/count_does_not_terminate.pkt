@@ -1,0 +1,13 @@
+name: "count action does not terminate evaluation; subsequent rule fires"
+source_fw: |
+  @xdp(eth0)
+  count tcp_traffic if pkt.proto == tcp
+  drop if pkt.proto == tcp
+  default allow
+
+test_packet:
+  builder: tcp()
+
+expected:
+  compiles: true
+  bpf_action: drop

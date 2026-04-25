@@ -15,9 +15,10 @@ RL_FIELD.10   : "src_ip" | "dst_ip" | "src_port" | "dst_port"
 
 default_rule  : "default" terminal_action
 
-action        : terminal_action
+action        : terminal_action | nonterminal_action
 
-terminal_action : ALLOW | DROP
+terminal_action    : ALLOW | DROP
+nonterminal_action : LOG | COUNT IDENTIFIER
 
 condition     : or_expr
 
@@ -72,11 +73,15 @@ IP_FIELD.10        : "pkt.src_ip" | "pkt.dst_ip"
 PORT_FIELD.10      : "pkt.src_port" | "pkt.dst_port"
 TCP_FLAG_FIELD.10  : "pkt.tcp.syn" | "pkt.tcp.ack"
 
-// Keyword terminals get priority above IDENTIFIER too — otherwise
-// `tcp`, `udp`, `allow`, etc. would be lexed as identifiers.
-PROTO_KEYWORD.10 : "tcp" | "udp" | "icmp"
-ALLOW.10         : "allow"
-DROP.10          : "drop"
+// Keywords use a negative-lookahead so they only match when not
+// followed by an identifier character — `tcp_traffic` lexes as
+// IDENTIFIER, bare `tcp ` lexes as PROTO_KEYWORD. Higher priority
+// then breaks the tie against IDENTIFIER for the same length.
+PROTO_KEYWORD.10 : /(tcp|udp|icmp)(?![a-z0-9_])/
+ALLOW.10         : /allow(?![a-z0-9_])/
+DROP.10          : /drop(?![a-z0-9_])/
+LOG.10           : /log(?![a-z0-9_])/
+COUNT.10         : /count(?![a-z0-9_])/
 
 // CIDR and IPV4 share a prefix with INTEGER; explicit priorities
 // ensure the lexer prefers the longer dotted forms even when scanning
