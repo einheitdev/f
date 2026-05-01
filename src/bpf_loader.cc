@@ -11,6 +11,11 @@
 #include <cstring>
 #include <filesystem>
 #include <format>
+#include <string>
+#include <system_error>
+#include <vector>
+
+#include <spdlog/spdlog.h>
 
 #include "f/types.h"
 
@@ -33,24 +38,45 @@ auto FindMap(struct bpf_object* obj, const char* name)
 
 }  // namespace
 
-auto LoadProgram()
-    -> std::expected<BpfHandles, Error<BpfError>> {
-  // Look for the compiled BPF object next to the binary
-  // or in the build directory.
-  const char* paths[] = {
-      "fw.bpf.o",
-      "build/fw.bpf.o",
-      "../bpf/fw.bpf.o",
-      "/usr/lib/f/fw.bpf.o",
-  };
+namespace {
 
-  for (const auto* path : paths) {
-    if (std::filesystem::exists(path)) {
-      g_obj = bpf_object__open(path);
-      if (g_obj) {
-        break;
-      }
+auto BuildSearchPaths(std::string_view bundle_dir)
+    -> std::vector<std::string> {
+  std::vector<std::string> paths;
+  if (!bundle_dir.empty()) {
+    auto current_link =
+        std::filesystem::path(bundle_dir) / "current" / "main.bpf.o";
+    paths.push_back(current_link.string());
+  }
+  paths.emplace_back("fw.bpf.o");
+  paths.emplace_back("build/fw.bpf.o");
+  paths.emplace_back("../bpf/fw.bpf.o");
+  paths.emplace_back("/usr/lib/f/fw.bpf.o");
+  return paths;
+}
+
+}  // namespace
+
+auto ResolveBpfObjPath(std::string_view bundle_dir) -> std::string {
+  for (const auto& path : BuildSearchPaths(bundle_dir)) {
+    std::error_code ec;
+    if (std::filesystem::exists(path, ec) && !ec) {
+      return path;
     }
+  }
+  return {};
+}
+
+auto LoadProgram(std::string_view bundle_dir)
+    -> std::expected<BpfHandles, Error<BpfError>> {
+  // Cold-boot bundle auto-load (Phase 2 hardening): when a bundle
+  // directory is provided, prefer the symlink the reload pipeline
+  // maintains. This lets a freshly-restarted daemon resume the
+  // previously-compiled FWL program without going through a full
+  // recompile cycle.
+  std::string loaded_from = ResolveBpfObjPath(bundle_dir);
+  if (!loaded_from.empty()) {
+    g_obj = bpf_object__open(loaded_from.c_str());
   }
 
   if (!g_obj) {
@@ -58,6 +84,7 @@ auto LoadProgram()
         "fw.bpf.o not found — compile the BPF program "
         "first (clang -target bpf)");
   }
+  spdlog::info("Loaded BPF object from {}", loaded_from);
 
   int err = bpf_object__load(g_obj);
   if (err) {

@@ -1,0 +1,15 @@
+name: "Tier 2: bool local computed once, reused"
+source_fw: |
+  @xdp(eth0)
+  def firewall(pkt):
+    internal = pkt.src_ip in [10.0.0.0/8, 192.168.0.0/16]
+    if internal:
+      allow
+    drop
+
+test_packet:
+  builder: tcp(src_ip="10.1.2.3", dst_port=22)
+
+expected:
+  compiles: true
+  bpf_action: allow

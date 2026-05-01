@@ -1,0 +1,17 @@
+name: "probe: pkt.src_ip == 0.0.0.0 on v6 packet — interpreter false, BPF true?"
+source_fw: |
+  @xdp(eth0)
+
+  def firewall(pkt):
+    if pkt.src_ip6 in fc00::/7:
+      drop
+    if pkt.src_ip == 0.0.0.0:
+      drop
+    allow
+
+test_packet:
+  builder: tcp6(src_ip="2001:db8::dead", dst_ip="2001:db8::cafe", dst_port=443)
+
+expected:
+  compiles: true
+  bpf_action: allow

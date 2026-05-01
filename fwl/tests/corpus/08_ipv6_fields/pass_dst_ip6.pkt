@@ -1,0 +1,12 @@
+name: "v6 dst_ip6 equality matches loopback target"
+source_fw: |
+  @xdp(eth0)
+  allow if pkt.dst_ip6 == ::1
+  default drop
+
+test_packet:
+  builder: tcp6(dst_ip="::1", dst_port=22)
+
+expected:
+  compiles: true
+  bpf_action: allow

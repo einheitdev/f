@@ -1,0 +1,12 @@
+name: "v6 packet against v4 rule falls through (no v4 read on v6 frame)"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.src_ip == 1.2.3.4
+  default allow
+
+test_packet:
+  builder: tcp6(src_ip="2001:db8::1", dst_port=80)
+
+expected:
+  compiles: true
+  bpf_action: allow

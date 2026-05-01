@@ -1,0 +1,15 @@
+name: "geoip(RU, RU) silently dedups; behaves identically to geoip(RU)"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.src_ip in geoip(RU, RU)
+  default allow
+
+geoip_data:
+  RU: ["5.8.0.0/16"]
+
+test_packet:
+  builder: tcp(src_ip="5.8.1.1", dst_port=80)
+
+expected:
+  compiles: true
+  bpf_action: drop

@@ -1,0 +1,12 @@
+name: "v6 rule with count action — non-terminal, falls through to default allow"
+source_fw: |
+  @xdp(eth0)
+  count v6_seen if pkt.src_ip6 in 2001:db8::/32
+  default allow
+
+test_packet:
+  builder: tcp6(src_ip="2001:db8::dead", dst_port=80)
+
+expected:
+  compiles: true
+  bpf_action: allow

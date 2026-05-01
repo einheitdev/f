@@ -1,0 +1,16 @@
+name: "v4 and v6 geoip rules in same program: each call site has its own family"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.src_ip in geoip(RU)
+  drop if pkt.src_ip6 in geoip(RU)
+  default allow
+
+geoip_data:
+  RU: ["5.8.0.0/16", "2a00:1370::/32"]
+
+test_packet:
+  builder: tcp6(src_ip="2a00:1370::1", dst_port=80)
+
+expected:
+  compiles: true
+  bpf_action: drop

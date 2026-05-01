@@ -1,11 +1,66 @@
-// FWL v0.1 grammar for Lark.
+// FWL v0.2 grammar for Lark.
 //
-// Transcribed from the EBNF reference in docs/FWL_V01_SPEC.md.
+// Transcribed from the EBNF reference in docs/FWL_V02_SPEC.md
+// (which is a near-superset of v0.1 — see :9 for the carve-out list).
 // Anything not listed here is a syntax error.
+//
+// Construct 1 (IPv6 fields) extends the v0.1 grammar with:
+//   - pkt.src_ip6 / pkt.dst_ip6 fields
+//   - IPv6 literals (RFC 5952 canonical, parser validates)
+//   - IPv6 CIDR literals (prefix 0..128)
+//   - icmp6 proto keyword
+// Construct 2 (geoip) extends with:
+//   - geoip(<cc>, ...) call as RHS-of-`in`
+//   - bare uppercase 2-letter country codes (ISO 3166-1 alpha-2)
+// Construct 3 (Tier 2) extends with:
+//   - def <name>(pkt): function body with if/elif/else, locals, statements
+//   - rate_limit_call as a primary inside Tier 2 if conditions
+//   - locals appearing on either side of a comparison
 
-program       : hook_decl rule* default_rule?
+// Tier 1 and Tier 2 share one parser surface: the body is a sequence
+// of any of `rule`, `default_rule`, or `function_def` items. The
+// FwlIndenter postlex drops `_NL` tokens at the top level (Tier 1
+// is line-oriented but tolerates `limited by` continuation
+// indentation), and only honours `_NL`/`_INDENT`/`_DEDENT` inside a
+// `def` block. The analyzer rejects mixed Tier 1 + Tier 2 with the
+// spec's "v0.2 program is either a Tier 1 rule sequence or a single
+// Tier 2 function" error.
+program       : hook_decl body_item*
+
+body_item     : rule | default_rule | function_def
 
 hook_decl     : "@xdp" "(" IDENTIFIER ")"
+
+// Tier 2 statement productions accept any number of `_NL` tokens
+// before/between statements. Comments split a single logical line
+// into two `_NL` tokens (the parser's lexer ignores `COMMENT` but
+// the newline before/after is captured), so collapsing them into
+// `_NL+` here keeps comment-laden function bodies parseable.
+// Tier 2 blocks accept _NL anywhere — comments and blank lines
+// produce extra _NL tokens that the indenter forwards to the parser.
+// Allowing _NL* between statements (and before the first one) keeps
+// comment-laden bodies parseable while preserving the indenter's
+// INDENT/DEDENT structure.
+function_def  : DEF IDENTIFIER "(" "pkt" ")" ":" _NL+ _INDENT block _DEDENT
+
+block         : _NL* statement (_NL* statement)* _NL*
+
+statement     : if_stmt
+              | assign_stmt
+              | action_stmt
+
+action_stmt   : ALLOW                  _NL+  -> action_allow
+              | DROP                   _NL+  -> action_drop
+              | LOG                    _NL+  -> action_log
+              | COUNT IDENTIFIER       _NL+  -> action_count
+
+assign_stmt   : IDENTIFIER "=" scalar_expr _NL+
+
+if_stmt       : "if" condition ":" _NL+ _INDENT block _DEDENT elif_clause* else_clause?
+
+elif_clause   : "elif" condition ":" _NL+ _INDENT block _DEDENT
+
+else_clause   : "else" ":" _NL+ _INDENT block _DEDENT
 
 rule          : action ("if" condition)? modifier?
 
@@ -29,31 +84,68 @@ and_expr      : not_expr ("and" not_expr)*
 not_expr      : NOT? primary
 
 primary       : comparison
-              | bool_field
+              | bool_primary
+              | rate_limit_call
+              | bare_field
               | "(" condition ")"
 
-comparison    : value_field comp_op operand   -> value_compare
-              | value_field "in" set_or_range -> value_in
-              | enum_field "==" PROTO_KEYWORD -> enum_eq
-              | enum_field "!=" PROTO_KEYWORD -> enum_neq
+// A bare value_field as a primary covers two distinct uses:
+//   - Tier 2 `port = pkt.dst_port` — the field appears as a
+//     scalar_expr by way of condition/or_expr/and_expr/primary.
+//   - A spec-rejected `if pkt.dst_port:` form — caught at analysis
+//     time as a "non-bool used as bare condition" error.
+// Adding it here keeps the grammar LALR-friendly without inventing
+// a separate scalar_expr surface.
+bare_field    : value_field
+
+bool_primary  : TCP_FLAG_FIELD                -> bool_flag
+              | IDENTIFIER                    -> bool_local
+
+// All comparisons share one production. The analyzer enforces type
+// discipline (PROTO_FIELD must compare against PROTO_KEYWORD; no
+// proto on the RHS of an IP comparison; etc.). Removing the
+// enum_field carve-out from v0.1 simplifies the grammar without
+// loosening any type rule — every former enum_eq / enum_neq is
+// expressible as value_compare with a PROTO_FIELD lvalue and a
+// PROTO_KEYWORD operand.
+comparison    : lvalue comp_op rvalue          -> value_compare
+              | lvalue "in" set_or_range       -> value_in
 
 comp_op       : EQ | NEQ | LT | GT | LE | GE
 
-value_field   : IP_FIELD | PORT_FIELD
+lvalue        : value_field                    -> lvalue_field
+              | IDENTIFIER                     -> lvalue_local
 
-enum_field    : PROTO_FIELD
+rvalue        : operand                        -> rvalue_operand
+              | value_field                    -> rvalue_field
+              | IDENTIFIER                     -> rvalue_local
 
-bool_field    : TCP_FLAG_FIELD
+// TCP_FLAG_FIELD is admitted via bool_primary (which is a primary
+// alternative), so it's not listed here — adding it would create
+// a reduce/reduce conflict against bool_primary's same-token rule.
+value_field   : IP_FIELD | PORT_FIELD | IP6_FIELD | PROTO_FIELD
 
-operand       : INTEGER | IPV4
+operand       : INTEGER | IPV4 | IPV6 | PROTO_KEYWORD
 
-set_or_range  : list | range | cidr | cidr_list
+set_or_range  : list | range | cidr | cidr_list | ipv6_cidr | ipv6_cidr_list | geoip_call
 
 list          : "[" operand ("," operand)* "]"
+
+proto_list    : "[" PROTO_KEYWORD ("," PROTO_KEYWORD)* "]"
 
 cidr          : CIDR
 
 cidr_list     : "[" CIDR ("," CIDR)* "]"
+
+ipv6_cidr     : IPV6_CIDR
+
+ipv6_cidr_list : "[" IPV6_CIDR ("," IPV6_CIDR)* "]"
+
+geoip_call    : GEOIP "(" CC_CODE ("," CC_CODE)* ")"
+
+rate_limit_call : "rate_limit" "(" INTEGER "," "per" "=" RL_FIELD ")"
+
+scalar_expr   : condition
 
 range         : INTEGER ".." INTEGER
 
@@ -68,7 +160,11 @@ NOT           : "not"
 // Multi-segment field terminals get explicit priority above IDENTIFIER
 // because Lark's basic lexer would otherwise tokenize "pkt" as an
 // identifier and stop there, never trying the longer match.
+//
+// IP6_FIELD is ordered before IP_FIELD because longest-match must
+// pick "pkt.src_ip6" over "pkt.src_ip" when scanning that prefix.
 PROTO_FIELD.10     : "pkt.proto"
+IP6_FIELD.11       : "pkt.src_ip6" | "pkt.dst_ip6"
 IP_FIELD.10        : "pkt.src_ip" | "pkt.dst_ip"
 PORT_FIELD.10      : "pkt.src_port" | "pkt.dst_port"
 TCP_FLAG_FIELD.10  : "pkt.tcp.syn" | "pkt.tcp.ack"
@@ -77,11 +173,39 @@ TCP_FLAG_FIELD.10  : "pkt.tcp.syn" | "pkt.tcp.ack"
 // followed by an identifier character — `tcp_traffic` lexes as
 // IDENTIFIER, bare `tcp ` lexes as PROTO_KEYWORD. Higher priority
 // then breaks the tie against IDENTIFIER for the same length.
-PROTO_KEYWORD.10 : /(tcp|udp|icmp)(?![a-z0-9_])/
+//
+// `icmp6` must come before `icmp` in the alternation so longest-match
+// picks the v6 form on input `icmp6` (otherwise `icmp` would match
+// first and `6` would lex separately as INTEGER).
+PROTO_KEYWORD.10 : /(icmp6|tcp|udp|icmp)(?![a-z0-9_])/
 ALLOW.10         : /allow(?![a-z0-9_])/
 DROP.10          : /drop(?![a-z0-9_])/
 LOG.10           : /log(?![a-z0-9_])/
 COUNT.10         : /count(?![a-z0-9_])/
+GEOIP.10         : /geoip(?![a-z0-9_])/
+DEF.10           : /def(?![a-z0-9_])/
+
+// CC_CODE: exactly two uppercase ASCII letters (ISO 3166-1 alpha-2).
+// Negative lookahead prevents `RUS` (3 letters) lexing as `CC_CODE("RU")`
+// + `IDENTIFIER("S")` — the trailing `S` would silently slip through.
+// Validation against the alpha-2 list happens at the analyzer pass.
+CC_CODE.10       : /[A-Z][A-Z](?![A-Za-z0-9])/
+
+// IPv6 literals (RFC 5952 canonical form is enforced by the parser
+// against `ipaddress.IPv6Address`; the regex here is a permissive
+// shape that captures the four syntactic forms — bare `::`,
+// leading-`::` (`::1`), trailing/embedded-`::` (`2001:db8::1`,
+// `2001::`), and full 8-group (`a:b:c:d:e:f:0:1`) — plus the
+// IPv4-mapped dotted-quad form (`::ffff:1.2.3.4`).
+//
+// The regex deliberately does NOT match a trailing single `:` so that
+// an IPv6 literal followed by an `if`-suffix `:` (Tier 2 syntax) or
+// any other terminal `:` is split correctly by the lexer.
+//
+// IPV6_CIDR comes before IPV6 because longest-match must prefer
+// `2001:db8::/32` over `2001:db8::` when scanning that prefix.
+IPV6_CIDR.7   : /(?:::ffff:\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}|(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}|(?:[0-9a-fA-F]{1,4}:){1,6}:(?:[0-9a-fA-F]{1,4}(?::[0-9a-fA-F]{1,4})*)?|::(?:[0-9a-fA-F]{1,4}(?::[0-9a-fA-F]{1,4})*)?)\/\d{1,3}/
+IPV6.6        : /::ffff:\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}|(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}|(?:[0-9a-fA-F]{1,4}:){1,6}:(?:[0-9a-fA-F]{1,4}(?::[0-9a-fA-F]{1,4})*)?|::(?:[0-9a-fA-F]{1,4}(?::[0-9a-fA-F]{1,4})*)?|::/
 
 // CIDR and IPV4 share a prefix with INTEGER; explicit priorities
 // ensure the lexer prefers the longer dotted forms even when scanning
@@ -94,6 +218,16 @@ IDENTIFIER    : /[a-z_][a-z0-9_]*/
 
 COMMENT       : /#[^\n]*/
 
-%import common.WS
-%ignore WS
+// Newline tokens are consumed by the FwlIndenter postlex (see
+// parser.py) which converts them into _INDENT/_DEDENT pairs around
+// indented Tier 2 blocks. _NL is emitted to the parser so Tier 2
+// statement productions can require a terminating newline.
+_NL: /(\r?\n[\t ]*)+/
+
+%declare _INDENT _DEDENT
+
+// WS without newlines: spaces and tabs only. The Indenter needs
+// _NL tokens preserved, so we cannot fold them into a generic WS
+// %ignore.
+%ignore /[ \t]+/
 %ignore COMMENT

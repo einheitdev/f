@@ -1,0 +1,21 @@
+name: "geoip + rate_limit: matches country, under threshold so rule does not fire"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.src_ip in geoip(RU)
+       limited by rate_limit(10, per=src_ip)
+  default allow
+
+geoip_data:
+  RU: ["5.8.0.0/16"]
+
+state:
+  rate_limit:
+    0:
+      "5.8.1.1": 5
+
+test_packet:
+  builder: tcp(src_ip="5.8.1.1", dst_port=22)
+
+expected:
+  compiles: true
+  bpf_action: allow

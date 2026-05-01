@@ -1,0 +1,11 @@
+name: "non-canonical IPv6 literal (uppercase hex) is rejected"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.src_ip6 == 2001:DB8::1
+  default allow
+
+test_packet:
+  builder: tcp6(src_ip="2001:db8::1")
+
+expected:
+  compiles: false

@@ -1,0 +1,15 @@
+name: "v4 packet against v6-bound geoip falls through (cross-family rule)"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.src_ip6 in geoip(RU)
+  default allow
+
+geoip_data:
+  RU: ["2a00:1370::/32"]
+
+test_packet:
+  builder: tcp(src_ip="5.8.1.1", dst_port=80)
+
+expected:
+  compiles: true
+  bpf_action: allow

@@ -1,0 +1,12 @@
+name: "v6 /64 prefix matches the boundary"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.src_ip6 in 2001:db8:0:1::/64
+  default allow
+
+test_packet:
+  builder: tcp6(src_ip="2001:db8:0:1:cafe:beef:dead:1", dst_port=80)
+
+expected:
+  compiles: true
+  bpf_action: drop

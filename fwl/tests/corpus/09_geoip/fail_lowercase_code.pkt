@@ -1,0 +1,11 @@
+name: "lowercase code 'ru' is rejected (CC_CODE is uppercase only)"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.src_ip in geoip(ru)
+  default allow
+
+test_packet:
+  builder: tcp(src_ip="1.2.3.4")
+
+expected:
+  compiles: false

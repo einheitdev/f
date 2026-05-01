@@ -1,0 +1,13 @@
+name: "Tier 2 compile error: local read before assignment"
+source_fw: |
+  @xdp(eth0)
+  def firewall(pkt):
+    if x:
+      allow
+    drop
+
+test_packet:
+  builder: tcp()
+
+expected:
+  compiles: false

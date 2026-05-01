@@ -1,0 +1,25 @@
+# Geoip block-list policy.
+#
+# Drops traffic from a small list of countries (v4 and v6), allows a
+# small allowlist (US, DE), and denies everything else by default.
+# This is the v0.2 dogfood for the geoip() built-in.
+#
+# Activates the v6 parse path via the second drop rule, so
+# pkt.proto == tcp/udp here matches both v4 and v6 frames per the
+# proto-enum table in FWL_V02_SPEC.md.
+
+@xdp(eth0)
+
+# Drop traffic from the block list, both v4 and v6
+drop if pkt.src_ip  in geoip(RU, CN, KP)
+drop if pkt.src_ip6 in geoip(RU, CN, KP)
+
+# Allow traffic from the allowlist countries
+allow if pkt.src_ip  in geoip(US, DE)
+allow if pkt.src_ip6 in geoip(US, DE)
+
+# Allow common public services regardless of source
+allow if pkt.proto == tcp and pkt.dst_port in [80, 443]
+allow if pkt.proto == udp and pkt.dst_port == 53
+
+default drop

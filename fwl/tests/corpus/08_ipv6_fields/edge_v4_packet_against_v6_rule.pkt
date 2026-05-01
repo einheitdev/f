@@ -1,0 +1,12 @@
+name: "v4 packet against v6 rule falls through (cross-family rule)"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.src_ip6 == 2001:db8::1
+  default allow
+
+test_packet:
+  builder: tcp(src_ip="1.2.3.4", dst_port=80)
+
+expected:
+  compiles: true
+  bpf_action: allow

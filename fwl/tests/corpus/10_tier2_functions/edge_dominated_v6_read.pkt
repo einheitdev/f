@@ -1,0 +1,16 @@
+name: "Tier 2: bare v6 read inside v6-establishing guard is OK"
+source_fw: |
+  @xdp(eth0)
+  def firewall(pkt):
+    if pkt.src_ip6 in ::/0:
+      addr = pkt.src_ip6
+      if addr == 2001:db8::1:
+        drop
+    allow
+
+test_packet:
+  builder: tcp6(src_ip="2001:db8::1")
+
+expected:
+  compiles: true
+  bpf_action: drop

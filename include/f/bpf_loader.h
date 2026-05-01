@@ -39,8 +39,21 @@ struct BpfHandles {
 };
 
 /// Load the BPF program and return map file descriptors.
-auto LoadProgram()
+///
+/// `bundle_dir` is the parent of the `current` symlink the
+/// reload pipeline maintains (`/usr/share/f/compiled` by default).
+/// When set, `<bundle_dir>/current/main.bpf.o` is tried first;
+/// otherwise the loader falls back to the built-in fw.bpf.o
+/// search paths. Empty string disables the bundle path entirely
+/// (used by tests that want the v0.1 search behaviour).
+auto LoadProgram(std::string_view bundle_dir = "")
     -> std::expected<BpfHandles, Error<BpfError>>;
+
+/// Resolve which BPF object the loader will pick, without
+/// actually opening it. Returns the empty string when nothing on
+/// the search list exists. Exposed for unit tests; the live
+/// loader uses the same logic.
+auto ResolveBpfObjPath(std::string_view bundle_dir) -> std::string;
 
 /// Attach the XDP program to an interface.
 auto AttachXdp(const BpfHandles& h, int ifindex)

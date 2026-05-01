@@ -1,0 +1,12 @@
+name: "::/0 matches every IPv6 packet (v6 equivalent of 0.0.0.0/0)"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.src_ip6 in ::/0
+  default allow
+
+test_packet:
+  builder: udp6(src_ip="2001:db8:cafe::dead", dst_port=53)
+
+expected:
+  compiles: true
+  bpf_action: drop

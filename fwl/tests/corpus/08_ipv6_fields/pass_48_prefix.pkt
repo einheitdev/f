@@ -1,0 +1,12 @@
+name: "v6 /48 prefix matches and allows"
+source_fw: |
+  @xdp(eth0)
+  allow if pkt.src_ip6 in 2001:db8:cafe::/48
+  default drop
+
+test_packet:
+  builder: tcp6(src_ip="2001:db8:cafe::1", dst_port=22)
+
+expected:
+  compiles: true
+  bpf_action: allow

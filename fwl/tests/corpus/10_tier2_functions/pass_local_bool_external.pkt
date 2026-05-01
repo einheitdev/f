@@ -1,0 +1,15 @@
+name: "Tier 2: external src_ip falls past `internal` allow → drop"
+source_fw: |
+  @xdp(eth0)
+  def firewall(pkt):
+    internal = pkt.src_ip in [10.0.0.0/8, 192.168.0.0/16]
+    if internal:
+      allow
+    drop
+
+test_packet:
+  builder: tcp(src_ip="8.8.8.8", dst_port=53)
+
+expected:
+  compiles: true
+  bpf_action: drop

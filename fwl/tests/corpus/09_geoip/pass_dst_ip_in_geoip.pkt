@@ -1,0 +1,15 @@
+name: "dst_ip in geoip drops outbound to a blocked country"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.dst_ip in geoip(RU)
+  default allow
+
+geoip_data:
+  RU: ["5.8.0.0/16"]
+
+test_packet:
+  builder: tcp(src_ip="10.0.0.1", dst_ip="5.8.1.5", dst_port=443)
+
+expected:
+  compiles: true
+  bpf_action: drop

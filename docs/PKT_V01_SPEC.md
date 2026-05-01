@@ -78,7 +78,7 @@ L4 header sizes: 20 (TCP), 8 (UDP), 8 (ICMP). The model assumes IHL = 5 (no IP o
 
 This exists so the corpus can verify the bounds-check fall-through paths the emitter generates without forcing corpus authors to hand-write hex.
 
-> Status (2026-04-25): builder is shipped. truncate_to is spec-only and not yet implemented in `pkt.py` / `runner.py`; cases that use it will fail to load until the loader gains the field.
+> Status (2026-05-01): builder + truncate_to both shipped. The interpreter mirrors the BPF parser's bounds-check semantics by stripping decoded fields whose underlying bytes lie past the truncation point (see `pkt.py:_strip_truncated_fields`). The two oracles agree on every truncated frame.
 
 ## The `state` Block
 
@@ -141,7 +141,7 @@ expected:
 
 The interpreter tracks counter increments as it walks; the BPF oracle reads the per-CPU counters array before and after the test run and compares the deltas (summed across all CPUs).
 
-> Status (2026-04-25): spec-only. The interpreter and emitter both produce counters, but the runner does not yet read them out for assertion.
+> Status (2026-05-01): **deferred to v0.3** per the pre-soak hardening audit. The interpreter and emitter both produce counters; the runner does not yet read the per-CPU counter map after `BPF_PROG_TEST_RUN`. `expected.counter_changes` is silently ignored — the runner does not fail a case for missing the assertion. v0.3 ships a `_read_counter_deltas` helper alongside the existing `_build_geoip_map_init`. Until then, a `count <n>` rule's effect is verified by inspection of the emitted C and via the existing `bpf_action` agreement check.
 
 ### `log_events`
 
@@ -172,7 +172,7 @@ expected:
 
 Mismatch in count (more or fewer events than expected), order, or any specified field is a failure.
 
-> Status (2026-04-25): spec-only. The emitter generates ringbuf submissions; the runner does not yet drain the ringbuf for assertion.
+> Status (2026-05-01): **deferred to v0.3** per the pre-soak hardening audit. The emitter generates ringbuf submissions; the runner does not yet drain the ringbuf after `BPF_PROG_TEST_RUN`. `expected.log_events` is silently ignored. The defer note in `counter_changes` above applies equally here: the runner needs a ringbuf-drain helper paired with `bpf_runner.run` before this assertion can fire.
 
 ## Builder Mini-Language Reference
 

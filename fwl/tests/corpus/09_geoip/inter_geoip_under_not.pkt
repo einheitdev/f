@@ -1,0 +1,15 @@
+name: "not (geoip): drops everything outside the allowed country"
+source_fw: |
+  @xdp(eth0)
+  drop if not (pkt.src_ip in geoip(US))
+  default allow
+
+geoip_data:
+  US: ["8.0.0.0/8"]
+
+test_packet:
+  builder: tcp(src_ip="1.2.3.4", dst_port=80)
+
+expected:
+  compiles: true
+  bpf_action: drop

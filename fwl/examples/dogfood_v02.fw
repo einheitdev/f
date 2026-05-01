@@ -1,0 +1,35 @@
+# v0.2 dogfood — combines IPv6, geoip(), and Tier 2.
+#
+# Mirrors a small production firewall: trust internal traffic on
+# both IPv4 and IPv6, drop traffic from a known-bad-actor country
+# list, allow common public services, drop everything else.
+#
+# Activates the v6 parse path via pkt.src_ip6, so pkt.proto == tcp/udp
+# match both v4 and v6 frames per the proto-enum table in the v0.2
+# spec. SSH gets per-source-IP rate limiting on each family.
+
+@xdp(eth0)
+
+def firewall(pkt):
+  # Internal v4 networks — trust unconditionally.
+  if pkt.src_ip in [10.0.0.0/8, 192.168.0.0/16, 172.16.0.0/12]:
+    allow
+
+  # Internal v6 networks — RFC 4193 unique-local.
+  if pkt.src_ip6 in fc00::/7:
+    allow
+
+  # Drop traffic from a known-bad-actor country list (v4 + v6).
+  if pkt.src_ip in geoip(RU, CN, KP):
+    drop
+  if pkt.src_ip6 in geoip(RU, CN, KP):
+    drop
+
+  # Common inbound services for both families.
+  if pkt.proto == tcp and pkt.dst_port in [80, 443]:
+    allow
+  if pkt.proto == udp and pkt.dst_port == 53:
+    allow
+
+  # Default: drop unsolicited inbound.
+  drop

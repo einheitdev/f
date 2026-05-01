@@ -143,4 +143,6 @@ class TestComposition:
     src = emit(
       "@xdp(eth0)\ndrop if pkt.proto == tcp and not pkt.tcp.syn\n"
     )
-    assert "!(tcp_syn)" in src
+    # v0.2: bool-field reads are gated on l4_ok to keep non-TCP
+    # frames out of the rule body.
+    assert "!((l4_ok && tcp_syn))" in src

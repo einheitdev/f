@@ -1,0 +1,15 @@
+name: "Tier 2: reassign local with different type"
+source_fw: |
+  @xdp(eth0)
+  def firewall(pkt):
+    x = 1
+    if pkt.proto == tcp and pkt.dst_port == 80:
+      x = pkt.src_ip
+      log
+    drop
+
+test_packet:
+  builder: tcp()
+
+expected:
+  compiles: false

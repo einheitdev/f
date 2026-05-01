@@ -1,0 +1,14 @@
+name: "Tier 2: pkt.proto in [tcp, udp] disjunction-establishes l4"
+source_fw: |
+  @xdp(eth0)
+  def firewall(pkt):
+    if pkt.proto in [tcp, udp] and pkt.dst_port in [80, 443]:
+      allow
+    drop
+
+test_packet:
+  builder: udp(dst_port=443)
+
+expected:
+  compiles: true
+  bpf_action: allow

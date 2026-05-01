@@ -1,0 +1,12 @@
+name: "Tier 1 + Tier 2 in same program is rejected"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.proto == tcp
+  def firewall(pkt):
+    allow
+
+test_packet:
+  builder: tcp()
+
+expected:
+  compiles: false

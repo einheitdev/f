@@ -1,0 +1,15 @@
+name: "v4 source one address past the /16 boundary does NOT match"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.src_ip in geoip(RU)
+  default allow
+
+geoip_data:
+  RU: ["5.8.0.0/16"]
+
+test_packet:
+  builder: tcp(src_ip="5.9.0.0", dst_port=80)
+
+expected:
+  compiles: true
+  bpf_action: allow
