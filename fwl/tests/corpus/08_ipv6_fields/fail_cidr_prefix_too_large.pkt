@@ -1,0 +1,11 @@
+name: "IPv6 CIDR prefix /130 exceeds the 0..128 range"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.src_ip6 in 2001:db8::/130
+  default allow
+
+test_packet:
+  builder: tcp6()
+
+expected:
+  compiles: false

@@ -1,0 +1,14 @@
+name: "Tier 2: nested if-then-drop, fall-through to allow"
+source_fw: |
+  @xdp(eth0)
+  def firewall(pkt):
+    if pkt.proto == tcp and pkt.dst_port == 22:
+      drop
+    allow
+
+test_packet:
+  builder: tcp(dst_port=22)
+
+expected:
+  compiles: true
+  bpf_action: drop

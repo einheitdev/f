@@ -1,0 +1,15 @@
+name: "Tier 2: else-branch is NOT dominated by the if's guard"
+source_fw: |
+  @xdp(eth0)
+  def firewall(pkt):
+    if pkt.proto == tcp:
+      log
+    else:
+      port = pkt.dst_port
+    drop
+
+test_packet:
+  builder: tcp()
+
+expected:
+  compiles: false

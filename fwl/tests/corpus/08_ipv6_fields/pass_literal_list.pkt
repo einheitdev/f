@@ -1,0 +1,12 @@
+name: "v6 in literal list matches loopback"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.src_ip6 in [::1, ::ffff:1.2.3.4]
+  default allow
+
+test_packet:
+  builder: tcp6(src_ip="::1", dst_port=80)
+
+expected:
+  compiles: true
+  bpf_action: drop

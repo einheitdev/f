@@ -143,16 +143,19 @@ auto HandleRequest(Engine& e, const std::string& req_str)
 auto EngineInit(Engine& e,
                 std::string_view sock_addr,
                 std::span<const std::string> ifaces,
-                std::string_view pin_path)
+                std::string_view pin_path,
+                std::string_view bundle_dir)
     -> std::expected<void, Error<EngineError>> {
   e.socket_addr = std::string(sock_addr);
   e.pin_path = std::string(pin_path);
   e.start_time_s = CurrentTimeS();
   e.state.store(EngineState::kStarting);
 
-  // Load BPF program.
+  // Load BPF program. When the operator has staged a bundle at
+  // <bundle_dir>/current, the cold-boot path picks it up; otherwise
+  // we fall back to the built-in search list.
   spdlog::info("Loading BPF program...");
-  auto bpf_res = LoadProgram();
+  auto bpf_res = LoadProgram(bundle_dir);
   if (!bpf_res) {
     return MakeError(EngineError::kBpfLoadFailed,
         bpf_res.error().message);

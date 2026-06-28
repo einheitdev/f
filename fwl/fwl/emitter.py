@@ -19,6 +19,7 @@ _PROTO_TO_IPPROTO = {
   ast.Proto.TCP: "IPPROTO_TCP",
   ast.Proto.UDP: "IPPROTO_UDP",
   ast.Proto.ICMP: "IPPROTO_ICMP",
+  ast.Proto.ICMP6: "IPPROTO_ICMPV6",
 }
 
 
@@ -28,6 +29,7 @@ _HEADER = """\
 #include <linux/bpf.h>
 #include <linux/if_ether.h>
 #include <linux/ip.h>
+#include <linux/ipv6.h>
 #include <linux/in.h>
 #include <linux/tcp.h>
 #include <linux/udp.h>
@@ -112,19 +114,30 @@ def _referenced_fields(program: ast.Program) -> set[str]:
 
   Includes fields used in conditions, rate_limit bucket keys, AND log
   events (the log_event struct carries every L4 field). Any program
-  with a `log` rule needs the full prelude.
+  with a `log` rule (or a Tier 2 `log` statement) needs the full
+  prelude. Tier 2 statement-position field reads (assignment RHS or
+  inner-condition reads) are also collected.
   """
   fields: set[str] = set()
   has_log = False
   for rule in program.rules:
     for n in _walk(rule.condition):
       if isinstance(n, ast.Comparison):
-        fields.add(n.field.name)
+        if isinstance(n.field, ast.FieldRef):
+          fields.add(n.field.name)
+        if isinstance(n.operand, ast.FieldRef):
+          fields.add(n.operand.name)
       elif isinstance(n, ast.BoolField):
         fields.add(n.field.name)
     if rule.modifier is not None:
       fields.add(_RL_FIELD_TO_AST[rule.modifier.per_field])
     if rule.action == ast.Action.LOG:
+      has_log = True
+  if program.function is not None:
+    log_in_func = _collect_tier2_field_refs(
+      program.function.body, fields
+    )
+    if log_in_func:
       has_log = True
   if has_log:
     fields.update({
@@ -133,6 +146,71 @@ def _referenced_fields(program: ast.Program) -> set[str]:
       ast.FIELD_TCP_SYN, ast.FIELD_TCP_ACK,
     })
   return fields
+
+
+def _collect_tier2_field_refs(stmts, fields: set[str]) -> bool:
+  """Walk Tier 2 stmts collecting referenced field names. Returns
+  True iff a `log` statement is present (caller widens the field set
+  to cover the log_event struct)."""
+  has_log = False
+  for s in stmts:
+    if isinstance(s, ast.AssignStmt):
+      for n in _walk_with_compares(s.rhs):
+        _add_field_refs_from_node(n, fields)
+    elif isinstance(s, ast.IfStmt):
+      for n in _walk_with_compares(s.cond):
+        _add_field_refs_from_node(n, fields)
+      if _collect_tier2_field_refs(s.body, fields):
+        has_log = True
+      for cond, body in s.elif_branches:
+        for n in _walk_with_compares(cond):
+          _add_field_refs_from_node(n, fields)
+        if _collect_tier2_field_refs(body, fields):
+          has_log = True
+      if s.else_body is not None:
+        if _collect_tier2_field_refs(s.else_body, fields):
+          has_log = True
+    elif isinstance(s, ast.ActionStmt):
+      if s.action == ast.Action.LOG:
+        has_log = True
+      if s.action == ast.Action.COUNT:
+        # COUNT side-effect uses no field reads.
+        pass
+  return has_log
+
+
+def _walk_with_compares(node):
+  """Walk a condition/scalar_expr yielding every Comparison and BoolField."""
+  if node is None:
+    return
+  if isinstance(node, ast.Comparison):
+    yield node
+    return
+  if isinstance(node, ast.BoolField):
+    yield node
+    return
+  if isinstance(node, ast.FieldRef):
+    yield node
+    return
+  if isinstance(node, ast.NotOp):
+    yield from _walk_with_compares(node.inner)
+    return
+  if isinstance(node, (ast.AndOp, ast.OrOp)):
+    for c in node.operands:
+      yield from _walk_with_compares(c)
+
+
+def _add_field_refs_from_node(node, fields: set[str]) -> None:
+  """Add every field name reached by `node` to `fields`."""
+  if isinstance(node, ast.Comparison):
+    if isinstance(node.field, ast.FieldRef):
+      fields.add(node.field.name)
+    if isinstance(node.operand, ast.FieldRef):
+      fields.add(node.operand.name)
+  elif isinstance(node, ast.BoolField):
+    fields.add(node.field.name)
+  elif isinstance(node, ast.FieldRef):
+    fields.add(node.name)
 
 
 def _needs_l4(fields: set[str]) -> bool:
@@ -145,6 +223,71 @@ def _needs_tcp(fields: set[str]) -> bool:
   return bool(fields & ast.TCP_FLAG_FIELDS)
 
 
+def _is_v6_active(program: ast.Program) -> bool:
+  """True iff the program touches any IPv6 surface (v0.2).
+
+  Per FWL_V02_SPEC.md "Compilation" section, a program activates the
+  v6 parse path when it mentions `pkt.src_ip6`/`pkt.dst_ip6`, an
+  IPv6 literal, an IPv6 CIDR, or the `icmp6` proto keyword. v0.1-
+  shaped programs (no v6 surface) get v0.1's IPv4-only parse and
+  preserve strict-superset semantics.
+
+  Tier 2: walk the function body's conditions and assignment RHSs.
+  """
+  for rule in program.rules:
+    for n in _walk(rule.condition):
+      if _node_activates_v6(n):
+        return True
+  if program.function is not None:
+    if _stmts_activate_v6(program.function.body):
+      return True
+  return False
+
+
+def _node_activates_v6(n) -> bool:
+  if isinstance(n, ast.Comparison):
+    if isinstance(n.field, ast.FieldRef) and n.field.name in ast.IP6_FIELDS:
+      return True
+    if isinstance(n.operand, ast.FieldRef) and n.operand.name in ast.IP6_FIELDS:
+      return True
+    op = n.operand
+    if isinstance(op, (ast.Ipv6Literal, ast.Ipv6CidrLiteral,
+                       ast.Ipv6CidrListLiteral)):
+      return True
+    if isinstance(op, ast.ProtoLiteral) and op.proto == ast.Proto.ICMP6:
+      return True
+    if isinstance(op, ast.ListLiteral):
+      for item in op.items:
+        if isinstance(item, ast.Ipv6Literal):
+          return True
+  if isinstance(n, ast.FieldRef) and n.name in ast.IP6_FIELDS:
+    return True
+  return False
+
+
+def _stmts_activate_v6(stmts) -> bool:
+  for s in stmts:
+    if isinstance(s, ast.AssignStmt):
+      for n in _walk_with_compares(s.rhs):
+        if _node_activates_v6(n):
+          return True
+    elif isinstance(s, ast.IfStmt):
+      for n in _walk_with_compares(s.cond):
+        if _node_activates_v6(n):
+          return True
+      if _stmts_activate_v6(s.body):
+        return True
+      for cond, body in s.elif_branches:
+        for n in _walk_with_compares(cond):
+          if _node_activates_v6(n):
+            return True
+        if _stmts_activate_v6(body):
+          return True
+      if s.else_body is not None and _stmts_activate_v6(s.else_body):
+        return True
+  return False
+
+
 def _emit_parse_prelude(program: ast.Program) -> str:
   """Emit the packet-parsing prelude.
 
@@ -152,6 +295,14 @@ def _emit_parse_prelude(program: ast.Program) -> str:
   when each parse step succeeds. Truncated or non-IPv4 packets fall
   through to subsequent rules (and the default) per
   FWL_V01_SPEC.md:185-191.
+
+  v0.2: when the program touches an IPv6 surface (FWL_V02_SPEC.md
+  "Compilation" section), the prelude branches on EtherType — v4
+  frames take the existing IPv4 path; v6 frames read the IPv6
+  fixed header and the same L4 fields, populating the same
+  variables (proto, src_port, ...) plus src_ip6_hi/lo and
+  dst_ip6_hi/lo. The two paths share variable storage so the
+  rule-emission code can reference them uniformly.
   """
   fields = _referenced_fields(program)
   if not fields:
@@ -159,12 +310,34 @@ def _emit_parse_prelude(program: ast.Program) -> str:
 
   needs_l4 = _needs_l4(fields)
   needs_tcp = _needs_tcp(fields)
+  v6_active = _is_v6_active(program)
 
   decls: list[str] = ["__u8 proto = 0;"]
+  # v4_ok gates every v4-field comparison so that v6-packet (or non-IP
+  # frame) zeros don't spuriously match `pkt.src_ip == 0.0.0.0`,
+  # `pkt.src_ip in [0.0.0.0/0]`, or `pkt.dst_port == 0`. Set to 1 only
+  # inside the IPv4 branch after the fixed-header bounds check
+  # succeeds, mirroring the v6_ok pattern.
+  decls.append("__u8 v4_ok = 0;")
+  # l4_ok gates port and TCP-flag reads. Set to 1 only inside the
+  # TCP/UDP guard blocks after the L4 bounds check succeeds.
+  if _needs_l4(fields):
+    decls.append("__u8 l4_ok = 0;")
   if ast.FIELD_SRC_IP in fields:
     decls.append("__u32 src_ip = 0;")
   if ast.FIELD_DST_IP in fields:
     decls.append("__u32 dst_ip = 0;")
+  # v6_ok gates every IPv6 comparison so that v4-packet zeros don't
+  # spuriously match `pkt.src_ip6 == ::` or `pkt.src_ip6 != <non-zero>`.
+  # Set to 1 only inside the v6 branch after the 40-byte fixed-header
+  # bounds check succeeds. Always declared so `(v4_ok || v6_ok)` is a
+  # well-formed L3-gate expression even in v0.1-shaped programs (where
+  # v6_ok stays 0 and the OR degrades to v4_ok).
+  decls.append("__u8 v6_ok = 0;")
+  if ast.FIELD_SRC_IP6 in fields:
+    decls.append("__u64 src_ip6_hi = 0, src_ip6_lo = 0;")
+  if ast.FIELD_DST_IP6 in fields:
+    decls.append("__u64 dst_ip6_hi = 0, dst_ip6_lo = 0;")
   if ast.FIELD_SRC_PORT in fields:
     decls.append("__u16 src_port = 0;")
   if ast.FIELD_DST_PORT in fields:
@@ -185,9 +358,9 @@ def _emit_parse_prelude(program: ast.Program) -> str:
   if ip_read_block:
     ip_read_block = "\n" + ip_read_block
 
+  # IPv4 L4 parse — variable IHL.
   l4_block = ""
   if needs_l4:
-    # Variable IHL: L4 starts at ip + ihl*4.
     port_reads_tcp = []
     port_reads_udp = []
     if ast.FIELD_SRC_PORT in fields:
@@ -219,6 +392,7 @@ def _emit_parse_prelude(program: ast.Program) -> str:
           if (proto == IPPROTO_TCP) {{
             struct tcphdr *tcp = (void *)ip + ip_hlen;
             if ((void *)(tcp + 1) <= data_end) {{
+              l4_ok = 1;
 {tcp_branch}
             }}
           }}"""
@@ -229,6 +403,7 @@ def _emit_parse_prelude(program: ast.Program) -> str:
           if (proto == IPPROTO_UDP) {{
             struct udphdr *udp = (void *)ip + ip_hlen;
             if ((void *)(udp + 1) <= data_end) {{
+              l4_ok = 1;
 {udp_branch}
             }}
           }}"""
@@ -239,6 +414,21 @@ def _emit_parse_prelude(program: ast.Program) -> str:
             (void *)ip + ip_hlen <= data_end) {{{tcp_block}{udp_block}
         }}"""
 
+  v6_branch = ""
+  if v6_active:
+    v6_branch = _emit_v6_branch(fields, needs_l4, needs_tcp)
+
+  # Non-IP frame early-out. Any program that references an IP-aware
+  # field (and therefore generates this prelude) cannot meaningfully
+  # filter on ARP, NDP, LLDP, or any other L2 control protocol — its
+  # rule guards are all gated on v4_ok / v6_ok. Without this gate,
+  # an explicit `drop` action (Tier 1 `default drop` or a Tier 2
+  # trailing `drop` statement) compiles to `return XDP_DROP;` at the
+  # function tail and silently drops ARP, killing the management
+  # plane within minutes of going live. Surfaced by the v0.2 dogfood
+  # soak (planning/SOAK_INCIDENTS.md Incident #3, 2026-05-02). Treated
+  # as an intentional v0.2 semantic improvement per the v4_ok/l4_ok
+  # precedent recorded in CLAUDE.md "Operating reminders".
   return f"""\
 {decl_block}
   void *data = (void *)(long)ctx->data;
@@ -248,12 +438,99 @@ def _emit_parse_prelude(program: ast.Program) -> str:
     if (eth->h_proto == bpf_htons(ETH_P_IP)) {{
       struct iphdr *ip = (void *)(eth + 1);
       if ((void *)(ip + 1) <= data_end) {{
+        v4_ok = 1;
         proto = ip->protocol;{ip_read_block}{l4_block}
       }}
-    }}
+    }}{v6_branch}
   }}
+  if (!v4_ok && !v6_ok) return XDP_PASS;
 
 """
+
+
+def _emit_v6_branch(
+  fields: set[str], needs_l4: bool, needs_tcp: bool
+) -> str:
+  """Emit the IPv6 parse branch for the dual-stack prelude (v0.2).
+
+  Reads the 40-byte fixed header at offset 14, populates the
+  src_ip6_hi/lo and dst_ip6_hi/lo locals, then parses TCP/UDP at
+  the fixed offset (no extension-header chasing per FWL_V02_SPEC.md).
+  Other next_header values (extension headers, ICMPv6) leave the
+  L4 fields at zero so rules touching them fall through.
+  """
+  reads: list[str] = []
+  if ast.FIELD_SRC_IP6 in fields:
+    reads.append(
+      "        src_ip6_hi = "
+      "((__u64)bpf_ntohl(ip6->saddr.s6_addr32[0]) << 32) | "
+      "bpf_ntohl(ip6->saddr.s6_addr32[1]);\n"
+      "        src_ip6_lo = "
+      "((__u64)bpf_ntohl(ip6->saddr.s6_addr32[2]) << 32) | "
+      "bpf_ntohl(ip6->saddr.s6_addr32[3]);"
+    )
+  if ast.FIELD_DST_IP6 in fields:
+    reads.append(
+      "        dst_ip6_hi = "
+      "((__u64)bpf_ntohl(ip6->daddr.s6_addr32[0]) << 32) | "
+      "bpf_ntohl(ip6->daddr.s6_addr32[1]);\n"
+      "        dst_ip6_lo = "
+      "((__u64)bpf_ntohl(ip6->daddr.s6_addr32[2]) << 32) | "
+      "bpf_ntohl(ip6->daddr.s6_addr32[3]);"
+    )
+  read_block = "\n".join(reads)
+  if read_block:
+    read_block = "\n" + read_block
+
+  # IPv6 L4 parse: fixed offset, TCP/UDP only. Extension headers
+  # (next_header in {0, 43, 44, ...}) leave L4 fields at zero.
+  l4_block = ""
+  if needs_l4:
+    port_tcp: list[str] = []
+    port_udp: list[str] = []
+    if ast.FIELD_SRC_PORT in fields:
+      port_tcp.append("            src_port = bpf_ntohs(tcp->source);")
+      port_udp.append("            src_port = bpf_ntohs(udp->source);")
+    if ast.FIELD_DST_PORT in fields:
+      port_tcp.append("            dst_port = bpf_ntohs(tcp->dest);")
+      port_udp.append("            dst_port = bpf_ntohs(udp->dest);")
+    tcp_flags: list[str] = []
+    if needs_tcp:
+      if ast.FIELD_TCP_SYN in fields:
+        tcp_flags.append("            tcp_syn = tcp->syn;")
+      if ast.FIELD_TCP_ACK in fields:
+        tcp_flags.append("            tcp_ack = tcp->ack;")
+    tcp_branch = "\n".join(port_tcp + tcp_flags)
+    udp_branch = "\n".join(port_udp)
+    tcp_block = ""
+    if tcp_branch:
+      tcp_block = f"""
+        if (proto == IPPROTO_TCP) {{
+          struct tcphdr *tcp = (void *)(ip6 + 1);
+          if ((void *)(tcp + 1) <= data_end) {{
+            l4_ok = 1;
+{tcp_branch}
+          }}
+        }}"""
+    udp_block = ""
+    if udp_branch:
+      udp_block = f"""
+        if (proto == IPPROTO_UDP) {{
+          struct udphdr *udp = (void *)(ip6 + 1);
+          if ((void *)(udp + 1) <= data_end) {{
+            l4_ok = 1;
+{udp_branch}
+          }}
+        }}"""
+    l4_block = tcp_block + udp_block
+
+  return f""" else if (eth->h_proto == bpf_htons(ETH_P_IPV6)) {{
+      struct ipv6hdr *ip6 = (void *)(eth + 1);
+      if ((void *)(ip6 + 1) <= data_end) {{
+        v6_ok = 1;
+        proto = ip6->nexthdr;{read_block}{l4_block}
+      }}
+    }}"""
 
 
 def _emit_condition(node: ast.Condition) -> str:
@@ -276,11 +553,17 @@ def _emit_condition(node: ast.Condition) -> str:
 
 
 def _emit_bool_field(node: ast.BoolField) -> str:
-  """Emit a C expression for a bare bool field."""
+  """Emit a C expression for a bare bool field.
+
+  Gated on `l4_ok` so a non-TCP frame (or an IP frame with no L4
+  parse) cannot spuriously evaluate `if pkt.tcp.syn:` to true when
+  the underlying byte stays 0 (which it does on every non-TCP
+  packet, by construction).
+  """
   if node.field.name == ast.FIELD_TCP_SYN:
-    return "tcp_syn"
+    return "(l4_ok && tcp_syn)"
   if node.field.name == ast.FIELD_TCP_ACK:
-    return "tcp_ack"
+    return "(l4_ok && tcp_ack)"
   raise NotImplementedError(
     f"emitter: unsupported bool field {node.field.name}"
   )
@@ -302,6 +585,8 @@ def _emit_comparison(cmp: ast.Comparison) -> str:
     return _emit_proto_compare(cmp)
   if field_name in ast.IP_FIELDS:
     return _emit_ip_compare(cmp)
+  if field_name in ast.IP6_FIELDS:
+    return _emit_ip6_compare(cmp)
   if field_name in ast.PORT_FIELDS:
     return _emit_port_compare(cmp)
   raise NotImplementedError(
@@ -310,19 +595,41 @@ def _emit_comparison(cmp: ast.Comparison) -> str:
 
 
 def _emit_proto_compare(cmp: ast.Comparison) -> str:
-  """proto == tcp / proto != udp / etc."""
-  ipproto = _PROTO_TO_IPPROTO[cmp.operand.proto]  # type: ignore[union-attr]
-  return f"(proto {cmp.op} {ipproto})"
+  """proto == tcp, proto != udp, proto in [tcp, icmp6], etc.
+
+  Gated on `(v4_ok || v6_ok)` so a non-IP frame (where proto is the
+  zero default) cannot spuriously match `pkt.proto == 0` or
+  `pkt.proto != tcp` (which evaluates true when proto stays 0).
+  v6_ok is only declared in v6-active programs; for v0.1-shaped
+  programs the gate degrades to `v4_ok`, which is the same as
+  v0.1's implicit "non-IP frames don't match" intent.
+  """
+  if isinstance(cmp.operand, ast.ListLiteral):
+    parts = [
+      f"(proto == {_PROTO_TO_IPPROTO[item.proto]})"
+      for item in cmp.operand.items
+    ]
+    body = "(" + " || ".join(parts) + ")"
+  else:
+    ipproto = _PROTO_TO_IPPROTO[cmp.operand.proto]  # type: ignore[union-attr]
+    body = f"(proto {cmp.op} {ipproto})"
+  return f"((v4_ok || v6_ok) && {body})"
 
 
 def _emit_ip_compare(cmp: ast.Comparison) -> str:
-  """src_ip/dst_ip comparisons (== / != / in)."""
+  """src_ip/dst_ip comparisons (== / != / in).
+
+  Gated on `v4_ok` so non-IPv4 frames (v6 packets, ARP, etc.) where
+  src_ip/dst_ip stay at their zero default cannot spuriously match
+  `pkt.src_ip == 0.0.0.0`, `pkt.src_ip in [0.0.0.0/0]`, or any other
+  pattern that evaluates true when the field is 0.
+  """
   c_field = _FIELD_TO_C[cmp.field.name]
   if cmp.op in ("==", "!="):
     val = cmp.operand.value  # type: ignore[union-attr]
-    return f"({c_field} {cmp.op} 0x{val:08X}u)"
+    return f"(v4_ok && ({c_field} {cmp.op} 0x{val:08X}u))"
   if cmp.op == "in":
-    return _emit_ip_in(c_field, cmp.operand)
+    return f"(v4_ok && {_emit_ip_in(c_field, cmp.operand)})"
   raise NotImplementedError(
     f"emitter: ip op {cmp.op} not supported"
   )
@@ -342,6 +649,8 @@ def _emit_ip_in(c_field: str, operand: ast.Operand) -> str:
       if isinstance(item, ast.IPv4Literal)
     ]
     return "(" + " || ".join(parts) + ")"
+  if isinstance(operand, ast.GeoIp):
+    return f"fwl_geoip_{operand.call_index}_v4({c_field})"
   raise NotImplementedError(
     f"emitter: ip 'in' operand {type(operand).__name__} not supported"
   )
@@ -357,14 +666,123 @@ def _emit_cidr_match(c_field: str, cidr: ast.CidrLiteral) -> str:
   )
 
 
+_IP6_FIELD_TO_C = {
+  ast.FIELD_SRC_IP6: ("src_ip6_hi", "src_ip6_lo"),
+  ast.FIELD_DST_IP6: ("dst_ip6_hi", "dst_ip6_lo"),
+}
+
+
+def _split_ipv6_value(value: int) -> tuple[int, int]:
+  """Split a 128-bit IPv6 integer into (hi 64 bits, lo 64 bits)."""
+  return (value >> 64) & 0xFFFFFFFFFFFFFFFF, value & 0xFFFFFFFFFFFFFFFF
+
+
+def _emit_ip6_compare(cmp: ast.Comparison) -> str:
+  """Emit a C boolean expression for an IPv6 field comparison.
+
+  ==/!= split the 128-bit literal into two 64-bit halves and compare
+  each half independently — the BPF verifier dislikes 128-bit ops.
+  Every comparison is gated by `v6_ok`, the flag the prelude sets to
+  1 only after the v6 fixed-header bounds check succeeds. Without
+  the gate, a v4 packet (where hi=lo=0) would spuriously match
+  `pkt.src_ip6 == ::` and `pkt.src_ip6 != <non-zero>`.
+  """
+  hi_var, lo_var = _IP6_FIELD_TO_C[cmp.field.name]
+  if cmp.op in ("==", "!="):
+    lit = cmp.operand.value  # type: ignore[union-attr]
+    lit_hi, lit_lo = _split_ipv6_value(lit)
+    if cmp.op == "==":
+      body = (
+        f"{hi_var} == 0x{lit_hi:016X}ull && "
+        f"{lo_var} == 0x{lit_lo:016X}ull"
+      )
+    else:
+      body = (
+        f"{hi_var} != 0x{lit_hi:016X}ull || "
+        f"{lo_var} != 0x{lit_lo:016X}ull"
+      )
+    return f"(v6_ok && ({body}))"
+  if cmp.op == "in":
+    return f"(v6_ok && {_emit_ip6_in(hi_var, lo_var, cmp.operand)})"
+  raise NotImplementedError(
+    f"emitter: ipv6 op {cmp.op} not supported"
+  )
+
+
+def _emit_ip6_in(hi_var: str, lo_var: str, operand: ast.Operand) -> str:
+  """Emit a C expression for `<ipv6_field> in <operand>`."""
+  if isinstance(operand, ast.Ipv6CidrLiteral):
+    return _emit_ipv6_cidr_match(hi_var, lo_var, operand)
+  if isinstance(operand, ast.Ipv6CidrListLiteral):
+    parts = [
+      _emit_ipv6_cidr_match(hi_var, lo_var, c) for c in operand.items
+    ]
+    return "(" + " || ".join(parts) + ")"
+  if isinstance(operand, ast.ListLiteral):
+    parts = []
+    for item in operand.items:
+      if isinstance(item, ast.Ipv6Literal):
+        lit_hi, lit_lo = _split_ipv6_value(item.value)
+        parts.append(
+          f"({hi_var} == 0x{lit_hi:016X}ull && "
+          f"{lo_var} == 0x{lit_lo:016X}ull)"
+        )
+    return "(" + " || ".join(parts) + ")"
+  if isinstance(operand, ast.GeoIp):
+    return f"fwl_geoip_{operand.call_index}_v6({hi_var}, {lo_var})"
+  raise NotImplementedError(
+    f"emitter: ipv6 'in' operand {type(operand).__name__} not supported"
+  )
+
+
+def _emit_ipv6_cidr_match(
+  hi_var: str, lo_var: str, cidr: ast.Ipv6CidrLiteral
+) -> str:
+  """Emit a C expression for an IPv6 CIDR membership test.
+
+  The 128-bit prefix and mask are split across the hi/lo halves:
+    bits == 0    -> always true (default-route equivalent ::/0)
+    bits <= 64   -> only hi matters; lo is unconstrained
+    bits == 64   -> hi must match exactly; lo is unconstrained
+    bits >  64   -> hi must match exactly; lo is partially masked
+    bits == 128  -> both halves must match exactly
+  """
+  if cidr.bits == 0:
+    return "1"
+  prefix_hi, prefix_lo = _split_ipv6_value(cidr.prefix)
+  if cidr.bits <= 64:
+    mask_hi = ((1 << cidr.bits) - 1) << (64 - cidr.bits)
+    return (
+      f"(({hi_var} & 0x{mask_hi:016X}ull) == 0x{prefix_hi:016X}ull)"
+    )
+  # bits in 65..128: hi is full mask, lo is partially masked.
+  if cidr.bits == 128:
+    return (
+      f"({hi_var} == 0x{prefix_hi:016X}ull && "
+      f"{lo_var} == 0x{prefix_lo:016X}ull)"
+    )
+  lo_bits = cidr.bits - 64
+  mask_lo = ((1 << lo_bits) - 1) << (64 - lo_bits)
+  return (
+    f"({hi_var} == 0x{prefix_hi:016X}ull && "
+    f"({lo_var} & 0x{mask_lo:016X}ull) == 0x{prefix_lo:016X}ull)"
+  )
+
+
 def _emit_port_compare(cmp: ast.Comparison) -> str:
-  """Port comparisons (== / != / < / > / <= / >= / in)."""
+  """Port comparisons (== / != / < / > / <= / >= / in).
+
+  Gated on `l4_ok` so frames where the L4 parse never ran (non-IP,
+  ICMPv6, IPv6 extension headers, IHL-mismatch) cannot spuriously
+  match `pkt.dst_port == 0` or `pkt.dst_port != 80` (which evaluates
+  true when dst_port stays 0).
+  """
   c_field = _FIELD_TO_C[cmp.field.name]
   if cmp.op in ("==", "!=", "<", ">", "<=", ">="):
     val = cmp.operand.value  # type: ignore[union-attr]
-    return f"({c_field} {cmp.op} {val})"
+    return f"(l4_ok && ({c_field} {cmp.op} {val}))"
   if cmp.op == "in":
-    return _emit_port_in(c_field, cmp.operand)
+    return f"(l4_ok && {_emit_port_in(c_field, cmp.operand)})"
   raise NotImplementedError(
     f"emitter: port op {cmp.op} not supported"
   )
@@ -396,10 +814,13 @@ def _emit_rule(
   gates the entire rule body — when blocked, neither the action's
   side effect nor return fires.
   """
+  overflow_slot = counter_slots.get(RATE_LIMIT_OVERFLOW_COUNTER)
   if rule.action in _TERMINAL_ACTION_TO_RETURN:
     ret = _TERMINAL_ACTION_TO_RETURN[rule.action]
     if rule.modifier is not None:
-      fire_block = _emit_rate_limit_gate(rule.modifier, idx, ret)
+      fire_block = _emit_rate_limit_gate(
+        rule.modifier, idx, ret, overflow_slot
+      )
     else:
       fire_block = f"return {ret};"
   else:
@@ -415,7 +836,7 @@ def _emit_rule(
       )
     if rule.modifier is not None:
       fire_block = _emit_rate_limit_side_effect(
-        rule.modifier, idx, side_effect
+        rule.modifier, idx, side_effect, overflow_slot
       )
     else:
       fire_block = side_effect
@@ -452,15 +873,32 @@ def _emit_count(slot: int) -> str:
     }}"""
 
 
+def _emit_rate_limit_overflow(overflow_slot: int | None) -> str:
+  """Emit the post-update overflow check (or empty when no slot)."""
+  if overflow_slot is None:
+    return ""
+  return f"""
+    if (upd_rc == -7) {{
+      __u32 ovf_slot = {overflow_slot};
+      __u64 *ovf = bpf_map_lookup_elem(&fwl_counters, &ovf_slot);
+      if (ovf) __sync_fetch_and_add(ovf, 1);
+    }}"""
+
+
 def _emit_rate_limit_side_effect(
-  mod: ast.RateLimit, idx: int, side_effect: str
+  mod: ast.RateLimit, idx: int, side_effect: str,
+  overflow_slot: int | None,
 ) -> str:
   """Wrap a non-terminal side effect with rate_limit gating.
 
   Counts every matching packet in the bucket; the side effect fires
   only once the bucket count reaches the threshold (rate exceeded).
+  When the per-CPU map's bucket key space is exhausted, the
+  reserved `__rate_limit_overflow` counter ticks once per dropped
+  insert.
   """
   c_field = _RL_FIELD_TO_C[mod.per_field]
+  ovf = _emit_rate_limit_overflow(overflow_slot)
   return f"""__u32 rl_key = (__u32){c_field};
     __u64 now = bpf_ktime_get_ns();
     struct fwl_rl_state *st =
@@ -472,22 +910,28 @@ def _emit_rate_limit_side_effect(
       cur_ts = st->ts;
     }}
     struct fwl_rl_state new_st = {{ .ts = cur_ts, .count = cur + 1 }};
-    bpf_map_update_elem(&fwl_rl_map_{idx}, &rl_key, &new_st, BPF_ANY);
+    int upd_rc = bpf_map_update_elem(
+      &fwl_rl_map_{idx}, &rl_key, &new_st, BPF_ANY);{ovf}
     if (cur >= {mod.threshold}) {{
       {side_effect}
     }}"""
 
 
-def _emit_rate_limit_gate(mod: ast.RateLimit, idx: int, ret: str) -> str:
+def _emit_rate_limit_gate(
+  mod: ast.RateLimit, idx: int, ret: str,
+  overflow_slot: int | None,
+) -> str:
   """Emit a rate-limit gate that returns `ret` only when rate exceeded.
 
   Reads the bucket counter from the per-CPU map; if (now - ts) >= 1s
   the counter resets. Every matching packet bumps the counter; the
   rule fires once the count has reached the threshold (matching the
   user-facing reading: `drop ... limited by rate_limit(N)` drops the
-  N+1-th packet onward, not the first N).
+  N+1-th packet onward, not the first N). On bucket-key-space
+  exhaustion, the reserved `__rate_limit_overflow` counter ticks.
   """
   c_field = _RL_FIELD_TO_C[mod.per_field]
+  ovf = _emit_rate_limit_overflow(overflow_slot)
   return f"""__u32 rl_key = (__u32){c_field};
     __u64 now = bpf_ktime_get_ns();
     struct fwl_rl_state *st =
@@ -499,7 +943,8 @@ def _emit_rate_limit_gate(mod: ast.RateLimit, idx: int, ret: str) -> str:
       cur_ts = st->ts;
     }}
     struct fwl_rl_state new_st = {{ .ts = cur_ts, .count = cur + 1 }};
-    bpf_map_update_elem(&fwl_rl_map_{idx}, &rl_key, &new_st, BPF_ANY);
+    int upd_rc = bpf_map_update_elem(
+      &fwl_rl_map_{idx}, &rl_key, &new_st, BPF_ANY);{ovf}
     if (cur >= {mod.threshold}) {{
       return {ret};
     }}"""
@@ -522,13 +967,130 @@ struct {{
   return "\n".join(blocks)
 
 
+def _collect_geoip_calls(program: ast.Program) -> list[ast.GeoIp]:
+  """Walk every rule (Tier 1) and statement (Tier 2) collecting geoip
+  call sites in source order. Mirrors the analyzer's call-index
+  assignment so the emitted helpers' indices line up with the bundle
+  manifest."""
+  out: list[ast.GeoIp] = []
+  for rule in program.rules:
+    for n in _walk(rule.condition):
+      if isinstance(n, ast.Comparison) and isinstance(n.operand, ast.GeoIp):
+        out.append(n.operand)
+  if program.function is not None:
+    out.extend(_collect_geoip_in_stmts(program.function.body))
+  return out
+
+
+def _collect_geoip_in_stmts(stmts) -> list[ast.GeoIp]:
+  out: list[ast.GeoIp] = []
+  for s in stmts:
+    if isinstance(s, ast.AssignStmt):
+      for n in _walk_with_compares(s.rhs):
+        if isinstance(n, ast.Comparison) and isinstance(n.operand, ast.GeoIp):
+          out.append(n.operand)
+    elif isinstance(s, ast.IfStmt):
+      for n in _walk_with_compares(s.cond):
+        if isinstance(n, ast.Comparison) and isinstance(n.operand, ast.GeoIp):
+          out.append(n.operand)
+      out.extend(_collect_geoip_in_stmts(s.body))
+      for cond, body in s.elif_branches:
+        for n in _walk_with_compares(cond):
+          if isinstance(n, ast.Comparison) and isinstance(n.operand, ast.GeoIp):
+            out.append(n.operand)
+        out.extend(_collect_geoip_in_stmts(body))
+      if s.else_body is not None:
+        out.extend(_collect_geoip_in_stmts(s.else_body))
+  return out
+
+
+def _emit_geoip_maps_and_helpers(program: ast.Program) -> str:
+  """Emit one BPF_MAP_TYPE_LPM_TRIE + lookup helper per geoip call site.
+
+  Per FWL_V02_SPEC.md, each call site is bound to exactly one family
+  (ipv4 or ipv6) and gets its own LPM trie. The daemon populates
+  the trie at load time from `geoip.json`; the BPF program does the
+  lookup. Helpers are `__always_inline` so the verifier sees a flat
+  call site rather than a function-pointer indirection.
+  """
+  blocks: list[str] = []
+  seen: set[int] = set()
+  for call in _collect_geoip_calls(program):
+    if call.call_index in seen:
+      continue
+    seen.add(call.call_index)
+    if call.family == "ipv4":
+      blocks.append(f"""\
+struct fwl_geoip_{call.call_index}_key {{
+  __u32 prefixlen;
+  __u32 ip;
+}};
+
+struct {{
+  __uint(type, BPF_MAP_TYPE_LPM_TRIE);
+  __type(key, struct fwl_geoip_{call.call_index}_key);
+  __type(value, __u8);
+  __uint(max_entries, 65536);
+  __uint(map_flags, BPF_F_NO_PREALLOC);
+}} fwl_geoip_{call.call_index} SEC(".maps");
+
+static __always_inline int fwl_geoip_{call.call_index}_v4(__u32 ip) {{
+  struct fwl_geoip_{call.call_index}_key key = {{
+    .prefixlen = 32,
+    .ip = bpf_htonl(ip),
+  }};
+  return bpf_map_lookup_elem(&fwl_geoip_{call.call_index}, &key) != 0;
+}}
+""")
+    elif call.family == "ipv6":
+      blocks.append(f"""\
+struct fwl_geoip_{call.call_index}_key {{
+  __u32 prefixlen;
+  __u8  ip[16];
+}};
+
+struct {{
+  __uint(type, BPF_MAP_TYPE_LPM_TRIE);
+  __type(key, struct fwl_geoip_{call.call_index}_key);
+  __type(value, __u8);
+  __uint(max_entries, 65536);
+  __uint(map_flags, BPF_F_NO_PREALLOC);
+}} fwl_geoip_{call.call_index} SEC(".maps");
+
+static __always_inline int fwl_geoip_{call.call_index}_v6(
+    __u64 hi, __u64 lo) {{
+  struct fwl_geoip_{call.call_index}_key key = {{ .prefixlen = 128 }};
+  key.ip[0]  = (hi >> 56) & 0xff; key.ip[1]  = (hi >> 48) & 0xff;
+  key.ip[2]  = (hi >> 40) & 0xff; key.ip[3]  = (hi >> 32) & 0xff;
+  key.ip[4]  = (hi >> 24) & 0xff; key.ip[5]  = (hi >> 16) & 0xff;
+  key.ip[6]  = (hi >>  8) & 0xff; key.ip[7]  = (hi      ) & 0xff;
+  key.ip[8]  = (lo >> 56) & 0xff; key.ip[9]  = (lo >> 48) & 0xff;
+  key.ip[10] = (lo >> 40) & 0xff; key.ip[11] = (lo >> 32) & 0xff;
+  key.ip[12] = (lo >> 24) & 0xff; key.ip[13] = (lo >> 16) & 0xff;
+  key.ip[14] = (lo >>  8) & 0xff; key.ip[15] = (lo      ) & 0xff;
+  return bpf_map_lookup_elem(&fwl_geoip_{call.call_index}, &key) != 0;
+}}
+""")
+    else:
+      raise AssertionError(
+        f"geoip call {call.call_index} has no family bound; "
+        f"analyzer should have set it"
+      )
+  return "\n".join(blocks)
+
+
 def emit(program: ast.Program) -> str:
-  """Emit BPF C source for `program`."""
+  """Emit BPF C source for `program`.
+
+  Tier 1: prelude + per-rule blocks + final return.
+  Tier 2: prelude + locals declaration + statement-by-statement body.
+  """
   prelude = _emit_parse_prelude(program)
   rl_maps = _emit_rl_maps(program)
+  geoip_block = _emit_geoip_maps_and_helpers(program)
 
   counter_slots = _allocate_counter_slots(program)
-  has_log = any(r.action == ast.Action.LOG for r in program.rules)
+  has_log = _program_uses_log(program)
 
   log_decl = _LOG_EVENT_DECL if has_log else ""
   if counter_slots:
@@ -540,17 +1102,21 @@ def emit(program: ast.Program) -> str:
     counter_decl = ""
     counter_table = ""
 
-  body = "".join(
-    _emit_rule(r, i, counter_slots) for i, r in enumerate(program.rules)
-  )
-
-  if program.default is not None:
-    final_return = _TERMINAL_ACTION_TO_RETURN[program.default.action]
+  if program.function is not None:
+    body, final_return = _emit_tier2_body(
+      program.function, counter_slots, program
+    )
   else:
-    final_return = "XDP_PASS"
+    body = "".join(
+      _emit_rule(r, i, counter_slots) for i, r in enumerate(program.rules)
+    )
+    if program.default is not None:
+      final_return = _TERMINAL_ACTION_TO_RETURN[program.default.action]
+    else:
+      final_return = "XDP_PASS"
 
   return f"""{_HEADER}
-{log_decl}{counter_decl}{rl_maps}
+{log_decl}{counter_decl}{rl_maps}{geoip_block}
 SEC("xdp")
 int fwl_prog(struct xdp_md *ctx) {{
 {prelude}{body}  return {final_return};
@@ -560,12 +1126,343 @@ char _license[] SEC("license") = "GPL";
 {counter_table}"""
 
 
+def _program_uses_log(program: ast.Program) -> bool:
+  """True if any rule or Tier 2 statement uses log."""
+  if any(r.action == ast.Action.LOG for r in program.rules):
+    return True
+  if program.function is not None:
+    return _stmts_use_log(program.function.body)
+  return False
+
+
+def _stmts_use_log(stmts) -> bool:
+  for s in stmts:
+    if isinstance(s, ast.ActionStmt) and s.action == ast.Action.LOG:
+      return True
+    if isinstance(s, ast.IfStmt):
+      if _stmts_use_log(s.body):
+        return True
+      for _, body in s.elif_branches:
+        if _stmts_use_log(body):
+          return True
+      if s.else_body and _stmts_use_log(s.else_body):
+        return True
+  return False
+
+
+_LOCAL_C_TYPE = {
+  ast.LocalType.BOOL: "__u8",
+  ast.LocalType.U16: "__u16",
+  ast.LocalType.U32: "__u32",
+  ast.LocalType.IPV4: "__u32",
+  ast.LocalType.IPV6: "__u64",  # split into hi/lo halves below
+  ast.LocalType.PROTO: "__u8",
+}
+
+
+def _collect_tier2_locals(stmts, out: dict[str, ast.LocalType]) -> None:
+  """Walk Tier 2 stmts collecting (name, inferred type) pairs.
+
+  Mirrors the analyzer's source-order first-assignment binding rule.
+  """
+  for s in stmts:
+    if isinstance(s, ast.AssignStmt):
+      if s.name not in out:
+        out[s.name] = _infer_assign_type(s.rhs, out)
+    elif isinstance(s, ast.IfStmt):
+      _collect_tier2_locals(s.body, out)
+      for _, body in s.elif_branches:
+        _collect_tier2_locals(body, out)
+      if s.else_body is not None:
+        _collect_tier2_locals(s.else_body, out)
+
+
+def _infer_assign_type(
+  rhs, locals_: dict[str, ast.LocalType]
+) -> ast.LocalType:
+  """Light type inference for the emitter's local declarations.
+
+  Mirrors analyzer._infer_scalar_type but doesn't run dominator
+  checks — analyzer already validated the program. Recurses through
+  comparison/condition exprs (always bool-typed in v0.2).
+  """
+  if isinstance(rhs, ast.IntLiteral):
+    return ast.LocalType.U16 if rhs.value <= 0xFFFF else ast.LocalType.U32
+  if isinstance(rhs, ast.IPv4Literal):
+    return ast.LocalType.IPV4
+  if isinstance(rhs, ast.Ipv6Literal):
+    return ast.LocalType.IPV6
+  if isinstance(rhs, ast.ProtoLiteral):
+    return ast.LocalType.PROTO
+  if isinstance(rhs, ast.LocalRead):
+    return locals_[rhs.name]
+  if isinstance(rhs, ast.FieldRef):
+    return _FIELD_LOCAL_TYPE[rhs.name]
+  if isinstance(rhs, (ast.BoolField, ast.Comparison, ast.AndOp, ast.OrOp,
+                      ast.NotOp, ast.RateLimitCall)):
+    return ast.LocalType.BOOL
+  raise AssertionError(f"unexpected scalar expr {type(rhs).__name__}")
+
+
+_FIELD_LOCAL_TYPE = {
+  ast.FIELD_PROTO: ast.LocalType.PROTO,
+  ast.FIELD_SRC_IP: ast.LocalType.IPV4,
+  ast.FIELD_DST_IP: ast.LocalType.IPV4,
+  ast.FIELD_SRC_IP6: ast.LocalType.IPV6,
+  ast.FIELD_DST_IP6: ast.LocalType.IPV6,
+  ast.FIELD_SRC_PORT: ast.LocalType.U16,
+  ast.FIELD_DST_PORT: ast.LocalType.U16,
+  ast.FIELD_TCP_SYN: ast.LocalType.BOOL,
+  ast.FIELD_TCP_ACK: ast.LocalType.BOOL,
+}
+
+
+def _emit_tier2_body(
+  func: ast.FunctionDef,
+  counter_slots: dict[str, int],
+  program: ast.Program,
+) -> tuple[str, str]:
+  """Emit the body of a Tier 2 function. Returns (body, final_return)."""
+  locals_: dict[str, ast.LocalType] = {}
+  _collect_tier2_locals(func.body, locals_)
+  decls = []
+  for name, t in locals_.items():
+    if t == ast.LocalType.IPV6:
+      decls.append(f"  __u64 fwl_local_{name}_hi = 0;")
+      decls.append(f"  __u64 fwl_local_{name}_lo = 0;")
+    else:
+      ctype = _LOCAL_C_TYPE[t]
+      decls.append(f"  {ctype} fwl_local_{name} = 0;")
+  decl_block = "\n".join(decls)
+  if decl_block:
+    decl_block += "\n"
+  ctx = _Tier2EmitCtx(locals=locals_, counter_slots=counter_slots)
+  body_text = _emit_tier2_stmts(func.body, ctx, indent="  ")
+  return decl_block + body_text, "XDP_PASS"
+
+
+class _Tier2EmitCtx:
+  """Mutable context threaded through Tier 2 emission."""
+  def __init__(self, *, locals, counter_slots):
+    self.locals = locals
+    self.counter_slots = counter_slots
+
+
+def _emit_tier2_stmts(stmts, ctx: _Tier2EmitCtx, indent: str) -> str:
+  out = []
+  for stmt in stmts:
+    out.append(_emit_tier2_stmt(stmt, ctx, indent))
+  return "".join(out)
+
+
+def _emit_tier2_stmt(stmt, ctx: _Tier2EmitCtx, indent: str) -> str:
+  if isinstance(stmt, ast.ActionStmt):
+    if stmt.action == ast.Action.ALLOW:
+      return f"{indent}return XDP_PASS;\n"
+    if stmt.action == ast.Action.DROP:
+      return f"{indent}return XDP_DROP;\n"
+    if stmt.action == ast.Action.LOG:
+      return (
+        f"{indent}{{\n{indent}  "
+        + _emit_log(0).replace("\n", f"\n{indent}  ")
+        + f"\n{indent}}}\n"
+      )
+    if stmt.action == ast.Action.COUNT:
+      slot = ctx.counter_slots[stmt.counter_name]
+      return (
+        f"{indent}{{\n{indent}  "
+        + _emit_count(slot).replace("\n", f"\n{indent}  ")
+        + f"\n{indent}}}\n"
+      )
+  if isinstance(stmt, ast.AssignStmt):
+    return _emit_tier2_assign(stmt, ctx, indent)
+  if isinstance(stmt, ast.IfStmt):
+    return _emit_tier2_if(stmt, ctx, indent)
+  raise AssertionError(f"unexpected stmt {type(stmt).__name__}")
+
+
+def _emit_tier2_assign(
+  stmt: ast.AssignStmt, ctx: _Tier2EmitCtx, indent: str
+) -> str:
+  """Emit a Tier 2 assignment: `<local> = <rhs>;`."""
+  t = ctx.locals[stmt.name]
+  if t == ast.LocalType.IPV6:
+    hi_expr, lo_expr = _emit_ipv6_scalar(stmt.rhs, ctx)
+    return (
+      f"{indent}fwl_local_{stmt.name}_hi = {hi_expr};\n"
+      f"{indent}fwl_local_{stmt.name}_lo = {lo_expr};\n"
+    )
+  expr = _emit_scalar(stmt.rhs, ctx)
+  return f"{indent}fwl_local_{stmt.name} = {expr};\n"
+
+
+def _emit_tier2_if(
+  stmt: ast.IfStmt, ctx: _Tier2EmitCtx, indent: str
+) -> str:
+  cond = _emit_scalar(stmt.cond, ctx)
+  inner = indent + "  "
+  out = f"{indent}if ({cond}) {{\n"
+  out += _emit_tier2_stmts(stmt.body, ctx, inner)
+  out += f"{indent}}}"
+  for elif_cond, elif_body in stmt.elif_branches:
+    cond_text = _emit_scalar(elif_cond, ctx)
+    out += f" else if ({cond_text}) {{\n"
+    out += _emit_tier2_stmts(elif_body, ctx, inner)
+    out += f"{indent}}}"
+  if stmt.else_body is not None:
+    out += " else {\n"
+    out += _emit_tier2_stmts(stmt.else_body, ctx, inner)
+    out += f"{indent}}}"
+  return out + "\n"
+
+
+def _emit_scalar(expr, ctx: _Tier2EmitCtx) -> str:
+  """Emit a C scalar expression (non-IPv6)."""
+  if isinstance(expr, ast.IntLiteral):
+    return f"{expr.value}u"
+  if isinstance(expr, ast.IPv4Literal):
+    return f"0x{expr.value:08X}u"
+  if isinstance(expr, ast.ProtoLiteral):
+    return _PROTO_TO_IPPROTO[expr.proto]
+  if isinstance(expr, ast.LocalRead):
+    return f"fwl_local_{expr.name}"
+  if isinstance(expr, ast.FieldRef):
+    return _emit_field_read_scalar(expr.name)
+  if isinstance(expr, ast.BoolField):
+    return _emit_field_read_scalar(expr.field.name)
+  if isinstance(expr, ast.Comparison):
+    return _emit_tier2_comparison(expr, ctx)
+  if isinstance(expr, ast.AndOp):
+    parts = [f"({_emit_scalar(c, ctx)})" for c in expr.operands]
+    return "(" + " && ".join(parts) + ")"
+  if isinstance(expr, ast.OrOp):
+    parts = [f"({_emit_scalar(c, ctx)})" for c in expr.operands]
+    return "(" + " || ".join(parts) + ")"
+  if isinstance(expr, ast.NotOp):
+    return f"(!({_emit_scalar(expr.inner, ctx)}))"
+  if isinstance(expr, ast.RateLimitCall):
+    # v0.2 minimum-viable: emit a stub that always returns false.
+    # Real rate_limit_call implementation is deferred to v0.3.
+    return "(0)"
+  raise AssertionError(f"unsupported scalar {type(expr).__name__}")
+
+
+def _emit_field_read_scalar(field_name: str) -> str:
+  """Emit a Tier 2 statement-position field read as a C lvalue."""
+  if field_name == ast.FIELD_PROTO:
+    return "proto"
+  if field_name == ast.FIELD_SRC_IP:
+    return "src_ip"
+  if field_name == ast.FIELD_DST_IP:
+    return "dst_ip"
+  if field_name == ast.FIELD_SRC_PORT:
+    return "src_port"
+  if field_name == ast.FIELD_DST_PORT:
+    return "dst_port"
+  if field_name == ast.FIELD_TCP_SYN:
+    return "tcp_syn"
+  if field_name == ast.FIELD_TCP_ACK:
+    return "tcp_ack"
+  raise NotImplementedError(f"emitter: tier2 field read {field_name}")
+
+
+def _emit_ipv6_scalar(expr, ctx: _Tier2EmitCtx) -> tuple[str, str]:
+  """Emit an IPv6-typed scalar as (hi_expr, lo_expr) C strings."""
+  if isinstance(expr, ast.Ipv6Literal):
+    hi, lo = _split_ipv6_value(expr.value)
+    return f"0x{hi:016X}ull", f"0x{lo:016X}ull"
+  if isinstance(expr, ast.LocalRead):
+    return f"fwl_local_{expr.name}_hi", f"fwl_local_{expr.name}_lo"
+  if isinstance(expr, ast.FieldRef):
+    if expr.name == ast.FIELD_SRC_IP6:
+      return "src_ip6_hi", "src_ip6_lo"
+    if expr.name == ast.FIELD_DST_IP6:
+      return "dst_ip6_hi", "dst_ip6_lo"
+  raise AssertionError(f"unsupported ipv6 scalar {type(expr).__name__}")
+
+
+def _emit_tier2_comparison(cmp: ast.Comparison, ctx: _Tier2EmitCtx) -> str:
+  """Emit a Tier 2 comparison's C expression.
+
+  Reuses the Tier 1 emit helpers when both sides are field/literal
+  shapes; for local-vs-local or local-vs-literal forms, emits the
+  appropriate C operator directly.
+  """
+  field = cmp.field
+  if isinstance(field, ast.FieldRef) and isinstance(cmp.operand, (
+    ast.IntLiteral, ast.IPv4Literal, ast.Ipv6Literal, ast.ProtoLiteral,
+    ast.CidrLiteral, ast.CidrListLiteral, ast.ListLiteral,
+    ast.Ipv6CidrLiteral, ast.Ipv6CidrListLiteral, ast.RangeLiteral,
+    ast.GeoIp,
+  )):
+    # Reuse Tier 1 path.
+    return _emit_comparison(cmp)
+  # Tier 2 forms: at least one side is a Local or a same-side field.
+  if cmp.op == "in":
+    return _emit_tier2_in(cmp, ctx)
+  lhs_is_v6 = _is_ipv6_lvalue(field, ctx)
+  if lhs_is_v6:
+    lhs_hi, lhs_lo = _emit_ipv6_scalar(field, ctx)
+    rhs_hi, rhs_lo = _emit_ipv6_scalar(cmp.operand, ctx)
+    if cmp.op == "==":
+      return f"({lhs_hi} == {rhs_hi} && {lhs_lo} == {rhs_lo})"
+    if cmp.op == "!=":
+      return f"({lhs_hi} != {rhs_hi} || {lhs_lo} != {rhs_lo})"
+  lhs = _emit_scalar(field, ctx)
+  rhs = _emit_scalar(cmp.operand, ctx)
+  return f"({lhs} {cmp.op} {rhs})"
+
+
+def _is_ipv6_lvalue(node, ctx: _Tier2EmitCtx) -> bool:
+  if isinstance(node, ast.FieldRef):
+    return node.name in ast.IP6_FIELDS
+  if isinstance(node, ast.LocalRead):
+    return ctx.locals.get(node.name) == ast.LocalType.IPV6
+  return False
+
+
+def _emit_tier2_in(cmp: ast.Comparison, ctx: _Tier2EmitCtx) -> str:
+  """Emit a Tier 2 `<lvalue> in <set>` comparison.
+
+  Reuses Tier 1's _emit_ip_in / _emit_ip6_in / _emit_port_in via the
+  underlying field type.
+  """
+  field = cmp.field
+  if isinstance(field, ast.FieldRef):
+    return _emit_comparison(cmp)
+  # local on LHS with `in`
+  assert isinstance(field, ast.LocalRead)
+  t = ctx.locals[field.name]
+  if t == ast.LocalType.IPV4:
+    return _emit_ip_in(f"fwl_local_{field.name}", cmp.operand)
+  if t == ast.LocalType.IPV6:
+    hi = f"fwl_local_{field.name}_hi"
+    lo = f"fwl_local_{field.name}_lo"
+    return _emit_ip6_in(hi, lo, cmp.operand)
+  if t == ast.LocalType.U16:
+    return _emit_port_in(f"fwl_local_{field.name}", cmp.operand)
+  raise NotImplementedError(f"emitter: tier2 'in' on local of type {t}")
+
+
+RATE_LIMIT_OVERFLOW_COUNTER = "__rate_limit_overflow"
+
+
 def _allocate_counter_slots(program: ast.Program) -> dict[str, int]:
   """Assign a stable per-CPU array slot to each named counter.
 
-  Slots are allocated in order of first appearance in the program;
-  userspace tools read the name->slot mapping from the emitted
-  fwl_counter_table comment block.
+  Slots are allocated in source order — Tier 1 rules first, then
+  Tier 2 statements in walk order. Userspace tools read the
+  name->slot mapping from the emitted fwl_counter_table comment
+  block.
+
+  When the program uses any rate_limit primitive, a reserved
+  `__rate_limit_overflow` slot is appended at the end. The BPF
+  emitter increments it whenever `bpf_map_update_elem` on a
+  rate-limit hash map returns -E2BIG (the per-CPU bucket key
+  space is exhausted). Surfaces through the same `/api/v1/counters`
+  endpoint as user-defined counters; double-underscore prefix
+  signals it's reserved (the analyzer's stylistic-warning pass
+  excludes names starting with `__`).
   """
   slots: dict[str, int] = {}
   for rule in program.rules:
@@ -576,7 +1473,65 @@ def _allocate_counter_slots(program: ast.Program) -> dict[str, int]:
       continue
     if name not in slots:
       slots[name] = len(slots)
+  if program.function is not None:
+    _collect_tier2_counter_slots(program.function.body, slots)
+  if _program_uses_rate_limit(program):
+    slots[RATE_LIMIT_OVERFLOW_COUNTER] = len(slots)
   return slots
+
+
+def _program_uses_rate_limit(program: ast.Program) -> bool:
+  """True iff any rule or Tier 2 statement uses a rate_limit primitive."""
+  for rule in program.rules:
+    if rule.modifier is not None:
+      return True
+  if program.function is not None:
+    if _stmts_use_rate_limit(program.function.body):
+      return True
+  return False
+
+
+def _stmts_use_rate_limit(stmts) -> bool:
+  for s in stmts:
+    if isinstance(s, ast.IfStmt):
+      for n in _walk_with_compares(s.cond):
+        pass
+      if _expr_has_rate_limit(s.cond):
+        return True
+      if _stmts_use_rate_limit(s.body):
+        return True
+      for cond, body in s.elif_branches:
+        if _expr_has_rate_limit(cond):
+          return True
+        if _stmts_use_rate_limit(body):
+          return True
+      if s.else_body is not None and _stmts_use_rate_limit(s.else_body):
+        return True
+  return False
+
+
+def _expr_has_rate_limit(expr) -> bool:
+  if isinstance(expr, ast.RateLimitCall):
+    return True
+  if isinstance(expr, ast.NotOp):
+    return _expr_has_rate_limit(expr.inner)
+  if isinstance(expr, (ast.AndOp, ast.OrOp)):
+    return any(_expr_has_rate_limit(c) for c in expr.operands)
+  return False
+
+
+def _collect_tier2_counter_slots(stmts, slots: dict[str, int]) -> None:
+  """Walk Tier 2 statements collecting `count <name>` action names."""
+  for s in stmts:
+    if isinstance(s, ast.ActionStmt) and s.action == ast.Action.COUNT:
+      if s.counter_name and s.counter_name not in slots:
+        slots[s.counter_name] = len(slots)
+    elif isinstance(s, ast.IfStmt):
+      _collect_tier2_counter_slots(s.body, slots)
+      for _, body in s.elif_branches:
+        _collect_tier2_counter_slots(body, slots)
+      if s.else_body is not None:
+        _collect_tier2_counter_slots(s.else_body, slots)
 
 
 def _emit_counter_table(slots: dict[str, int]) -> str:

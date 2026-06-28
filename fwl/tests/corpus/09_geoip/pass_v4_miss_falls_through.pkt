@@ -1,0 +1,15 @@
+name: "v4 source not in geoip set falls through to default"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.src_ip in geoip(RU)
+  default allow
+
+geoip_data:
+  RU: ["5.8.0.0/16"]
+
+test_packet:
+  builder: tcp(src_ip="8.8.8.8", dst_port=80)
+
+expected:
+  compiles: true
+  bpf_action: allow

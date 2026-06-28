@@ -1,0 +1,12 @@
+name: "icmp6 proto keyword matches v6 ICMPv6 packet"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.proto == icmp6
+  default allow
+
+test_packet:
+  builder: icmp6(src_ip="2001:db8::1")
+
+expected:
+  compiles: true
+  bpf_action: drop

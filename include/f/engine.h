@@ -87,10 +87,16 @@ auto IsProcessRunning(int pid) -> bool;
 
 /// Initialize the engine: load BPF, attach XDP, pin maps,
 /// bind ZMQ control socket.
+///
+/// `bundle_dir` is the parent of the `current` symlink the
+/// reload pipeline maintains. When a freshly-compiled bundle
+/// is staged there, `fd` cold-boots into it directly; otherwise
+/// it falls back to the built-in `fw.bpf.o` search paths.
 auto EngineInit(Engine& e,
                 std::string_view sock_addr,
                 std::span<const std::string> ifaces,
-                std::string_view pin_path)
+                std::string_view pin_path,
+                std::string_view bundle_dir = "")
     -> std::expected<void, Error<EngineError>>;
 
 /// Run the engine ZMQ control loop (blocks until stop).

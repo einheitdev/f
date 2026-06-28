@@ -1,0 +1,12 @@
+name: "pkt.proto == tcp combined with pkt.src_ip6 in CIDR — proto guard + v6 read"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.proto == tcp and pkt.src_ip6 in 2001:db8::/32
+  default allow
+
+test_packet:
+  builder: tcp6(src_ip="2001:db8::1", dst_port=22)
+
+expected:
+  compiles: true
+  bpf_action: drop

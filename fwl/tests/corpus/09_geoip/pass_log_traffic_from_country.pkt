@@ -1,0 +1,15 @@
+name: "log action with geoip — non-terminal, falls through to default"
+source_fw: |
+  @xdp(eth0)
+  log if pkt.src_ip in geoip(CN)
+  default allow
+
+geoip_data:
+  CN: ["1.0.1.0/24"]
+
+test_packet:
+  builder: tcp(src_ip="1.0.1.5", dst_port=80)
+
+expected:
+  compiles: true
+  bpf_action: allow

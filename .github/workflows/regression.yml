@@ -1,0 +1,110 @@
+name: regression
+
+on:
+  pull_request:
+  push:
+    branches: [main, master]
+
+jobs:
+  fwl-pytest:
+    name: FWL pytest + flake8
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install fwl + dev tooling
+        working-directory: fwl
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e '.[dev]'
+
+      - name: pytest
+        working-directory: fwl
+        run: pytest tests/ -q
+
+      - name: flake8
+        working-directory: fwl
+        run: flake8 fwl/
+
+  hone-regress:
+    name: hone regress (interpreter oracle, BPF skipped)
+    runs-on: ubuntu-24.04
+    needs: fwl-pytest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: f
+          submodules: recursive
+
+      - name: Check out f-hone
+        uses: actions/checkout@v4
+        with:
+          repository: einheitdev/f-hone
+          path: f-hone
+
+      - name: Check out kb
+        uses: actions/checkout@v4
+        with:
+          repository: einheitdev/f-knowlege-base
+          path: f-knowlege-base
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Bootstrap f-hone venv
+        working-directory: f-hone
+        run: |
+          python -m venv .venv
+          ./.venv/bin/pip install --upgrade pip
+          ./.venv/bin/pip install -e '.[dev,fuzz]'
+          ./.venv/bin/pip install -e ../f/fwl
+
+      # CI runners don't have CAP_BPF; the BPF oracle skips
+      # gracefully and we exercise the spec + interpreter paths.
+      # The structural-compile path still runs (clang -target bpf)
+      # so emitter changes can't introduce uncompilable output.
+      - name: Install clang for BPF compile
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y clang libbpf-dev linux-headers-$(uname -r) || true
+
+      - name: hone regress (corpus)
+        working-directory: f-hone
+        env:
+          PATH: ${{ github.workspace }}/f-hone/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+        run: |
+          hone regress --corpus ../f/fwl/tests/corpus/ \
+              | tee /tmp/regress.log
+          # Fail the job if any case is FAIL (skips are fine for
+          # the BPF oracle in unprivileged CI).
+          ! grep -E '^│ FAIL' /tmp/regress.log
+
+  cpp-build-test:
+    name: C++ build + ctest
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install build tooling
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y cmake ninja-build clang \
+              libbpf-dev libzmq3-dev
+
+      - name: Configure
+        run: cmake --preset default
+
+      - name: Build
+        run: cmake --build --preset default
+
+      - name: ctest
+        run: ctest --preset default --output-on-failure

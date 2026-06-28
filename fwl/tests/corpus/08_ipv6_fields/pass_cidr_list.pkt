@@ -1,0 +1,12 @@
+name: "v6 in cidr list matches second element"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.src_ip6 in [2001:db8::/32, fc00::/7]
+  default allow
+
+test_packet:
+  builder: tcp6(src_ip="fc00::1", dst_port=22)
+
+expected:
+  compiles: true
+  bpf_action: drop

@@ -8,6 +8,7 @@ pass/fail with diffs.
 Methodology reference: docs/F_DEVELOPMENT_METHODOLOGY.md:132-181.
 """
 from __future__ import annotations
+import ipaddress
 import struct
 import subprocess
 from dataclasses import dataclass
@@ -100,7 +101,10 @@ def _interpreter_oracle(
       "expected compile failure but program parsed cleanly",
     )
 
-  got = interpreter.evaluate(program, case.packet.fields, case.state)
+  got = interpreter.evaluate(
+    program, case.packet.fields, case.state,
+    geoip_data=(case.geoip_data or None),
+  )
   if got == expected:
     return OracleResult("interpreter", "pass", "")
   return OracleResult(
@@ -139,6 +143,10 @@ def _bpf_oracle(
 
   c_source = emitter.emit(program)
   map_init = _build_map_init(program, case.state)
+  for name, entries in _build_geoip_map_init(
+    program, case.geoip_data or {}
+  ).items():
+    map_init[name] = entries
 
   try:
     got = bpf_runner.run(c_source, case.packet.raw, map_init)
@@ -264,6 +272,92 @@ def _encode_rl_value_per_cpu(count: int, nr_cpus: int) -> bytes:
   now_ns = time.monotonic_ns()
   per_cpu_value = struct.pack("<QI4x", now_ns, count)
   return per_cpu_value * nr_cpus
+
+
+def _build_geoip_map_init(
+  program: ast.Program,
+  geoip_data: dict[str, list[str]],
+) -> dict[str, dict[bytes, bytes]]:
+  """Translate .pkt geoip_data into LPM trie map entries per call site.
+
+  Walks every `geoip(...)` call in `program`, looks up its codes in
+  `geoip_data`, and produces a `{map_name: {key_bytes: value_bytes}}`
+  layout matching the BPF runtime's expectations.
+
+  v4 key layout: `struct { __u32 prefixlen; __u32 ip; }` — prefixlen
+  in host byte order, ip in network byte order (matches the lookup
+  helper's `bpf_htonl(ip)`). v6 key: `struct { __u32 prefixlen;
+  __u8 ip[16]; }` — 16 bytes of network-order address.
+
+  The map's value type is `__u8` so each entry's value is a single
+  membership byte (1).
+  """
+  if not geoip_data:
+    return {}
+  result: dict[str, dict[bytes, bytes]] = {}
+  seen: set[int] = set()
+  geoip_nodes: list[ast.GeoIp] = []
+  for rule in program.rules:
+    geoip_nodes.extend(_walk_geoip_operands(rule.condition))
+  if program.function is not None:
+    geoip_nodes.extend(_walk_geoip_in_tier2(program.function.body))
+  for node in geoip_nodes:
+      if node.call_index in seen:
+        continue
+      seen.add(node.call_index)
+      map_name = f"fwl_geoip_{node.call_index}"
+      entries: dict[bytes, bytes] = {}
+      for code in node.codes:
+        for cidr in geoip_data.get(code, ()):
+          net = ipaddress.ip_network(cidr, strict=False)
+          if node.family == "ipv4":
+            if not isinstance(net, ipaddress.IPv4Network):
+              continue
+            key = struct.pack(
+              "<I", net.prefixlen
+            ) + int(net.network_address).to_bytes(4, "big")
+          else:
+            if not isinstance(net, ipaddress.IPv6Network):
+              continue
+            key = struct.pack(
+              "<I", net.prefixlen
+            ) + int(net.network_address).to_bytes(16, "big")
+          entries[key] = b"\x01"
+      if entries:
+        result[map_name] = entries
+  return result
+
+
+def _walk_geoip_operands(node):
+  """Yield every GeoIp node reachable from a Condition subtree."""
+  if node is None:
+    return
+  if isinstance(node, ast.Comparison):
+    if isinstance(node.operand, ast.GeoIp):
+      yield node.operand
+    return
+  if isinstance(node, ast.NotOp):
+    yield from _walk_geoip_operands(node.inner)
+    return
+  if isinstance(node, (ast.AndOp, ast.OrOp)):
+    for child in node.operands:
+      yield from _walk_geoip_operands(child)
+    return
+
+
+def _walk_geoip_in_tier2(stmts):
+  """Yield every GeoIp node reachable from a Tier 2 statement block."""
+  for s in stmts:
+    if isinstance(s, ast.AssignStmt):
+      yield from _walk_geoip_operands(s.rhs)
+    elif isinstance(s, ast.IfStmt):
+      yield from _walk_geoip_operands(s.cond)
+      yield from _walk_geoip_in_tier2(s.body)
+      for cond, body in s.elif_branches:
+        yield from _walk_geoip_operands(cond)
+        yield from _walk_geoip_in_tier2(body)
+      if s.else_body is not None:
+        yield from _walk_geoip_in_tier2(s.else_body)
 
 
 def discover(directory: Path) -> list[Path]:

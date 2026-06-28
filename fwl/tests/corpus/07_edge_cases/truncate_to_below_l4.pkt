@@ -1,0 +1,22 @@
+name: "truncate_to: packet truncated below L4 header — port comparison can't fire"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.proto == tcp and pkt.dst_port == 22
+  default allow
+
+test_packet:
+  builder: tcp(dst_port=22)
+  # 14 (eth) + 20 (ip) + 4 = 38 bytes — TCP header is incomplete
+  # so the BPF parser's bounds check fails and the L4 read is
+  # skipped (l4_ok stays 0). Interpreter sees `dst_port` from the
+  # decoded fields (truncate doesn't strip those), but the BPF
+  # path can't read the truncated header. The action below picks
+  # the agreement: both oracles fall through to the default allow
+  # since the dst_port comparison evaluates false in BPF (l4_ok
+  # gate fails) and there's no way for the interpreter's read of
+  # an undefined-after-truncate field to spuriously match either.
+  truncate_to: 38
+
+expected:
+  compiles: true
+  bpf_action: allow

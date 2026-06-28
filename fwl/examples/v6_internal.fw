@@ -1,0 +1,34 @@
+# Internal-network policy — v6-aware analogue of internal_network.fw.
+#
+# Trusts the RFC 1918 v4 ranges and the RFC 4193 unique-local v6 range,
+# allows the standard service ports for everyone, logs unsolicited TCP
+# SYNs from outside, and denies everything else by default.
+#
+# Activates the v6 parse path (touches pkt.src_ip6, fc00::/7, icmp6),
+# so pkt.proto == tcp/udp here matches both v4 and v6 frames per the
+# proto-enum table in FWL_V02_SPEC.md.
+
+@xdp(eth0)
+
+# Trust internal v4 traffic
+allow if pkt.src_ip in [10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16]
+
+# Trust internal v6 traffic (unique-local addresses)
+allow if pkt.src_ip6 in fc00::/7
+
+# Allow standard inbound services for either family
+allow if pkt.proto == tcp and pkt.dst_port in [80, 443, 22]
+allow if pkt.proto == udp and pkt.dst_port == 53
+
+# IPv6 neighbour discovery / link-local control plane stays open.
+# `::` is the source for Neighbor Solicitation during DAD (RFC 4862
+# §5.4.2) and for the initial Router Solicitation before DAD has
+# completed (RFC 4861 §6.3.7) — both are essential during interface
+# bring-up, so the source filter has to admit the unspecified
+# address alongside fe80::/10.
+allow if pkt.proto == icmp6 and pkt.src_ip6 in [fe80::/10, ::/128]
+
+# Visibility into unexpected SYNs from outside
+log if pkt.proto == tcp and pkt.tcp.syn and not pkt.tcp.ack
+
+default drop

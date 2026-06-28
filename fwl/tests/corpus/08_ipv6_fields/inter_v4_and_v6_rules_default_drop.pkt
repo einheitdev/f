@@ -1,0 +1,13 @@
+name: "v4 and v6 rules in same program with default drop — v4 path"
+source_fw: |
+  @xdp(eth0)
+  allow if pkt.src_ip in [10.0.0.0/8, 192.168.0.0/16]
+  allow if pkt.src_ip6 in [2001:db8::/32, fc00::/7]
+  default drop
+
+test_packet:
+  builder: tcp(src_ip="10.0.0.5", dst_port=22)
+
+expected:
+  compiles: true
+  bpf_action: allow

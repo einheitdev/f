@@ -1,0 +1,12 @@
+name: "Tier 2 compile error: bare src_ip6 read without v6 guard"
+source_fw: |
+  @xdp(eth0)
+  def firewall(pkt):
+    addr = pkt.src_ip6
+    drop
+
+test_packet:
+  builder: tcp6(src_ip="2001:db8::1")
+
+expected:
+  compiles: false

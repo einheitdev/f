@@ -1,0 +1,17 @@
+name: "no geoip_data block: every geoip lookup misses, rule falls through"
+# Mirrors the spec's "fd refuses to attach a bundle missing
+# geoip.json" — without data, the lookup map is effectively empty
+# at the interpreter layer.
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.src_ip in geoip(RU)
+  default allow
+
+# (no geoip_data: block)
+
+test_packet:
+  builder: tcp(src_ip="5.8.1.1", dst_port=80)
+
+expected:
+  compiles: true
+  bpf_action: allow

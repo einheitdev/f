@@ -50,6 +50,17 @@ class PktCase:
         0: { "1.2.3.4": 5 }    # rule index 0, bucket "1.2.3.4" = 5
 
   Empty dict when the file omits a `state:` block.
+
+  `geoip_data` carries a country-code → CIDR-list mapping (v0.2)
+  used by geoip(...) lookups. Mirrors the bundle's `geoip.json`.
+  Format in the .pkt file:
+
+    geoip_data:
+      RU: ["5.8.0.0/16", "2a00:1370::/32"]
+      CN: ["1.0.1.0/24"]
+
+  Empty dict when the file omits a `geoip_data:` block — geoip
+  lookups against an empty dict always miss.
   """
   name: str
   source_fw: str
@@ -57,12 +68,13 @@ class PktCase:
   expected: dict[str, Any]
   state: dict[int, dict[Any, int]]
   path: Path
+  geoip_data: dict[str, list[str]] = None  # type: ignore[assignment]
 
 
 _BUILDER_RE = re.compile(
   r"""
   ^\s*
-  (?P<proto>tcp|udp|icmp)
+  (?P<proto>tcp6|udp6|icmp6|tcp|udp|icmp)
   \s*\(\s*
   (?P<args>.*?)
   \s*\)\s*$
@@ -125,6 +137,15 @@ _BUILDER_FIELD_TABLE: dict[str, frozenset[str]] = {
                     "syn", "ack"}),
   "udp": frozenset({"src_ip", "dst_ip", "src_port", "dst_port"}),
   "icmp": frozenset({"src_ip", "dst_ip"}),
+  # v0.2 IPv6 builders. Per PKT_V02_SPEC.md, the field names src_ip
+  # and dst_ip are reused for symmetry with the v4 builders; the
+  # values are RFC 4291 IPv6 strings, so the type is unambiguous to
+  # the loader. src_ip6 and dst_ip6 are NOT separate fields on the v6
+  # builders.
+  "tcp6": frozenset({"src_ip", "dst_ip", "src_port", "dst_port",
+                     "syn", "ack"}),
+  "udp6": frozenset({"src_ip", "dst_ip", "src_port", "dst_port"}),
+  "icmp6": frozenset({"src_ip", "dst_ip"}),
 }
 
 
@@ -151,9 +172,13 @@ def parse_builder(text: str) -> dict[str, Any]:
 _DEFAULT_SRC_MAC = b"\x02\x00\x00\x00\x00\x01"
 _DEFAULT_DST_MAC = b"\x02\x00\x00\x00\x00\x02"
 _ETH_P_IP = 0x0800
+_ETH_P_IPV6 = 0x86DD
 _IPPROTO_TCP = 6
 _IPPROTO_UDP = 17
 _IPPROTO_ICMP = 1
+_IPPROTO_ICMPV6 = 58
+_DEFAULT_V6_SRC = "2001:db8::1"
+_DEFAULT_V6_DST = "2001:db8::2"
 
 
 def _ipv4_to_bytes(addr: Any, field: str = "ip") -> bytes:
@@ -192,17 +217,167 @@ def _ipv4_checksum(header: bytes) -> int:
   return (~total) & 0xFFFF
 
 
+def _ipv6_to_bytes(addr: Any, field: str = "ip") -> bytes:
+  """Pack an RFC 5952 canonical IPv6 string as 16 big-endian bytes (v0.2).
+
+  Per PKT_V02_SPEC.md, builder field values must be RFC 5952
+  canonical — the same discipline parser._parse_ipv6 enforces on
+  .fw source literals. Without this gate, corpus authors can write
+  tests whose source strings the .fw program can't contain.
+  """
+  import ipaddress as _ipaddress
+  if not isinstance(addr, str):
+    raise ValueError(
+      f"{field}: expected IPv6 string, got "
+      f"{type(addr).__name__} ({addr!r})"
+    )
+  try:
+    parsed = _ipaddress.IPv6Address(addr)
+  except _ipaddress.AddressValueError as e:
+    raise ValueError(
+      f"{field}: not a valid IPv6 address: {addr!r}"
+    ) from e
+  expected = _canonical_ipv6_for_builder(addr, parsed)
+  if addr != expected:
+    raise ValueError(
+      f"builder {field}: {addr!r} must be RFC 5952 canonical IPv6 "
+      f"(expected {expected!r})"
+    )
+  return parsed.packed
+
+
+_IPV4_MAPPED_BLOCK_BUILDER = None
+
+
+def _canonical_ipv6_for_builder(text, addr) -> str:
+  """RFC 5952 canonical form for a builder field — mirrors parser.
+
+  Rules 1-3 via IPv6Address.compressed; rule 4 (RFC 5952 §5)
+  applies dotted-quad to the ::ffff:0:0/96 IPv4-mapped block. The
+  parser holds an identical helper; lifting them into a shared
+  module is a follow-up.
+  """
+  import ipaddress as _ipaddress
+  global _IPV4_MAPPED_BLOCK_BUILDER
+  if _IPV4_MAPPED_BLOCK_BUILDER is None:
+    _IPV4_MAPPED_BLOCK_BUILDER = _ipaddress.IPv6Network("::ffff:0:0/96")
+  if addr in _IPV4_MAPPED_BLOCK_BUILDER:
+    v4 = _ipaddress.IPv4Address(int(addr) & 0xFFFFFFFF)
+    return f"::ffff:{v4}"
+  return addr.compressed
+
+
+def _build_v6_packet(fields: dict[str, Any]) -> Packet:
+  """Build a Packet for an IPv6 builder (tcp6/udp6/icmp6) — v0.2.
+
+  Produces an Ethernet frame with EtherType 0x86DD, an IPv6 fixed
+  header (40 bytes: version=6, traffic class=0, flow label=0,
+  payload length, next header, hop limit=64, src/dst addresses), and
+  the L4 header. No extension headers; ICMPv6 is type 128 (Echo
+  Request). The decoded-fields dict carries `src_ip6`/`dst_ip6` keys
+  (not `src_ip`/`dst_ip`) so a v0.1-shaped rule reading `pkt.src_ip`
+  finds the field absent and falls through, matching FWL_V02_SPEC.md's
+  cross-family rule.
+
+  Per PKT_V02_SPEC.md, the `proto` key in the decoded dict is the
+  wire-level next_header value translated to a v0.1-style keyword
+  string (`tcp` for next_header=6, `udp` for 17, `icmp6` for 58).
+  Whether a v0.1-shaped program SEES this proto value is governed by
+  the v6-surface-activation rule the interpreter applies separately.
+  """
+  proto = fields["proto"]
+  src = fields.get("src_ip", _DEFAULT_V6_SRC)
+  dst = fields.get("dst_ip", _DEFAULT_V6_DST)
+
+  if proto == "tcp6":
+    next_header = _IPPROTO_TCP
+    proto_str = "tcp"
+    src_port = fields.get("src_port", 12345)
+    dst_port = fields.get("dst_port", 80)
+    syn = fields.get("syn", False)
+    ack = fields.get("ack", False)
+    flags = (0x02 if syn else 0) | (0x10 if ack else 0)
+    data_offset_reserved = 0x50
+    l4 = struct.pack(
+      ">HHIIBBHHH",
+      src_port, dst_port,
+      0, 0,
+      data_offset_reserved, flags,
+      8192, 0, 0,
+    )
+    decoded = {
+      "ether_type": _ETH_P_IPV6,
+      "proto": proto_str,
+      "src_ip6": src,
+      "dst_ip6": dst,
+      "src_port": src_port,
+      "dst_port": dst_port,
+      "syn": syn,
+      "ack": ack,
+    }
+  elif proto == "udp6":
+    next_header = _IPPROTO_UDP
+    proto_str = "udp"
+    src_port = fields.get("src_port", 12345)
+    dst_port = fields.get("dst_port", 53)
+    udp_len = 8
+    l4 = struct.pack(">HHHH", src_port, dst_port, udp_len, 0)
+    decoded = {
+      "ether_type": _ETH_P_IPV6,
+      "proto": proto_str,
+      "src_ip6": src,
+      "dst_ip6": dst,
+      "src_port": src_port,
+      "dst_port": dst_port,
+    }
+  else:
+    # icmp6
+    next_header = _IPPROTO_ICMPV6
+    proto_str = "icmp6"
+    # type=128 (Echo Request), code=0, checksum=0, id=0, seq=0
+    l4 = struct.pack(">BBHHH", 128, 0, 0, 0, 0)
+    decoded = {
+      "ether_type": _ETH_P_IPV6,
+      "proto": proto_str,
+      "src_ip6": src,
+      "dst_ip6": dst,
+    }
+
+  payload_len = len(l4)
+  # IPv6 fixed header: 4 bytes version+TC+flow, 2 bytes payload length,
+  # 1 byte next header, 1 byte hop limit, 16 bytes src, 16 bytes dst.
+  ipv6_header = (
+    struct.pack(">IHBB", 0x60000000, payload_len, next_header, 64)
+    + _ipv6_to_bytes(src, "src_ip")
+    + _ipv6_to_bytes(dst, "dst_ip")
+  )
+  eth = (
+    _DEFAULT_DST_MAC
+    + _DEFAULT_SRC_MAC
+    + struct.pack(">H", _ETH_P_IPV6)
+  )
+  raw = eth + ipv6_header + l4
+  return Packet(raw=raw, fields=decoded)
+
+
 def build_packet(fields: dict[str, Any]) -> Packet:
   """Build a Packet from a decoded-fields dict.
 
   Sensible defaults are filled in for missing fields so corpus
   authors only specify what matters for their test:
 
-    src_ip = "1.1.1.1", dst_ip = "2.2.2.2"
-    src_port = 12345, dst_port = 80   (TCP/UDP only)
-    syn = false, ack = false          (TCP only)
+    src_ip = "1.1.1.1", dst_ip = "2.2.2.2"     (v4 builders)
+    src_ip = "2001:db8::1", dst_ip = "::2"     (v6 builders)
+    src_port = 12345, dst_port = 80            (TCP/UDP only)
+    syn = false, ack = false                   (TCP only)
+
+  v0.2 v6 builders (tcp6/udp6/icmp6) are dispatched to a separate
+  helper because the IPv6 frame layout (40-byte fixed header,
+  EtherType 0x86DD, 16-byte addresses, no checksum) differs from v4.
   """
   proto = fields["proto"]
+  if proto in ("tcp6", "udp6", "icmp6"):
+    return _build_v6_packet(fields)
   src_ip = fields.get("src_ip", "1.1.1.1")
   dst_ip = fields.get("dst_ip", "2.2.2.2")
 
@@ -278,6 +453,30 @@ def build_packet(fields: dict[str, Any]) -> Packet:
   return Packet(raw=raw, fields=decoded)
 
 
+_TOP_LEVEL_KEYS = frozenset({
+  "name", "source_fw", "test_packet", "expected", "state", "geoip_data",
+})
+_TEST_PACKET_KEYS = frozenset({"builder", "truncate_to"})
+_EXPECTED_KEYS = frozenset({
+  "compiles", "bpf_action", "counter_changes", "log_events",
+  "load_action", "load_error_pattern", "loads",
+  # Hunt-emitted assertion text. The runner does not consume it
+  # today — wiring it through the analyzer is a v0.3 backlog item.
+  "compile_error_pattern",
+})
+_STATE_KEYS = frozenset({"rate_limit"})
+
+
+def _reject_unknown_keys(
+  block: dict, allowed: frozenset[str], where: str,
+) -> None:
+  """Per PKT_V01_SPEC.md:39, unknown keys at any documented level
+  are validation errors — silently discarding typos breaks tests."""
+  for key in block:
+    if key not in allowed:
+      raise ValueError(f"unknown field {key!r} at {where}")
+
+
 def load(path: Path) -> PktCase:
   """Load a `.pkt` YAML file from disk.
 
@@ -288,10 +487,33 @@ def load(path: Path) -> PktCase:
   """
   text = path.read_text(encoding="utf-8")
   doc = yaml.safe_load(text)
+  _reject_unknown_keys(doc, _TOP_LEVEL_KEYS, "top level")
+  _reject_unknown_keys(
+    doc["test_packet"], _TEST_PACKET_KEYS, "test_packet"
+  )
+  _reject_unknown_keys(doc["expected"], _EXPECTED_KEYS, "expected")
+  if doc.get("state") is not None:
+    _reject_unknown_keys(doc["state"], _STATE_KEYS, "state")
 
   builder_text = doc["test_packet"]["builder"]
   fields = parse_builder(builder_text)
   packet = build_packet(fields)
+
+  # truncate_to: optional integer that truncates the built packet to N
+  # bytes (PKT_V01_SPEC.md "test_packet"). Required for tests that
+  # exercise the BPF parser's bounds-check on partial frames. The
+  # interpreter must mirror the BPF parser's behaviour by stripping
+  # decoded fields that would land past the truncation point;
+  # otherwise the two oracles disagree on every truncated case.
+  truncate_to = doc["test_packet"].get("truncate_to")
+  if truncate_to is not None:
+    if not isinstance(truncate_to, int) or truncate_to < 0:
+      raise ValueError("truncate_to must be ≥ 0")
+    if truncate_to < len(packet.raw):
+      packet = Packet(
+        raw=packet.raw[:truncate_to],
+        fields=_strip_truncated_fields(packet.fields, truncate_to),
+      )
 
   raw_state = (doc.get("state") or {}).get("rate_limit", {})
   state: dict[int, dict[Any, int]] = {}
@@ -304,7 +526,35 @@ def load(path: Path) -> PktCase:
           f"state.rate_limit references rule index {idx} without a "
           f"rate_limit modifier"
         )
+      # PKT_V01_SPEC.md:96 — bucket count is a non-negative integer.
+      # Catching it here keeps the loader the single point that rejects
+      # malformed state, instead of letting struct.pack crash later.
+      for bucket_key, count in buckets.items():
+        if not isinstance(count, int) or isinstance(count, bool):
+          raise ValueError(
+            f"state.rate_limit[{idx}][{bucket_key!r}] must be a "
+            f"non-negative integer; got {count!r}"
+          )
+        if count < 0:
+          raise ValueError(
+            f"state.rate_limit[{idx}][{bucket_key!r}] must be a "
+            f"non-negative integer; got {count}"
+          )
       state[idx] = dict(buckets)
+
+  raw_geoip = doc.get("geoip_data") or {}
+  geoip_data: dict[str, list[str]] = {}
+  for code, prefixes in raw_geoip.items():
+    if not isinstance(code, str) or len(code) != 2 or not code.isupper():
+      raise ValueError(
+        f"geoip_data key {code!r} must be an uppercase 2-letter "
+        f"ISO 3166-1 alpha-2 country code"
+      )
+    if not isinstance(prefixes, list):
+      raise ValueError(
+        f"geoip_data[{code}] must be a list of CIDR strings"
+      )
+    geoip_data[code] = [str(p) for p in prefixes]
 
   return PktCase(
     name=doc["name"],
@@ -313,7 +563,56 @@ def load(path: Path) -> PktCase:
     expected=doc["expected"],
     state=state,
     path=path,
+    geoip_data=geoip_data,
   )
+
+
+def _strip_truncated_fields(
+  fields: dict[str, Any], truncate_to: int
+) -> dict[str, Any]:
+  """Mirror the BPF parser's bounds-check on a truncated frame.
+
+  Per the v0.2 emitter prelude: the parser bumps `v4_ok`/`v6_ok`
+  only when the L3 header fits, and `l4_ok` only when the L4
+  header fits. The decoded-field dict the interpreter consumes
+  must reflect those gates by dropping fields the parser couldn't
+  read on this truncated frame.
+
+  Layout offsets (Ethernet II, no VLAN):
+    14            end of Ethernet header
+    14 + 20 = 34  end of IPv4 fixed header (ihl=5)
+    14 + 40 = 54  end of IPv6 fixed header
+    34 + 4  = 38  TCP source/dest ports readable (v4)
+    34 + 14 = 48  TCP flag byte readable (v4)
+    54 + 4  = 58  TCP source/dest ports readable (v6)
+
+  Beyond v0.1's IHL≠5 case, the spec deferred extension headers,
+  variable-IHL, and L4-after-IPv6-extensions to v0.3, so this
+  helper assumes the v0.2 builder defaults (IHL=5, no v6 ext
+  headers).
+  """
+  out = dict(fields)
+  ether_type = out.get("ether_type")
+  is_v6 = ether_type == 0x86DD
+  l3_end = 14 + (40 if is_v6 else 20)
+  if truncate_to < 14:
+    out.pop("ether_type", None)
+  if truncate_to < l3_end:
+    for key in (
+      "proto", "src_ip", "dst_ip", "src_ip6", "dst_ip6",
+    ):
+      out.pop(key, None)
+    for key in ("src_port", "dst_port", "syn", "ack"):
+      out.pop(key, None)
+    return out
+  # The BPF emitter's L4 parse only sets `l4_ok` after a *full*
+  # tcphdr/udphdr fits — not just the port pair. tcphdr is 20 B,
+  # udphdr is 8 B. Use the conservative tcphdr-sized gate for both
+  # so the interpreter mirrors BPF on every truncation boundary.
+  if truncate_to < l3_end + 20:
+    for key in ("src_port", "dst_port", "syn", "ack"):
+      out.pop(key, None)
+  return out
 
 
 def _rate_limit_rule_indices(source_fw: str) -> frozenset[int]:

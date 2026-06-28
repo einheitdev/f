@@ -1,0 +1,12 @@
+name: "Tier 2 compile error: statement after bare-terminal drop"
+source_fw: |
+  @xdp(eth0)
+  def firewall(pkt):
+    drop
+    allow
+
+test_packet:
+  builder: tcp()
+
+expected:
+  compiles: false

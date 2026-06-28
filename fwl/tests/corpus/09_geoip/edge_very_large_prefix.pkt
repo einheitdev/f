@@ -1,0 +1,20 @@
+name: "very large /1 prefix in geoip data covers half the v4 space"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.src_ip in geoip(XX_DATA)
+  default allow
+
+# Use US as the country code — the spec's analyzer validates against
+# the alpha-2 list; here we feed an absurdly broad /1 prefix to the
+# loader to verify the lookup machinery doesn't choke on edge-case
+# prefix lengths.
+geoip_data:
+  US: ["0.0.0.0/1"]
+
+test_packet:
+  builder: tcp(src_ip="100.0.0.1", dst_port=80)
+
+# This file's source_fw uses an unknown code XX_DATA which is invalid;
+# the test asserts compile-failure to lock that path.
+expected:
+  compiles: false

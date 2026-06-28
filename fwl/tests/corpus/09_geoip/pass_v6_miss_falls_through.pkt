@@ -1,0 +1,15 @@
+name: "v6 source not in geoip set falls through to default"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.src_ip6 in geoip(RU)
+  default allow
+
+geoip_data:
+  RU: ["2a00:1370::/32"]
+
+test_packet:
+  builder: tcp6(src_ip="2001:db8::1", dst_port=80)
+
+expected:
+  compiles: true
+  bpf_action: allow

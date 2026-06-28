@@ -1,0 +1,15 @@
+name: "v6 source matches a country's v6 prefix in geoip"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.src_ip6 in geoip(RU)
+  default allow
+
+geoip_data:
+  RU: ["2a00:1370::/32"]
+
+test_packet:
+  builder: tcp6(src_ip="2a00:1370::1", dst_port=22)
+
+expected:
+  compiles: true
+  bpf_action: drop

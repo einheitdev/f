@@ -1,0 +1,12 @@
+name: "Tier 2: 'pkt' is reserved as a local name"
+source_fw: |
+  @xdp(eth0)
+  def firewall(pkt):
+    pkt = 1
+    drop
+
+test_packet:
+  builder: tcp()
+
+expected:
+  compiles: false

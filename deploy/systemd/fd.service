@@ -1,0 +1,51 @@
+[Unit]
+Description=f — eBPF firewall engine
+Documentation=https://github.com/einheitdev/f
+After=network-pre.target sys-fs-bpf.mount
+Wants=sys-fs-bpf.mount
+ConditionPathIsMountPoint=/sys/fs/bpf
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/fd \
+    --interfaces=eth0 \
+    --pin-path=/sys/fs/bpf/f \
+    --bundle-dir=/usr/share/f/compiled \
+    --log-level=info \
+    run
+
+# Capabilities — least-privilege subset that supports BPF
+# program loading, XDP attach, and per-CPU map operations.
+# CAP_BPF       — bpf() syscall
+# CAP_NET_ADMIN — XDP attach + map pinning to bpffs
+# CAP_PERFMON   — perf-style sampling for telemetry
+# CAP_SYS_RESOURCE — RLIMIT_MEMLOCK uplift on older kernels
+CapabilityBoundingSet=CAP_BPF CAP_NET_ADMIN CAP_PERFMON CAP_SYS_RESOURCE
+AmbientCapabilities=CAP_BPF CAP_NET_ADMIN CAP_PERFMON CAP_SYS_RESOURCE
+
+# Hardening — runs unprivileged otherwise.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=false
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET AF_INET6
+LockPersonality=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+SystemCallArchitectures=native
+
+# Allow writes to bpffs and the bundle directory.
+ReadWritePaths=/sys/fs/bpf /usr/share/f/compiled /var/log/f
+
+# Memory + restart policy.
+LimitMEMLOCK=infinity
+Restart=on-failure
+RestartSec=2s
+TimeoutStopSec=10s
+
+[Install]
+WantedBy=multi-user.target

@@ -42,10 +42,11 @@ auto ParseInterfaces(const std::string& s)
 
 auto RunEngine(const std::string& sock_addr,
                const std::vector<std::string>& ifaces,
-               const std::string& pin_path) -> int {
+               const std::string& pin_path,
+               const std::string& bundle_dir) -> int {
   f::Engine engine;
   auto res = f::EngineInit(
-      engine, sock_addr, ifaces, pin_path);
+      engine, sock_addr, ifaces, pin_path, bundle_dir);
   if (!res) {
     spdlog::error("Init failed: {}",
                   res.error().message);
@@ -89,6 +90,7 @@ int main(int argc, char** argv) {
   std::string socket_addr =
       "ipc:///tmp/fd-control.sock";
   std::string pin_path = "/sys/fs/bpf/f";
+  std::string bundle_dir = "/usr/share/f/compiled";
   std::string log_level = "info";
 
   app.add_option("-i,--interfaces", interfaces,
@@ -97,6 +99,9 @@ int main(int argc, char** argv) {
                  "ZMQ IPC control address");
   app.add_option("--pin-path", pin_path,
                  "BPF map pin directory");
+  app.add_option("--bundle-dir", bundle_dir,
+                 "Compiled-bundle root; <dir>/current/main.bpf.o "
+                 "is loaded at startup when present");
   app.add_option("-l,--log-level", log_level,
                  "Log level")
       ->check(CLI::IsMember(
@@ -133,14 +138,14 @@ int main(int argc, char** argv) {
     }
     f::WritePidFile(f::kEnginePidPath);
     chmod(f::kEnginePidPath, 0644);
-    int rc = RunEngine(socket_addr, ifaces, pin_path);
+    int rc = RunEngine(socket_addr, ifaces, pin_path, bundle_dir);
     f::RemovePidFile(f::kEnginePidPath);
     return rc;
   }
 
   // "run" — foreground.
   f::WritePidFile(f::kEnginePidPath);
-  int rc = RunEngine(socket_addr, ifaces, pin_path);
+  int rc = RunEngine(socket_addr, ifaces, pin_path, bundle_dir);
   f::RemovePidFile(f::kEnginePidPath);
   return rc;
 }

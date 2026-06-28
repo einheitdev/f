@@ -1,0 +1,12 @@
+name: "minimal Tier 2: single drop statement"
+source_fw: |
+  @xdp(eth0)
+  def firewall(pkt):
+    drop
+
+test_packet:
+  builder: tcp(dst_port=80)
+
+expected:
+  compiles: true
+  bpf_action: drop

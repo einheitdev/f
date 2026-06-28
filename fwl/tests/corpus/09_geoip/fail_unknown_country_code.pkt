@@ -1,0 +1,11 @@
+name: "unknown country code 'XQ' is rejected by analyzer"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.src_ip in geoip(XQ)
+  default allow
+
+test_packet:
+  builder: tcp(src_ip="1.2.3.4")
+
+expected:
+  compiles: false

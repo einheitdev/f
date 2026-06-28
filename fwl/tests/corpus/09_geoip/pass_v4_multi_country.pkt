@@ -1,0 +1,17 @@
+name: "v4 source in second country of multi-country geoip drops"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.src_ip in geoip(RU, CN, KP)
+  default allow
+
+geoip_data:
+  RU: ["5.8.0.0/16"]
+  CN: ["1.0.1.0/24"]
+  KP: ["175.45.176.0/22"]
+
+test_packet:
+  builder: tcp(src_ip="1.0.1.5", dst_port=22)
+
+expected:
+  compiles: true
+  bpf_action: drop

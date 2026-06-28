@@ -1,0 +1,15 @@
+name: "v4 source on exact /16 prefix boundary matches"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.src_ip in geoip(RU)
+  default allow
+
+geoip_data:
+  RU: ["5.8.0.0/16"]
+
+test_packet:
+  builder: tcp(src_ip="5.8.0.0", dst_port=80)
+
+expected:
+  compiles: true
+  bpf_action: drop

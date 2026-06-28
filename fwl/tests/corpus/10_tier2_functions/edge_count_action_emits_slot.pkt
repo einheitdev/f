@@ -1,0 +1,15 @@
+name: "Tier 2: count action allocates a counter slot"
+source_fw: |
+  @xdp(eth0)
+  def firewall(pkt):
+    if pkt.proto == tcp:
+      count tcp_seen
+      allow
+    drop
+
+test_packet:
+  builder: tcp(src_ip="1.2.3.4", dst_port=80)
+
+expected:
+  compiles: true
+  bpf_action: allow

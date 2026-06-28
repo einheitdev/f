@@ -1,0 +1,12 @@
+name: "v4 packet does NOT match pkt.src_ip6 == :: (v6_ok gate)"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.src_ip6 == ::
+  default allow
+
+test_packet:
+  builder: tcp(src_ip="1.2.3.4", dst_port=80)
+
+expected:
+  compiles: true
+  bpf_action: allow

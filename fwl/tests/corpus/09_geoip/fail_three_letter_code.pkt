@@ -1,0 +1,11 @@
+name: "3-letter code 'RUS' is rejected (alpha-2 only)"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.src_ip in geoip(RUS)
+  default allow
+
+test_packet:
+  builder: tcp(src_ip="1.2.3.4")
+
+expected:
+  compiles: false

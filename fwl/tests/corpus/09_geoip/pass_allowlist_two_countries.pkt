@@ -1,0 +1,16 @@
+name: "allowlist of two countries: US source matches and is allowed"
+source_fw: |
+  @xdp(eth0)
+  allow if pkt.src_ip in geoip(US, DE)
+  default drop
+
+geoip_data:
+  US: ["8.0.0.0/8"]
+  DE: ["77.0.0.0/8"]
+
+test_packet:
+  builder: tcp(src_ip="8.8.8.8", dst_port=443)
+
+expected:
+  compiles: true
+  bpf_action: allow

@@ -1,0 +1,12 @@
+name: "all-ones IPv6 address ffff:.../128 matches itself"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.src_ip6 == ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff
+  default allow
+
+test_packet:
+  builder: tcp6(src_ip="ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff", dst_port=80)
+
+expected:
+  compiles: true
+  bpf_action: drop
