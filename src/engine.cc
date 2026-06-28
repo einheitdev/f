@@ -283,6 +283,17 @@ auto EngineRun(Engine& e, std::stop_token stop)
         spdlog::error("ZMQ error: {}", ex.what());
       }
     }
+
+    auto now_ns = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now()
+                .time_since_epoch())
+            .count());
+    auto evicted = e.conntrack.MaybeRunGc(now_ns);
+    if (evicted > 0) {
+      spdlog::debug("conntrack gc: evicted {} entries",
+                    evicted);
+    }
   }
 
   spdlog::info("Engine stopping.");
