@@ -533,22 +533,47 @@ def _emit_v6_branch(
     }}"""
 
 
-def _emit_condition(node: ast.Condition) -> str:
+def _emit_condition(
+  node: ast.Condition,
+  counter_slots: dict[str, int] | None = None,
+) -> str:
   """Emit a C boolean expression for `node`. Parens for safety."""
   if isinstance(node, ast.Comparison):
     return _emit_comparison(node)
+  if isinstance(node, ast.CountCompare):
+    return _emit_count_compare(node, counter_slots or {})
   if isinstance(node, ast.BoolField):
     return _emit_bool_field(node)
   if isinstance(node, ast.NotOp):
-    return f"!({_emit_condition(node.inner)})"
+    return f"!({_emit_condition(node.inner, counter_slots)})"
   if isinstance(node, ast.AndOp):
-    parts = [_emit_condition(c) for c in node.operands]
+    parts = [
+      _emit_condition(c, counter_slots) for c in node.operands
+    ]
     return "(" + " && ".join(parts) + ")"
   if isinstance(node, ast.OrOp):
-    parts = [_emit_condition(c) for c in node.operands]
+    parts = [
+      _emit_condition(c, counter_slots) for c in node.operands
+    ]
     return "(" + " || ".join(parts) + ")"
   raise NotImplementedError(
     f"emitter: unsupported condition {type(node).__name__}"
+  )
+
+
+def _emit_count_compare(
+  node: ast.CountCompare,
+  counter_slots: dict[str, int],
+) -> str:
+  """Emit a C expression for count(name) op value."""
+  slot = counter_slots.get(node.call.counter_name)
+  if slot is None:
+    return "0"
+  val = node.operand.value  # type: ignore[union-attr]
+  return (
+    f"({{ __u32 _ck = {slot}; "
+    f"__u64 *_cv = bpf_map_lookup_elem(&fwl_counters, &_ck); "
+    f"_cv ? (*_cv {node.op} {val}) : (0 {node.op} {val}); }})"
   )
 
 
@@ -826,7 +851,7 @@ def _emit_rule(
   else:
     # Non-terminal: emit the side effect, no return.
     if rule.action == ast.Action.LOG:
-      side_effect = _emit_log(idx)
+      side_effect = _emit_log(idx, rule.log_sample)
     elif rule.action == ast.Action.COUNT:
       slot = counter_slots[rule.counter_name]  # type: ignore[index]
       side_effect = _emit_count(slot)
@@ -843,13 +868,15 @@ def _emit_rule(
 
   if rule.condition is None:
     return f"  {{\n    {fire_block}\n  }}\n"
-  expr = _emit_condition(rule.condition)
+  expr = _emit_condition(rule.condition, counter_slots)
   return f"  if ({expr}) {{\n    {fire_block}\n  }}\n"
 
 
-def _emit_log(rule_idx: int) -> str:
+def _emit_log(
+  rule_idx: int, sample: int | None = None
+) -> str:
   """Emit code that submits a log_event for rule `rule_idx`."""
-  return f"""struct fwl_log_event *ev =
+  submit = f"""struct fwl_log_event *ev =
       bpf_ringbuf_reserve(&fwl_log_events, sizeof(*ev), 0);
     if (ev) {{
       ev->timestamp_ns = bpf_ktime_get_ns();
@@ -862,6 +889,15 @@ def _emit_log(rule_idx: int) -> str:
       ev->rule_index = {rule_idx};
       bpf_ringbuf_submit(ev, 0);
     }}"""
+  if sample is not None and sample > 1:
+    return f"""__u32 lsk = {rule_idx};
+    __u64 *lsc = bpf_map_lookup_elem(&fwl_log_sample, &lsk);
+    __u64 lsv = lsc ? *lsc + 1 : 1;
+    if (lsc) {{ *lsc = lsv; }}
+    if ((lsv - 1) % {sample} == 0) {{
+      {submit}
+    }}"""
+  return submit
 
 
 def _emit_count(slot: int) -> str:
@@ -1093,6 +1129,21 @@ def emit(program: ast.Program) -> str:
   has_log = _program_uses_log(program)
 
   log_decl = _LOG_EVENT_DECL if has_log else ""
+  sampled = sum(
+    1 for r in program.rules
+    if r.action == ast.Action.LOG
+    and r.log_sample is not None and r.log_sample > 1
+  )
+  log_sample_decl = ""
+  if sampled > 0:
+    log_sample_decl = (
+      "struct {\n"
+      "  __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);\n"
+      "  __type(key, __u32);\n"
+      "  __type(value, __u64);\n"
+      f"  __uint(max_entries, {len(program.rules)});\n"
+      "} fwl_log_sample SEC(\".maps\");\n"
+    )
   if counter_slots:
     counter_decl = _COUNTER_MAP_DECL_TEMPLATE.format(
       n_slots=max(len(counter_slots), 1)
@@ -1116,7 +1167,7 @@ def emit(program: ast.Program) -> str:
       final_return = "XDP_PASS"
 
   return f"""{_HEADER}
-{log_decl}{counter_decl}{rl_maps}{geoip_block}
+{log_decl}{log_sample_decl}{counter_decl}{rl_maps}{geoip_block}
 SEC("xdp")
 int fwl_prog(struct xdp_md *ctx) {{
 {prelude}{body}  return {final_return};
@@ -1466,13 +1517,14 @@ def _allocate_counter_slots(program: ast.Program) -> dict[str, int]:
   """
   slots: dict[str, int] = {}
   for rule in program.rules:
-    if rule.action != ast.Action.COUNT:
-      continue
-    name = rule.counter_name
-    if name is None:
-      continue
-    if name not in slots:
-      slots[name] = len(slots)
+    if rule.action == ast.Action.COUNT and rule.counter_name:
+      if rule.counter_name not in slots:
+        slots[rule.counter_name] = len(slots)
+    for n in _walk(rule.condition):
+      if isinstance(n, ast.CountCompare):
+        name = n.call.counter_name
+        if name not in slots:
+          slots[name] = len(slots)
   if program.function is not None:
     _collect_tier2_counter_slots(program.function.body, slots)
   if _program_uses_rate_limit(program):

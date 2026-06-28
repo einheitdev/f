@@ -1,0 +1,13 @@
+name: "log no emit on miss"
+source_fw: |
+  @xdp(eth0)
+  log if pkt.proto == tcp
+  allow
+
+test_packet:
+  builder: udp()
+
+expected:
+  compiles: true
+  bpf_action: allow
+  log_events: []

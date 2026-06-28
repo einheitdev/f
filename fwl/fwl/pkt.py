@@ -542,6 +542,16 @@ def load(path: Path) -> PktCase:
           )
       state[idx] = dict(buckets)
 
+  expected = doc["expected"]
+  counter_changes = expected.get("counter_changes", {})
+  if counter_changes:
+    declared = _declared_counter_names(doc["source_fw"])
+    for name in counter_changes:
+      if name not in declared:
+        raise ValueError(
+          f"counter '{name}' not declared in source_fw"
+        )
+
   raw_geoip = doc.get("geoip_data") or {}
   geoip_data: dict[str, list[str]] = {}
   for code, prefixes in raw_geoip.items():
@@ -626,4 +636,15 @@ def _rate_limit_rule_indices(source_fw: str) -> frozenset[int]:
   return frozenset(
     idx for idx, rule in enumerate(program.rules)
     if isinstance(rule.modifier, ast.RateLimit)
+  )
+
+
+def _declared_counter_names(source_fw: str) -> frozenset[str]:
+  """Counter names declared by `count <name>` rules in `source_fw`."""
+  from . import analyzer, ast, parser
+  program = analyzer.analyze(parser.parse(source_fw))
+  return frozenset(
+    rule.counter_name
+    for rule in program.rules
+    if rule.action == ast.Action.COUNT and rule.counter_name
   )

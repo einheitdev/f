@@ -1,0 +1,16 @@
+name: "log captures SYN"
+source_fw: |
+  @xdp(eth0)
+  log if pkt.proto == tcp and pkt.tcp.syn
+  allow
+
+test_packet:
+  builder: tcp(dst_port=22, syn=true)
+
+expected:
+  compiles: true
+  bpf_action: allow
+  log_events:
+    - rule_index: 0
+      syn: true
+      ack: false

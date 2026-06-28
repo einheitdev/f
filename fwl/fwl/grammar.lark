@@ -73,7 +73,10 @@ default_rule  : "default" terminal_action
 action        : terminal_action | nonterminal_action
 
 terminal_action    : ALLOW | DROP
-nonterminal_action : LOG | COUNT IDENTIFIER
+nonterminal_action : log_action | COUNT IDENTIFIER
+
+log_action        : LOG
+                  | LOG "(" "sample" "=" INTEGER ")"
 
 condition     : or_expr
 
@@ -110,6 +113,9 @@ bool_primary  : TCP_FLAG_FIELD                -> bool_flag
 // PROTO_KEYWORD operand.
 comparison    : lvalue comp_op rvalue          -> value_compare
               | lvalue "in" set_or_range       -> value_in
+              | count_call comp_op rvalue      -> count_compare
+
+count_call    : COUNT "(" IDENTIFIER ")"
 
 comp_op       : EQ | NEQ | LT | GT | LE | GE
 

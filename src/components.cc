@@ -7,6 +7,7 @@
 
 #include <arpa/inet.h>
 #include <cstring>
+#include <vector>
 
 #include <bpf/bpf.h>
 #include <bpf/libbpf.h>
@@ -146,7 +147,9 @@ auto ConntrackMgr::GetState() const -> nlohmann::json {
   return {
       {"enabled", enabled},
       {"timeout_s", timeout_s},
+      {"gc_interval_s", gc_interval_s},
       {"entries", entries},
+      {"total_evicted", total_evicted},
   };
 }
 
@@ -158,7 +161,55 @@ auto ConntrackMgr::SetState(const nlohmann::json& j)
   if (j.contains("timeout_s")) {
     timeout_s = j["timeout_s"].get<uint32_t>();
   }
+  if (j.contains("gc_interval_s")) {
+    gc_interval_s = j["gc_interval_s"].get<uint32_t>();
+  }
   return true;
+}
+
+auto ConntrackMgr::RunGc(uint64_t now_ns) -> uint32_t {
+  if (map_fd < 0 || !enabled || timeout_s == 0) {
+    return 0;
+  }
+  uint64_t timeout_ns =
+      static_cast<uint64_t>(timeout_s) * 1'000'000'000ULL;
+  ConnKey key{}, next{};
+  ConnValue val{};
+  std::vector<ConnKey> stale;
+  while (bpf_map_get_next_key(
+             map_fd, &key, &next) == 0) {
+    if (bpf_map_lookup_elem(
+            map_fd, &next, &val) == 0) {
+      if (now_ns > val.last_seen_ns &&
+          now_ns - val.last_seen_ns > timeout_ns) {
+        stale.push_back(next);
+      }
+    }
+    key = next;
+  }
+  uint32_t evicted = 0;
+  for (const auto& k : stale) {
+    if (bpf_map_delete_elem(map_fd, &k) == 0) {
+      evicted++;
+    }
+  }
+  total_evicted += evicted;
+  return evicted;
+}
+
+auto ConntrackMgr::MaybeRunGc(uint64_t now_ns)
+    -> uint32_t {
+  if (!enabled || gc_interval_s == 0) {
+    return 0;
+  }
+  uint64_t interval_ns =
+      static_cast<uint64_t>(gc_interval_s) * 1'000'000'000ULL;
+  if (last_gc_ns != 0 &&
+      now_ns - last_gc_ns < interval_ns) {
+    return 0;
+  }
+  last_gc_ns = now_ns;
+  return RunGc(now_ns);
 }
 
 }  // namespace f

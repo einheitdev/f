@@ -1,0 +1,14 @@
+name: "log after terminal"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.proto == tcp
+  log if pkt.proto == tcp
+  default allow
+
+test_packet:
+  builder: tcp()
+
+expected:
+  compiles: true
+  bpf_action: drop
+  log_events: []

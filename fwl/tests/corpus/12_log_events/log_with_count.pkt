@@ -1,0 +1,16 @@
+name: "log and count"
+source_fw: |
+  @xdp(eth0)
+  count hits if pkt.proto == tcp
+  log if pkt.proto == tcp
+  allow
+
+test_packet:
+  builder: tcp(dst_port=443)
+
+expected:
+  compiles: true
+  bpf_action: allow
+  log_events:
+    - rule_index: 1
+      proto: tcp

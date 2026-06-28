@@ -1,0 +1,14 @@
+name: "single counter increments on TCP"
+source_fw: |
+  @xdp(eth0)
+  count tcp_seen if pkt.proto == tcp
+  allow
+
+test_packet:
+  builder: tcp()
+
+expected:
+  compiles: true
+  bpf_action: allow
+  counter_changes:
+    tcp_seen: 1

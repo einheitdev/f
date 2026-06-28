@@ -1,0 +1,14 @@
+name: "log CIDR match"
+source_fw: |
+  @xdp(eth0)
+  log if pkt.src_ip in 192.168.0.0/16
+  allow
+
+test_packet:
+  builder: tcp(src_ip="192.168.1.100")
+
+expected:
+  compiles: true
+  bpf_action: allow
+  log_events:
+    - rule_index: 0

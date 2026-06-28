@@ -10,6 +10,7 @@ v0.1 baseline). Methodology: docs/F_DEVELOPMENT_METHODOLOGY.md:307-311.
 """
 from __future__ import annotations
 import ipaddress
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
@@ -20,6 +21,27 @@ class XdpAction(Enum):
   """The XDP return values an FWL program can produce."""
   PASS = "XDP_PASS"
   DROP = "XDP_DROP"
+
+
+@dataclass
+class LogEvent:
+  """A log event emitted by a `log` rule."""
+  rule_index: int
+  proto: str
+  src_ip: str
+  dst_ip: str
+  src_port: int
+  dst_port: int
+  syn: bool
+  ack: bool
+
+
+@dataclass
+class EvalResult:
+  """Full evaluation result including side effects."""
+  action: XdpAction
+  counter_changes: dict[str, int] = field(default_factory=dict)
+  log_events: list[LogEvent] = field(default_factory=list)
 
 
 _TERMINAL_ACTION_TO_XDP = {
@@ -59,27 +81,62 @@ def evaluate(
   matches the BPF emitter's behaviour: a v0.1-shaped program produces
   no v6 parse path, so v6 frames hit the default action.
   """
+  return evaluate_full(program, packet, state, geoip_data).action
+
+
+def evaluate_full(
+  program: ast.Program,
+  packet: dict[str, Any],
+  state: dict[int, dict[Any, int]] | None = None,
+  geoip_data: dict[str, list[str]] | None = None,
+) -> EvalResult:
+  """Run `program` against `packet` and return full results.
+
+  Like evaluate() but also returns counter_changes and log_events.
+  """
   state = state or {}
   geoip_data = geoip_data or {}
   packet = _gate_v6_packet_for_v01_program(program, packet)
   ctx = _Ctx(geoip_data=geoip_data)
+  counters: dict[str, int] = {}
+  log_events: list[LogEvent] = []
   if program.function is not None:
     result = _exec_tier2(program.function, packet, ctx, state)
-    return result if result is not None else XdpAction.PASS
+    action = result if result is not None else XdpAction.PASS
+    return EvalResult(action=action)
   for idx, rule in enumerate(program.rules):
-    if rule.condition is not None and not _eval(rule.condition, packet, ctx):
+    if rule.condition is not None and not _eval(
+      rule.condition, packet, ctx, counters
+    ):
       continue
     if rule.modifier is not None:
       if not _rate_limit_allows(rule.modifier, idx, packet, state):
         continue
     if rule.action in _TERMINAL_ACTION_TO_XDP:
-      return _TERMINAL_ACTION_TO_XDP[rule.action]
-    # LOG and COUNT are non-terminal: side effects happen here in a
-    # real run, but the test verification only inspects the final XDP
-    # action, so just continue to the next rule.
+      return EvalResult(
+        action=_TERMINAL_ACTION_TO_XDP[rule.action],
+        counter_changes=counters,
+        log_events=log_events,
+      )
+    if rule.action == ast.Action.COUNT and rule.counter_name:
+      counters[rule.counter_name] = (
+        counters.get(rule.counter_name, 0) + 1
+      )
+    if rule.action == ast.Action.LOG:
+      sample = getattr(rule, "log_sample", None)
+      if sample is not None and sample > 1:
+        pass
+      else:
+        log_events.append(_build_log_event(idx, packet))
   if program.default is not None:
-    return _TERMINAL_ACTION_TO_XDP[program.default.action]
-  return XdpAction.PASS
+    action = _TERMINAL_ACTION_TO_XDP[program.default.action]
+  else:
+    action = XdpAction.PASS
+  return EvalResult(
+    action=action,
+    counter_changes=counters,
+    log_events=log_events,
+  )
 
 
 def _exec_tier2(
@@ -413,6 +470,22 @@ def _condition_touches_v6(node) -> bool:
   return False
 
 
+def _build_log_event(
+  rule_idx: int, packet: dict[str, Any]
+) -> LogEvent:
+  """Construct a LogEvent from the current packet fields."""
+  return LogEvent(
+    rule_index=rule_idx,
+    proto=packet.get("proto", ""),
+    src_ip=packet.get("src_ip", "0.0.0.0"),
+    dst_ip=packet.get("dst_ip", "0.0.0.0"),
+    src_port=int(packet.get("src_port", 0)),
+    dst_port=int(packet.get("dst_port", 0)),
+    syn=bool(packet.get("syn", False)),
+    ack=bool(packet.get("ack", False)),
+  )
+
+
 def _rate_limit_allows(
   mod: ast.RateLimit,
   rule_idx: int,
@@ -473,24 +546,42 @@ class _Ctx:
     self._resolved: dict[int, list] = {}
 
 
+_COUNT_OPS = {
+  "==": lambda a, b: a == b,
+  "!=": lambda a, b: a != b,
+  "<": lambda a, b: a < b,
+  ">": lambda a, b: a > b,
+  "<=": lambda a, b: a <= b,
+  ">=": lambda a, b: a >= b,
+}
+
+
 def _eval(
-  node: ast.Condition, packet: dict[str, Any], ctx: "_Ctx"
+  node: ast.Condition,
+  packet: dict[str, Any],
+  ctx: "_Ctx",
+  counters: dict[str, int] | None = None,
 ) -> bool:
   """Evaluate a condition node against a decoded packet."""
   if isinstance(node, ast.Comparison):
     return _eval_comparison(node, packet, ctx)
+  if isinstance(node, ast.CountCompare):
+    cur = (counters or {}).get(node.call.counter_name, 0)
+    val = node.operand.value  # type: ignore[union-attr]
+    op_fn = _COUNT_OPS.get(node.op)
+    return op_fn(cur, val) if op_fn else False
   if isinstance(node, ast.BoolField):
     return bool(packet.get(_field_key(node.field.name), False))
   if isinstance(node, ast.NotOp):
-    return not _eval(node.inner, packet, ctx)
+    return not _eval(node.inner, packet, ctx, counters)
   if isinstance(node, ast.AndOp):
     for child in node.operands:
-      if not _eval(child, packet, ctx):
+      if not _eval(child, packet, ctx, counters):
         return False
     return True
   if isinstance(node, ast.OrOp):
     for child in node.operands:
-      if _eval(child, packet, ctx):
+      if _eval(child, packet, ctx, counters):
         return True
     return False
   raise NotImplementedError(

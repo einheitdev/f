@@ -1,0 +1,14 @@
+name: "partial field check"
+source_fw: |
+  @xdp(eth0)
+  log if pkt.proto == tcp
+  allow
+
+test_packet:
+  builder: tcp(src_ip="172.16.0.1", dst_port=443)
+
+expected:
+  compiles: true
+  bpf_action: allow
+  log_events:
+    - rule_index: 0

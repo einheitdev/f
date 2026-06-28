@@ -1,0 +1,16 @@
+name: "log SYN+ACK"
+source_fw: |
+  @xdp(eth0)
+  log if pkt.proto == tcp and pkt.tcp.syn and pkt.tcp.ack
+  allow
+
+test_packet:
+  builder: tcp(syn=true, ack=true)
+
+expected:
+  compiles: true
+  bpf_action: allow
+  log_events:
+    - rule_index: 0
+      syn: true
+      ack: true

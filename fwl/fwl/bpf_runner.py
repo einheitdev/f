@@ -13,6 +13,7 @@ from __future__ import annotations
 import ctypes
 import os
 import shutil
+import struct
 import subprocess
 import tempfile
 from dataclasses import dataclass
@@ -27,6 +28,27 @@ class BpfUnavailable(RuntimeError):
   Reasons include: libbpf not installed, kernel
   unprivileged_bpf_disabled=2 with no CAP_BPF, missing clang.
   """
+
+
+@dataclass(frozen=True)
+class LogEvent:
+  """A log event read from the BPF ring buffer."""
+  rule_index: int
+  proto: str
+  src_ip: str
+  dst_ip: str
+  src_port: int
+  dst_port: int
+  syn: bool
+  ack: bool
+
+
+@dataclass(frozen=True)
+class RunResult:
+  """Full result of a BPF_PROG_TEST_RUN execution."""
+  action: XdpAction
+  counter_deltas: dict[int, int]
+  log_events: list[LogEvent]
 
 
 @dataclass(frozen=True)
@@ -131,8 +153,30 @@ def run(
       "unprivileged_bpf_disabled is set"
     )
 
+  return run_full(c_source, packet, map_init).action
+
+
+def run_full(
+  c_source: str,
+  packet: bytes,
+  map_init: dict[str, dict[bytes, bytes]] | None = None,
+  counter_slots: int = 0,
+  has_log: bool = False,
+) -> RunResult:
+  """Compile, load, and run `c_source` against `packet`.
+
+  Returns the XDP action, counter deltas, and log events.
+  """
+  if not _can_load_bpf():
+    raise BpfUnavailable(
+      "kernel BPF load unavailable: not root and "
+      "unprivileged_bpf_disabled is set"
+    )
   result = compile_c(c_source)
-  return _load_and_run(result.obj_path, packet, map_init or {})
+  return _load_and_run(
+    result.obj_path, packet, map_init or {},
+    counter_slots, has_log,
+  )
 
 
 def num_possible_cpus() -> int:
@@ -158,19 +202,15 @@ def _load_and_run(
   obj_path: Path,
   packet: bytes,
   map_init: dict[str, dict[bytes, bytes]],
-) -> XdpAction:
-  """Load `obj_path` via libbpf and BPF_PROG_RUN against `packet`.
-
-  Implementation note: this is the part of the harness that needs
-  CAP_BPF. Kept in its own function so the import-time cost of
-  loading libbpf is paid only when we're actually going to use it.
-  """
+  counter_slots: int = 0,
+  has_log: bool = False,
+) -> RunResult:
+  """Load `obj_path` via libbpf and BPF_PROG_RUN against `packet`."""
   try:
     libbpf = ctypes.CDLL("libbpf.so.1", use_errno=True)
   except OSError as exc:
     raise BpfUnavailable(f"cannot load libbpf: {exc}") from exc
 
-  # bpf_object__open_file(path) -> struct bpf_object *
   libbpf.bpf_object__open_file.restype = ctypes.c_void_p
   libbpf.bpf_object__open_file.argtypes = [
     ctypes.c_char_p, ctypes.c_void_p
@@ -195,6 +235,19 @@ def _load_and_run(
   libbpf.bpf_map_update_elem.argtypes = [
     ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint64
   ]
+  libbpf.bpf_map_lookup_elem.restype = ctypes.c_int
+  libbpf.bpf_map_lookup_elem.argtypes = [
+    ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p
+  ]
+  libbpf.ring_buffer__new.restype = ctypes.c_void_p
+  libbpf.ring_buffer__new.argtypes = [
+    ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p,
+    ctypes.c_void_p,
+  ]
+  libbpf.ring_buffer__consume.restype = ctypes.c_int
+  libbpf.ring_buffer__consume.argtypes = [ctypes.c_void_p]
+  libbpf.ring_buffer__free.restype = None
+  libbpf.ring_buffer__free.argtypes = [ctypes.c_void_p]
 
   obj = libbpf.bpf_object__open_file(
     str(obj_path).encode("utf-8"), None
@@ -203,22 +256,47 @@ def _load_and_run(
     raise OSError(
       ctypes.get_errno(), "bpf_object__open_file failed"
     )
+  rb = None
   try:
     if libbpf.bpf_object__load(obj) != 0:
-      raise OSError(ctypes.get_errno(), "bpf_object__load failed")
+      raise OSError(
+        ctypes.get_errno(), "bpf_object__load failed"
+      )
 
     for map_name, entries in map_init.items():
       _populate_map(libbpf, obj, map_name, entries)
+
+    log_events: list[LogEvent] = []
+    if has_log:
+      rb = _setup_ring_buffer(libbpf, obj, log_events)
 
     prog = libbpf.bpf_object__find_program_by_name(
       obj, b"fwl_prog"
     )
     if not prog:
-      raise RuntimeError("BPF program 'fwl_prog' not found in object")
+      raise RuntimeError(
+        "BPF program 'fwl_prog' not found in object"
+      )
     prog_fd = libbpf.bpf_program__fd(prog)
+    action = _bpf_prog_test_run(prog_fd, packet)
 
-    return _bpf_prog_test_run(prog_fd, packet)
+    if rb:
+      libbpf.ring_buffer__consume(rb)
+
+    counter_deltas: dict[int, int] = {}
+    if counter_slots > 0:
+      counter_deltas = _read_counter_deltas(
+        libbpf, obj, counter_slots
+      )
+
+    return RunResult(
+      action=action,
+      counter_deltas=counter_deltas,
+      log_events=log_events,
+    )
   finally:
+    if rb:
+      libbpf.ring_buffer__free(rb)
     libbpf.bpf_object__close(obj)
 
 
@@ -245,6 +323,94 @@ def _populate_map(
         err,
         f"bpf_map_update_elem failed on {map_name}: errno={err}",
       )
+
+
+_PROTO_NUM_TO_STR = {6: "tcp", 17: "udp", 1: "icmp"}
+
+
+def _u32_to_ip(val: int) -> str:
+  """Convert a host-byte-order u32 to dotted-quad string."""
+  return (f"{(val >> 24) & 0xFF}.{(val >> 16) & 0xFF}."
+          f"{(val >> 8) & 0xFF}.{val & 0xFF}")
+
+
+_RING_BUFFER_SAMPLE_FN = ctypes.CFUNCTYPE(
+  ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p,
+  ctypes.c_size_t,
+)
+
+_LOG_EVENT_STRUCT = struct.Struct("<Q II HH BB xx I")
+
+
+def _setup_ring_buffer(libbpf, obj, log_events):
+  """Set up a ring buffer consumer for fwl_log_events."""
+  bpf_map = libbpf.bpf_object__find_map_by_name(
+    obj, b"fwl_log_events"
+  )
+  if not bpf_map:
+    return None
+  fd = libbpf.bpf_map__fd(bpf_map)
+
+  @_RING_BUFFER_SAMPLE_FN
+  def callback(ctx, data, size):
+    if size < _LOG_EVENT_STRUCT.size:
+      return 0
+    raw = ctypes.string_at(data, _LOG_EVENT_STRUCT.size)
+    (ts, src_ip, dst_ip, src_port, dst_port,
+     proto, flags, rule_index) = _LOG_EVENT_STRUCT.unpack(raw)
+    log_events.append(LogEvent(
+      rule_index=rule_index,
+      proto=_PROTO_NUM_TO_STR.get(proto, str(proto)),
+      src_ip=_u32_to_ip(src_ip),
+      dst_ip=_u32_to_ip(dst_ip),
+      src_port=src_port,
+      dst_port=dst_port,
+      syn=bool(flags & 0x01),
+      ack=bool(flags & 0x02),
+    ))
+    return 0
+
+  _setup_ring_buffer._active_cb = callback  # type: ignore[attr-defined]
+  rb = libbpf.ring_buffer__new(fd, callback, None, None)
+  if not rb:
+    return None
+  return rb
+
+
+def _read_counter_deltas(
+  libbpf, obj, n_slots: int
+) -> dict[int, int]:
+  """Read fwl_counters per-CPU array and sum across CPUs."""
+  bpf_map = libbpf.bpf_object__find_map_by_name(
+    obj, b"fwl_counters"
+  )
+  if not bpf_map:
+    return {}
+  fd = libbpf.bpf_map__fd(bpf_map)
+  try:
+    nr_cpus = num_possible_cpus()
+  except OSError:
+    nr_cpus = 1
+  val_size = 8 * nr_cpus
+  deltas: dict[int, int] = {}
+  for slot in range(n_slots):
+    key = (ctypes.c_uint32)(slot)
+    val_buf = (ctypes.c_ubyte * val_size)()
+    rc = libbpf.bpf_map_lookup_elem(
+      fd, ctypes.byref(key), val_buf
+    )
+    if rc != 0:
+      continue
+    total = 0
+    for cpu in range(nr_cpus):
+      offset = cpu * 8
+      cpu_val = struct.unpack_from(
+        "<Q", bytes(val_buf), offset
+      )
+      total += cpu_val[0]
+    if total != 0:
+      deltas[slot] = total
+  return deltas
 
 
 # union bpf_attr layout for BPF_PROG_TEST_RUN — minimal fields
