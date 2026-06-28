@@ -1,0 +1,14 @@
+name: "counter CIDR miss"
+source_fw: |
+  @xdp(eth0)
+  count internal if pkt.src_ip in 10.0.0.0/8
+  allow
+
+test_packet:
+  builder: tcp(src_ip="8.8.8.8")
+
+expected:
+  compiles: true
+  bpf_action: allow
+  counter_changes:
+    internal: 0

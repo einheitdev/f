@@ -1,0 +1,14 @@
+name: "unconditional counter"
+source_fw: |
+  @xdp(eth0)
+  count all_traffic
+  allow
+
+test_packet:
+  builder: icmp()
+
+expected:
+  compiles: true
+  bpf_action: allow
+  counter_changes:
+    all_traffic: 1

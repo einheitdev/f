@@ -1,0 +1,15 @@
+name: "log OR condition"
+source_fw: |
+  @xdp(eth0)
+  log if pkt.proto == tcp or pkt.proto == udp
+  allow
+
+test_packet:
+  builder: udp(src_ip="10.0.0.1")
+
+expected:
+  compiles: true
+  bpf_action: allow
+  log_events:
+    - rule_index: 0
+      proto: udp

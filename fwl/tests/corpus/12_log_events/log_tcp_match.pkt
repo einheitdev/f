@@ -1,0 +1,16 @@
+name: "log emits on TCP"
+source_fw: |
+  @xdp(eth0)
+  log if pkt.proto == tcp
+  allow
+
+test_packet:
+  builder: tcp(src_ip="1.2.3.4", dst_port=80)
+
+expected:
+  compiles: true
+  bpf_action: allow
+  log_events:
+    - rule_index: 0
+      proto: tcp
+      src_ip: "1.2.3.4"

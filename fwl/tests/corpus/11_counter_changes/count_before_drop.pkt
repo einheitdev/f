@@ -1,0 +1,15 @@
+name: "counter fires before drop"
+source_fw: |
+  @xdp(eth0)
+  count blocked if pkt.proto == tcp and pkt.dst_port == 22
+  drop if pkt.proto == tcp and pkt.dst_port == 22
+  default allow
+
+test_packet:
+  builder: tcp(dst_port=22)
+
+expected:
+  compiles: true
+  bpf_action: drop
+  counter_changes:
+    blocked: 1

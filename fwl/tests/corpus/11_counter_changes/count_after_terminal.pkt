@@ -1,0 +1,15 @@
+name: "counter after terminal not reached"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.proto == tcp
+  count unreachable if pkt.proto == tcp
+  default allow
+
+test_packet:
+  builder: tcp()
+
+expected:
+  compiles: true
+  bpf_action: drop
+  counter_changes:
+    unreachable: 0

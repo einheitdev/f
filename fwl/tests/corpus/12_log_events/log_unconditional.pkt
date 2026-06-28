@@ -1,0 +1,15 @@
+name: "unconditional log"
+source_fw: |
+  @xdp(eth0)
+  log
+  allow
+
+test_packet:
+  builder: icmp(src_ip="10.0.0.1", dst_ip="10.0.0.2")
+
+expected:
+  compiles: true
+  bpf_action: allow
+  log_events:
+    - rule_index: 0
+      proto: icmp

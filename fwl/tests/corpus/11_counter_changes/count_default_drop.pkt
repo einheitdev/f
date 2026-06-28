@@ -1,0 +1,14 @@
+name: "counter with default drop"
+source_fw: |
+  @xdp(eth0)
+  count icmp_t if pkt.proto == icmp
+  default drop
+
+test_packet:
+  builder: icmp()
+
+expected:
+  compiles: true
+  bpf_action: drop
+  counter_changes:
+    icmp_t: 1

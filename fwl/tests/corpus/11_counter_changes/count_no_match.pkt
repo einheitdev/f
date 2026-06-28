@@ -1,0 +1,14 @@
+name: "counter not incremented on miss"
+source_fw: |
+  @xdp(eth0)
+  count tcp_seen if pkt.proto == tcp
+  allow
+
+test_packet:
+  builder: udp()
+
+expected:
+  compiles: true
+  bpf_action: allow
+  counter_changes:
+    tcp_seen: 0

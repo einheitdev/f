@@ -1,0 +1,14 @@
+name: "counter SYN guard"
+source_fw: |
+  @xdp(eth0)
+  count syn_seen if pkt.proto == tcp and pkt.tcp.syn
+  allow
+
+test_packet:
+  builder: tcp(syn=true)
+
+expected:
+  compiles: true
+  bpf_action: allow
+  counter_changes:
+    syn_seen: 1

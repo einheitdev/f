@@ -1,0 +1,17 @@
+name: "log UDP fields"
+source_fw: |
+  @xdp(eth0)
+  log if pkt.proto == udp
+  allow
+
+test_packet:
+  builder: udp(src_ip="8.8.8.8", src_port=53, dst_port=12345)
+
+expected:
+  compiles: true
+  bpf_action: allow
+  log_events:
+    - rule_index: 0
+      proto: udp
+      src_port: 53
+      dst_port: 12345

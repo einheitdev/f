@@ -1,0 +1,14 @@
+name: "counter NOT condition"
+source_fw: |
+  @xdp(eth0)
+  count non_tcp if pkt.proto != tcp
+  allow
+
+test_packet:
+  builder: udp()
+
+expected:
+  compiles: true
+  bpf_action: allow
+  counter_changes:
+    non_tcp: 1

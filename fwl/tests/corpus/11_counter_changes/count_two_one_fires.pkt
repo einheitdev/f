@@ -1,0 +1,16 @@
+name: "two counters one fires"
+source_fw: |
+  @xdp(eth0)
+  count tcp_t if pkt.proto == tcp
+  count udp_t if pkt.proto == udp
+  allow
+
+test_packet:
+  builder: tcp()
+
+expected:
+  compiles: true
+  bpf_action: allow
+  counter_changes:
+    tcp_t: 1
+    udp_t: 0

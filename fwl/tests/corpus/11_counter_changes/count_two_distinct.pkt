@@ -1,0 +1,16 @@
+name: "two counters both increment"
+source_fw: |
+  @xdp(eth0)
+  count all_traffic
+  count tcp_traffic if pkt.proto == tcp
+  allow
+
+test_packet:
+  builder: tcp()
+
+expected:
+  compiles: true
+  bpf_action: allow
+  counter_changes:
+    all_traffic: 1
+    tcp_traffic: 1

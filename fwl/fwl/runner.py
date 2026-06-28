@@ -9,6 +9,7 @@ Methodology reference: docs/F_DEVELOPMENT_METHODOLOGY.md:132-181.
 """
 from __future__ import annotations
 import ipaddress
+import re
 import struct
 import subprocess
 from dataclasses import dataclass
@@ -101,16 +102,28 @@ def _interpreter_oracle(
       "expected compile failure but program parsed cleanly",
     )
 
-  got = interpreter.evaluate(
+  result = interpreter.evaluate_full(
     program, case.packet.fields, case.state,
     geoip_data=(case.geoip_data or None),
   )
-  if got == expected:
-    return OracleResult("interpreter", "pass", "")
-  return OracleResult(
-    "interpreter", "fail",
-    f"expected {expected.value}, got {got.value}",
+  if result.action != expected:
+    return OracleResult(
+      "interpreter", "fail",
+      f"expected {expected.value}, got {result.action.value}",
+    )
+  counter_diff = _check_counter_changes(
+    case.expected.get("counter_changes", {}),
+    result.counter_changes,
   )
+  if counter_diff:
+    return OracleResult("interpreter", "fail", counter_diff)
+  log_diff = _check_log_events(
+    case.expected.get("log_events", []),
+    result.log_events,
+  )
+  if log_diff:
+    return OracleResult("interpreter", "fail", log_diff)
+  return OracleResult("interpreter", "pass", "")
 
 
 def _bpf_oracle(
@@ -147,17 +160,24 @@ def _bpf_oracle(
     program, case.geoip_data or {}
   ).items():
     map_init[name] = entries
+  counter_slots = _parse_counter_table(c_source)
+  n_slots = len(counter_slots)
+  has_log = any(
+    r.action == ast.Action.LOG for r in program.rules
+  )
 
   try:
-    got = bpf_runner.run(c_source, case.packet.raw, map_init)
+    result = bpf_runner.run_full(
+      c_source, case.packet.raw, map_init, n_slots, has_log
+    )
   except bpf_runner.BpfUnavailable as exc:
-    # Still try to compile, so we catch structural emitter errors.
     try:
       bpf_runner.compile_c(c_source)
     except subprocess.CalledProcessError as cexc:
       stderr = cexc.stderr.decode("utf-8", "replace")
       return OracleResult(
-        "bpf", "fail", f"clang failed to compile emitter output:\n{stderr}"
+        "bpf", "fail",
+        f"clang failed to compile emitter output:\n{stderr}",
       )
     return OracleResult(
       "bpf", "skip",
@@ -169,11 +189,37 @@ def _bpf_oracle(
       "bpf", "fail", f"clang failed:\n{stderr}"
     )
 
-  if got == expected:
-    return OracleResult("bpf", "pass", "")
-  return OracleResult(
-    "bpf", "fail", f"expected {expected.value}, got {got.value}"
-  )
+  if result.action != expected:
+    return OracleResult(
+      "bpf", "fail",
+      f"expected {expected.value}, got {result.action.value}",
+    )
+
+  expected_cc = case.expected.get("counter_changes", {})
+  if expected_cc and counter_slots:
+    named = _slot_deltas_to_named(
+      result.counter_deltas, counter_slots
+    )
+    counter_diff = _check_counter_changes(expected_cc, named)
+    if counter_diff:
+      return OracleResult("bpf", "fail", counter_diff)
+
+  expected_le = case.expected.get("log_events", [])
+  if expected_le:
+    bpf_log = [
+      interpreter.LogEvent(
+        rule_index=e.rule_index, proto=e.proto,
+        src_ip=e.src_ip, dst_ip=e.dst_ip,
+        src_port=e.src_port, dst_port=e.dst_port,
+        syn=e.syn, ack=e.ack,
+      )
+      for e in result.log_events
+    ]
+    log_diff = _check_log_events(expected_le, bpf_log)
+    if log_diff:
+      return OracleResult("bpf", "fail", log_diff)
+
+  return OracleResult("bpf", "pass", "")
 
 
 def run_case(case: pkt.PktCase) -> CaseResult:
@@ -236,6 +282,99 @@ def _build_map_init(
     if entries:
       result[map_name] = entries
   return result
+
+
+def _check_counter_changes(
+  expected: dict[str, int],
+  actual: dict[str, int],
+) -> str:
+  """Compare expected vs actual counter deltas. Empty string = match."""
+  diffs: list[str] = []
+  for name, want in expected.items():
+    got = actual.get(name, 0)
+    if got != want:
+      diffs.append(f"counter {name!r}: expected {want}, got {got}")
+  if diffs:
+    return "counter_changes mismatch: " + "; ".join(diffs)
+  return ""
+
+
+_COUNTER_TABLE_RE = re.compile(
+  r"^//\s+(\d+)\t(.+)$", re.MULTILINE
+)
+
+
+def _parse_counter_table(c_source: str) -> dict[str, int]:
+  """Parse the fwl_counter_table comment block from emitted C."""
+  result: dict[str, int] = {}
+  for match in _COUNTER_TABLE_RE.finditer(c_source):
+    slot = int(match.group(1))
+    name = match.group(2).strip()
+    result[name] = slot
+  return result
+
+
+def _slot_deltas_to_named(
+  slot_deltas: dict[int, int],
+  counter_slots: dict[str, int],
+) -> dict[str, int]:
+  """Convert {slot: delta} to {name: delta}."""
+  slot_to_name = {v: k for k, v in counter_slots.items()}
+  return {
+    slot_to_name[slot]: delta
+    for slot, delta in slot_deltas.items()
+    if slot in slot_to_name
+  }
+
+
+def _check_log_events(
+  expected: list[dict[str, Any]],
+  actual: list[interpreter.LogEvent],
+) -> str:
+  """Compare expected vs actual log events. Empty string = match."""
+  if not expected:
+    return ""
+  if len(expected) != len(actual):
+    return (
+      f"log_events count mismatch: expected {len(expected)}, "
+      f"got {len(actual)}"
+    )
+  for i, (want, got) in enumerate(zip(expected, actual)):
+    diff = _compare_log_event(i, want, got)
+    if diff:
+      return diff
+  return ""
+
+
+_LOG_FIELD_GETTERS = {
+  "rule_index": lambda e: e.rule_index,
+  "proto": lambda e: e.proto,
+  "src_ip": lambda e: e.src_ip,
+  "dst_ip": lambda e: e.dst_ip,
+  "src_port": lambda e: e.src_port,
+  "dst_port": lambda e: e.dst_port,
+  "syn": lambda e: e.syn,
+  "ack": lambda e: e.ack,
+}
+
+
+def _compare_log_event(
+  idx: int,
+  expected: dict[str, Any],
+  actual: interpreter.LogEvent,
+) -> str:
+  """Compare one expected log event against an actual LogEvent."""
+  for field_name, value in expected.items():
+    getter = _LOG_FIELD_GETTERS.get(field_name)
+    if getter is None:
+      continue
+    actual_val = getter(actual)
+    if actual_val != value:
+      return (
+        f"log_events[{idx}].{field_name}: "
+        f"expected {value!r}, got {actual_val!r}"
+      )
+  return ""
 
 
 def _encode_rl_key(per_field: str, raw_key: Any) -> bytes:

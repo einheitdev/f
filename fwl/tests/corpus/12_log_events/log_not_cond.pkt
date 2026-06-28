@@ -1,0 +1,15 @@
+name: "log NOT condition"
+source_fw: |
+  @xdp(eth0)
+  log if pkt.proto != tcp
+  allow
+
+test_packet:
+  builder: udp(dst_port=53)
+
+expected:
+  compiles: true
+  bpf_action: allow
+  log_events:
+    - rule_index: 0
+      proto: udp
