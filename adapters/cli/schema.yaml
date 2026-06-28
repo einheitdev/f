@@ -1,0 +1,45 @@
+version: 1
+product: f
+config:
+  firewall:
+    type: object
+    fields:
+      source:
+        type: string
+        help: "Path to the FWL source file"
+        default: "/etc/f/rules.fw"
+        example: "/etc/f/rules.fw"
+      compiled_dir:
+        type: string
+        help: "Directory for compiled bundles"
+        default: "/usr/share/f/compiled"
+      default_action:
+        type: enum
+        values: [allow, drop]
+        default: "allow"
+        help: "Default action when no rule matches"
+      conntrack:
+        type: boolean
+        default: "false"
+        help: "Enable connection tracking"
+  daemon:
+    type: object
+    fields:
+      socket:
+        type: string
+        help: "ZMQ IPC control socket path"
+        default: "ipc:///run/f/control.sock"
+      pin_path:
+        type: string
+        help: "BPF map pin directory"
+        default: "/sys/fs/bpf/f"
+      log_level:
+        type: enum
+        values: [trace, debug, info, warn, error]
+        default: "info"
+  editor:
+    type: string
+    help: "Preferred editor for configure firewall"
+    default: "vim"
+
+types: {}

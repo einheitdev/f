@@ -1,0 +1,8 @@
+# KSZ9477S switch ports (DSA).
+# No addresses by default — the operator assigns them
+# via the CLI or first-boot provisioning.
+[Match]
+Name=lan*
+
+[Network]
+LinkLocalAddressing=no

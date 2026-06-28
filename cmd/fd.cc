@@ -8,13 +8,16 @@
 #include <atomic>
 #include <chrono>
 #include <cstring>
+#include <fstream>
 #include <print>
 #include <string>
 #include <thread>
 #include <vector>
 
 #include <CLI/CLI.hpp>
+#include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
+#include <yaml-cpp/yaml.h>
 
 #include "f/engine.h"
 
@@ -77,6 +80,37 @@ auto RunEngine(const std::string& sock_addr,
 
 }  // namespace
 
+auto LoadConfig(const std::string& path,
+                std::string& interfaces,
+                std::string& socket_addr,
+                std::string& pin_path,
+                std::string& log_level) -> bool {
+  try {
+    auto cfg = YAML::LoadFile(path);
+    if (cfg["interfaces"]) {
+      std::string ifaces;
+      for (const auto& n : cfg["interfaces"]) {
+        if (!ifaces.empty()) ifaces += ',';
+        ifaces += n.as<std::string>();
+      }
+      if (!ifaces.empty()) interfaces = ifaces;
+    }
+    if (cfg["socket"]) {
+      socket_addr = cfg["socket"].as<std::string>();
+    }
+    if (cfg["pin_path"]) {
+      pin_path = cfg["pin_path"].as<std::string>();
+    }
+    if (cfg["log_level"]) {
+      log_level = cfg["log_level"].as<std::string>();
+    }
+    return true;
+  } catch (const std::exception& e) {
+    spdlog::warn("Config {}: {}", path, e.what());
+    return false;
+  }
+}
+
 int main(int argc, char** argv) {
   spdlog::set_level(spdlog::level::info);
   spdlog::set_pattern(
@@ -86,13 +120,16 @@ int main(int argc, char** argv) {
   app.require_subcommand(1);
   app.fallthrough();
 
+  std::string config_file;
   std::string interfaces;
   std::string socket_addr =
-      "ipc:///tmp/fd-control.sock";
+      "ipc:///run/f/control.sock";
   std::string pin_path = "/sys/fs/bpf/f";
   std::string bundle_dir = "/usr/share/f/compiled";
   std::string log_level = "info";
 
+  app.add_option("-c,--config", config_file,
+                 "YAML config file");
   app.add_option("-i,--interfaces", interfaces,
                  "Comma-separated NIC list");
   app.add_option("-s,--socket", socket_addr,
@@ -111,6 +148,15 @@ int main(int argc, char** argv) {
   app.add_subcommand("start", "Daemonize and run");
 
   CLI11_PARSE(app, argc, argv);
+
+  // Load config file (CLI flags override).
+  if (!config_file.empty()) {
+    LoadConfig(config_file, interfaces, socket_addr,
+               pin_path, log_level);
+  } else if (std::ifstream("/etc/f/fd.yaml").good()) {
+    LoadConfig("/etc/f/fd.yaml", interfaces, socket_addr,
+               pin_path, log_level);
+  }
 
   if (log_level == "trace")
     spdlog::set_level(spdlog::level::trace);

@@ -1,0 +1,33 @@
+<section class="card">
+  <h2 class="card-title">network interfaces</h2>
+  <div class="card-body">
+{% if length(interfaces) > 0 %}
+    <table class="data-table">
+      <thead>
+        <tr>
+          <th>name</th>
+          <th>state</th>
+          <th>mac</th>
+          <th>mtu</th>
+          <th>speed</th>
+          <th>addresses</th>
+        </tr>
+      </thead>
+      <tbody>
+{% for iface in interfaces %}
+        <tr>
+          <td><strong>{{ iface.name }}</strong></td>
+          <td><span class="badge badge-{{ iface.state_semantic }}">{{ iface.state }}</span></td>
+          <td class="mono">{{ iface.mac }}</td>
+          <td>{{ iface.mtu }}</td>
+          <td>{{ iface.speed }}</td>
+          <td>{{ iface.addr_str }}</td>
+        </tr>
+{% endfor %}
+      </tbody>
+    </table>
+{% else %}
+    <div class="empty">no interfaces found</div>
+{% endif %}
+  </div>
+</section>

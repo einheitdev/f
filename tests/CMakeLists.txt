@@ -7,13 +7,22 @@ file(GLOB_RECURSE test_sources
 foreach(test_source ${test_sources})
   get_filename_component(test_name ${test_source} NAME_WE)
   add_executable(${test_name} ${test_source})
-  target_link_libraries(${test_name} PRIVATE
-    libf-api
-    libf-engine
-    GTest::gtest_main
-  )
-  gtest_discover_tests(${test_name}
-    DISCOVERY_TIMEOUT 10
-    PROPERTIES TIMEOUT 30
-  )
+  if(test_name STREQUAL "test_fw_adapter")
+    target_link_libraries(${test_name} PRIVATE
+      einheit_adapter_fw
+      GTest::gtest_main
+    )
+  else()
+    target_link_libraries(${test_name} PRIVATE
+      libf-api
+      libf-engine
+      GTest::gtest_main
+    )
+  endif()
+  if(NOT CMAKE_CROSSCOMPILING)
+    gtest_discover_tests(${test_name}
+      DISCOVERY_TIMEOUT 10
+      PROPERTIES TIMEOUT 30
+    )
+  endif()
 endforeach()

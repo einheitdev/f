@@ -1,0 +1,15 @@
+[Unit]
+Description=f appliance first-boot provisioning
+ConditionPathExists=!/etc/f/.provisioned
+After=local-fs.target systemd-networkd.service
+Before=fd.service einheit-f-ui.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/share/f/firstboot.sh
+RemainAfterExit=yes
+StandardOutput=journal+console
+StandardError=journal+console
+
+[Install]
+WantedBy=multi-user.target

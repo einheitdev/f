@@ -3,6 +3,7 @@
 
 #include "f/engine.h"
 
+#include <arpa/inet.h>
 #include <net/if.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -133,6 +134,114 @@ auto HandleRequest(Engine& e, const std::string& req_str)
         return json({{"error", ex.what()}}).dump();
       }
     }
+    case Cmd::kGetFirewall: {
+      json j;
+      j["default_action"] =
+          e.current_config.default_action == 0
+              ? "drop" : "allow";
+      j["active_table"] = e.current_config.active_table;
+      j["conntrack"] =
+          e.current_config.conntrack_enabled != 0;
+      auto status = GetStatus(e);
+      j["rule_count"] = status.rule_count;
+      return j.dump();
+    }
+    case Cmd::kGetRules: {
+      auto rules_res = GetRules(e);
+      if (!rules_res) {
+        return json({{"error",
+            rules_res.error().message}}).dump();
+      }
+      auto status = GetStatus(e);
+      int ncpus = libbpf_num_possible_cpus();
+      if (ncpus < 1) ncpus = 1;
+      json arr = json::array();
+      uint32_t idx = 0;
+      for (const auto& [key, val] : *rules_res) {
+        uint64_t pkts = 0, bytes = 0;
+        std::vector<RuleCounter> per_cpu(ncpus);
+        if (bpf_map_lookup_elem(
+                e.bpf.counters_fd, &idx,
+                per_cpu.data()) == 0) {
+          for (int c = 0; c < ncpus; c++) {
+            pkts += per_cpu[c].packets;
+            bytes += per_cpu[c].bytes;
+          }
+        }
+        char src[INET_ADDRSTRLEN], dst[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &key.src_addr, src,
+                  sizeof(src));
+        inet_ntop(AF_INET, &key.dst_addr, dst,
+                  sizeof(dst));
+        std::string action_str =
+            val.action == 0 ? "drop"
+            : val.action == 1 ? "allow"
+            : "rate-limit";
+        std::string proto_str =
+            key.proto == 0 ? "any"
+            : key.proto == 1 ? "icmp"
+            : key.proto == 6 ? "tcp"
+            : key.proto == 17 ? "udp"
+            : std::to_string(key.proto);
+        std::string action_sem =
+            action_str == "allow" ? "good"
+            : action_str == "drop" ? "bad"
+            : "warn";
+        arr.push_back({
+            {"idx", idx},
+            {"src", std::string(src)},
+            {"dst", std::string(dst)},
+            {"src_port", key.src_port},
+            {"dst_port", key.dst_port},
+            {"proto", proto_str},
+            {"action", action_str},
+            {"action_semantic", action_sem},
+            {"packets", pkts},
+            {"bytes", bytes},
+        });
+        idx++;
+      }
+      return arr.dump();
+    }
+    case Cmd::kGetCounters: {
+      int ncpus = libbpf_num_possible_cpus();
+      if (ncpus < 1) ncpus = 1;
+      json arr = json::array();
+      for (uint32_t i = 0; i < 256; i++) {
+        std::vector<RuleCounter> per_cpu(ncpus);
+        if (bpf_map_lookup_elem(
+                e.bpf.counters_fd, &i,
+                per_cpu.data()) != 0) {
+          break;
+        }
+        uint64_t pkts = 0, bytes = 0;
+        for (int c = 0; c < ncpus; c++) {
+          pkts += per_cpu[c].packets;
+          bytes += per_cpu[c].bytes;
+        }
+        if (pkts == 0 && bytes == 0) continue;
+        arr.push_back({
+            {"id", i}, {"packets", pkts},
+            {"bytes", bytes},
+        });
+      }
+      return arr.dump();
+    }
+    case Cmd::kClearCounters: {
+      int ncpus = libbpf_num_possible_cpus();
+      if (ncpus < 1) ncpus = 1;
+      std::vector<RuleCounter> zeros(ncpus);
+      uint32_t cleared = 0;
+      for (uint32_t i = 0; i < 256; i++) {
+        if (bpf_map_update_elem(
+                e.bpf.counters_fd, &i, zeros.data(),
+                BPF_ANY) != 0) {
+          break;
+        }
+        cleared++;
+      }
+      return json({{"cleared", cleared}}).dump();
+    }
     default:
       return R"({"error":"unknown command"})";
   }
@@ -169,12 +278,15 @@ auto EngineInit(Engine& e,
     spdlog::warn("Pin maps failed: {} — continuing.",
                  pin_res.error().message);
   } else {
-    // Make pinned maps world-readable for f-api.
+    // Make pinned maps world-readable for the CLI and UI.
+    auto bpffs = std::filesystem::path(e.pin_path)
+                     .parent_path();
+    chmod(bpffs.c_str(), 0755);
+    chmod(e.pin_path.c_str(), 0755);
     for (const auto& entry :
          std::filesystem::directory_iterator(e.pin_path)) {
       chmod(entry.path().c_str(), 0644);
     }
-    chmod(e.pin_path.c_str(), 0755);
     spdlog::info("Maps pinned to {}.", e.pin_path);
   }
 

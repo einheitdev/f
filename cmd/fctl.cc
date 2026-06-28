@@ -61,7 +61,7 @@ int main(int argc, char** argv) {
   app.fallthrough();
 
   std::string socket_addr =
-      "ipc:///tmp/fd-control.sock";
+      "ipc:///run/f/control.sock";
   app.add_option("-s,--socket", socket_addr,
                  "ZMQ IPC address");
 

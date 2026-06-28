@@ -1,0 +1,24 @@
+# f appliance provisioning data.
+# Place this file at /boot/f-provision.yaml before first boot.
+
+hostname: fw-edge-01
+
+# Management interface (eth0) static IP.
+# Omit this section to use DHCP.
+management:
+  address: 192.168.1.1/24
+  gateway: 192.168.1.254
+  dns:
+    - 1.1.1.1
+    - 8.8.8.8
+
+# SSH authorized keys for root access.
+ssh_keys:
+  - ssh-ed25519 AAAA... operator@workstation
+
+# Interfaces to attach XDP firewall programs.
+interfaces:
+  - lan0
+  - lan1
+  - lan2
+  - lan3
