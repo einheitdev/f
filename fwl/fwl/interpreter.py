@@ -564,11 +564,12 @@ def _eval_comparison(
 
   # Protocol enum
   if field_name == ast.FIELD_PROTO:
-    expected = operand.proto.value  # type: ignore[union-attr]
     if op == "==":
-      return actual == expected
+      return actual == operand.proto.value  # type: ignore[union-attr]
     if op == "!=":
-      return actual != expected
+      return actual != operand.proto.value  # type: ignore[union-attr]
+    if op == "in":
+      return _proto_in_set(actual, operand)
 
   # IP fields
   if field_name in ast.IP_FIELDS:
@@ -730,3 +731,22 @@ def _port_in_set(port_value: int, operand: ast.Operand) -> bool:
         return True
     return False
   raise TypeError(f"unexpected operand for port in: {type(operand).__name__}")
+
+
+def _proto_in_set(proto_value: int, operand: ast.Operand) -> bool:
+  """Membership test for `pkt.proto in [list]`.
+
+  Per the v0.2 spec fix to FWL_V02_SPEC.md:566/:718, a proto-typed LHS
+  admits `in` over a list of proto_keyword tokens; the analyzer
+  enforces that every list item is a ProtoLiteral, so this only
+  needs to handle ListLiteral.
+  """
+  if isinstance(operand, ast.ListLiteral):
+    for item in operand.items:
+      if (isinstance(item, ast.ProtoLiteral)
+          and item.proto.value == proto_value):
+        return True
+    return False
+  raise TypeError(
+    f"unexpected operand for proto in: {type(operand).__name__}"
+  )

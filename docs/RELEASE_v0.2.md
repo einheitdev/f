@@ -73,8 +73,39 @@ None required. v0.1 programs compile and run unchanged. The strict-superset guar
 ## Verification
 
 - `f/fwl/tests/corpus/`: 133/133 cases pass under `sudo hone regress` (BPF oracle live). 70 v0.1 cases + 22 IPv6 + 24 geoip + 17 Tier 2 + reproducers from each construct's hunt.
-- `pytest`: 457/457 cases (parser + analyzer + emitter + bundle + clang-compile regression).
+- `pytest`: 462/462 cases (parser + analyzer + emitter + bundle + clang-compile regression). Includes 4 new `TestNonIpEarlyOut` cases pinning the soak-surfaced ARP-pass contract.
 - `flake8`: clean.
+
+### Soak verification — `f/fwl/examples/dogfood_v02.fw` on deb-02
+
+| Field | Value |
+|---|---|
+| VM | `deb-02` @ 10.101.0.100 (Debian 13 trixie, kernel 6.12.73, libbpf 1.5) |
+| Soak start | 2026-05-02 11:03:27 UTC (v2 attach after Incident #3 fix) |
+| Soak end | 2026-05-04 16:12:28 UTC (graceful systemd stop, ahead of host powercut at ~16:13) |
+| Continuous fd attach | **53 h 1 min**, single attach, `NRestarts=0` |
+| `fd.service` journal | 0 WARN, 0 ERROR, 0 FAILED across the window — quiet steady state, two log lines on attach + four on graceful detach |
+| dmesg | only the `XDP request 5 queues but max is 1` informational line at attach (virtio_net + XDP queue mismatch — XDP_TX/REDIRECT degrade, irrelevant for PASS/DROP semantics) |
+| `hone-soak.timer` cadence | 30 min, `Persistent=false` |
+| Successful ticks | **96** (`hone-soak done` lines in journal) |
+| Failed ticks | 8 — all in the 08:00–09:59 UTC daily window, root cause Soak Finding #4 (`hone-soak.sh:54` octal parse on `08`/`09`) |
+| Net tick attempts | 104; **acceptance threshold ≥96 met by the success count alone** |
+| `hone fuzz` divergent count | **0** across every tick (`boundary_probing` 0/42 and `oracle_divergence` 0/1000 per tick) |
+| Hunt step | did not contribute — Finding #2 (claude CLI not in fd's PATH) blocked every hunt invocation; LLM spend across the soak: **$0.00** |
+| KB findings before / after soak | 66 / 66 (no growth — boundary/oracle 0-divergent, hunt blocked) |
+| Strategy weights at close | `boundary_probing=0.243 · oracle_divergence=0.243 · hunt=0.220 · mutate=0.147 · transfer=0.147` (5%-floor respected, no strategy hoarding >60%) |
+| Patterns post-`hone abstract` | 8 → 11 (3 new: `geoip-spec-cross-section-drift`, `ipv6-literal-spec-incompleteness`, `v02-rule-incomplete-enumeration`) |
+
+The soak window also surfaced four soak-time issues — three Phase-1 stop-condition incidents during stand-up that all resolved before the soak's clean window opened, and one in-window non-blocking finding. Full reproducer logs and resolutions live in `~/dev/workspaces/f-phase2-soak/planning/SOAK_INCIDENTS.md` and `SOAK_FINDINGS.md` in the soak workspace.
+
+| ID | Class | One-line | Fix landed in |
+|---|---|---|---|
+| Incident #1 | stop-condition | v0.1 daemon hard-codes `fw_prog`; v0.2 emitter outputs `fwl_prog` | `f/src/bpf_loader.cc` (dual-name lookup) |
+| Incident #2 | stop-condition | `PinMaps` calls `bpf_obj_pin(-1, …)` for v0.1-only maps absent in v0.2 bundles; `--interfaces=eth0` hard-coded against deb-02's `enp1s0` | `f/src/bpf_loader.cc` (skip fd<0) + soak workspace `f-hone/deploy/staging/{fd.service,fd.yaml}` |
+| Incident #3 | stop-condition | dogfood's trailing `drop` compiled to unconditional `XDP_DROP` for non-IP frames; ARP cache expired at T+10 min and re-ARP got dropped | `f/fwl/fwl/emitter.py` non-IP early-out (`if (!v4_ok && !v6_ok) return XDP_PASS;`) |
+| Finding #4 | non-blocking | `hone-soak.sh:54` `$(( $(date -u +%H) % 4 ))` trips on `08`/`09` octal interpretation; 8 daily-recurring tick failures | (deferred — soak workspace `f-hone/deploy/staging/hone-soak.sh`, fix is `10#$(date -u +%H)`) |
+
+The pre-soak, in-soak, and post-soak verification together exercise: the FWL→BPF compile path (462 pytest), the three-oracle agreement on 350 cumulative-corpus cases (`hone regress`, BPF live under sudo, 318 BPF-live oracles green), zero divergent across deterministic fuzz strategies (boundary_probing + oracle_divergence at multiple seeds, both before the soak and 96× during), and a 53-hour live-link attach against the dogfood program with no journal events between attach and graceful stop. The soak's three Phase-1 stop conditions surfaced at the integration boundary that the per-packet test runners cannot reach (live-NIC traffic streams + systemd unit + interface-name binding); each was triaged, fixed in the impl workspace, redeployed, and re-armed, and the resulting clean window covered the full 48-hour DoD ask.
 
 ## Known deferrals to v0.3
 

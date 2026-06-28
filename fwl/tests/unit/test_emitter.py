@@ -44,6 +44,48 @@ class TestPrelude:
     assert "tcp_syn = tcp->syn" in src
 
 
+class TestNonIpEarlyOut:
+  """Pin the ARP/non-IP early-out per planning/SOAK_INCIDENTS.md
+  Incident #3. The dogfood soak surfaced that programs with
+  `default drop` or a Tier 2 trailing `drop` silently dropped
+  ARP, killing the management plane within minutes. The emitter
+  must inject an unconditional XDP_PASS for non-IP frames after
+  the prelude, when the program references any IP-aware field."""
+  def test_prelude_emits_non_ip_early_out(self):
+    src = emit("@xdp(eth0)\ndrop if pkt.proto == tcp\n")
+    assert "if (!v4_ok && !v6_ok) return XDP_PASS;" in src
+
+  def test_no_prelude_no_early_out(self):
+    src = emit("@xdp(eth0)\nallow\n")
+    # No fields referenced ⇒ no prelude ⇒ no early-out (the user
+    # is explicitly choosing to apply the action to every frame).
+    assert "v4_ok" not in src
+
+  def test_v6_active_program_keeps_early_out(self):
+    src = emit(
+      "@xdp(eth0)\n"
+      "allow if pkt.src_ip6 in 2001:db8::/32\n"
+      "default drop\n"
+    )
+    assert "if (!v4_ok && !v6_ok) return XDP_PASS;" in src
+
+  def test_tier2_default_drop_does_not_drop_non_ip(self):
+    src = emit(
+      "@xdp(eth0)\n\n"
+      "def firewall(pkt):\n"
+      "  if pkt.proto == tcp:\n"
+      "    allow\n"
+      "  drop\n"
+    )
+    # Without the early-out, ARP would land on the trailing
+    # `return XDP_DROP;` and kill the link.
+    assert "if (!v4_ok && !v6_ok) return XDP_PASS;" in src
+    # And the early-out must precede any user rule.
+    early_pos = src.index("if (!v4_ok && !v6_ok) return XDP_PASS;")
+    drop_pos = src.index("return XDP_DROP")
+    assert early_pos < drop_pos
+
+
 class TestActions:
   def test_allow_returns_xdp_pass(self):
     src = emit("@xdp(eth0)\nallow\n")

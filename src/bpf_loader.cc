@@ -95,13 +95,20 @@ auto LoadProgram(std::string_view bundle_dir)
                     std::strerror(-err)));
   }
 
+  // The v0.2 FWL emitter names the XDP entry point `fwl_prog`;
+  // the legacy v0.1 `bpf/fw.bpf.c` uses `fw_prog`. Try the v0.2
+  // name first so freshly-compiled bundles load, fall back to the
+  // v0.1 name so the cold-boot search list (no bundle) still works.
   struct bpf_program* prog =
-      bpf_object__find_program_by_name(g_obj, "fw_prog");
+      bpf_object__find_program_by_name(g_obj, "fwl_prog");
+  if (!prog) {
+    prog = bpf_object__find_program_by_name(g_obj, "fw_prog");
+  }
   if (!prog) {
     bpf_object__close(g_obj);
     g_obj = nullptr;
     return MakeError(BpfError::kLoadFailed,
-        "fw_prog not found in BPF object");
+        "neither fwl_prog nor fw_prog found in BPF object");
   }
 
   BpfHandles h;
@@ -175,6 +182,11 @@ auto PinMaps(const BpfHandles& h,
   };
 
   for (const auto& p : pins) {
+    // v0.2 FWL bundles don't carry the legacy rule-table /
+    // conntrack maps (their machinery now lives per-rule inside
+    // the program). FindMap returns -1 for absent maps; skip
+    // pinning those rather than failing the whole step.
+    if (p.fd < 0) continue;
     std::string path = base + "/" + p.name;
     int err = bpf_obj_pin(p.fd, path.c_str());
     if (err) {

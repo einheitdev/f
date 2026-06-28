@@ -453,6 +453,30 @@ def build_packet(fields: dict[str, Any]) -> Packet:
   return Packet(raw=raw, fields=decoded)
 
 
+_TOP_LEVEL_KEYS = frozenset({
+  "name", "source_fw", "test_packet", "expected", "state", "geoip_data",
+})
+_TEST_PACKET_KEYS = frozenset({"builder", "truncate_to"})
+_EXPECTED_KEYS = frozenset({
+  "compiles", "bpf_action", "counter_changes", "log_events",
+  "load_action", "load_error_pattern", "loads",
+  # Hunt-emitted assertion text. The runner does not consume it
+  # today — wiring it through the analyzer is a v0.3 backlog item.
+  "compile_error_pattern",
+})
+_STATE_KEYS = frozenset({"rate_limit"})
+
+
+def _reject_unknown_keys(
+  block: dict, allowed: frozenset[str], where: str,
+) -> None:
+  """Per PKT_V01_SPEC.md:39, unknown keys at any documented level
+  are validation errors — silently discarding typos breaks tests."""
+  for key in block:
+    if key not in allowed:
+      raise ValueError(f"unknown field {key!r} at {where}")
+
+
 def load(path: Path) -> PktCase:
   """Load a `.pkt` YAML file from disk.
 
@@ -463,6 +487,13 @@ def load(path: Path) -> PktCase:
   """
   text = path.read_text(encoding="utf-8")
   doc = yaml.safe_load(text)
+  _reject_unknown_keys(doc, _TOP_LEVEL_KEYS, "top level")
+  _reject_unknown_keys(
+    doc["test_packet"], _TEST_PACKET_KEYS, "test_packet"
+  )
+  _reject_unknown_keys(doc["expected"], _EXPECTED_KEYS, "expected")
+  if doc.get("state") is not None:
+    _reject_unknown_keys(doc["state"], _STATE_KEYS, "state")
 
   builder_text = doc["test_packet"]["builder"]
   fields = parse_builder(builder_text)
@@ -495,6 +526,20 @@ def load(path: Path) -> PktCase:
           f"state.rate_limit references rule index {idx} without a "
           f"rate_limit modifier"
         )
+      # PKT_V01_SPEC.md:96 — bucket count is a non-negative integer.
+      # Catching it here keeps the loader the single point that rejects
+      # malformed state, instead of letting struct.pack crash later.
+      for bucket_key, count in buckets.items():
+        if not isinstance(count, int) or isinstance(count, bool):
+          raise ValueError(
+            f"state.rate_limit[{idx}][{bucket_key!r}] must be a "
+            f"non-negative integer; got {count!r}"
+          )
+        if count < 0:
+          raise ValueError(
+            f"state.rate_limit[{idx}][{bucket_key!r}] must be a "
+            f"non-negative integer; got {count}"
+          )
       state[idx] = dict(buckets)
 
   raw_geoip = doc.get("geoip_data") or {}

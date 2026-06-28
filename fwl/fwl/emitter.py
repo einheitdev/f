@@ -418,6 +418,17 @@ def _emit_parse_prelude(program: ast.Program) -> str:
   if v6_active:
     v6_branch = _emit_v6_branch(fields, needs_l4, needs_tcp)
 
+  # Non-IP frame early-out. Any program that references an IP-aware
+  # field (and therefore generates this prelude) cannot meaningfully
+  # filter on ARP, NDP, LLDP, or any other L2 control protocol — its
+  # rule guards are all gated on v4_ok / v6_ok. Without this gate,
+  # an explicit `drop` action (Tier 1 `default drop` or a Tier 2
+  # trailing `drop` statement) compiles to `return XDP_DROP;` at the
+  # function tail and silently drops ARP, killing the management
+  # plane within minutes of going live. Surfaced by the v0.2 dogfood
+  # soak (planning/SOAK_INCIDENTS.md Incident #3, 2026-05-02). Treated
+  # as an intentional v0.2 semantic improvement per the v4_ok/l4_ok
+  # precedent recorded in CLAUDE.md "Operating reminders".
   return f"""\
 {decl_block}
   void *data = (void *)(long)ctx->data;
@@ -432,6 +443,7 @@ def _emit_parse_prelude(program: ast.Program) -> str:
       }}
     }}{v6_branch}
   }}
+  if (!v4_ok && !v6_ok) return XDP_PASS;
 
 """
 
