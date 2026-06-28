@@ -22,7 +22,7 @@ struct FLocalConfig {
   /// bpffs pin path where fd pins its maps.
   std::string pin_path = "/sys/fs/bpf/f";
   /// Raw ZMQ IPC endpoint for fd's control socket.
-  std::string fd_socket = "ipc:///tmp/fd-control.sock";
+  std::string fd_socket = "ipc:///run/f/control.sock";
   /// Path to the FWL source file.
   std::string fw_source = "/etc/f/rules.fw";
   /// Path to the fwl compiler.

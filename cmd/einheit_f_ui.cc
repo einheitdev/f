@@ -24,7 +24,7 @@ auto main(int argc, char** argv) -> int {
   std::string bind = "0.0.0.0";
   uint16_t port = 7542;
   std::string pin_path = "/sys/fs/bpf/f";
-  std::string fd_socket = "ipc:///tmp/fd-control.sock";
+  std::string fd_socket = "ipc:///run/f/control.sock";
   int sample_ms = 1000;
   std::string templates_dir;
   std::string assets_dir;

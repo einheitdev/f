@@ -9,6 +9,6 @@ target_include_directories(einheit_adapter_fw PUBLIC
 
 target_link_libraries(einheit_adapter_fw PUBLIC
   einheit_cli
-  libf-engine
   nlohmann_json::nlohmann_json
+  cppzmq
 )

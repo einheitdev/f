@@ -24,6 +24,9 @@ enum class Cmd : uint8_t {
   kGetStatus = 3,
   kReloadProg = 4,
   kStop = 5,
+  kGetFirewall = 6,
+  kGetRules = 7,
+  kClearCounters = 8,
 };
 
 // ============================================================================

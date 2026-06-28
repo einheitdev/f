@@ -10,7 +10,7 @@ ExecStart=/usr/local/bin/einheit-f-ui \
     --bind 0.0.0.0 \
     --port 443 \
     --pin-path /sys/fs/bpf/f \
-    --socket ipc:///tmp/fd-control.sock \
+    --socket ipc:///run/f/control.sock \
     --templates /usr/share/einheit-ui/templates \
     --assets /usr/share/einheit-ui/assets
 Restart=on-failure

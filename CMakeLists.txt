@@ -160,29 +160,6 @@ target_link_libraries(libf-api PUBLIC
 )
 
 # ============================================================================
-# fd — BPF engine daemon
-# ============================================================================
-add_executable(fd cmd/fd.cc)
-target_link_libraries(fd PRIVATE
-  libf-engine CLI11::CLI11)
-
-# ============================================================================
-# fctl — engine control CLI
-# ============================================================================
-add_executable(fctl cmd/fctl.cc)
-target_include_directories(fctl PRIVATE
-  ${PROJECT_SOURCE_DIR}/include)
-target_link_libraries(fctl PRIVATE
-  libf-engine CLI11::CLI11)
-
-# ============================================================================
-# f-api — web dashboard daemon
-# ============================================================================
-add_executable(f-api cmd/f_api.cc)
-target_link_libraries(f-api PRIVATE
-  libf-api libf-engine CLI11::CLI11)
-
-# ============================================================================
 # einheit-cli framework (sibling repo)
 # ============================================================================
 set(EINHEIT_BUILD_TESTS OFF CACHE BOOL "" FORCE)
@@ -204,6 +181,36 @@ add_subdirectory(
   ${CMAKE_BINARY_DIR}/_deps/einheit-ui
   EXCLUDE_FROM_ALL
 )
+
+# ============================================================================
+# yaml-cpp (system, for fd config file parsing)
+# ============================================================================
+if(NOT TARGET yaml-cpp::yaml-cpp)
+  find_package(yaml-cpp REQUIRED)
+endif()
+
+# ============================================================================
+# fd — BPF engine daemon
+# ============================================================================
+add_executable(fd cmd/fd.cc)
+target_link_libraries(fd PRIVATE
+  libf-engine CLI11::CLI11 yaml-cpp::yaml-cpp)
+
+# ============================================================================
+# fctl — engine control CLI
+# ============================================================================
+add_executable(fctl cmd/fctl.cc)
+target_include_directories(fctl PRIVATE
+  ${PROJECT_SOURCE_DIR}/include)
+target_link_libraries(fctl PRIVATE
+  libf-engine CLI11::CLI11)
+
+# ============================================================================
+# f-api — web dashboard daemon
+# ============================================================================
+add_executable(f-api cmd/f_api.cc)
+target_link_libraries(f-api PRIVATE
+  libf-api libf-engine CLI11::CLI11)
 
 # ============================================================================
 # f CLI adapter

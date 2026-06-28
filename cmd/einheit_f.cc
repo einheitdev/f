@@ -44,7 +44,7 @@ auto main(int argc, char** argv) -> int {
   bool ascii = false;
   int width = 0;
   std::string pin_path = "/sys/fs/bpf/f";
-  std::string fd_socket = "ipc:///tmp/fd-control.sock";
+  std::string fd_socket = "ipc:///run/f/control.sock";
   std::string fw_source = "/etc/f/rules.fw";
   bool locked = false;
 
@@ -103,14 +103,11 @@ auto main(int argc, char** argv) -> int {
   s.locked = locked;
   s.theme = cli::render::PickTheme(caps, false);
 
-  // On the appliance, every SSH session is at least operator.
+  // On the appliance, every SSH session is admin.
   s.caller.user = "operator";
-  s.caller.role = cli::RoleGate::OperatorOrAdmin;
+  s.caller.role = cli::RoleGate::AdminOnly;
   if (auto id = cli::auth::ResolveLocal(); id) {
     s.caller.user = id->user;
-    if (id->role == cli::RoleGate::AdminOnly) {
-      s.caller.role = cli::RoleGate::AdminOnly;
-    }
   }
 
   BuildTree(s.tree, *adapter);

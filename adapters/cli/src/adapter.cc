@@ -69,7 +69,7 @@ config:
       socket:
         type: string
         help: "ZMQ IPC control socket path"
-        default: "ipc:///tmp/fd-control.sock"
+        default: "ipc:///run/f/control.sock"
       pin_path:
         type: string
         help: "BPF map pin directory"
@@ -134,6 +134,23 @@ auto FormatBytes(uint64_t bytes) -> std::string {
         static_cast<double>(bytes) / 1'000.0);
   }
   return std::to_string(bytes);
+}
+
+auto ListFwFileNames(const std::string& partial)
+    -> std::vector<std::string> {
+  std::vector<std::string> out;
+  std::string dir = "/etc/f";
+  if (!std::filesystem::is_directory(dir)) return out;
+  for (const auto& e :
+       std::filesystem::directory_iterator(dir)) {
+    if (e.path().extension() != ".fw") continue;
+    auto name = e.path().filename().string();
+    if (name.rfind(partial, 0) == 0) {
+      out.push_back(name);
+    }
+  }
+  std::sort(out.begin(), out.end());
+  return out;
 }
 
 auto SemanticForState(const std::string& state)
@@ -374,43 +391,91 @@ auto RenderShowCounters(const Response& resp,
 auto RenderSimpleOk(const Response& resp,
                     Renderer& renderer) -> void {
   auto j = ParseData(resp);
+  // show_config renders file contents directly.
+  if (j.contains("files")) {
+    auto& out = renderer.Out();
+    for (const auto& f : j["files"]) {
+      out << "## " << f.value("path", "") << "\n";
+      out << f.value("content", "") << "\n";
+    }
+    return;
+  }
+  // show_diff renders the diff directly.
+  if (j.contains("diff")) {
+    renderer.Out() << j["diff"].get<std::string>()
+                   << "\n";
+    return;
+  }
+  // show_commits renders the commit list.
+  if (j.contains("commits")) {
+    auto& commits = j["commits"];
+    if (commits.empty()) {
+      renderer.Out() << "no commits yet\n";
+    }
+    return;
+  }
   Table t;
   AddColumn(t, "RESULT");
   std::string msg = "ok";
+  if (j.contains("status")) {
+    msg = j["status"].get<std::string>();
+  }
   if (j.contains("cleared")) {
     msg = std::format("cleared {} counter slots",
                       j["cleared"].get<int>());
+  }
+  if (j.contains("reload")) {
+    msg += " (" + j["reload"].get<std::string>() + ")";
+  }
+  if (j.contains("files_restored")) {
+    msg += std::format(" ({} files restored)",
+                       j["files_restored"].get<int>());
   }
   AddRow(t, {Cell{msg, Semantic::Good}});
   RenderFormatted(t, renderer);
 }
 
-auto RenderConfigureFirewall(const Response& resp,
-                             Renderer& renderer) -> void {
+auto RenderShowFiles(const Response& resp,
+                     Renderer& renderer) -> void {
+  auto j = ParseData(resp);
+  auto files = j.value("files", json::array());
+  if (files.empty()) {
+    Table t;
+    AddColumn(t, "FILES");
+    AddRow(t, {Cell{"no .fw files found", Semantic::Dim}});
+    RenderFormatted(t, renderer);
+    return;
+  }
+  Table t;
+  AddColumn(t, "FILE", Align::Left, Priority::High);
+  AddColumn(t, "SIZE", Align::Right, Priority::Medium);
+  AddColumn(t, "LINES", Align::Right, Priority::Medium);
+  for (const auto& f : files) {
+    AddRow(t, {
+        Cell{f.value("name", ""), Semantic::Emphasis},
+        Cell{f.value("size", "")},
+        Cell{std::to_string(f.value("lines", 0))},
+    });
+  }
+  RenderFormatted(t, renderer);
+}
+
+auto RenderEdit(const Response& resp,
+                Renderer& renderer) -> void {
   auto j = ParseData(resp);
   Table t;
   AddColumn(t, "FIELD", Align::Left, Priority::High);
   AddColumn(t, "VALUE", Align::Left, Priority::High);
 
-  auto status = j.value("status", "");
-  Semantic sem = status == "valid"     ? Semantic::Good
-                 : status == "unchanged" ? Semantic::Dim
-                                       : Semantic::Warn;
-  AddRow(t, {Cell{"status", Semantic::Info},
-             Cell{status, sem}});
-  if (j.contains("source")) {
-    AddRow(t, {Cell{"source", Semantic::Info},
-               Cell{j["source"].get<std::string>()}});
+  if (j.contains("file")) {
+    AddRow(t, {Cell{"file", Semantic::Info},
+               Cell{j["file"].get<std::string>()}});
   }
-  if (j.contains("reload")) {
-    AddRow(t, {Cell{"reload", Semantic::Info},
-               Cell{j["reload"].get<std::string>(),
-                    Semantic::Good}});
-  }
-  if (j.contains("message")) {
-    AddRow(t, {Cell{"message", Semantic::Info},
-               Cell{j["message"].get<std::string>()}});
-  }
+  bool changed = j.value("changed", false);
+  AddRow(t, {Cell{"changed", Semantic::Info},
+             Cell{changed ? "yes" : "no",
+                  changed ? Semantic::Good
+                          : Semantic::Dim}});
   RenderFormatted(t, renderer);
 }
 
@@ -477,7 +542,7 @@ class FwAdapter final : public cli::ProductAdapter {
   }
 
   auto ControlSocketPath() const -> std::string override {
-    return "ipc:///tmp/fd-control.sock";
+    return "ipc:///run/f/control.sock";
   }
 
   auto EventSocketPath() const -> std::string override {
@@ -498,7 +563,11 @@ class FwAdapter final : public cli::ProductAdapter {
         Show("counters", "show_counters",
              "Named counters from the BPF program"),
         MakeShowLog(),
-        MakeConfigureFirewall(),
+        MakeShowFiles(),
+        MakeEdit(),
+        MakeNewFile(),
+        MakeRenameFile(),
+        MakeDeleteFile(),
         MakeSetEditor(),
         MakeReload(),
         MakeClearCounters(),
@@ -527,11 +596,18 @@ class FwAdapter final : public cli::ProductAdapter {
       RenderShowCounters(response, renderer);
     } else if (wc == "show_log") {
       RenderShowLog(response, renderer);
-    } else if (wc == "configure_firewall") {
-      RenderConfigureFirewall(response, renderer);
+    } else if (wc == "show_files") {
+      RenderShowFiles(response, renderer);
+    } else if (wc == "edit" || wc == "new_file" ||
+               wc == "rename_file" || wc == "delete_file") {
+      RenderEdit(response, renderer);
     } else if (wc == "set_editor") {
       RenderSetEditor(response, renderer);
-    } else if (wc == "reload_firewall" ||
+    } else if (wc == "configure" || wc == "commit" ||
+               wc == "rollback" || wc == "set" ||
+               wc == "delete" || wc == "show_config" ||
+               wc == "show_diff" || wc == "show_commits" ||
+               wc == "reload_firewall" ||
                wc == "clear_counters") {
       RenderSimpleOk(response, renderer);
     }
@@ -539,6 +615,17 @@ class FwAdapter final : public cli::ProductAdapter {
 
   auto EventTopicsFor(const CommandSpec& /*cmd*/) const
       -> std::vector<std::string> override {
+    return {};
+  }
+
+  auto CompleteArg(const CommandSpec& cmd,
+                   const cli::ArgSpec& arg,
+                   const std::string& partial) const
+      -> std::vector<std::string> override {
+    if (arg.name == "file" || arg.name == "name" ||
+        arg.name == "from") {
+      return ListFwFileNames(partial);
+    }
     return {};
   }
 
@@ -563,13 +650,76 @@ class FwAdapter final : public cli::ProductAdapter {
     return c;
   }
 
-  static auto MakeConfigureFirewall() -> CommandSpec {
+  static auto MakeShowFiles() -> CommandSpec {
     CommandSpec c;
-    c.path = "configure firewall";
-    c.wire_command = "configure_firewall";
-    c.help = "Edit firewall rules in your preferred "
-             "editor, validate, and reload";
-    c.role = RoleGate::OperatorOrAdmin;
+    c.path = "show files";
+    c.wire_command = "show_files";
+    c.help = "List firewall rule files";
+    return c;
+  }
+
+  static auto MakeNewFile() -> CommandSpec {
+    CommandSpec c;
+    c.path = "new file";
+    c.wire_command = "new_file";
+    c.help = "Create a new .fw rules file";
+    c.role = RoleGate::AdminOnly;
+    c.requires_session = true;
+    c.args = {{
+        .name = "name",
+        .help = "Filename (e.g. dmz.fw)",
+        .required = true,
+    }};
+    return c;
+  }
+
+  static auto MakeRenameFile() -> CommandSpec {
+    CommandSpec c;
+    c.path = "rename file";
+    c.wire_command = "rename_file";
+    c.help = "Rename a .fw rules file";
+    c.role = RoleGate::AdminOnly;
+    c.requires_session = true;
+    c.args = {
+        {.name = "from",
+         .help = "Current filename",
+         .required = true},
+        {.name = "to",
+         .help = "New filename",
+         .required = true},
+    };
+    return c;
+  }
+
+  static auto MakeDeleteFile() -> CommandSpec {
+    CommandSpec c;
+    c.path = "delete file";
+    c.wire_command = "delete_file";
+    c.help = "Delete a .fw rules file";
+    c.role = RoleGate::AdminOnly;
+    c.requires_session = true;
+    c.args = {{
+        .name = "name",
+        .help = "Filename to delete",
+        .required = true,
+    }};
+    return c;
+  }
+
+  static auto MakeEdit() -> CommandSpec {
+    CommandSpec c;
+    c.path = "edit";
+    c.wire_command = "edit";
+    c.help = "Open a firewall rules file in the "
+             "editor (default: main source file)";
+    c.role = RoleGate::AdminOnly;
+    c.requires_session = true;
+    c.args = {{
+        .name = "file",
+        .help = "Filename to edit (relative to "
+                "/etc/f/ or absolute path)",
+        .required = false,
+    }};
     return c;
   }
 

@@ -6,7 +6,7 @@
 interfaces: []
 
 # ZMQ control socket for the CLI.
-socket: ipc:///tmp/fd-control.sock
+socket: ipc:///run/f/control.sock
 
 # BPF map pin directory.
 pin_path: /sys/fs/bpf/f

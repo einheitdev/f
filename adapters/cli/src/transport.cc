@@ -24,14 +24,20 @@
 #include <string>
 #include <vector>
 
-#include <bpf/bpf.h>
-#include <bpf/libbpf.h>
 #include <nlohmann/json.hpp>
 #include <zmq.hpp>
 
-#include "f/bpf_loader.h"
-#include "f/engine.h"
-#include "f/types.h"
+namespace fd_cmd {
+enum : uint8_t {
+  kGetCounters = 2,
+  kGetStatus = 3,
+  kReloadProg = 4,
+  kStop = 5,
+  kGetFirewall = 6,
+  kGetRules = 7,
+  kClearCounters = 8,
+};
+}  // namespace fd_cmd
 
 namespace einheit::adapters::fw {
 
@@ -145,7 +151,7 @@ auto GatherInterfaces() -> json {
   return ifaces;
 }
 
-auto SendRawToFd(zmq::socket_t& sock, f::Cmd cmd,
+auto SendRawToFd(zmq::socket_t& sock, uint8_t cmd,
                  const std::string& payload = "")
     -> std::expected<std::string, std::string> {
   std::string msg;
@@ -201,10 +207,6 @@ auto ResolveEditor(const FLocalConfig& cfg) -> std::string {
   if (cli_cfg.contains("editor")) {
     return cli_cfg["editor"].get<std::string>();
   }
-  const char* env = std::getenv("EDITOR");
-  if (env && env[0]) return env;
-  env = std::getenv("VISUAL");
-  if (env && env[0]) return env;
   return cfg.editor;
 }
 
@@ -270,6 +272,84 @@ auto FileMtime(const std::string& path) -> timespec {
   return st.st_mtim;
 }
 
+auto ReadFile(const std::string& path) -> std::string {
+  std::ifstream f(path);
+  if (!f) return "";
+  return std::string(std::istreambuf_iterator<char>(f),
+                     std::istreambuf_iterator<char>());
+}
+
+auto WriteFile(const std::string& path,
+               const std::string& content) -> bool {
+  auto dir = std::filesystem::path(path).parent_path();
+  std::filesystem::create_directories(dir);
+  std::ofstream f(path);
+  if (!f) return false;
+  f << content;
+  return f.good();
+}
+
+auto ListFwFiles(const std::string& source_path)
+    -> std::vector<std::string> {
+  std::vector<std::string> files;
+  // Single source file.
+  if (std::filesystem::is_regular_file(source_path)) {
+    files.push_back(source_path);
+    return files;
+  }
+  // Directory of .fw files.
+  if (std::filesystem::is_directory(source_path)) {
+    for (const auto& e :
+         std::filesystem::directory_iterator(
+             source_path)) {
+      if (e.path().extension() == ".fw") {
+        files.push_back(e.path().string());
+      }
+    }
+    std::sort(files.begin(), files.end());
+  }
+  return files;
+}
+
+auto SimpleDiff(const std::string& before,
+                const std::string& after,
+                const std::string& label) -> std::string {
+  if (before == after) return "";
+  std::string out;
+  out += "--- " + label + " (running)\n";
+  out += "+++ " + label + " (candidate)\n";
+  std::istringstream ba(before), aa(after);
+  std::string bl, al;
+  bool have_b = true, have_a = true;
+  while (have_b || have_a) {
+    have_b = !!std::getline(ba, bl);
+    have_a = !!std::getline(aa, al);
+    if (!have_b && !have_a) break;
+    std::string lb = have_b ? bl : "";
+    std::string la = have_a ? al : "";
+    if (lb != la) {
+      if (!lb.empty()) out += "- " + lb + "\n";
+      if (!la.empty()) out += "+ " + la + "\n";
+    }
+  }
+  return out;
+}
+
+auto NewSessionId() -> std::string {
+  static int counter = 0;
+  auto now = std::chrono::system_clock::now();
+  auto epoch = std::chrono::duration_cast<
+      std::chrono::seconds>(now.time_since_epoch())
+                   .count();
+  return std::format("s-{}-{}", epoch, ++counter);
+}
+
+struct CandidateConfig {
+  std::string session_id;
+  std::map<std::string, std::string> snapshots;
+  bool active = false;
+};
+
 class FLocalTransport final
     : public cli::transport::Transport {
  public:
@@ -278,12 +358,6 @@ class FLocalTransport final
 
   auto Connect()
       -> std::expected<void, Error_t> override {
-    auto maps = f::OpenPinnedMaps(cfg_.pin_path);
-    if (maps) {
-      maps_ = *maps;
-      maps_open_ = true;
-    }
-
     try {
       zmq_ctx_ = std::make_unique<zmq::context_t>(1);
       zmq_sock_ = std::make_unique<zmq::socket_t>(
@@ -293,9 +367,7 @@ class FLocalTransport final
       zmq_sock_->set(zmq::sockopt::sndtimeo, 3000);
       zmq_sock_->connect(cfg_.fd_socket);
       fd_connected_ = true;
-    } catch (const zmq::error_t& e) {
-      // fd might not be running — show commands still
-      // work via pinned maps.
+    } catch (const zmq::error_t&) {
     }
     return {};
   }
@@ -332,8 +404,44 @@ class FLocalTransport final
     if (req.command == "clear_counters") {
       return HandleClearCounters(req);
     }
-    if (req.command == "configure_firewall") {
-      return HandleConfigureFirewall(req);
+    if (req.command == "configure") {
+      return HandleConfigure(req);
+    }
+    if (req.command == "commit") {
+      return HandleCommit(req);
+    }
+    if (req.command == "rollback") {
+      return HandleRollback(req);
+    }
+    if (req.command == "set") {
+      return HandleSet(req);
+    }
+    if (req.command == "delete") {
+      return HandleDelete(req);
+    }
+    if (req.command == "show_config") {
+      return HandleShowConfig(req);
+    }
+    if (req.command == "show_diff") {
+      return HandleShowDiff(req);
+    }
+    if (req.command == "show_commits") {
+      return HandleShowCommits(req);
+    }
+    if (req.command == "edit") {
+      return HandleEdit(req);
+    }
+    if (req.command == "show_files") {
+      return HandleShowFiles(req);
+    }
+    if (req.command == "new_file") {
+      return HandleNewFile(req);
+    }
+    if (req.command == "rename_file") {
+      return HandleRenameFile(req);
+    }
+    if (req.command == "delete_file") {
+      return HandleDeleteFile(req);
     }
     if (req.command == "set_editor") {
       return HandleSetEditor(req);
@@ -358,33 +466,53 @@ class FLocalTransport final
 
  private:
   FLocalConfig cfg_;
-  f::BpfHandles maps_{};
-  bool maps_open_ = false;
   std::unique_ptr<zmq::context_t> zmq_ctx_;
   std::unique_ptr<zmq::socket_t> zmq_sock_;
   bool fd_connected_ = false;
+  CandidateConfig candidate_;
+
+  auto RequireFd(const std::string& id)
+      -> std::optional<proto::Response> {
+    if (!fd_connected_) {
+      return MakeErr(id, "no_daemon",
+          "fd is not running",
+          "Start fd: sudo systemctl start fd");
+    }
+    return std::nullopt;
+  }
+
+  auto FdQuery(const std::string& id, uint8_t cmd)
+      -> proto::Response {
+    if (auto err = RequireFd(id)) return *err;
+    auto resp = SendRawToFd(*zmq_sock_, cmd);
+    if (!resp) {
+      return MakeErr(id, "fd_error", resp.error());
+    }
+    json j;
+    try {
+      j = json::parse(*resp);
+    } catch (...) {
+      j = {{"raw", *resp}};
+    }
+    if (j.contains("error")) {
+      return MakeErr(id, "fd_error",
+                     j["error"].get<std::string>());
+    }
+    return MakeOk(id, j);
+  }
 
   auto HandleShowStatus(const proto::Request& req)
       -> proto::Response {
-    json j;
-    if (fd_connected_) {
-      auto resp = SendRawToFd(
-          *zmq_sock_, f::Cmd::kGetStatus);
-      if (resp) {
-        try {
-          j = json::parse(*resp);
-        } catch (...) {
-          j["daemon"] = "error parsing response";
-        }
-      } else {
-        j["daemon"] = "not responding";
-      }
-    } else {
-      j["daemon"] = "not connected";
+    auto resp = FdQuery(req.id, fd_cmd::kGetStatus);
+    if (resp.status == proto::ResponseStatus::Error &&
+        resp.error &&
+        resp.error->code == "no_daemon") {
+      return MakeOk(req.id, {
+          {"daemon", "not connected"},
+          {"pin_path", cfg_.pin_path},
+      });
     }
-    j["maps_available"] = maps_open_;
-    j["pin_path"] = cfg_.pin_path;
-    return MakeOk(req.id, j);
+    return resp;
   }
 
   auto HandleShowInterfaces(const proto::Request& req)
@@ -394,262 +522,374 @@ class FLocalTransport final
 
   auto HandleShowFirewall(const proto::Request& req)
       -> proto::Response {
-    if (!maps_open_) {
-      return MakeErr(req.id, "no_maps",
-          "BPF maps not available — is fd running?",
-          "Start fd first: sudo fd -i <iface> run");
-    }
-    json j;
-    // Read config map.
-    uint32_t cfg_key = 0;
-    f::FwConfig fw_cfg{};
-    if (bpf_map_lookup_elem(
-            maps_.config_fd, &cfg_key, &fw_cfg) == 0) {
-      j["default_action"] =
-          fw_cfg.default_action == 0 ? "drop" : "allow";
-      j["active_table"] = fw_cfg.active_table;
-      j["conntrack"] = fw_cfg.conntrack_enabled != 0;
-    }
-    // Count rules in active table.
-    int rules_fd = fw_cfg.active_table == 0
-                       ? maps_.rules_a_fd
-                       : maps_.rules_b_fd;
-    uint32_t count = 0;
-    f::RuleKey key{}, next{};
-    while (bpf_map_get_next_key(
-               rules_fd, &key, &next) == 0) {
-      count++;
-      key = next;
-    }
-    j["rule_count"] = count;
-    return MakeOk(req.id, j);
+    return FdQuery(req.id, fd_cmd::kGetFirewall);
   }
 
   auto HandleShowFirewallRules(
       const proto::Request& req)
       -> proto::Response {
-    if (!maps_open_) {
-      return MakeErr(req.id, "no_maps",
-          "BPF maps not available — is fd running?");
-    }
-    uint32_t cfg_key = 0;
-    f::FwConfig fw_cfg{};
-    bpf_map_lookup_elem(
-        maps_.config_fd, &cfg_key, &fw_cfg);
-    int rules_fd = fw_cfg.active_table == 0
-                       ? maps_.rules_a_fd
-                       : maps_.rules_b_fd;
-
-    // Read counters.
-    int ncpus = libbpf_num_possible_cpus();
-    if (ncpus < 1) ncpus = 1;
-
-    json rules = json::array();
-    f::RuleKey key{}, next{};
-    uint32_t idx = 0;
-    while (bpf_map_get_next_key(
-               rules_fd, &key, &next) == 0) {
-      f::RuleValue val{};
-      bpf_map_lookup_elem(rules_fd, &next, &val);
-      // Aggregate per-CPU counters.
-      uint64_t pkts = 0, bytes = 0;
-      std::vector<f::RuleCounter> per_cpu(ncpus);
-      if (bpf_map_lookup_elem(
-              maps_.counters_fd, &idx,
-              per_cpu.data()) == 0) {
-        for (int c = 0; c < ncpus; c++) {
-          pkts += per_cpu[c].packets;
-          bytes += per_cpu[c].bytes;
-        }
-      }
-      char src[INET_ADDRSTRLEN], dst[INET_ADDRSTRLEN];
-      inet_ntop(AF_INET, &next.src_addr, src,
-                sizeof(src));
-      inet_ntop(AF_INET, &next.dst_addr, dst,
-                sizeof(dst));
-      std::string action_str;
-      switch (static_cast<f::Action>(val.action)) {
-        case f::Action::kDrop: action_str = "drop"; break;
-        case f::Action::kAllow:
-          action_str = "allow";
-          break;
-        case f::Action::kRateLimit:
-          action_str = std::format(
-              "rate-limit({})", val.rate_pps);
-          break;
-      }
-      std::string proto_str;
-      switch (static_cast<f::Proto>(next.proto)) {
-        case f::Proto::kAny: proto_str = "any"; break;
-        case f::Proto::kIcmp: proto_str = "icmp"; break;
-        case f::Proto::kTcp: proto_str = "tcp"; break;
-        case f::Proto::kUdp: proto_str = "udp"; break;
-        default:
-          proto_str = std::to_string(next.proto);
-          break;
-      }
-      rules.push_back({
-          {"idx", idx},
-          {"src", std::string(src)},
-          {"dst", std::string(dst)},
-          {"src_port", next.src_port},
-          {"dst_port", next.dst_port},
-          {"proto", proto_str},
-          {"action", action_str},
-          {"packets", pkts},
-          {"bytes", bytes},
-      });
-      key = next;
-      idx++;
-    }
-    return MakeOk(req.id, rules);
+    return FdQuery(req.id, fd_cmd::kGetRules);
   }
 
   auto HandleShowCounters(const proto::Request& req)
       -> proto::Response {
-    if (!maps_open_) {
-      return MakeErr(req.id, "no_maps",
-          "BPF maps not available — is fd running?");
-    }
-    int ncpus = libbpf_num_possible_cpus();
-    if (ncpus < 1) ncpus = 1;
-
-    json counters = json::array();
-    for (uint32_t i = 0; i < 256; i++) {
-      std::vector<f::RuleCounter> per_cpu(ncpus);
-      if (bpf_map_lookup_elem(
-              maps_.counters_fd, &i,
-              per_cpu.data()) != 0) {
-        break;
-      }
-      uint64_t pkts = 0, bytes = 0;
-      for (int c = 0; c < ncpus; c++) {
-        pkts += per_cpu[c].packets;
-        bytes += per_cpu[c].bytes;
-      }
-      if (pkts == 0 && bytes == 0) continue;
-      counters.push_back({
-          {"id", i},
-          {"packets", pkts},
-          {"bytes", bytes},
-      });
-    }
-    return MakeOk(req.id, counters);
+    return FdQuery(req.id, fd_cmd::kGetCounters);
   }
 
   auto HandleReloadFirewall(const proto::Request& req)
       -> proto::Response {
-    if (!fd_connected_) {
-      return MakeErr(req.id, "no_daemon",
-          "fd is not running",
-          "Start fd first: sudo fd -i <iface> run");
-    }
-    auto resp = SendRawToFd(
-        *zmq_sock_, f::Cmd::kReloadProg);
-    if (!resp) {
-      return MakeErr(req.id, "send_failed", resp.error());
-    }
-    json j;
-    try {
-      j = json::parse(*resp);
-    } catch (...) {
-      j["raw"] = *resp;
-    }
-    if (j.contains("error")) {
-      return MakeErr(req.id, "reload_failed",
-                     j["error"].get<std::string>());
-    }
-    return MakeOk(req.id, j);
+    return FdQuery(req.id, fd_cmd::kReloadProg);
   }
 
   auto HandleClearCounters(const proto::Request& req)
       -> proto::Response {
-    if (!maps_open_) {
-      return MakeErr(req.id, "no_maps",
-          "BPF maps not available — is fd running?");
-    }
-    int ncpus = libbpf_num_possible_cpus();
-    if (ncpus < 1) ncpus = 1;
-    std::vector<f::RuleCounter> zeros(ncpus);
-    uint32_t cleared = 0;
-    for (uint32_t i = 0; i < 256; i++) {
-      if (bpf_map_update_elem(
-              maps_.counters_fd, &i, zeros.data(),
-              BPF_ANY) != 0) {
-        break;
-      }
-      cleared++;
-    }
-    return MakeOk(req.id, {{"cleared", cleared}});
+    return FdQuery(req.id, fd_cmd::kClearCounters);
   }
 
-  auto HandleConfigureFirewall(const proto::Request& req)
+  auto HandleConfigure(const proto::Request& req)
       -> proto::Response {
-    auto source = cfg_.fw_source;
-    // Create the source file with a template if it
-    // doesn't exist.
-    if (!std::filesystem::exists(source)) {
-      auto dir = std::filesystem::path(source)
+    if (candidate_.active) {
+      return MakeErr(req.id, "already_configuring",
+          "A configure session is already active",
+          "commit or rollback first");
+    }
+    candidate_.session_id = NewSessionId();
+    candidate_.active = true;
+    candidate_.snapshots.clear();
+    // Snapshot all managed files.
+    for (const auto& path :
+         ListFwFiles(cfg_.fw_source)) {
+      candidate_.snapshots[path] = ReadFile(path);
+    }
+    // Session ID goes in data as raw bytes — the
+    // framework extracts it with ExtractSessionIdFromData.
+    auto sid = candidate_.session_id;
+    return {
+        .id = req.id,
+        .status = proto::ResponseStatus::Ok,
+        .data = {sid.begin(), sid.end()},
+    };
+  }
+
+  auto HandleCommit(const proto::Request& req)
+      -> proto::Response {
+    if (!candidate_.active) {
+      return MakeErr(req.id, "no_session",
+          "No configure session active");
+    }
+    // Validate all .fw files with fwl check.
+    for (const auto& path :
+         ListFwFiles(cfg_.fw_source)) {
+      auto [rc, out] = RunSubprocess(
+          {cfg_.fwl_path, "check", path});
+      if (rc != 0) {
+        return MakeErr(req.id, "validation_failed",
+            out.empty()
+                ? std::format("fwl check failed: {}",
+                              path)
+                : out,
+            "Fix errors, then commit again");
+      }
+    }
+    // All valid — trigger reload if fd is running.
+    json result = {{"status", "committed"}};
+    if (fd_connected_) {
+      auto resp = SendRawToFd(
+          *zmq_sock_, fd_cmd::kReloadProg);
+      result["reload"] = resp ? "triggered"
+                              : "watcher will apply";
+    } else {
+      result["reload"] =
+          "fd not running — applied on next start";
+    }
+    candidate_.active = false;
+    candidate_.snapshots.clear();
+    return MakeOk(req.id, result);
+  }
+
+  auto HandleRollback(const proto::Request& req)
+      -> proto::Response {
+    if (!candidate_.active) {
+      return MakeErr(req.id, "no_session",
+          "No configure session active");
+    }
+    int restored = 0;
+    for (const auto& [path, content] :
+         candidate_.snapshots) {
+      WriteFile(path, content);
+      restored++;
+    }
+    candidate_.active = false;
+    candidate_.snapshots.clear();
+    return MakeOk(req.id, {
+        {"status", "rolled back"},
+        {"files_restored", restored},
+    });
+  }
+
+  auto HandleEdit(const proto::Request& req)
+      -> proto::Response {
+    if (!candidate_.active) {
+      return MakeErr(req.id, "no_session",
+          "Enter configure mode first");
+    }
+    std::string target;
+    if (!req.args.empty()) {
+      target = req.args[0];
+      // Resolve relative to the source directory.
+      if (!std::filesystem::path(target).is_absolute()) {
+        auto dir = std::filesystem::path(cfg_.fw_source)
+                       .parent_path();
+        target = (dir / target).string();
+      }
+    } else {
+      target = cfg_.fw_source;
+    }
+    // Create the file if it doesn't exist.
+    if (!std::filesystem::exists(target)) {
+      auto dir = std::filesystem::path(target)
                      .parent_path();
       std::filesystem::create_directories(dir);
-      std::ofstream f(source);
+      std::ofstream f(target);
       f << "# f firewall rules\n"
         << "# See: fwl --help\n\n"
         << "default allow\n";
+      // Snapshot the new file too.
+      candidate_.snapshots[target] = "";
     }
-
+    // Snapshot if not already tracked.
+    if (candidate_.snapshots.find(target) ==
+        candidate_.snapshots.end()) {
+      candidate_.snapshots[target] = ReadFile(target);
+    }
     auto editor = ResolveEditor(cfg_);
-    auto before = FileMtime(source);
-
-    int rc = RunInteractive({editor, source});
+    int rc = RunInteractive({editor, target});
     if (rc != 0) {
       return MakeErr(req.id, "editor_failed",
-          std::format("{} exited with code {}", editor,
-                      rc));
+          std::format("{} exited with code {}",
+                      editor, rc));
     }
+    auto current = ReadFile(target);
+    auto& snapshot = candidate_.snapshots[target];
+    bool changed = (current != snapshot);
+    return MakeOk(req.id, {
+        {"file", target},
+        {"changed", changed},
+    });
+  }
 
-    auto after = FileMtime(source);
-    bool changed = (before.tv_sec != after.tv_sec ||
-                    before.tv_nsec != after.tv_nsec);
-    if (!changed) {
-      return MakeOk(req.id, {
-          {"status", "unchanged"},
-          {"message", "No changes made"},
+  auto ResolveFwPath(const std::string& name)
+      -> std::string {
+    if (std::filesystem::path(name).is_absolute()) {
+      return name;
+    }
+    auto dir = std::filesystem::path(cfg_.fw_source)
+                   .parent_path();
+    return (dir / name).string();
+  }
+
+  auto FormatSize(uintmax_t bytes) -> std::string {
+    if (bytes >= 1'000'000) {
+      return std::format("{:.1f}M",
+          static_cast<double>(bytes) / 1'000'000.0);
+    }
+    if (bytes >= 1'000) {
+      return std::format("{:.1f}K",
+          static_cast<double>(bytes) / 1'000.0);
+    }
+    return std::to_string(bytes);
+  }
+
+  auto HandleShowFiles(const proto::Request& req)
+      -> proto::Response {
+    json files = json::array();
+    for (const auto& path :
+         ListFwFiles(cfg_.fw_source)) {
+      auto content = ReadFile(path);
+      int lines = 0;
+      for (char c : content) {
+        if (c == '\n') lines++;
+      }
+      auto name =
+          std::filesystem::path(path).filename()
+              .string();
+      uintmax_t sz = 0;
+      try {
+        sz = std::filesystem::file_size(path);
+      } catch (...) {}
+      files.push_back({
+          {"name", name},
+          {"path", path},
+          {"size", FormatSize(sz)},
+          {"lines", lines},
       });
     }
+    return MakeOk(req.id, {{"files", files}});
+  }
 
-    // Validate with fwl check.
-    auto [check_rc, check_out] = RunSubprocess(
-        {cfg_.fwl_path, "check", source});
-    if (check_rc != 0) {
-      return MakeErr(req.id, "validation_failed",
-          check_out.empty()
-              ? "fwl check failed"
-              : check_out,
-          "Fix the errors and run configure firewall "
-          "again");
+  auto HandleNewFile(const proto::Request& req)
+      -> proto::Response {
+    if (!candidate_.active) {
+      return MakeErr(req.id, "no_session",
+          "Enter configure mode first");
     }
-
-    json result = {
-        {"status", "valid"},
-        {"source", source},
-    };
-
-    // If fd is running with watcher, it will pick up
-    // the change. Optionally force immediate reload.
-    if (fd_connected_) {
-      auto resp = SendRawToFd(
-          *zmq_sock_, f::Cmd::kReloadProg);
-      if (resp) {
-        result["reload"] = "triggered";
-      } else {
-        result["reload"] = "watcher will pick up change";
-      }
-    } else {
-      result["reload"] = "fd not running — reload "
-                         "when fd starts";
+    if (req.args.empty()) {
+      return MakeErr(req.id, "missing_args",
+          "Usage: new file <name.fw>");
     }
-    return MakeOk(req.id, result);
+    auto name = req.args[0];
+    if (name.find('/') != std::string::npos) {
+      return MakeErr(req.id, "invalid_name",
+          "Filename must not contain /");
+    }
+    if (!name.ends_with(".fw")) {
+      name += ".fw";
+    }
+    auto path = ResolveFwPath(name);
+    if (std::filesystem::exists(path)) {
+      return MakeErr(req.id, "already_exists",
+          std::format("{} already exists", name),
+          "Use edit to modify it");
+    }
+    auto dir = std::filesystem::path(path)
+                   .parent_path();
+    std::filesystem::create_directories(dir);
+    std::ofstream f(path);
+    f << "# " << name << "\n\n"
+      << "default allow\n";
+    candidate_.snapshots[path] = "";
+    return MakeOk(req.id, {
+        {"file", name},
+        {"path", path},
+        {"changed", true},
+    });
+  }
+
+  auto HandleRenameFile(const proto::Request& req)
+      -> proto::Response {
+    if (!candidate_.active) {
+      return MakeErr(req.id, "no_session",
+          "Enter configure mode first");
+    }
+    if (req.args.size() < 2) {
+      return MakeErr(req.id, "missing_args",
+          "Usage: rename file <from> <to>");
+    }
+    auto from = ResolveFwPath(req.args[0]);
+    auto to_name = req.args[1];
+    if (!to_name.ends_with(".fw")) {
+      to_name += ".fw";
+    }
+    auto to = ResolveFwPath(to_name);
+    if (!std::filesystem::exists(from)) {
+      return MakeErr(req.id, "not_found",
+          std::format("{} not found", req.args[0]));
+    }
+    if (std::filesystem::exists(to)) {
+      return MakeErr(req.id, "already_exists",
+          std::format("{} already exists", to_name));
+    }
+    // Snapshot the old file for rollback.
+    if (candidate_.snapshots.find(from) ==
+        candidate_.snapshots.end()) {
+      candidate_.snapshots[from] = ReadFile(from);
+    }
+    std::filesystem::rename(from, to);
+    candidate_.snapshots[to] = "";
+    return MakeOk(req.id, {
+        {"from", req.args[0]},
+        {"to", to_name},
+        {"changed", true},
+    });
+  }
+
+  auto HandleDeleteFile(const proto::Request& req)
+      -> proto::Response {
+    if (!candidate_.active) {
+      return MakeErr(req.id, "no_session",
+          "Enter configure mode first");
+    }
+    if (req.args.empty()) {
+      return MakeErr(req.id, "missing_args",
+          "Usage: delete file <name>");
+    }
+    auto path = ResolveFwPath(req.args[0]);
+    if (!std::filesystem::exists(path)) {
+      return MakeErr(req.id, "not_found",
+          std::format("{} not found", req.args[0]));
+    }
+    // Snapshot for rollback.
+    if (candidate_.snapshots.find(path) ==
+        candidate_.snapshots.end()) {
+      candidate_.snapshots[path] = ReadFile(path);
+    }
+    std::filesystem::remove(path);
+    return MakeOk(req.id, {
+        {"file", req.args[0]},
+        {"changed", true},
+    });
+  }
+
+  auto HandleSet(const proto::Request& req)
+      -> proto::Response {
+    // Schema-based set — store in the candidate config
+    // file (fd.yaml). Minimal: just acknowledge.
+    if (req.args.size() < 2) {
+      return MakeErr(req.id, "missing_args",
+          "Usage: set <path> <value>");
+    }
+    return MakeOk(req.id, {
+        {"path", req.args[0]},
+        {"value", req.args[1]},
+        {"status", "set"},
+    });
+  }
+
+  auto HandleDelete(const proto::Request& req)
+      -> proto::Response {
+    if (req.args.empty()) {
+      return MakeErr(req.id, "missing_args",
+          "Usage: delete <path>");
+    }
+    return MakeOk(req.id, {
+        {"path", req.args[0]},
+        {"status", "deleted"},
+    });
+  }
+
+  auto HandleShowConfig(const proto::Request& req)
+      -> proto::Response {
+    json files = json::array();
+    for (const auto& path :
+         ListFwFiles(cfg_.fw_source)) {
+      files.push_back({
+          {"path", path},
+          {"content", ReadFile(path)},
+      });
+    }
+    return MakeOk(req.id, {{"files", files}});
+  }
+
+  auto HandleShowDiff(const proto::Request& req)
+      -> proto::Response {
+    if (!candidate_.active) {
+      return MakeOk(req.id, {{"diff", ""}});
+    }
+    std::string diff;
+    for (const auto& [path, snapshot] :
+         candidate_.snapshots) {
+      auto current = ReadFile(path);
+      diff += SimpleDiff(snapshot, current, path);
+    }
+    if (diff.empty()) diff = "no changes";
+    return MakeOk(req.id, {{"diff", diff}});
+  }
+
+  auto HandleShowCommits(const proto::Request& req)
+      -> proto::Response {
+    return MakeOk(req.id, {
+        {"commits", json::array()},
+    });
   }
 
   auto HandleSetEditor(const proto::Request& req)

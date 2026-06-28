@@ -102,7 +102,7 @@ int main(int argc, char** argv) {
   std::string static_dir = "ui/";
   std::string pin_path = "/sys/fs/bpf/f";
   std::string engine_addr =
-      "ipc:///tmp/fd-control.sock";
+      "ipc:///run/f/control.sock";
   std::string log_level = "info";
 
   app.add_option("-p,--port", port, "HTTP port");

@@ -279,42 +279,35 @@ TEST_F(FwAdapterTest, RenderClearCounters) {
   EXPECT_NE(output.find("256"), std::string::npos);
 }
 
-TEST_F(FwAdapterTest, RenderConfigureFirewallValid) {
+TEST_F(FwAdapterTest, RenderEdit) {
   auto cmds = adapter_->Commands();
   cli::CommandSpec cmd;
   for (const auto& c : cmds) {
-    if (c.wire_command == "configure_firewall") {
+    if (c.wire_command == "edit") {
       cmd = c;
       break;
     }
   }
+  ASSERT_FALSE(cmd.wire_command.empty());
   json data = {
-      {"status", "valid"},
-      {"source", "/etc/f/rules.fw"},
-      {"reload", "triggered"},
+      {"file", "/etc/f/rules.fw"},
+      {"changed", true},
   };
   auto resp = MakeResponse(data);
   auto output = RenderToString(cmd, resp);
-  EXPECT_NE(output.find("valid"), std::string::npos);
-  EXPECT_NE(output.find("triggered"), std::string::npos);
+  EXPECT_NE(output.find("rules.fw"), std::string::npos);
+  EXPECT_NE(output.find("yes"), std::string::npos);
 }
 
-TEST_F(FwAdapterTest, RenderConfigureFirewallUnchanged) {
-  auto cmds = adapter_->Commands();
-  cli::CommandSpec cmd;
-  for (const auto& c : cmds) {
-    if (c.wire_command == "configure_firewall") {
-      cmd = c;
-      break;
+TEST_F(FwAdapterTest, EditRequiresSession) {
+  for (const auto& c : adapter_->Commands()) {
+    if (c.wire_command == "edit") {
+      EXPECT_TRUE(c.requires_session);
+      EXPECT_EQ(c.role, cli::RoleGate::AdminOnly);
+      return;
     }
   }
-  json data = {
-      {"status", "unchanged"},
-      {"message", "No changes made"},
-  };
-  auto resp = MakeResponse(data);
-  auto output = RenderToString(cmd, resp);
-  EXPECT_NE(output.find("unchanged"), std::string::npos);
+  FAIL() << "edit command not found";
 }
 
 TEST_F(FwAdapterTest, RenderSetEditor) {
@@ -381,7 +374,7 @@ TEST_F(FwAdapterTest, NewCommandsRegistered) {
   auto cmds = adapter_->Commands();
   std::vector<std::string> expected = {
       "show log",
-      "configure firewall",
+      "edit",
       "set editor",
   };
   for (const auto& path : expected) {
@@ -393,16 +386,6 @@ TEST_F(FwAdapterTest, NewCommandsRegistered) {
       }
     }
     EXPECT_TRUE(found) << "missing command: " << path;
-  }
-}
-
-TEST_F(FwAdapterTest, ConfigureFirewallRequiresRole) {
-  auto cmds = adapter_->Commands();
-  for (const auto& c : cmds) {
-    if (c.path == "configure firewall") {
-      EXPECT_EQ(c.role, cli::RoleGate::OperatorOrAdmin);
-      break;
-    }
   }
 }
 

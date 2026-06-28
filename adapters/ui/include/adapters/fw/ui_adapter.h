@@ -16,7 +16,7 @@ struct FwUiConfig {
   /// bpffs pin path where fd pins its maps.
   std::string pin_path = "/sys/fs/bpf/f";
   /// Raw ZMQ IPC endpoint for fd's control socket.
-  std::string fd_socket = "ipc:///tmp/fd-control.sock";
+  std::string fd_socket = "ipc:///run/f/control.sock";
   /// Counter sampling interval in milliseconds.
   int sample_interval_ms = 1000;
 };

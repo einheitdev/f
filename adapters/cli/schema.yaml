@@ -28,7 +28,7 @@ config:
       socket:
         type: string
         help: "ZMQ IPC control socket path"
-        default: "ipc:///tmp/fd-control.sock"
+        default: "ipc:///run/f/control.sock"
       pin_path:
         type: string
         help: "BPF map pin directory"
