@@ -183,6 +183,77 @@ target_link_libraries(f-api PRIVATE
   libf-api libf-engine CLI11::CLI11)
 
 # ============================================================================
+# einheit-cli framework (sibling repo)
+# ============================================================================
+set(EINHEIT_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(EINHEIT_BUILD_ADAPTERS OFF CACHE BOOL "" FORCE)
+add_subdirectory(
+  ${CMAKE_CURRENT_SOURCE_DIR}/../cli
+  ${CMAKE_BINARY_DIR}/_deps/einheit-cli
+  EXCLUDE_FROM_ALL
+)
+
+# ============================================================================
+# einheit-ui framework (sibling repo)
+# ============================================================================
+set(EINHEIT_UI_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(EINHEIT_UI_BUILD_ADAPTERS OFF CACHE BOOL "" FORCE)
+set(EINHEIT_UI_BUILD_BINARY OFF CACHE BOOL "" FORCE)
+add_subdirectory(
+  ${CMAKE_CURRENT_SOURCE_DIR}/../ui
+  ${CMAKE_BINARY_DIR}/_deps/einheit-ui
+  EXCLUDE_FROM_ALL
+)
+
+# ============================================================================
+# f CLI adapter
+# ============================================================================
+add_subdirectory(adapters/cli)
+
+# ============================================================================
+# f UI adapter
+# ============================================================================
+add_subdirectory(adapters/ui)
+
+# ============================================================================
+# einheit-f — appliance CLI binary
+# ============================================================================
+add_executable(einheit-f cmd/einheit_f.cc)
+target_link_libraries(einheit-f PRIVATE
+  einheit_adapter_fw CLI11::CLI11)
+
+# ============================================================================
+# einheit-f-ui — appliance web UI binary
+# ============================================================================
+add_executable(einheit-f-ui cmd/einheit_f_ui.cc)
+target_link_libraries(einheit-f-ui PRIVATE
+  einheit_ui_adapter_fw CLI11::CLI11)
+
+# ============================================================================
+# Install rules
+# ============================================================================
+install(TARGETS fd fctl einheit-f einheit-f-ui f-api
+  RUNTIME DESTINATION bin
+)
+install(FILES deploy/fd.yaml
+  DESTINATION share/f
+)
+install(FILES
+  deploy/systemd/fd.service
+  deploy/systemd/einheit-f-ui.service
+  deploy/systemd/f-firstboot.service
+  DESTINATION lib/systemd/system
+)
+install(FILES
+  deploy/networkd/10-eth0.network
+  deploy/networkd/20-lan.network
+  DESTINATION share/f/networkd
+)
+install(PROGRAMS deploy/firstboot/firstboot.sh
+  DESTINATION share/f
+)
+
+# ============================================================================
 # Tests
 # ============================================================================
 enable_testing()

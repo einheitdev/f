@@ -27,6 +27,18 @@
         "CMAKE_BUILD_TYPE": "Debug",
         "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
       }
+    },
+    {
+      "name": "aarch64",
+      "displayName": "aarch64 cross-compile",
+      "description": "Release build for aarch64-linux-gnu",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build-aarch64",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/cmake/toolchain-aarch64.cmake",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
+      }
     }
   ],
   "buildPresets": [
@@ -37,6 +49,10 @@
     {
       "name": "debug",
       "configurePreset": "debug"
+    },
+    {
+      "name": "aarch64",
+      "configurePreset": "aarch64"
     }
   ],
   "testPresets": [

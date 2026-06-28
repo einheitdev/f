@@ -1,0 +1,13 @@
+# Management interface — SoM uplink.
+# First-boot provisioning overwrites Address/Gateway.
+[Match]
+Name=eth0
+
+[Network]
+DHCP=yes
+LinkLocalAddressing=ipv6
+
+[DHCP]
+UseDNS=yes
+UseNTP=yes
+UseDomains=yes

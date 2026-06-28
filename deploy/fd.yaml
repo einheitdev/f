@@ -1,0 +1,23 @@
+# fd — firewall engine configuration
+#
+# Interfaces to attach XDP programs to. On the A733 carrier board
+# these are the KSZ9477S switch ports (lan0-lan3) and the SoM
+# uplink (eth0). On a generic box, list the relevant NICs.
+interfaces: []
+
+# ZMQ control socket for the CLI.
+socket: ipc:///tmp/fd-control.sock
+
+# BPF map pin directory.
+pin_path: /sys/fs/bpf/f
+
+# Log level: trace, debug, info, warn, error.
+log_level: info
+
+# File watcher — recompiles and hot-reloads on source changes.
+watch:
+  enabled: true
+  interval: 5s
+  source: /etc/f/rules.fw
+  compiled_dir: /usr/share/f/compiled
+  fwl: /usr/local/bin/fwl

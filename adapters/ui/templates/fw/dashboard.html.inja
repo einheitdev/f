@@ -1,0 +1,69 @@
+<div class="grid-2col">
+  <section class="card">
+    <h2 class="card-title">status</h2>
+    <div class="card-body">
+      <table class="data-table">
+        <tbody>
+          <tr>
+            <td>daemon</td>
+            <td>
+{% if daemon.connected %}
+              <span class="badge badge-good">connected</span>
+{% else %}
+              <span class="badge badge-bad">disconnected</span>
+{% endif %}
+            </td>
+          </tr>
+          <tr>
+            <td>maps</td>
+            <td>
+{% if maps_available %}
+              <span class="badge badge-good">available</span>
+{% else %}
+              <span class="badge badge-bad">unavailable</span>
+{% endif %}
+            </td>
+          </tr>
+{% if existsIn(daemon, "uptime_s") %}
+          <tr>
+            <td>uptime</td>
+            <td>{{ daemon.uptime_s }}s</td>
+          </tr>
+{% endif %}
+{% if existsIn(daemon, "pid") %}
+          <tr>
+            <td>pid</td>
+            <td>{{ daemon.pid }}</td>
+          </tr>
+{% endif %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2 class="card-title">firewall</h2>
+    <div class="card-body">
+      <table class="data-table">
+        <tbody>
+          <tr>
+            <td>interfaces</td>
+            <td>{{ iface_count }}</td>
+          </tr>
+{% if existsIn(at("."), "default_action") %}
+          <tr>
+            <td>default action</td>
+            <td>
+              <span class="badge badge-{{ default_action == "allow" ? "good" : "bad" }}">{{ default_action }}</span>
+            </td>
+          </tr>
+          <tr>
+            <td>rules loaded</td>
+            <td>{{ rule_count }}</td>
+          </tr>
+{% endif %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+</div>

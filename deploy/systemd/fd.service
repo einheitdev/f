@@ -1,0 +1,38 @@
+[Unit]
+Description=f firewall engine (XDP/eBPF)
+Documentation=man:fd(8)
+After=network-pre.target systemd-networkd.service
+Before=network.target
+Wants=network-pre.target
+
+[Service]
+Type=notify-reload
+ExecStart=/usr/local/bin/fd -c /etc/f/fd.yaml run
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5s
+WatchdogSec=30s
+
+# fd needs root for BPF and XDP attachment.
+User=root
+
+# Hardening.
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/sys/fs/bpf/f /usr/share/f/compiled /tmp/fd-control.sock /run/f
+PrivateTmp=yes
+NoNewPrivileges=yes
+ProtectKernelTunables=no
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+MemoryDenyWriteExecute=no
+LockPersonality=yes
+
+# Logging.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=fd
+
+[Install]
+WantedBy=multi-user.target
