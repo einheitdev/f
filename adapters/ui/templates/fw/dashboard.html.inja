@@ -50,11 +50,11 @@
             <td>interfaces</td>
             <td>{{ iface_count }}</td>
           </tr>
-{% if existsIn(at("."), "default_action") %}
+{% if has_firewall %}
           <tr>
             <td>default action</td>
             <td>
-              <span class="badge badge-{{ default_action == "allow" ? "good" : "bad" }}">{{ default_action }}</span>
+              <span class="badge badge-{{ action_semantic }}">{{ default_action }}</span>
             </td>
           </tr>
           <tr>

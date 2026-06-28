@@ -166,8 +166,15 @@ auto RenderShowStatus(const Response& resp,
                Cell{val, sem}});
   };
 
+  auto jstr = [](const json& v) -> std::string {
+    if (v.is_string()) return v.get<std::string>();
+    if (v.is_number()) return std::to_string(v.get<int64_t>());
+    if (v.is_boolean()) return v.get<bool>() ? "true" : "false";
+    return v.dump();
+  };
+
   if (j.contains("pid")) {
-    row("pid", std::to_string(j["pid"].get<int>()));
+    row("pid", jstr(j["pid"]));
   }
   if (j.contains("uptime_s")) {
     auto s = j["uptime_s"].get<uint64_t>();
@@ -177,11 +184,15 @@ auto RenderShowStatus(const Response& resp,
                               h, m, s % 60));
   }
   if (j.contains("daemon")) {
-    auto v = j["daemon"].get<std::string>();
-    auto sem = v == "not connected" ? Semantic::Bad
-               : v == "not responding" ? Semantic::Warn
-               : Semantic::Good;
-    row("daemon", v, sem);
+    if (j["daemon"].is_string()) {
+      auto v = j["daemon"].get<std::string>();
+      auto sem = v == "not connected" ? Semantic::Bad
+                 : v == "not responding" ? Semantic::Warn
+                 : Semantic::Good;
+      row("daemon", v, sem);
+    } else {
+      row("daemon", "connected", Semantic::Good);
+    }
   }
   row("maps", j.value("maps_available", false)
                   ? "available"
@@ -193,20 +204,26 @@ auto RenderShowStatus(const Response& resp,
   }
   if (j.contains("rules")) {
     auto& r = j["rules"];
-    row("active_table",
-        std::to_string(r.value("active_table", 0)));
-    row("rule_count",
-        std::to_string(r.value("rule_count", 0)));
+    if (r.contains("active_table")) {
+      row("active_table", jstr(r["active_table"]));
+    }
+    if (r.contains("count")) {
+      row("rule_count", jstr(r["count"]));
+    } else if (r.contains("rule_count")) {
+      row("rule_count", jstr(r["rule_count"]));
+    }
   }
   if (j.contains("interfaces")) {
     auto& ifaces = j["interfaces"];
-    row("interfaces",
-        std::to_string(ifaces.value("count", 0)));
+    if (ifaces.contains("count")) {
+      row("interfaces", jstr(ifaces["count"]));
+    }
   }
   if (j.contains("slow_path")) {
     auto& sp = j["slow_path"];
-    row("events",
-        std::to_string(sp.value("events", 0)));
+    if (sp.contains("events")) {
+      row("events", jstr(sp["events"]));
+    }
   }
   RenderFormatted(t, renderer);
 }

@@ -103,12 +103,14 @@ auto main(int argc, char** argv) -> int {
   s.locked = locked;
   s.theme = cli::render::PickTheme(caps, false);
 
-  // Local auth — resolve from UID.
+  // On the appliance, every SSH session is at least operator.
+  s.caller.user = "operator";
+  s.caller.role = cli::RoleGate::OperatorOrAdmin;
   if (auto id = cli::auth::ResolveLocal(); id) {
-    s.caller = *id;
-  } else {
-    s.caller.user = "operator";
-    s.caller.role = cli::RoleGate::OperatorOrAdmin;
+    s.caller.user = id->user;
+    if (id->role == cli::RoleGate::AdminOnly) {
+      s.caller.role = cli::RoleGate::AdminOnly;
+    }
   }
 
   BuildTree(s.tree, *adapter);

@@ -228,6 +228,10 @@ target_link_libraries(einheit-f PRIVATE
 add_executable(einheit-f-ui cmd/einheit_f_ui.cc)
 target_link_libraries(einheit-f-ui PRIVATE
   einheit_ui_adapter_fw CLI11::CLI11)
+target_compile_definitions(einheit-f-ui PRIVATE
+  EINHEIT_UI_TEMPLATES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../ui/templates"
+  EINHEIT_UI_ASSETS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../ui/assets"
+)
 
 # ============================================================================
 # Install rules

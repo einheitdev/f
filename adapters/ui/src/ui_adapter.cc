@@ -283,15 +283,19 @@ class FwUiAdapter final : public ui::ProductUiAdapter {
           {"daemon", status},
           {"maps_available", maps_open_},
           {"iface_count", ifaces.size()},
+          {"has_firewall", false},
       };
       if (maps_open_) {
         uint32_t cfg_key = 0;
         f::FwConfig fw_cfg{};
         bpf_map_lookup_elem(
             maps_.config_fd, &cfg_key, &fw_cfg);
-        data["default_action"] =
-            fw_cfg.default_action == 0 ? "drop"
-                                       : "allow";
+        auto action = fw_cfg.default_action == 0
+                          ? "drop" : "allow";
+        data["has_firewall"] = true;
+        data["default_action"] = action;
+        data["action_semantic"] =
+            ActionSemantic(action);
         data["rule_count"] = 0;
         f::RuleKey key{}, next{};
         int rules_fd = fw_cfg.active_table == 0

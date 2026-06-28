@@ -1,6 +1,4 @@
-{% if existsIn(at("."), "error") %}
-<div class="empty">{{ error }}</div>
-{% else if length(rules) > 0 %}
+{% if length(rules) > 0 %}
 <table class="data-table">
   <thead>
     <tr>
@@ -22,8 +20,8 @@
       <td class="mono">{{ r.src }}</td>
       <td class="mono">{{ r.dst }}</td>
       <td>{{ r.proto }}</td>
-      <td class="right">{{ r.src_port == 0 ? "*" : r.src_port }}</td>
-      <td class="right">{{ r.dst_port == 0 ? "*" : r.dst_port }}</td>
+      <td class="right">{% if r.src_port == 0 %}*{% else %}{{ r.src_port }}{% endif %}</td>
+      <td class="right">{% if r.dst_port == 0 %}*{% else %}{{ r.dst_port }}{% endif %}</td>
       <td><span class="badge badge-{{ r.action_semantic }}">{{ r.action }}</span></td>
       <td class="right">{{ r.packets }}</td>
       <td class="right">{{ r.bytes }}</td>
