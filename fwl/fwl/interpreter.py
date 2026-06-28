@@ -106,7 +106,7 @@ def evaluate_full(
     return EvalResult(action=action)
   for idx, rule in enumerate(program.rules):
     if rule.condition is not None and not _eval(
-      rule.condition, packet, ctx
+      rule.condition, packet, ctx, counters
     ):
       continue
     if rule.modifier is not None:
@@ -546,24 +546,42 @@ class _Ctx:
     self._resolved: dict[int, list] = {}
 
 
+_COUNT_OPS = {
+  "==": lambda a, b: a == b,
+  "!=": lambda a, b: a != b,
+  "<": lambda a, b: a < b,
+  ">": lambda a, b: a > b,
+  "<=": lambda a, b: a <= b,
+  ">=": lambda a, b: a >= b,
+}
+
+
 def _eval(
-  node: ast.Condition, packet: dict[str, Any], ctx: "_Ctx"
+  node: ast.Condition,
+  packet: dict[str, Any],
+  ctx: "_Ctx",
+  counters: dict[str, int] | None = None,
 ) -> bool:
   """Evaluate a condition node against a decoded packet."""
   if isinstance(node, ast.Comparison):
     return _eval_comparison(node, packet, ctx)
+  if isinstance(node, ast.CountCompare):
+    cur = (counters or {}).get(node.call.counter_name, 0)
+    val = node.operand.value  # type: ignore[union-attr]
+    op_fn = _COUNT_OPS.get(node.op)
+    return op_fn(cur, val) if op_fn else False
   if isinstance(node, ast.BoolField):
     return bool(packet.get(_field_key(node.field.name), False))
   if isinstance(node, ast.NotOp):
-    return not _eval(node.inner, packet, ctx)
+    return not _eval(node.inner, packet, ctx, counters)
   if isinstance(node, ast.AndOp):
     for child in node.operands:
-      if not _eval(child, packet, ctx):
+      if not _eval(child, packet, ctx, counters):
         return False
     return True
   if isinstance(node, ast.OrOp):
     for child in node.operands:
-      if _eval(child, packet, ctx):
+      if _eval(child, packet, ctx, counters):
         return True
     return False
   raise NotImplementedError(

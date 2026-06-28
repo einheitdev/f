@@ -109,6 +109,15 @@ def _analyze_tier1(program: ast.Program) -> ast.Program:
       _check_modifier(rule.modifier)
     if rule.action == ast.Action.COUNT and rule.counter_name is not None:
       counter_names.add(rule.counter_name)
+    if rule.log_sample is not None and rule.log_sample < 1:
+      raise FwlException(FwlError(
+        category="semantic",
+        message=(
+          f"log(sample=N) requires N >= 1 "
+          f"(got {rule.log_sample})"
+        ),
+        span=rule.span,
+      ))
 
   if len(counter_names) > _MAX_COUNTERS:
     # Find the rule that pushed us over so we can point at a span.
@@ -1172,6 +1181,9 @@ def _check(node: ast.Condition, possible: Possible) -> Possible:
       and isinstance(node.operand, ast.ProtoLiteral)
     ):
       return _intersect(possible, frozenset({node.operand.proto}))
+    return possible
+
+  if isinstance(node, ast.CountCompare):
     return possible
 
   if isinstance(node, ast.BoolField):

@@ -276,36 +276,36 @@ class _ToAst(Transformer):
     (iface_tok,) = children
     return ast.Hook(interface=str(iface_tok), span=_span(iface_tok))
 
-  def terminal_action(
-    self, children
-  ) -> tuple[ast.Action, Span, str | None]:
+  def terminal_action(self, children):
     (tok,) = children
     if tok.type == "ALLOW":
-      return ast.Action.ALLOW, _span(tok), None
-    return ast.Action.DROP, _span(tok), None
+      return ast.Action.ALLOW, _span(tok), None, None
+    return ast.Action.DROP, _span(tok), None, None
 
-  def nonterminal_action(
-    self, children
-  ) -> tuple[ast.Action, Span, str | None]:
-    if children[0].type == "LOG":
-      return ast.Action.LOG, _span(children[0]), None
-    # COUNT IDENTIFIER
+  def log_action(self, children):
+    log_tok = children[0]
+    sample = None
+    if len(children) > 1:
+      sample = _parse_int(str(children[1]))
+    return ast.Action.LOG, _span(log_tok), None, sample
+
+  def nonterminal_action(self, children):
+    if isinstance(children[0], tuple):
+      return children[0]
     count_tok, name_tok = children
-    return ast.Action.COUNT, _span(count_tok), str(name_tok)
+    return ast.Action.COUNT, _span(count_tok), str(name_tok), None
 
-  def action(
-    self, children
-  ) -> tuple[ast.Action, Span, str | None]:
+  def action(self, children):
     (action_tuple,) = children
     return action_tuple
 
   def default_rule(self, children) -> ast.DefaultRule:
     (action_tuple,) = children
-    action, span, _ = action_tuple
+    action, span, _, _ = action_tuple
     return ast.DefaultRule(action=action, span=span)
 
   def rule(self, children) -> ast.Rule:
-    action, action_span, counter_name = children[0]
+    action, action_span, counter_name, log_sample = children[0]
     condition: ast.Condition | None = None
     modifier: ast.RateLimit | None = None
     for child in children[1:]:
@@ -319,6 +319,7 @@ class _ToAst(Transformer):
       modifier=modifier,
       span=action_span,
       counter_name=counter_name,
+      log_sample=log_sample,
     )
 
   def modifier(self, children) -> ast.RateLimit:
@@ -457,6 +458,18 @@ class _ToAst(Transformer):
     span = getattr(lvalue, "span", None) or _span(lvalue)
     return ast.Comparison(
       field=lvalue, op="in", operand=operand, span=span
+    )
+
+  def count_call(self, children) -> ast.CountCall:
+    count_tok, name_tok = children
+    return ast.CountCall(
+      counter_name=str(name_tok), span=_span(count_tok)
+    )
+
+  def count_compare(self, children) -> ast.CountCompare:
+    call, op, rvalue = children
+    return ast.CountCompare(
+      call=call, op=op, operand=rvalue, span=call.span
     )
 
   def operand(self, children) -> ast.Operand:

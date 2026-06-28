@@ -248,7 +248,9 @@ class OrOp:
   span: Span
 
 
-Condition = Union[Comparison, BoolField, NotOp, AndOp, OrOp]
+Condition = Union[
+  Comparison, BoolField, NotOp, AndOp, OrOp, "CountCompare"
+]
 
 
 @dataclass(frozen=True)
@@ -281,6 +283,23 @@ class Rule:
   modifier: RateLimit | None
   span: Span
   counter_name: str | None = None
+  log_sample: int | None = None
+
+
+@dataclass(frozen=True)
+class CountCall:
+  """A `count(name)` function call returning the counter's value."""
+  counter_name: str
+  span: Span
+
+
+@dataclass(frozen=True)
+class CountCompare:
+  """A comparison involving count(name): count(n) op operand."""
+  call: CountCall
+  op: str
+  operand: "Operand"
+  span: Span
 
 
 @dataclass(frozen=True)
