@@ -1,0 +1,47 @@
+# v0.3 dogfood — exercises sampled log, count() function, and
+# conntrack-aware traffic shaping.
+
+@xdp(eth0)
+
+# --- counters ---
+count all_traffic
+count tcp_traffic if pkt.proto == tcp
+count udp_traffic if pkt.proto == udp
+count icmp_traffic if pkt.proto == icmp
+
+# --- adaptive drop: if total traffic exceeds threshold, drop ICMP ---
+drop if pkt.proto == icmp and count(all_traffic) > 10000
+
+# --- per-source flood guard ---
+drop limited by rate_limit(500, per=src_ip)
+
+# --- SSH: management subnet only ---
+count ssh_attempts if pkt.proto == tcp and pkt.dst_port == 22
+drop if pkt.proto == tcp and pkt.dst_port == 22
+       and not pkt.src_ip in 10.0.0.0/8
+
+# --- sampled log for SSH SYNs (1 in 10) ---
+log(sample=10) if pkt.proto == tcp
+       and pkt.dst_port == 22
+       and pkt.tcp.syn and not pkt.tcp.ack
+
+allow if pkt.proto == tcp and pkt.dst_port == 22
+
+# --- HTTP/HTTPS ---
+count http_hits if pkt.proto == tcp and pkt.dst_port == 80
+count https_hits if pkt.proto == tcp and pkt.dst_port == 443
+
+log(sample=100) if pkt.proto == tcp and pkt.dst_port in [80, 443]
+
+allow if pkt.proto == tcp and pkt.dst_port in [80, 443]
+
+# --- DNS ---
+allow if pkt.proto == udp and pkt.dst_port == 53
+
+# --- established outbound ---
+allow if pkt.proto == tcp and not pkt.tcp.syn
+
+# --- log everything else (sampled) before dropping ---
+log(sample=50)
+
+default drop
