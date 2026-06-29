@@ -1,0 +1,14 @@
+name: "ICMP type match increments a named counter (non-terminal)"
+source_fw: |
+  @xdp(eth0)
+  count pings if pkt.proto == icmp and pkt.icmp.type == 8
+  default allow
+
+test_packet:
+  builder: icmp(type=8)
+
+expected:
+  compiles: true
+  bpf_action: allow
+  counter_changes:
+    pings: 1

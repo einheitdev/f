@@ -1,0 +1,12 @@
+name: "not pkt.tcp.syn matches a segment with the SYN bit clear"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.proto == tcp and not pkt.tcp.syn
+  default allow
+
+test_packet:
+  builder: tcp(ack=true)
+
+expected:
+  compiles: true
+  bpf_action: drop

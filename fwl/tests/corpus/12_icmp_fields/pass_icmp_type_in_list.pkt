@@ -1,0 +1,12 @@
+name: "pkt.icmp.type in [0, 3, 8, 11] matches time-exceeded (11)"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.proto == icmp and pkt.icmp.type in [0, 3, 8, 11]
+  default allow
+
+test_packet:
+  builder: icmp(type=11)
+
+expected:
+  compiles: true
+  bpf_action: drop

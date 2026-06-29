@@ -1,0 +1,16 @@
+name: "ICMP type matched inside a Tier 2 function"
+source_fw: |
+  @xdp(eth0)
+  def filter(pkt):
+    if pkt.proto == icmp:
+      if pkt.icmp.type == 8:
+        allow
+      drop
+    allow
+
+test_packet:
+  builder: icmp(type=3)
+
+expected:
+  compiles: true
+  bpf_action: drop

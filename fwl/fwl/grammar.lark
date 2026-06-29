@@ -130,6 +130,7 @@ rvalue        : operand                        -> rvalue_operand
 // alternative), so it's not listed here — adding it would create
 // a reduce/reduce conflict against bool_primary's same-token rule.
 value_field   : IP_FIELD | PORT_FIELD | IP6_FIELD | PROTO_FIELD
+              | ICMP_FIELD | ICMP6_FIELD
 
 operand       : INTEGER | IPV4 | IPV6 | PROTO_KEYWORD
 
@@ -173,7 +174,16 @@ PROTO_FIELD.10     : "pkt.proto"
 IP6_FIELD.11       : "pkt.src_ip6" | "pkt.dst_ip6"
 IP_FIELD.10        : "pkt.src_ip" | "pkt.dst_ip"
 PORT_FIELD.10      : "pkt.src_port" | "pkt.dst_port"
-TCP_FLAG_FIELD.10  : "pkt.tcp.syn" | "pkt.tcp.ack"
+TCP_FLAG_FIELD.10  : "pkt.tcp.syn" | "pkt.tcp.ack" | "pkt.tcp.fin"
+                   | "pkt.tcp.rst" | "pkt.tcp.psh" | "pkt.tcp.urg"
+                   | "pkt.tcp.ece" | "pkt.tcp.cwr"
+// ICMP6_FIELD is ordered before ICMP_FIELD so longest-match prefers
+// "pkt.icmp6.type" over "pkt.icmp.*" when scanning that prefix
+// (mirrors the IP6_FIELD-before-IP_FIELD ordering above). The u8
+// type/code fields take integer comparisons via value_field, unlike
+// the bool-valued TCP_FLAG_FIELD which routes through bool_primary.
+ICMP6_FIELD.12     : "pkt.icmp6.type" | "pkt.icmp6.code"
+ICMP_FIELD.10      : "pkt.icmp.type" | "pkt.icmp.code"
 
 // Keywords use a negative-lookahead so they only match when not
 // followed by an identifier character — `tcp_traffic` lexes as

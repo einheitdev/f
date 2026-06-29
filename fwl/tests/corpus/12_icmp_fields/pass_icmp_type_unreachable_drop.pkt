@@ -1,0 +1,12 @@
+name: "pkt.icmp.type == 3 (destination unreachable) drops"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.proto == icmp and pkt.icmp.type == 3
+  default allow
+
+test_packet:
+  builder: icmp(type=3, code=1)
+
+expected:
+  compiles: true
+  bpf_action: drop

@@ -1,0 +1,12 @@
+name: "pkt.icmp.type == 255 (max u8) is valid and matchable"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.proto == icmp and pkt.icmp.type == 255
+  default allow
+
+test_packet:
+  builder: icmp(type=255)
+
+expected:
+  compiles: true
+  bpf_action: drop

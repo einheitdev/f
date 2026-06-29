@@ -1,0 +1,15 @@
+name: "ICMP type + geoip src match drops pings from a blocked country"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.proto == icmp and pkt.icmp.type == 8 and pkt.src_ip in geoip(CN)
+  default allow
+
+test_packet:
+  builder: icmp(type=8, src_ip="1.0.1.5")
+
+geoip_data:
+  CN: ["1.0.1.0/24"]
+
+expected:
+  compiles: true
+  bpf_action: drop

@@ -1,0 +1,12 @@
+name: "pkt.tcp.urg set on a guarded TCP packet drops"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.proto == tcp and pkt.tcp.urg
+  default allow
+
+test_packet:
+  builder: tcp(urg=true)
+
+expected:
+  compiles: true
+  bpf_action: drop

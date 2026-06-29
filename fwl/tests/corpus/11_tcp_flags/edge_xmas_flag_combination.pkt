@@ -1,0 +1,12 @@
+name: "XMAS scan (FIN+PSH+URG) flag combination matches"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.proto == tcp and pkt.tcp.fin and pkt.tcp.psh and pkt.tcp.urg
+  default allow
+
+test_packet:
+  builder: tcp(fin=true, psh=true, urg=true)
+
+expected:
+  compiles: true
+  bpf_action: drop
