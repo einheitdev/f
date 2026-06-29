@@ -129,7 +129,7 @@ rvalue        : operand                        -> rvalue_operand
 // TCP_FLAG_FIELD is admitted via bool_primary (which is a primary
 // alternative), so it's not listed here — adding it would create
 // a reduce/reduce conflict against bool_primary's same-token rule.
-value_field   : IP_FIELD | PORT_FIELD | IP6_FIELD | PROTO_FIELD
+value_field   : IP_FIELD | PORT_FIELD | IP6_FIELD | PROTO_FIELD | VLAN_FIELD
 
 operand       : INTEGER | IPV4 | IPV6 | PROTO_KEYWORD
 
@@ -174,6 +174,11 @@ IP6_FIELD.11       : "pkt.src_ip6" | "pkt.dst_ip6"
 IP_FIELD.10        : "pkt.src_ip" | "pkt.dst_ip"
 PORT_FIELD.10      : "pkt.src_port" | "pkt.dst_port"
 TCP_FLAG_FIELD.10  : "pkt.tcp.syn" | "pkt.tcp.ack"
+// v0.4 VLAN fields. "pkt.vlan_priority" is listed before
+// "pkt.vlan_id" so longest-match prefers the longer field name when
+// scanning the shared "pkt.vlan" prefix (the basic lexer is greedy
+// per-alternative, but explicit ordering keeps intent clear).
+VLAN_FIELD.10      : "pkt.vlan_priority" | "pkt.vlan_id"
 
 // Keywords use a negative-lookahead so they only match when not
 // followed by an identifier character — `tcp_traffic` lexes as
