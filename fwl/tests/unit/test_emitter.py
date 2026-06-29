@@ -6,6 +6,8 @@ formatting changes shouldn't fail the suite. The corpus + clang
 compile already verifies the C is well-formed; these tests pin
 specific emission decisions.
 """
+import pytest
+
 from fwl import analyzer, emitter, parser
 
 
@@ -42,6 +44,35 @@ class TestPrelude:
       "@xdp(eth0)\ndrop if pkt.proto == tcp and pkt.tcp.syn\n"
     )
     assert "tcp_syn = tcp->syn" in src
+
+  @pytest.mark.parametrize(
+    "flag", ["fin", "rst", "psh", "urg", "ece", "cwr"]
+  )
+  def test_new_flags_emit_bitfield_read(self, flag):
+    src = emit(
+      f"@xdp(eth0)\ndrop if pkt.proto == tcp and pkt.tcp.{flag}\n"
+    )
+    assert f"tcp_{flag} = tcp->{flag}" in src
+    assert f"(l4_ok && tcp_{flag})" in src
+
+  def test_icmp_type_emits_icmp_branch(self):
+    src = emit(
+      "@xdp(eth0)\ndrop if pkt.proto == icmp and pkt.icmp.type == 8\n"
+    )
+    assert "proto == IPPROTO_ICMP" in src
+    assert "icmp_type = icmp->type" in src
+    assert "(icmp_ok && (icmp_type == 8))" in src
+    # Must NOT pull in the un-BPF-compilable kernel ICMP header.
+    assert "#include <linux/icmp.h>" not in src
+    assert "struct fwl_icmphdr" in src
+
+  def test_icmp6_code_emits_icmpv6_branch(self):
+    src = emit(
+      "@xdp(eth0)\ndrop if pkt.proto == icmp6 and pkt.icmp6.code != 0\n"
+    )
+    assert "proto == IPPROTO_ICMPV6" in src
+    assert "icmp6_code = icmp6->code" in src
+    assert "(icmp6_ok && (icmp6_code != 0))" in src
 
 
 class TestNonIpEarlyOut:

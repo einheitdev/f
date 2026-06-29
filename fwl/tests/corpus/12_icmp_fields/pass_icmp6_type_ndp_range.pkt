@@ -1,0 +1,13 @@
+name: "pkt.icmp6.type in 133..137 matches NDP router advertisement (134)"
+source_fw: |
+  @xdp(eth0)
+  allow if pkt.proto == icmp6 and pkt.icmp6.type in 133..137
+  drop if pkt.proto == icmp6
+  default allow
+
+test_packet:
+  builder: icmp6(type=134)
+
+expected:
+  compiles: true
+  bpf_action: allow

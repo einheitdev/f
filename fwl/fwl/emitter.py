@@ -36,6 +36,16 @@ _HEADER = """\
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
 
+// Minimal ICMP/ICMPv6 header. The kernel's <linux/icmp.h> transitively
+// pulls in <linux/if.h> and glibc socket headers that don't compile
+// under `clang -target bpf`, so we declare just the two bytes v0.4
+// reads (type at offset 0, code at offset 1). The layout is identical
+// for ICMPv4 and ICMPv6 (RFC 792 / RFC 4443).
+struct fwl_icmphdr {
+  __u8 type;
+  __u8 code;
+};
+
 struct fwl_rl_state {
   __u64 ts;
   __u32 count;
@@ -221,6 +231,21 @@ def _add_field_refs_from_node(node, fields: set[str]) -> None:
     fields.add(node.name)
 
 
+# (field constant, C variable name, struct tcphdr bitfield name) for
+# all 8 TCP flags. The prelude declares/reads a var per referenced
+# flag; both the v4 and v6 TCP branches reuse this table.
+_TCP_FLAG_VARS = (
+  (ast.FIELD_TCP_SYN, "tcp_syn", "syn"),
+  (ast.FIELD_TCP_ACK, "tcp_ack", "ack"),
+  (ast.FIELD_TCP_FIN, "tcp_fin", "fin"),
+  (ast.FIELD_TCP_RST, "tcp_rst", "rst"),
+  (ast.FIELD_TCP_PSH, "tcp_psh", "psh"),
+  (ast.FIELD_TCP_URG, "tcp_urg", "urg"),
+  (ast.FIELD_TCP_ECE, "tcp_ece", "ece"),
+  (ast.FIELD_TCP_CWR, "tcp_cwr", "cwr"),
+)
+
+
 def _needs_l4(fields: set[str]) -> bool:
   """True iff any port or TCP-flag field is referenced."""
   return bool(fields & (ast.PORT_FIELDS | ast.TCP_FLAG_FIELDS))
@@ -229,6 +254,16 @@ def _needs_l4(fields: set[str]) -> bool:
 def _needs_tcp(fields: set[str]) -> bool:
   """True iff any TCP-flag field is referenced."""
   return bool(fields & ast.TCP_FLAG_FIELDS)
+
+
+def _needs_icmp(fields: set[str]) -> bool:
+  """True iff any IPv4 ICMP type/code field is referenced."""
+  return bool(fields & ast.ICMP_FIELDS)
+
+
+def _needs_icmp6(fields: set[str]) -> bool:
+  """True iff any ICMPv6 type/code field is referenced."""
+  return bool(fields & ast.ICMP6_FIELDS)
 
 
 def _is_v6_active(program: ast.Program) -> bool:
@@ -318,6 +353,8 @@ def _emit_parse_prelude(program: ast.Program) -> str:
 
   needs_l4 = _needs_l4(fields)
   needs_tcp = _needs_tcp(fields)
+  needs_icmp = _needs_icmp(fields)
+  needs_icmp6 = _needs_icmp6(fields)
   v6_active = _is_v6_active(program)
 
   decls: list[str] = ["__u8 proto = 0;"]
@@ -350,10 +387,24 @@ def _emit_parse_prelude(program: ast.Program) -> str:
     decls.append("__u16 src_port = 0;")
   if ast.FIELD_DST_PORT in fields:
     decls.append("__u16 dst_port = 0;")
-  if ast.FIELD_TCP_SYN in fields:
-    decls.append("__u8 tcp_syn = 0;")
-  if ast.FIELD_TCP_ACK in fields:
-    decls.append("__u8 tcp_ack = 0;")
+  for field_const, c_var, _bit in _TCP_FLAG_VARS:
+    if field_const in fields:
+      decls.append(f"__u8 {c_var} = 0;")
+  # icmp_ok / icmp6_ok gate ICMP type/code reads, mirroring l4_ok.
+  # Set to 1 only inside the ICMP/ICMPv6 guard blocks after the header
+  # bounds check succeeds.
+  if needs_icmp:
+    decls.append("__u8 icmp_ok = 0;")
+    if ast.FIELD_ICMP_TYPE in fields:
+      decls.append("__u8 icmp_type = 0;")
+    if ast.FIELD_ICMP_CODE in fields:
+      decls.append("__u8 icmp_code = 0;")
+  if needs_icmp6:
+    decls.append("__u8 icmp6_ok = 0;")
+    if ast.FIELD_ICMP6_TYPE in fields:
+      decls.append("__u8 icmp6_type = 0;")
+    if ast.FIELD_ICMP6_CODE in fields:
+      decls.append("__u8 icmp6_code = 0;")
   # v0.4 VLAN. vlan_ok gates vlan-field comparisons so an untagged
   # frame (where the tag never parsed) cannot spuriously match
   # `pkt.vlan_id == 0`, mirroring the v4_ok/v6_ok/l4_ok pattern. Only
@@ -380,9 +431,11 @@ def _emit_parse_prelude(program: ast.Program) -> str:
   if ip_read_block:
     ip_read_block = "\n" + ip_read_block
 
-  # IPv4 L4 parse — variable IHL.
+  # IPv4 L4 parse — variable IHL. The ip_hlen-guarded block is emitted
+  # when any L4 (port/TCP-flag) OR IPv4 ICMP field is referenced; the
+  # TCP/UDP/ICMP sub-branches are each emitted only when relevant.
   l4_block = ""
-  if needs_l4:
+  if needs_l4 or needs_icmp:
     port_reads_tcp = []
     port_reads_udp = []
     if ast.FIELD_SRC_PORT in fields:
@@ -401,10 +454,9 @@ def _emit_parse_prelude(program: ast.Program) -> str:
       )
     tcp_flag_reads = []
     if needs_tcp:
-      if ast.FIELD_TCP_SYN in fields:
-        tcp_flag_reads.append("              tcp_syn = tcp->syn;")
-      if ast.FIELD_TCP_ACK in fields:
-        tcp_flag_reads.append("              tcp_ack = tcp->ack;")
+      for field_const, c_var, bit in _TCP_FLAG_VARS:
+        if field_const in fields:
+          tcp_flag_reads.append(f"              {c_var} = tcp->{bit};")
     tcp_branch = "\n".join(port_reads_tcp + tcp_flag_reads)
     udp_branch = "\n".join(port_reads_udp)
 
@@ -430,15 +482,33 @@ def _emit_parse_prelude(program: ast.Program) -> str:
             }}
           }}"""
 
+    icmp_block = ""
+    if needs_icmp:
+      icmp_reads = []
+      if ast.FIELD_ICMP_TYPE in fields:
+        icmp_reads.append("              icmp_type = icmp->type;")
+      if ast.FIELD_ICMP_CODE in fields:
+        icmp_reads.append("              icmp_code = icmp->code;")
+      icmp_read_block = "\n".join(icmp_reads)
+      icmp_block = f"""
+          if (proto == IPPROTO_ICMP) {{
+            struct fwl_icmphdr *icmp = (void *)ip + ip_hlen;
+            if ((void *)(icmp + 1) <= data_end) {{
+              icmp_ok = 1;
+{icmp_read_block}
+            }}
+          }}"""
+
     l4_block = f"""
         __u32 ip_hlen = ip->ihl * 4;
         if (ip_hlen >= sizeof(struct iphdr) &&
-            (void *)ip + ip_hlen <= data_end) {{{tcp_block}{udp_block}
+            (void *)ip + ip_hlen <= data_end) \
+{{{tcp_block}{udp_block}{icmp_block}
         }}"""
 
   v6_branch = ""
   if v6_active:
-    v6_branch = _emit_v6_branch(fields, needs_l4, needs_tcp)
+    v6_branch = _emit_v6_branch(fields, needs_l4, needs_tcp, needs_icmp6)
 
   # v0.4 VLAN dispatch. Emitted in EVERY prelude (not just programs
   # that read vlan fields) so an existing IPv4/IPv6 rule still matches
@@ -507,15 +577,18 @@ def _emit_parse_prelude(program: ast.Program) -> str:
 
 
 def _emit_v6_branch(
-  fields: set[str], needs_l4: bool, needs_tcp: bool
+  fields: set[str], needs_l4: bool, needs_tcp: bool,
+  needs_icmp6: bool = False,
 ) -> str:
   """Emit the IPv6 parse branch for the dual-stack prelude (v0.2).
 
   Reads the 40-byte fixed header at offset 14, populates the
   src_ip6_hi/lo and dst_ip6_hi/lo locals, then parses TCP/UDP at
   the fixed offset (no extension-header chasing per FWL_V02_SPEC.md).
-  Other next_header values (extension headers, ICMPv6) leave the
-  L4 fields at zero so rules touching them fall through.
+  v0.4 adds an ICMPv6 sub-branch reading type/code at the same fixed
+  offset when next_header == IPPROTO_ICMPV6. Other next_header values
+  (extension headers) leave the L4/ICMP fields at zero so rules
+  touching them fall through.
   """
   reads: list[str] = []
   if ast.FIELD_SRC_IP6 in fields:
@@ -554,10 +627,9 @@ def _emit_v6_branch(
       port_udp.append("            dst_port = bpf_ntohs(udp->dest);")
     tcp_flags: list[str] = []
     if needs_tcp:
-      if ast.FIELD_TCP_SYN in fields:
-        tcp_flags.append("            tcp_syn = tcp->syn;")
-      if ast.FIELD_TCP_ACK in fields:
-        tcp_flags.append("            tcp_ack = tcp->ack;")
+      for field_const, c_var, bit in _TCP_FLAG_VARS:
+        if field_const in fields:
+          tcp_flags.append(f"            {c_var} = tcp->{bit};")
     tcp_branch = "\n".join(port_tcp + tcp_flags)
     udp_branch = "\n".join(port_udp)
     tcp_block = ""
@@ -581,6 +653,27 @@ def _emit_v6_branch(
           }}
         }}"""
     l4_block = tcp_block + udp_block
+
+  # ICMPv6 type/code parse at the fixed offset (no ext-header chasing).
+  # `icmp6` derives from `ip6` (== `l3`), so it lands at the correct
+  # VLAN-shifted offset on tagged frames.
+  icmp6_block = ""
+  if needs_icmp6:
+    icmp6_reads = []
+    if ast.FIELD_ICMP6_TYPE in fields:
+      icmp6_reads.append("            icmp6_type = icmp6->type;")
+    if ast.FIELD_ICMP6_CODE in fields:
+      icmp6_reads.append("            icmp6_code = icmp6->code;")
+    icmp6_read_block = "\n".join(icmp6_reads)
+    icmp6_block = f"""
+        if (proto == IPPROTO_ICMPV6) {{
+          struct fwl_icmphdr *icmp6 = (void *)(ip6 + 1);
+          if ((void *)(icmp6 + 1) <= data_end) {{
+            icmp6_ok = 1;
+{icmp6_read_block}
+          }}
+        }}"""
+  l4_block = l4_block + icmp6_block
 
   # `l3` / `l3_proto` are the VLAN-aware L3 pointer + EtherType the
   # prelude computes once (offset 14 untagged, 18 tagged); deriving
@@ -646,10 +739,9 @@ def _emit_bool_field(node: ast.BoolField) -> str:
   the underlying byte stays 0 (which it does on every non-TCP
   packet, by construction).
   """
-  if node.field.name == ast.FIELD_TCP_SYN:
-    return "(l4_ok && tcp_syn)"
-  if node.field.name == ast.FIELD_TCP_ACK:
-    return "(l4_ok && tcp_ack)"
+  for field_const, c_var, _bit in _TCP_FLAG_VARS:
+    if node.field.name == field_const:
+      return f"(l4_ok && {c_var})"
   raise NotImplementedError(
     f"emitter: unsupported bool field {node.field.name}"
   )
@@ -661,6 +753,10 @@ _FIELD_TO_C = {
   ast.FIELD_DST_IP: "dst_ip",
   ast.FIELD_SRC_PORT: "src_port",
   ast.FIELD_DST_PORT: "dst_port",
+  ast.FIELD_ICMP_TYPE: "icmp_type",
+  ast.FIELD_ICMP_CODE: "icmp_code",
+  ast.FIELD_ICMP6_TYPE: "icmp6_type",
+  ast.FIELD_ICMP6_CODE: "icmp6_code",
   ast.FIELD_VLAN_ID: "vlan_id",
   ast.FIELD_VLAN_PRIORITY: "vlan_priority",
 }
@@ -677,6 +773,8 @@ def _emit_comparison(cmp: ast.Comparison) -> str:
     return _emit_ip6_compare(cmp)
   if field_name in ast.PORT_FIELDS:
     return _emit_port_compare(cmp)
+  if field_name in ast.ICMP_FIELDS or field_name in ast.ICMP6_FIELDS:
+    return _emit_icmp_compare(cmp)
   if field_name in ast.VLAN_FIELDS:
     return _emit_vlan_compare(cmp)
   raise NotImplementedError(
@@ -892,6 +990,26 @@ def _emit_port_in(c_field: str, operand: ast.Operand) -> str:
   raise NotImplementedError(
     f"emitter: port 'in' operand {type(operand).__name__} not supported"
   )
+
+
+def _emit_icmp_compare(cmp: ast.Comparison) -> str:
+  """ICMP/ICMPv6 type/code comparisons (== / != / < / > / <= / >= / in).
+
+  Gated on `icmp_ok` (v4) or `icmp6_ok` (v6) so a frame whose ICMP
+  header never parsed (non-ICMP proto, truncated header, IPv6 ext
+  headers) cannot spuriously match `pkt.icmp.type == 0` or
+  `pkt.icmp.code != 3` (which evaluates true when the byte stays 0).
+  """
+  c_field = _FIELD_TO_C[cmp.field.name]
+  ok = "icmp_ok" if cmp.field.name in ast.ICMP_FIELDS else "icmp6_ok"
+  if cmp.op in ("==", "!=", "<", ">", "<=", ">="):
+    val = cmp.operand.value  # type: ignore[union-attr]
+    return f"({ok} && ({c_field} {cmp.op} {val}))"
+  if cmp.op == "in":
+    return f"({ok} && {_emit_port_in(c_field, cmp.operand)})"
+  # Unreachable: the analyzer restricts ICMP type/code to exactly the
+  # comparison ops handled above.
+  raise AssertionError(f"unexpected icmp op {cmp.op}")
 
 
 def _emit_vlan_compare(cmp: ast.Comparison) -> str:
@@ -1348,6 +1466,16 @@ _FIELD_LOCAL_TYPE = {
   ast.FIELD_DST_PORT: ast.LocalType.U16,
   ast.FIELD_TCP_SYN: ast.LocalType.BOOL,
   ast.FIELD_TCP_ACK: ast.LocalType.BOOL,
+  ast.FIELD_TCP_FIN: ast.LocalType.BOOL,
+  ast.FIELD_TCP_RST: ast.LocalType.BOOL,
+  ast.FIELD_TCP_PSH: ast.LocalType.BOOL,
+  ast.FIELD_TCP_URG: ast.LocalType.BOOL,
+  ast.FIELD_TCP_ECE: ast.LocalType.BOOL,
+  ast.FIELD_TCP_CWR: ast.LocalType.BOOL,
+  ast.FIELD_ICMP_TYPE: ast.LocalType.U16,
+  ast.FIELD_ICMP_CODE: ast.LocalType.U16,
+  ast.FIELD_ICMP6_TYPE: ast.LocalType.U16,
+  ast.FIELD_ICMP6_CODE: ast.LocalType.U16,
   ast.FIELD_VLAN_ID: ast.LocalType.U16,
   ast.FIELD_VLAN_PRIORITY: ast.LocalType.U16,
 }
@@ -1495,10 +1623,13 @@ def _emit_field_read_scalar(field_name: str) -> str:
     return "src_port"
   if field_name == ast.FIELD_DST_PORT:
     return "dst_port"
-  if field_name == ast.FIELD_TCP_SYN:
-    return "tcp_syn"
-  if field_name == ast.FIELD_TCP_ACK:
-    return "tcp_ack"
+  for field_const, c_var, _bit in _TCP_FLAG_VARS:
+    if field_name == field_const:
+      return c_var
+  if field_name in _FIELD_TO_C and (
+    field_name in ast.ICMP_FIELDS or field_name in ast.ICMP6_FIELDS
+  ):
+    return _FIELD_TO_C[field_name]
   if field_name == ast.FIELD_VLAN_ID:
     return "vlan_id"
   if field_name == ast.FIELD_VLAN_PRIORITY:

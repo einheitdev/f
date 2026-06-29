@@ -1,0 +1,16 @@
+name: "ICMPv6 NDP allowed, other ICMPv6 dropped, inside a Tier 2 function"
+source_fw: |
+  @xdp(eth0)
+  def filter(pkt):
+    if pkt.proto == icmp6:
+      if pkt.icmp6.type in 133..137:
+        allow
+      drop
+    allow
+
+test_packet:
+  builder: icmp6(type=135)
+
+expected:
+  compiles: true
+  bpf_action: allow

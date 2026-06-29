@@ -1,0 +1,12 @@
+name: "TCP flag + rate_limit modifier compiles and falls through below threshold"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.proto == tcp and pkt.tcp.syn limited by rate_limit(5, per=src_ip)
+  default allow
+
+test_packet:
+  builder: tcp(syn=true, src_ip="1.2.3.4")
+
+expected:
+  compiles: true
+  bpf_action: allow

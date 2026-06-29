@@ -191,3 +191,53 @@ class TestRateLimit:
     assert evaluate(
       src, {"proto": "tcp", "src_ip": "5.6.7.8"}, state
     ) == PASS
+
+
+class TestV04Fields:
+  """v0.4 — TCP flags (all 8) and ICMP/ICMPv6 type/code evaluation."""
+
+  def test_new_flag_set_matches(self):
+    src = (
+      "@xdp(eth0)\n"
+      "drop if pkt.proto == tcp and pkt.tcp.fin\n"
+      "default allow\n"
+    )
+    assert evaluate(src, {"proto": "tcp", "fin": True}) == DROP
+    assert evaluate(src, {"proto": "tcp", "fin": False}) == PASS
+
+  def test_flag_on_non_tcp_does_not_match(self):
+    src = (
+      "@xdp(eth0)\n"
+      "drop if pkt.proto == tcp and pkt.tcp.rst\n"
+      "default allow\n"
+    )
+    # A UDP packet never reaches the flag (proto guard is false).
+    assert evaluate(src, {"proto": "udp", "rst": True}) == PASS
+
+  def test_icmp_type_equality(self):
+    src = (
+      "@xdp(eth0)\n"
+      "drop if pkt.proto == icmp and pkt.icmp.type == 3\n"
+      "default allow\n"
+    )
+    assert evaluate(src, {"proto": "icmp", "icmp_type": 3}) == DROP
+    assert evaluate(src, {"proto": "icmp", "icmp_type": 8}) == PASS
+
+  def test_icmp_type_in_range(self):
+    src = (
+      "@xdp(eth0)\n"
+      "allow if pkt.proto == icmp6 and pkt.icmp6.type in 133..137\n"
+      "drop if pkt.proto == icmp6\n"
+      "default allow\n"
+    )
+    assert evaluate(src, {"proto": "icmp6", "icmp6_type": 134}) == PASS
+    assert evaluate(src, {"proto": "icmp6", "icmp6_type": 128}) == DROP
+
+  def test_icmp_field_absent_falls_through(self):
+    """A missing icmp_type (e.g. truncated) makes the rule not match."""
+    src = (
+      "@xdp(eth0)\n"
+      "drop if pkt.proto == icmp and pkt.icmp.type == 8\n"
+      "default allow\n"
+    )
+    assert evaluate(src, {"proto": "icmp"}) == PASS

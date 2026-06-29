@@ -1,0 +1,12 @@
+name: "pkt.icmp6.type does not match an IPv4 ICMP packet (cross-family)"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.proto == icmp6 and pkt.icmp6.type == 8
+  default allow
+
+test_packet:
+  builder: icmp(type=8)
+
+expected:
+  compiles: true
+  bpf_action: allow

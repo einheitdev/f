@@ -1,0 +1,10 @@
+name: "pkt.icmp.type without a proto guard is rejected"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.icmp.type == 8
+
+test_packet:
+  builder: icmp(type=8)
+
+expected:
+  compiles: false

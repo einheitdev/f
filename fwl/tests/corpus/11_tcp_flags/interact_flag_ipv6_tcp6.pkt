@@ -1,0 +1,12 @@
+name: "TCP flag on an IPv6 TCP frame (v6 path activated by src_ip6)"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.proto == tcp and pkt.tcp.fin and pkt.src_ip6 in ::/0
+  default allow
+
+test_packet:
+  builder: tcp6(fin=true)
+
+expected:
+  compiles: true
+  bpf_action: drop

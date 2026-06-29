@@ -132,33 +132,65 @@ def _split_args(args_text: str) -> list[tuple[str, str]]:
   return result
 
 
-# v0.4: every builder additionally accepts vlan_id / vlan_priority,
-# which insert a 4-byte 802.1Q tag after the source MAC
-# (FWL_V04_SPEC.md "Builder additions"). The two field names appear
-# in every builder's allowed-field set below.
+# v0.4 adds the six remaining TCP flags to the tcp/tcp6 builders and
+# type/code to the icmp/icmp6 builders (f-04a), plus the VLAN tag
+# fields to every builder (f-04b).
+_TCP_BUILDER_FIELDS = frozenset({
+  "src_ip", "dst_ip", "src_port", "dst_port",
+  "syn", "ack", "fin", "rst", "psh", "urg", "ece", "cwr",
+})
 # Shared VLAN builder fields: the outer tag (vlan_id/vlan_priority)
 # plus the optional inner tag (inner_vlan_id/inner_vlan_priority) that
 # produces a double-tagged QinQ frame for the outer-only-parse tests.
+# Every builder accepts these and inserts a 4-byte 802.1Q tag after
+# the source MAC (FWL_V04_SPEC.md "Builder additions").
 _VLAN_BUILDER_FIELDS = frozenset({
   "vlan_id", "vlan_priority", "inner_vlan_id", "inner_vlan_priority",
 })
 _BUILDER_FIELD_TABLE: dict[str, frozenset[str]] = {
-  "tcp": frozenset({"src_ip", "dst_ip", "src_port", "dst_port",
-                    "syn", "ack"}) | _VLAN_BUILDER_FIELDS,
+  "tcp": _TCP_BUILDER_FIELDS | _VLAN_BUILDER_FIELDS,
   "udp": frozenset({"src_ip", "dst_ip", "src_port",
                     "dst_port"}) | _VLAN_BUILDER_FIELDS,
-  "icmp": frozenset({"src_ip", "dst_ip"}) | _VLAN_BUILDER_FIELDS,
+  "icmp": frozenset({"src_ip", "dst_ip", "type",
+                     "code"}) | _VLAN_BUILDER_FIELDS,
   # v0.2 IPv6 builders. Per PKT_V02_SPEC.md, the field names src_ip
   # and dst_ip are reused for symmetry with the v4 builders; the
   # values are RFC 4291 IPv6 strings, so the type is unambiguous to
   # the loader. src_ip6 and dst_ip6 are NOT separate fields on the v6
   # builders.
-  "tcp6": frozenset({"src_ip", "dst_ip", "src_port", "dst_port",
-                     "syn", "ack"}) | _VLAN_BUILDER_FIELDS,
+  "tcp6": _TCP_BUILDER_FIELDS | _VLAN_BUILDER_FIELDS,
   "udp6": frozenset({"src_ip", "dst_ip", "src_port",
                      "dst_port"}) | _VLAN_BUILDER_FIELDS,
-  "icmp6": frozenset({"src_ip", "dst_ip"}) | _VLAN_BUILDER_FIELDS,
+  "icmp6": frozenset({"src_ip", "dst_ip", "type",
+                      "code"}) | _VLAN_BUILDER_FIELDS,
 }
+
+# TCP flag bit positions in the flags byte (TCP header offset 13).
+_TCP_FLAG_BITS = (
+  ("fin", 0x01),
+  ("syn", 0x02),
+  ("rst", 0x04),
+  ("psh", 0x08),
+  ("ack", 0x10),
+  ("urg", 0x20),
+  ("ece", 0x40),
+  ("cwr", 0x80),
+)
+
+
+def _tcp_flags_byte(fields: dict[str, Any]) -> int:
+  """Assemble the TCP flags byte from the builder's bool fields."""
+  flags = 0
+  for name, bit in _TCP_FLAG_BITS:
+    if fields.get(name, False):
+      flags |= bit
+  return flags
+
+
+def _set_tcp_flag_decoded(decoded: dict[str, Any], fields: dict[str, Any]):
+  """Default every TCP flag to False on the decoded-fields dict."""
+  for name, _bit in _TCP_FLAG_BITS:
+    decoded.setdefault(name, bool(fields.get(name, False)))
 
 
 def parse_builder(text: str) -> dict[str, Any]:
@@ -358,9 +390,7 @@ def _build_v6_packet(fields: dict[str, Any]) -> Packet:
     proto_str = "tcp"
     src_port = fields.get("src_port", 12345)
     dst_port = fields.get("dst_port", 80)
-    syn = fields.get("syn", False)
-    ack = fields.get("ack", False)
-    flags = (0x02 if syn else 0) | (0x10 if ack else 0)
+    flags = _tcp_flags_byte(fields)
     data_offset_reserved = 0x50
     l4 = struct.pack(
       ">HHIIBBHHH",
@@ -376,9 +406,8 @@ def _build_v6_packet(fields: dict[str, Any]) -> Packet:
       "dst_ip6": dst,
       "src_port": src_port,
       "dst_port": dst_port,
-      "syn": syn,
-      "ack": ack,
     }
+    _set_tcp_flag_decoded(decoded, fields)
   elif proto == "udp6":
     next_header = _IPPROTO_UDP
     proto_str = "udp"
@@ -398,13 +427,18 @@ def _build_v6_packet(fields: dict[str, Any]) -> Packet:
     # icmp6
     next_header = _IPPROTO_ICMPV6
     proto_str = "icmp6"
-    # type=128 (Echo Request), code=0, checksum=0, id=0, seq=0
-    l4 = struct.pack(">BBHHH", 128, 0, 0, 0, 0)
+    # type defaults to 128 (Echo Request); code defaults to 0.
+    # checksum, id, seq are left zero for tests.
+    icmp6_type = fields.get("type", 128)
+    icmp6_code = fields.get("code", 0)
+    l4 = struct.pack(">BBHHH", icmp6_type, icmp6_code, 0, 0, 0)
     decoded = {
       "ether_type": _ETH_P_IPV6,
       "proto": proto_str,
       "src_ip6": src,
       "dst_ip6": dst,
+      "icmp6_type": icmp6_type,
+      "icmp6_code": icmp6_code,
     }
 
   payload_len = len(l4)
@@ -449,9 +483,7 @@ def build_packet(fields: dict[str, Any]) -> Packet:
     proto_num = _IPPROTO_TCP
     src_port = fields.get("src_port", 12345)
     dst_port = fields.get("dst_port", 80)
-    syn = fields.get("syn", False)
-    ack = fields.get("ack", False)
-    flags = (0x02 if syn else 0) | (0x10 if ack else 0)
+    flags = _tcp_flags_byte(fields)
     # data offset = 5 (no options), reserved = 0
     data_offset_reserved = 0x50
     l4 = struct.pack(
@@ -470,8 +502,7 @@ def build_packet(fields: dict[str, Any]) -> Packet:
     decoded.setdefault("dst_ip", dst_ip)
     decoded.setdefault("src_port", src_port)
     decoded.setdefault("dst_port", dst_port)
-    decoded.setdefault("syn", syn)
-    decoded.setdefault("ack", ack)
+    _set_tcp_flag_decoded(decoded, fields)
   elif proto == "udp":
     proto_num = _IPPROTO_UDP
     src_port = fields.get("src_port", 12345)
@@ -487,11 +518,18 @@ def build_packet(fields: dict[str, Any]) -> Packet:
     decoded.setdefault("dst_port", dst_port)
   elif proto == "icmp":
     proto_num = _IPPROTO_ICMP
-    # type=8 (echo request), code=0, checksum=0, id=0, seq=0
-    l4 = struct.pack(">BBHHH", 8, 0, 0, 0, 0)
+    # type defaults to 8 (echo request); code defaults to 0. checksum,
+    # id, seq are left zero for tests.
+    icmp_type = fields.get("type", 8)
+    icmp_code = fields.get("code", 0)
+    l4 = struct.pack(">BBHHH", icmp_type, icmp_code, 0, 0, 0)
     decoded = dict(fields)
+    decoded.pop("type", None)
+    decoded.pop("code", None)
     decoded.setdefault("src_ip", src_ip)
     decoded.setdefault("dst_ip", dst_ip)
+    decoded["icmp_type"] = icmp_type
+    decoded["icmp_code"] = icmp_code
   else:
     raise ValueError(f"unknown proto: {proto!r}")
 
@@ -677,9 +715,19 @@ def _strip_truncated_fields(
   out = dict(fields)
   ether_type = out.get("ether_type")
   is_v6 = ether_type == 0x86DD
+  # A present 802.1Q tag shifts every L3/L4 offset by 4 (l2_end is 18
+  # instead of 14), so all boundaries below derive from l2_end.
   has_vlan = "vlan_id" in out or "vlan_priority" in out
   l2_end = 18 if has_vlan else 14
   l3_end = l2_end + (40 if is_v6 else 20)
+  # L4 port/TCP-flag fields (gated by l4_ok) and ICMP type/code fields
+  # (gated by icmp_ok/icmp6_ok) parse at different header sizes, so
+  # they get separate truncation boundaries below.
+  l4_keys = (
+    "src_port", "dst_port",
+    "syn", "ack", "fin", "rst", "psh", "urg", "ece", "cwr",
+  )
+  icmp_keys = ("icmp_type", "icmp_code", "icmp6_type", "icmp6_code")
   # VLAN fields are readable only once the full 4-byte tag fits
   # (bytes 12..16). A frame truncated inside the tag leaves them
   # unreadable, mirroring the emitter's vlan_ok gate.
@@ -693,7 +741,7 @@ def _strip_truncated_fields(
       "proto", "src_ip", "dst_ip", "src_ip6", "dst_ip6",
     ):
       out.pop(key, None)
-    for key in ("src_port", "dst_port", "syn", "ack"):
+    for key in l4_keys + icmp_keys:
       out.pop(key, None)
     return out
   # The BPF emitter's L4 parse only sets `l4_ok` after a *full*
@@ -701,7 +749,13 @@ def _strip_truncated_fields(
   # udphdr is 8 B. Use the conservative tcphdr-sized gate for both
   # so the interpreter mirrors BPF on every truncation boundary.
   if truncate_to < l3_end + 20:
-    for key in ("src_port", "dst_port", "syn", "ack"):
+    for key in l4_keys:
+      out.pop(key, None)
+  # The emitter reads ICMP/ICMPv6 type+code via a minimal 2-byte
+  # struct fwl_icmphdr, setting icmp_ok/icmp6_ok only when those 2
+  # bytes fit. Mirror that exact boundary.
+  if truncate_to < l3_end + 2:
+    for key in icmp_keys:
       out.pop(key, None)
   return out
 
