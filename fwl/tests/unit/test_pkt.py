@@ -92,3 +92,60 @@ class TestBuildPacket:
     packet = pkt.build_packet(pkt.parse_builder("tcp()"))
     assert "src_port" in packet.fields
     assert "dst_port" in packet.fields
+
+
+class TestV04Builders:
+  """v0.4 — all 8 TCP flags and ICMP/ICMPv6 type/code builders."""
+
+  @pytest.mark.parametrize(
+    "flag,bit",
+    [("fin", 0x01), ("syn", 0x02), ("rst", 0x04), ("psh", 0x08),
+     ("ack", 0x10), ("urg", 0x20), ("ece", 0x40), ("cwr", 0x80)],
+  )
+  def test_each_tcp_flag_sets_its_bit(self, flag, bit):
+    packet = pkt.build_packet(pkt.parse_builder(f"tcp({flag}=true)"))
+    # TCP flags byte: eth(14) + ip(20) + offset 13 = 47.
+    assert packet.raw[47] == bit
+    assert packet.fields[flag] is True
+
+  def test_tcp_flags_default_false_in_decoded(self):
+    packet = pkt.build_packet(pkt.parse_builder("tcp()"))
+    for flag in ("syn", "ack", "fin", "rst", "psh", "urg", "ece", "cwr"):
+      assert packet.fields[flag] is False
+
+  def test_xmas_flags_combine(self):
+    packet = pkt.build_packet(
+      pkt.parse_builder("tcp(fin=true, psh=true, urg=true)")
+    )
+    assert packet.raw[47] == (0x01 | 0x08 | 0x20)
+
+  def test_icmp_type_code_in_header_and_decoded(self):
+    packet = pkt.build_packet(pkt.parse_builder("icmp(type=3, code=1)"))
+    # ICMP header: eth(14) + ip(20) = 34 → type, 35 → code.
+    assert packet.raw[34] == 3
+    assert packet.raw[35] == 1
+    assert packet.fields["icmp_type"] == 3
+    assert packet.fields["icmp_code"] == 1
+
+  def test_icmp_type_defaults_to_echo_request(self):
+    packet = pkt.build_packet(pkt.parse_builder("icmp()"))
+    assert packet.fields["icmp_type"] == 8
+    assert packet.fields["icmp_code"] == 0
+
+  def test_icmp6_type_code_in_header_and_decoded(self):
+    packet = pkt.build_packet(
+      pkt.parse_builder("icmp6(type=135, code=0)")
+    )
+    # ICMPv6 header: eth(14) + ipv6(40) = 54 → type, 55 → code.
+    assert packet.raw[54] == 135
+    assert packet.raw[55] == 0
+    assert packet.fields["icmp6_type"] == 135
+    assert packet.fields["icmp6_code"] == 0
+
+  def test_icmp6_type_defaults_to_echo_request(self):
+    packet = pkt.build_packet(pkt.parse_builder("icmp6()"))
+    assert packet.fields["icmp6_type"] == 128
+
+  def test_unknown_icmp_field_rejected(self):
+    with pytest.raises(ValueError):
+      pkt.parse_builder("icmp(syn=true)")

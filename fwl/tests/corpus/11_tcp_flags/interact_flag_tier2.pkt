@@ -1,0 +1,16 @@
+name: "TCP flag inside a Tier 2 function under a proto guard"
+source_fw: |
+  @xdp(eth0)
+  def filter(pkt):
+    if pkt.proto == tcp:
+      if pkt.tcp.rst:
+        drop
+      allow
+    allow
+
+test_packet:
+  builder: tcp(rst=true)
+
+expected:
+  compiles: true
+  bpf_action: drop

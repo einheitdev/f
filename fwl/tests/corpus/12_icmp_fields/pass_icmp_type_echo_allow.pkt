@@ -1,0 +1,13 @@
+name: "pkt.icmp.type == 8 (echo request) allows ping"
+source_fw: |
+  @xdp(eth0)
+  allow if pkt.proto == icmp and pkt.icmp.type == 8
+  drop if pkt.proto == icmp
+  default allow
+
+test_packet:
+  builder: icmp(type=8)
+
+expected:
+  compiles: true
+  bpf_action: allow

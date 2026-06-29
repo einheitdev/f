@@ -1,0 +1,12 @@
+name: "pkt.icmp.code == 0 matches an echo request's zero code"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.proto == icmp and pkt.icmp.code == 0
+  default allow
+
+test_packet:
+  builder: icmp(type=8, code=0)
+
+expected:
+  compiles: true
+  bpf_action: drop

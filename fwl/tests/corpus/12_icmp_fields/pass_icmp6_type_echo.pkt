@@ -1,0 +1,12 @@
+name: "pkt.icmp6.type == 128 matches an ICMPv6 echo request"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.proto == icmp6 and pkt.icmp6.type == 128
+  default allow
+
+test_packet:
+  builder: icmp6(type=128)
+
+expected:
+  compiles: true
+  bpf_action: drop

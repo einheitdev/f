@@ -1,0 +1,12 @@
+name: "SYN set and ACK clear matches a bare-SYN connection attempt"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.proto == tcp and pkt.tcp.syn and not pkt.tcp.ack
+  default allow
+
+test_packet:
+  builder: tcp(syn=true, ack=false)
+
+expected:
+  compiles: true
+  bpf_action: drop

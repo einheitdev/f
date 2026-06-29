@@ -48,6 +48,16 @@ _ALLOWED_PROTOS: dict[str, frozenset[ast.Proto]] = {
   ast.FIELD_DST_PORT: frozenset({ast.Proto.TCP, ast.Proto.UDP}),
   ast.FIELD_TCP_SYN: frozenset({ast.Proto.TCP}),
   ast.FIELD_TCP_ACK: frozenset({ast.Proto.TCP}),
+  ast.FIELD_TCP_FIN: frozenset({ast.Proto.TCP}),
+  ast.FIELD_TCP_RST: frozenset({ast.Proto.TCP}),
+  ast.FIELD_TCP_PSH: frozenset({ast.Proto.TCP}),
+  ast.FIELD_TCP_URG: frozenset({ast.Proto.TCP}),
+  ast.FIELD_TCP_ECE: frozenset({ast.Proto.TCP}),
+  ast.FIELD_TCP_CWR: frozenset({ast.Proto.TCP}),
+  ast.FIELD_ICMP_TYPE: frozenset({ast.Proto.ICMP}),
+  ast.FIELD_ICMP_CODE: frozenset({ast.Proto.ICMP}),
+  ast.FIELD_ICMP6_TYPE: frozenset({ast.Proto.ICMP6}),
+  ast.FIELD_ICMP6_CODE: frozenset({ast.Proto.ICMP6}),
 }
 
 
@@ -363,6 +373,19 @@ _FIELD_LOCAL_TYPE = {
   ast.FIELD_DST_PORT: ast.LocalType.U16,
   ast.FIELD_TCP_SYN: ast.LocalType.BOOL,
   ast.FIELD_TCP_ACK: ast.LocalType.BOOL,
+  ast.FIELD_TCP_FIN: ast.LocalType.BOOL,
+  ast.FIELD_TCP_RST: ast.LocalType.BOOL,
+  ast.FIELD_TCP_PSH: ast.LocalType.BOOL,
+  ast.FIELD_TCP_URG: ast.LocalType.BOOL,
+  ast.FIELD_TCP_ECE: ast.LocalType.BOOL,
+  ast.FIELD_TCP_CWR: ast.LocalType.BOOL,
+  # ICMP type/code are u8 on the wire; v0.2 has no u8 LocalType, so
+  # they hoist into a u16 local (the smallest unsigned scalar that
+  # holds 0..255). Direct field comparisons still range-check 0..255.
+  ast.FIELD_ICMP_TYPE: ast.LocalType.U16,
+  ast.FIELD_ICMP_CODE: ast.LocalType.U16,
+  ast.FIELD_ICMP6_TYPE: ast.LocalType.U16,
+  ast.FIELD_ICMP6_CODE: ast.LocalType.U16,
 }
 
 
@@ -687,6 +710,21 @@ def _comparison_guards(cmp: ast.Comparison) -> frozenset[str]:
         and cmp.operand.proto in (ast.Proto.TCP, ast.Proto.UDP)
       ):
         out.add("l4")
+      # pkt.proto == icmp / icmp6 establish the guard tags that
+      # dominate pkt.icmp.* / pkt.icmp6.* reads in Tier 2. The icmp6
+      # form also contributes ipv6 + l3 above (it implies the v6 path).
+      if (
+        cmp.op == "=="
+        and isinstance(cmp.operand, ast.ProtoLiteral)
+        and cmp.operand.proto == ast.Proto.ICMP
+      ):
+        out.add("icmp")
+      if (
+        cmp.op == "=="
+        and isinstance(cmp.operand, ast.ProtoLiteral)
+        and cmp.operand.proto == ast.Proto.ICMP6
+      ):
+        out.add("icmp6")
   return frozenset(out)
 
 
@@ -710,6 +748,26 @@ def _check_dominator(field: ast.FieldRef, guards: frozenset[str]) -> None:
         category="semantic",
         message=(
           f"'{name}' read on a path not guarded by 'pkt.proto == tcp'"
+        ),
+        span=field.span,
+      ))
+    return
+  if name in ast.ICMP_FIELDS:
+    if "icmp" not in guards:
+      raise FwlException(FwlError(
+        category="semantic",
+        message=(
+          f"'{name}' read on a path not guarded by 'pkt.proto == icmp'"
+        ),
+        span=field.span,
+      ))
+    return
+  if name in ast.ICMP6_FIELDS:
+    if "icmp6" not in guards:
+      raise FwlException(FwlError(
+        category="semantic",
+        message=(
+          f"'{name}' read on a path not guarded by 'pkt.proto == icmp6'"
         ),
         span=field.span,
       ))
@@ -881,6 +939,16 @@ _FIELD_TYPE_LABEL = {
   ast.FIELD_DST_PORT: "port (u16)",
   ast.FIELD_TCP_SYN: "bool",
   ast.FIELD_TCP_ACK: "bool",
+  ast.FIELD_TCP_FIN: "bool",
+  ast.FIELD_TCP_RST: "bool",
+  ast.FIELD_TCP_PSH: "bool",
+  ast.FIELD_TCP_URG: "bool",
+  ast.FIELD_TCP_ECE: "bool",
+  ast.FIELD_TCP_CWR: "bool",
+  ast.FIELD_ICMP_TYPE: "icmp type (u8)",
+  ast.FIELD_ICMP_CODE: "icmp code (u8)",
+  ast.FIELD_ICMP6_TYPE: "icmp6 type (u8)",
+  ast.FIELD_ICMP6_CODE: "icmp6 code (u8)",
 }
 
 
@@ -917,6 +985,20 @@ def _check_port_int(value: int, span) -> None:
         category="semantic",
         message=(
           f"port value {value} outside valid range 0..65535"
+        ),
+        span=span,
+      )
+    )
+
+
+def _check_u8_int(value: int, span) -> None:
+  """ICMP type/code literal must be in 0..255 (u8 wire field)."""
+  if not (0 <= value <= 255):
+    raise FwlException(
+      FwlError(
+        category="semantic",
+        message=(
+          f"icmp type/code value {value} outside valid range 0..255"
         ),
         span=span,
       )
@@ -1034,6 +1116,40 @@ def _check_comparison_types(cmp: ast.Comparison) -> None:
           if not isinstance(item, ast.IntLiteral):
             raise _type_error(field_label, op, item, item.span)
           _check_port_int(item.value, item.span)
+      else:
+        raise _type_error(field_label, op, operand, span)
+    else:
+      raise _type_error(field_label, op, operand, span)
+    return
+
+  # ICMP/ICMPv6 type and code are u8 integer fields — same comparison
+  # surface as ports (==/!=/ordered/in range or list) but bounded to
+  # 0..255 (FWL_V04_SPEC.md § 4.2).
+  if field_name in ast.ICMP_FIELDS or field_name in ast.ICMP6_FIELDS:
+    if op in ("==", "!=", "<", ">", "<=", ">="):
+      if not isinstance(operand, ast.IntLiteral):
+        raise _type_error(field_label, op, operand, span)
+      _check_u8_int(operand.value, operand.span)
+    elif op == "in":
+      if isinstance(operand, ast.RangeLiteral):
+        _check_u8_int(operand.lo, operand.span)
+        _check_u8_int(operand.hi, operand.span)
+        if operand.lo > operand.hi:
+          raise FwlException(
+            FwlError(
+              category="semantic",
+              message=(
+                f"range lower bound ({operand.lo}) exceeds upper "
+                f"bound ({operand.hi})"
+              ),
+              span=operand.span,
+            )
+          )
+      elif isinstance(operand, ast.ListLiteral):
+        for item in operand.items:
+          if not isinstance(item, ast.IntLiteral):
+            raise _type_error(field_label, op, item, item.span)
+          _check_u8_int(item.value, item.span)
       else:
         raise _type_error(field_label, op, operand, span)
     else:

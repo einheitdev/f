@@ -1,0 +1,16 @@
+name: "TCP flag read falls through on a truncated TCP header"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.proto == tcp and pkt.tcp.fin
+  default allow
+
+test_packet:
+  builder: tcp(fin=true)
+  # 14 (eth) + 20 (ip) + 4 = 38 bytes: the full 20-byte TCP header
+  # does not fit, so the parser's bounds check fails, l4_ok stays 0,
+  # and the flag read never happens. Both oracles fall through.
+  truncate_to: 38
+
+expected:
+  compiles: true
+  bpf_action: allow

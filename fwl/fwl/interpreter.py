@@ -249,6 +249,16 @@ _FIELD_TO_PACKET_KEY = {
   ast.FIELD_DST_PORT: "dst_port",
   ast.FIELD_TCP_SYN: "syn",
   ast.FIELD_TCP_ACK: "ack",
+  ast.FIELD_TCP_FIN: "fin",
+  ast.FIELD_TCP_RST: "rst",
+  ast.FIELD_TCP_PSH: "psh",
+  ast.FIELD_TCP_URG: "urg",
+  ast.FIELD_TCP_ECE: "ece",
+  ast.FIELD_TCP_CWR: "cwr",
+  ast.FIELD_ICMP_TYPE: "icmp_type",
+  ast.FIELD_ICMP_CODE: "icmp_code",
+  ast.FIELD_ICMP6_TYPE: "icmp6_type",
+  ast.FIELD_ICMP6_CODE: "icmp6_code",
 }
 
 
@@ -604,6 +614,16 @@ _FIELD_TO_KEY = {
   ast.FIELD_DST_PORT: "dst_port",
   ast.FIELD_TCP_SYN: "syn",
   ast.FIELD_TCP_ACK: "ack",
+  ast.FIELD_TCP_FIN: "fin",
+  ast.FIELD_TCP_RST: "rst",
+  ast.FIELD_TCP_PSH: "psh",
+  ast.FIELD_TCP_URG: "urg",
+  ast.FIELD_TCP_ECE: "ece",
+  ast.FIELD_TCP_CWR: "cwr",
+  ast.FIELD_ICMP_TYPE: "icmp_type",
+  ast.FIELD_ICMP_CODE: "icmp_code",
+  ast.FIELD_ICMP6_TYPE: "icmp6_type",
+  ast.FIELD_ICMP6_CODE: "icmp6_code",
 }
 
 
@@ -684,6 +704,24 @@ def _eval_comparison(
 
   # Port fields
   if field_name in ast.PORT_FIELDS:
+    actual_int = int(actual)
+    if op == "==":
+      return actual_int == operand.value  # type: ignore[union-attr]
+    if op == "!=":
+      return actual_int != operand.value  # type: ignore[union-attr]
+    if op == "<":
+      return actual_int < operand.value   # type: ignore[union-attr]
+    if op == ">":
+      return actual_int > operand.value   # type: ignore[union-attr]
+    if op == "<=":
+      return actual_int <= operand.value  # type: ignore[union-attr]
+    if op == ">=":
+      return actual_int >= operand.value  # type: ignore[union-attr]
+    if op == "in":
+      return _port_in_set(actual_int, operand)
+
+  # ICMP/ICMPv6 type and code: u8 integer comparisons (mirror ports).
+  if field_name in ast.ICMP_FIELDS or field_name in ast.ICMP6_FIELDS:
     actual_int = int(actual)
     if op == "==":
       return actual_int == operand.value  # type: ignore[union-attr]

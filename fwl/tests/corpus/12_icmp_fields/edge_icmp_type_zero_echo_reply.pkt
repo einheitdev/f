@@ -1,0 +1,12 @@
+name: "pkt.icmp.type == 0 (echo reply) boundary value matches"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.proto == icmp and pkt.icmp.type == 0
+  default allow
+
+test_packet:
+  builder: icmp(type=0)
+
+expected:
+  compiles: true
+  bpf_action: drop

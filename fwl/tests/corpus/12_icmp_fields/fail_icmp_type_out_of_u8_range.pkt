@@ -1,0 +1,10 @@
+name: "pkt.icmp.type == 300 exceeds the u8 range and is rejected"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.proto == icmp and pkt.icmp.type == 300
+
+test_packet:
+  builder: icmp(type=8)
+
+expected:
+  compiles: false

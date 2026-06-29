@@ -1,0 +1,10 @@
+name: "pkt.icmp.type under an icmp6 guard is rejected (cross-family)"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.proto == icmp6 and pkt.icmp.type == 8
+
+test_packet:
+  builder: icmp(type=8)
+
+expected:
+  compiles: false

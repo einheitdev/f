@@ -67,6 +67,78 @@ class TestProtocolGuards:
       )
 
 
+class TestV04Fields:
+  """v0.4 — all 8 TCP flags and ICMP/ICMPv6 type/code guards."""
+
+  @pytest.mark.parametrize(
+    "flag", ["syn", "ack", "fin", "rst", "psh", "urg", "ece", "cwr"]
+  )
+  def test_all_eight_flags_with_tcp_guard_pass(self, flag):
+    analyze(f"@xdp(eth0)\ndrop if pkt.proto == tcp and pkt.tcp.{flag}\n")
+
+  @pytest.mark.parametrize(
+    "flag", ["fin", "rst", "psh", "urg", "ece", "cwr"]
+  )
+  def test_new_flag_no_guard_fails(self, flag):
+    with pytest.raises(FwlException):
+      analyze(f"@xdp(eth0)\ndrop if pkt.tcp.{flag}\n")
+
+  def test_icmp_type_with_icmp_guard_passes(self):
+    analyze(
+      "@xdp(eth0)\ndrop if pkt.proto == icmp and pkt.icmp.type == 8\n"
+    )
+
+  def test_icmp_code_with_icmp_guard_passes(self):
+    analyze(
+      "@xdp(eth0)\ndrop if pkt.proto == icmp and pkt.icmp.code == 0\n"
+    )
+
+  def test_icmp6_type_with_icmp6_guard_passes(self):
+    analyze(
+      "@xdp(eth0)\ndrop if pkt.proto == icmp6 and pkt.icmp6.type == 128\n"
+    )
+
+  def test_icmp_type_no_guard_fails(self):
+    with pytest.raises(FwlException):
+      analyze("@xdp(eth0)\ndrop if pkt.icmp.type == 8\n")
+
+  def test_icmp_type_under_tcp_guard_fails(self):
+    with pytest.raises(FwlException):
+      analyze(
+        "@xdp(eth0)\ndrop if pkt.proto == tcp and pkt.icmp.type == 8\n"
+      )
+
+  def test_icmp_type_under_icmp6_guard_fails(self):
+    """ICMPv4 field requires icmp, not icmp6 (cross-family)."""
+    with pytest.raises(FwlException):
+      analyze(
+        "@xdp(eth0)\ndrop if pkt.proto == icmp6 and pkt.icmp.type == 8\n"
+      )
+
+  def test_icmp6_type_under_icmp_guard_fails(self):
+    with pytest.raises(FwlException):
+      analyze(
+        "@xdp(eth0)\ndrop if pkt.proto == icmp and pkt.icmp6.type == 8\n"
+      )
+
+  def test_icmp_type_out_of_u8_range_fails(self):
+    with pytest.raises(FwlException) as exc:
+      analyze(
+        "@xdp(eth0)\ndrop if pkt.proto == icmp and pkt.icmp.type == 300\n"
+      )
+    assert "0..255" in str(exc.value)
+
+  def test_icmp_type_range_and_list_pass(self):
+    analyze(
+      "@xdp(eth0)\n"
+      "allow if pkt.proto == icmp6 and pkt.icmp6.type in 133..137\n"
+    )
+    analyze(
+      "@xdp(eth0)\n"
+      "allow if pkt.proto == icmp and pkt.icmp.type in [0, 3, 8, 11]\n"
+    )
+
+
 class TestRateLimit:
   def test_threshold_positive_passes(self):
     analyze(

@@ -64,11 +64,31 @@ FIELD_SRC_PORT = "pkt.src_port"
 FIELD_DST_PORT = "pkt.dst_port"
 FIELD_TCP_SYN = "pkt.tcp.syn"
 FIELD_TCP_ACK = "pkt.tcp.ack"
+# v0.4 adds the remaining six TCP flag bits. Each is a bool field with
+# the same pkt.proto == tcp guard as syn/ack (FWL_V04_SPEC.md § 4.1).
+FIELD_TCP_FIN = "pkt.tcp.fin"
+FIELD_TCP_RST = "pkt.tcp.rst"
+FIELD_TCP_PSH = "pkt.tcp.psh"
+FIELD_TCP_URG = "pkt.tcp.urg"
+FIELD_TCP_ECE = "pkt.tcp.ece"
+FIELD_TCP_CWR = "pkt.tcp.cwr"
+# v0.4 ICMP/ICMPv6 type and code (u8 fields, integer comparisons).
+# ICMP fields require a pkt.proto == icmp guard; ICMPv6 fields require
+# a pkt.proto == icmp6 guard (FWL_V04_SPEC.md § 4.2).
+FIELD_ICMP_TYPE = "pkt.icmp.type"
+FIELD_ICMP_CODE = "pkt.icmp.code"
+FIELD_ICMP6_TYPE = "pkt.icmp6.type"
+FIELD_ICMP6_CODE = "pkt.icmp6.code"
 
 IP_FIELDS = frozenset({FIELD_SRC_IP, FIELD_DST_IP})
 IP6_FIELDS = frozenset({FIELD_SRC_IP6, FIELD_DST_IP6})
 PORT_FIELDS = frozenset({FIELD_SRC_PORT, FIELD_DST_PORT})
-TCP_FLAG_FIELDS = frozenset({FIELD_TCP_SYN, FIELD_TCP_ACK})
+TCP_FLAG_FIELDS = frozenset({
+  FIELD_TCP_SYN, FIELD_TCP_ACK, FIELD_TCP_FIN, FIELD_TCP_RST,
+  FIELD_TCP_PSH, FIELD_TCP_URG, FIELD_TCP_ECE, FIELD_TCP_CWR,
+})
+ICMP_FIELDS = frozenset({FIELD_ICMP_TYPE, FIELD_ICMP_CODE})
+ICMP6_FIELDS = frozenset({FIELD_ICMP6_TYPE, FIELD_ICMP6_CODE})
 
 
 @dataclass(frozen=True)

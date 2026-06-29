@@ -1,0 +1,16 @@
+name: "pkt.icmp.type read falls through on a truncated ICMP header"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.proto == icmp and pkt.icmp.type == 8
+  default allow
+
+test_packet:
+  builder: icmp(type=8)
+  # 14 (eth) + 20 (ip) + 1 = 35 bytes: only the type byte is present,
+  # not the 2-byte type+code pair, so icmp_ok stays 0 and the read
+  # falls through.
+  truncate_to: 35
+
+expected:
+  compiles: true
+  bpf_action: allow
