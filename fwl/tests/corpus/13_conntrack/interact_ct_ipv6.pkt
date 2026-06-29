@@ -1,0 +1,17 @@
+name: "conntrack v4 tracking coexists with an IPv6 rule in one program"
+source_fw: |
+  @xdp(eth0)
+  allow if conntrack(pkt).state == established
+  allow if pkt.src_ip6 in 2001:db8::/32
+  allow if pkt.proto == tcp and pkt.tcp.syn and pkt.dst_port == 80
+  default drop
+sequence:
+  - name: v4 SYN out (creates v4 entry)
+    builder: tcp(src_ip="1.1.1.1", dst_ip="2.2.2.2", src_port=53000, dst_port=80, syn=true)
+    expected: { bpf_action: allow }
+  - name: v4 reply (established)
+    builder: tcp(src_ip="2.2.2.2", dst_ip="1.1.1.1", src_port=80, dst_port=53000, ack=true)
+    expected: { bpf_action: allow }
+  - name: v6 packet (reads new, matched by the v6 rule)
+    builder: tcp6(src_ip="2001:db8::1", dst_ip="2001:db8::2", dst_port=80, syn=true)
+    expected: { bpf_action: allow }

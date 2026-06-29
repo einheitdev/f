@@ -1,0 +1,11 @@
+name: "an IPv6 packet reads new (v0.4 conntrack is IPv4-only)"
+source_fw: |
+  @xdp(eth0)
+  allow if conntrack(pkt).state == established
+  allow if pkt.src_ip6 in 2001:db8::/32
+  default drop
+test_packet:
+  builder: tcp6(src_ip="2001:db8::1", dst_ip="2001:db8::2", dst_port=80, syn=true)
+expected:
+  compiles: true
+  bpf_action: allow

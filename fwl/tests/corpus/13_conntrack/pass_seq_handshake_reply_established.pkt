@@ -1,0 +1,13 @@
+name: "handshake: an allowed new SYN creates state the reply matches"
+source_fw: |
+  @xdp(eth0)
+  allow if conntrack(pkt).state == established
+  allow if pkt.proto == tcp and pkt.tcp.syn and pkt.dst_port == 80
+  default drop
+sequence:
+  - name: client SYN out (new, allowed -> creates entry)
+    builder: tcp(src_ip="1.1.1.1", dst_ip="2.2.2.2", src_port=40000, dst_port=80, syn=true)
+    expected: { bpf_action: allow }
+  - name: server reply (established via reverse 5-tuple)
+    builder: tcp(src_ip="2.2.2.2", dst_ip="1.1.1.1", src_port=80, dst_port=40000, syn=true, ack=true)
+    expected: { bpf_action: allow }

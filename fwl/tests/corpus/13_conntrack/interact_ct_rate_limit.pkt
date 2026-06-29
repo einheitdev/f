@@ -1,0 +1,14 @@
+name: "conntrack established allow takes precedence over a rate_limit rule"
+source_fw: |
+  @xdp(eth0)
+  allow if conntrack(pkt).state == established
+  drop if pkt.proto == tcp and pkt.dst_port == 22 limited by rate_limit(2, per=src_ip)
+  default drop
+state:
+  conntrack:
+    - { src_ip: "1.2.3.4", dst_ip: "2.2.2.2", src_port: 50000, dst_port: 22, proto: tcp }
+test_packet:
+  builder: tcp(src_ip="1.2.3.4", dst_ip="2.2.2.2", src_port=50000, dst_port=22, ack=true)
+expected:
+  compiles: true
+  bpf_action: allow

@@ -114,6 +114,10 @@ bool_primary  : TCP_FLAG_FIELD                -> bool_flag
 comparison    : lvalue comp_op rvalue          -> value_compare
               | lvalue "in" set_or_range       -> value_in
               | count_call comp_op rvalue      -> count_compare
+              | CT_STATE_FIELD comp_op CT_STATE_KEYWORD   -> ct_compare
+              | CT_STATE_FIELD "in" ct_state_list         -> ct_in
+
+ct_state_list : "[" CT_STATE_KEYWORD ("," CT_STATE_KEYWORD)* "]"
 
 count_call    : COUNT "(" IDENTIFIER ")"
 
@@ -190,6 +194,14 @@ ICMP_FIELD.10      : "pkt.icmp.type" | "pkt.icmp.code"
 // per-alternative, but explicit ordering keeps intent clear).
 VLAN_FIELD.10      : "pkt.vlan_priority" | "pkt.vlan_id"
 
+// v0.4 conntrack accessor. The whole `conntrack(pkt).state` phrase is
+// one terminal (like the multi-segment pkt.* fields), tolerating
+// internal whitespace so `conntrack( pkt ).state` lexes too. Nothing
+// else in the grammar starts with `conntrack`, so a bare
+// `conntrack(pkt)` (no `.state`) fails to match this terminal and is a
+// syntax error — the spec's "must access .state" compile error.
+CT_STATE_FIELD.13  : /conntrack[ \t]*\([ \t]*pkt[ \t]*\)[ \t]*\.[ \t]*state(?![a-z0-9_])/
+
 // Keywords use a negative-lookahead so they only match when not
 // followed by an identifier character — `tcp_traffic` lexes as
 // IDENTIFIER, bare `tcp ` lexes as PROTO_KEYWORD. Higher priority
@@ -205,6 +217,12 @@ LOG.10           : /log(?![a-z0-9_])/
 COUNT.10         : /count(?![a-z0-9_])/
 GEOIP.10         : /geoip(?![a-z0-9_])/
 DEF.10           : /def(?![a-z0-9_])/
+
+// v0.4 conntrack state keywords. Reserved words (like the proto
+// keywords): negative-lookahead so `established_flows` still lexes as
+// IDENTIFIER, while bare `established` is a CT_STATE_KEYWORD. They
+// appear only as the right side of a `conntrack(pkt).state` comparison.
+CT_STATE_KEYWORD.10 : /(established|invalid|related|new)(?![a-z0-9_])/
 
 // CC_CODE: exactly two uppercase ASCII letters (ISO 3166-1 alpha-2).
 // Negative lookahead prevents `RUS` (3 letters) lexing as `CC_CODE("RU")`

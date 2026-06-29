@@ -52,6 +52,23 @@ class Proto(Enum):
   ICMP6 = "icmp6"
 
 
+class CtState(Enum):
+  """Connection-tracking state keywords (FWL_V04_SPEC.md § 4.3).
+
+  The value of `conntrack(pkt).state`. NEW means the packet's 5-tuple
+  is absent from the conntrack table; ESTABLISHED means it was found
+  (forward or reverse direction); INVALID is a TCP state-machine
+  violation (a non-SYN TCP segment for an untracked flow). RELATED
+  (ICMP-error embedded 5-tuple) is reserved in the language but not
+  detected in v0.4 — no packet is ever classified RELATED, so
+  `== related` never matches (deferred to post-ICMP-error tracking).
+  """
+  NEW = "new"
+  ESTABLISHED = "established"
+  RELATED = "related"
+  INVALID = "invalid"
+
+
 # Field identifier strings keyed off the spec's accessor names. Using
 # strings (not enums) keeps the AST extension-friendly: future fields
 # don't require enum updates everywhere that matches on field type.
@@ -83,6 +100,11 @@ FIELD_ICMP6_CODE = "pkt.icmp6.code"
 # (FWL_V04_SPEC.md "VLAN 802.1Q / Type rules").
 FIELD_VLAN_ID = "pkt.vlan_id"
 FIELD_VLAN_PRIORITY = "pkt.vlan_priority"
+# v0.4 conntrack accessor. `conntrack(pkt).state` is a ct_state-typed
+# read with no protocol guard — conntrack is evaluated on any frame
+# (a non-IP or IPv6 frame reads NEW). Carried as a constant so the
+# field tables and walks can name it uniformly (FWL_V04_SPEC.md § 4.3).
+FIELD_CT_STATE = "conntrack(pkt).state"
 
 IP_FIELDS = frozenset({FIELD_SRC_IP, FIELD_DST_IP})
 IP6_FIELDS = frozenset({FIELD_SRC_IP6, FIELD_DST_IP6})
@@ -280,8 +302,27 @@ class OrOp:
   span: Span
 
 
+@dataclass(frozen=True)
+class ConntrackStateCompare:
+  """`conntrack(pkt).state` compared against state keyword(s) (v0.4).
+
+  A self-contained Condition (like CountCompare) rather than a
+  FieldRef-based Comparison: ct_state is its own type with no Tier 2
+  local form, so keeping it off the generic field tables avoids
+  polluting the port/IP type machinery.
+
+  `op` is '==', '!=', or 'in'. For ==/!= `states` holds exactly one
+  CtState; for `in` it holds the (de-duplicated, source-order) list of
+  CtStates on the right of `in [ ... ]`.
+  """
+  op: str
+  states: tuple[CtState, ...]
+  span: Span
+
+
 Condition = Union[
-  Comparison, BoolField, NotOp, AndOp, OrOp, "CountCompare"
+  Comparison, BoolField, NotOp, AndOp, OrOp,
+  "CountCompare", ConntrackStateCompare,
 ]
 
 

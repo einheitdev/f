@@ -1,0 +1,10 @@
+name: "an untracked UDP datagram is new, not invalid (invalid is TCP-only)"
+source_fw: |
+  @xdp(eth0)
+  drop if conntrack(pkt).state == invalid
+  allow
+test_packet:
+  builder: udp(src_ip="9.9.9.9", dst_ip="2.2.2.2", dst_port=53)
+expected:
+  compiles: true
+  bpf_action: allow

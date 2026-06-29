@@ -69,6 +69,22 @@ class PktCase:
   state: dict[int, dict[Any, int]]
   path: Path
   geoip_data: dict[str, list[str]] = None  # type: ignore[assignment]
+  # v0.4 conntrack. `conntrack_seed` holds pre-existing forward
+  # 5-tuple keys (proto str, src u32, dst u32, sport, dport) from the
+  # `state.conntrack` block — both oracles start with these entries
+  # present. `sequence`, when set, makes this a multi-packet case: an
+  # ordered list of PktStep run against one carried-over conntrack
+  # table (interpreter) / one loaded BPF object (bpf).
+  conntrack_seed: tuple = ()
+  sequence: tuple = None  # type: ignore[assignment]
+
+
+@dataclass(frozen=True)
+class PktStep:
+  """One ordered packet in a multi-packet `sequence:` case (v0.4)."""
+  name: str
+  packet: Packet
+  expected: dict[str, Any]
 
 
 _BUILDER_RE = re.compile(
@@ -564,6 +580,9 @@ def build_packet(fields: dict[str, Any]) -> Packet:
 
 _TOP_LEVEL_KEYS = frozenset({
   "name", "source_fw", "test_packet", "expected", "state", "geoip_data",
+  # v0.4: a multi-packet conntrack test. Mutually exclusive with the
+  # single test_packet/expected pair.
+  "sequence",
 })
 _TEST_PACKET_KEYS = frozenset({"builder", "truncate_to"})
 _EXPECTED_KEYS = frozenset({
@@ -573,7 +592,74 @@ _EXPECTED_KEYS = frozenset({
   # today — wiring it through the analyzer is a v0.3 backlog item.
   "compile_error_pattern",
 })
-_STATE_KEYS = frozenset({"rate_limit"})
+# v0.4 adds `conntrack` (a list of pre-seeded entries) alongside the
+# v0.1 `rate_limit` bucket state.
+_STATE_KEYS = frozenset({"rate_limit", "conntrack"})
+_SEQUENCE_STEP_KEYS = frozenset({"name", "builder", "truncate_to", "expected"})
+_CONNTRACK_ENTRY_KEYS = frozenset({
+  "src_ip", "dst_ip", "src_port", "dst_port", "proto",
+})
+# v0.4 conntrack tracks IPv4 only (the daemon's ConnKey is 32-bit), so
+# the seed proto is one of these three.
+_CONNTRACK_PROTO_NUM = {
+  "tcp": _IPPROTO_TCP,
+  "udp": _IPPROTO_UDP,
+  "icmp": _IPPROTO_ICMP,
+}
+
+
+def _ipv4_str_to_int(addr: str, where: str) -> int:
+  """Dotted-quad to host-order u32 (high octet first), with validation."""
+  if not isinstance(addr, str):
+    raise ValueError(f"{where}: expected dotted-quad string, got {addr!r}")
+  parts = addr.split(".")
+  if len(parts) != 4:
+    raise ValueError(f"{where}: not an IPv4 dotted quad: {addr!r}")
+  value = 0
+  for part in parts:
+    n = int(part)
+    if not (0 <= n <= 255):
+      raise ValueError(f"{where}: IPv4 octet out of range 0..255: {n}")
+    value = (value << 8) | n
+  return value
+
+
+def _parse_conntrack_seed(raw: Any) -> tuple:
+  """Parse `state.conntrack` into normalized forward 5-tuple keys.
+
+  Each entry is a mapping with src_ip/dst_ip/proto (required) and
+  optional src_port/dst_port (default 0, as for ICMP). v0.4 conntrack
+  is IPv4-only, so v6 addresses are rejected. The returned keys match
+  the interpreter's `ConntrackTable` format:
+  `(proto_str, src_u32, dst_u32, src_port, dst_port)`.
+  """
+  if raw is None:
+    return ()
+  if not isinstance(raw, list):
+    raise ValueError("state.conntrack must be a list of entries")
+  out: list[tuple] = []
+  for i, entry in enumerate(raw):
+    if not isinstance(entry, dict):
+      raise ValueError(f"state.conntrack[{i}] must be a mapping")
+    _reject_unknown_keys(
+      entry, _CONNTRACK_ENTRY_KEYS, f"state.conntrack[{i}]"
+    )
+    proto = entry.get("proto")
+    if proto not in _CONNTRACK_PROTO_NUM:
+      raise ValueError(
+        f"state.conntrack[{i}].proto must be one of "
+        f"tcp/udp/icmp (v0.4 conntrack is IPv4-only); got {proto!r}"
+      )
+    if "src_ip" not in entry or "dst_ip" not in entry:
+      raise ValueError(
+        f"state.conntrack[{i}] requires src_ip and dst_ip"
+      )
+    src = _ipv4_str_to_int(entry["src_ip"], f"state.conntrack[{i}].src_ip")
+    dst = _ipv4_str_to_int(entry["dst_ip"], f"state.conntrack[{i}].dst_ip")
+    sport = int(entry.get("src_port", 0))
+    dport = int(entry.get("dst_port", 0))
+    out.append((proto, src, dst, sport, dport))
+  return tuple(out)
 
 
 def _reject_unknown_keys(
@@ -586,35 +672,16 @@ def _reject_unknown_keys(
       raise ValueError(f"unknown field {key!r} at {where}")
 
 
-def load(path: Path) -> PktCase:
-  """Load a `.pkt` YAML file from disk.
+def _build_from_spec(builder_text: str, truncate_to: Any) -> Packet:
+  """Build a Packet from a builder string + optional truncate_to.
 
-  Per PKT_V01_SPEC.md:256, every key under `state.rate_limit` must
-  reference a rule index that exists AND carries a rate_limit
-  modifier; otherwise the loader rejects the file rather than
-  silently discarding the bucket data.
+  truncate_to (optional) truncates the built packet to N bytes and
+  strips the decoded fields that would land past it, mirroring the
+  BPF parser's bounds checks so the two oracles agree on partial
+  frames (PKT_V01_SPEC.md "test_packet").
   """
-  text = path.read_text(encoding="utf-8")
-  doc = yaml.safe_load(text)
-  _reject_unknown_keys(doc, _TOP_LEVEL_KEYS, "top level")
-  _reject_unknown_keys(
-    doc["test_packet"], _TEST_PACKET_KEYS, "test_packet"
-  )
-  _reject_unknown_keys(doc["expected"], _EXPECTED_KEYS, "expected")
-  if doc.get("state") is not None:
-    _reject_unknown_keys(doc["state"], _STATE_KEYS, "state")
-
-  builder_text = doc["test_packet"]["builder"]
   fields = parse_builder(builder_text)
   packet = build_packet(fields)
-
-  # truncate_to: optional integer that truncates the built packet to N
-  # bytes (PKT_V01_SPEC.md "test_packet"). Required for tests that
-  # exercise the BPF parser's bounds-check on partial frames. The
-  # interpreter must mirror the BPF parser's behaviour by stripping
-  # decoded fields that would land past the truncation point;
-  # otherwise the two oracles disagree on every truncated case.
-  truncate_to = doc["test_packet"].get("truncate_to")
   if truncate_to is not None:
     if not isinstance(truncate_to, int) or truncate_to < 0:
       raise ValueError("truncate_to must be ≥ 0")
@@ -623,44 +690,45 @@ def load(path: Path) -> PktCase:
         raw=packet.raw[:truncate_to],
         fields=_strip_truncated_fields(packet.fields, truncate_to),
       )
+  return packet
 
+
+def _parse_rate_limit_state(doc: dict) -> dict[int, dict[Any, int]]:
+  """Parse + validate the `state.rate_limit` block.
+
+  Per PKT_V01_SPEC.md:256, every key must reference a rule index that
+  exists AND carries a rate_limit modifier; bucket counts must be
+  non-negative integers.
+  """
   raw_state = (doc.get("state") or {}).get("rate_limit", {})
   state: dict[int, dict[Any, int]] = {}
-  if raw_state:
-    valid = _rate_limit_rule_indices(doc["source_fw"])
-    for rule_idx, buckets in raw_state.items():
-      idx = int(rule_idx)
-      if idx not in valid:
+  if not raw_state:
+    return state
+  valid = _rate_limit_rule_indices(doc["source_fw"])
+  for rule_idx, buckets in raw_state.items():
+    idx = int(rule_idx)
+    if idx not in valid:
+      raise ValueError(
+        f"state.rate_limit references rule index {idx} without a "
+        f"rate_limit modifier"
+      )
+    for bucket_key, count in buckets.items():
+      if not isinstance(count, int) or isinstance(count, bool):
         raise ValueError(
-          f"state.rate_limit references rule index {idx} without a "
-          f"rate_limit modifier"
+          f"state.rate_limit[{idx}][{bucket_key!r}] must be a "
+          f"non-negative integer; got {count!r}"
         )
-      # PKT_V01_SPEC.md:96 — bucket count is a non-negative integer.
-      # Catching it here keeps the loader the single point that rejects
-      # malformed state, instead of letting struct.pack crash later.
-      for bucket_key, count in buckets.items():
-        if not isinstance(count, int) or isinstance(count, bool):
-          raise ValueError(
-            f"state.rate_limit[{idx}][{bucket_key!r}] must be a "
-            f"non-negative integer; got {count!r}"
-          )
-        if count < 0:
-          raise ValueError(
-            f"state.rate_limit[{idx}][{bucket_key!r}] must be a "
-            f"non-negative integer; got {count}"
-          )
-      state[idx] = dict(buckets)
-
-  expected = doc["expected"]
-  counter_changes = expected.get("counter_changes", {})
-  if counter_changes:
-    declared = _declared_counter_names(doc["source_fw"])
-    for name in counter_changes:
-      if name not in declared:
+      if count < 0:
         raise ValueError(
-          f"counter '{name}' not declared in source_fw"
+          f"state.rate_limit[{idx}][{bucket_key!r}] must be a "
+          f"non-negative integer; got {count}"
         )
+    state[idx] = dict(buckets)
+  return state
 
+
+def _parse_geoip_data(doc: dict) -> dict[str, list[str]]:
+  """Parse + validate the `geoip_data` block (v0.2)."""
   raw_geoip = doc.get("geoip_data") or {}
   geoip_data: dict[str, list[str]] = {}
   for code, prefixes in raw_geoip.items():
@@ -674,6 +742,91 @@ def load(path: Path) -> PktCase:
         f"geoip_data[{code}] must be a list of CIDR strings"
       )
     geoip_data[code] = [str(p) for p in prefixes]
+  return geoip_data
+
+
+def _check_counter_changes_declared(doc: dict, expected: dict) -> None:
+  """Reject counter_changes naming a counter the source doesn't declare."""
+  counter_changes = expected.get("counter_changes", {})
+  if counter_changes:
+    declared = _declared_counter_names(doc["source_fw"])
+    for name in counter_changes:
+      if name not in declared:
+        raise ValueError(f"counter '{name}' not declared in source_fw")
+
+
+def _load_sequence(doc: dict, path: Path) -> PktCase:
+  """Load a multi-packet `sequence:` case (v0.4 conntrack)."""
+  raw_steps = doc["sequence"]
+  if not isinstance(raw_steps, list) or not raw_steps:
+    raise ValueError("sequence must be a non-empty list of steps")
+  steps: list[PktStep] = []
+  for i, raw in enumerate(raw_steps):
+    _reject_unknown_keys(raw, _SEQUENCE_STEP_KEYS, f"sequence[{i}]")
+    if "builder" not in raw or "expected" not in raw:
+      raise ValueError(f"sequence[{i}] requires builder and expected")
+    _reject_unknown_keys(
+      raw["expected"], _EXPECTED_KEYS, f"sequence[{i}].expected"
+    )
+    _check_counter_changes_declared(doc, raw["expected"])
+    packet = _build_from_spec(raw["builder"], raw.get("truncate_to"))
+    steps.append(PktStep(
+      name=raw.get("name", f"step {i}"),
+      packet=packet,
+      expected=raw["expected"],
+    ))
+  return PktCase(
+    name=doc["name"],
+    source_fw=doc["source_fw"],
+    # The first step doubles as the case's `packet`/`expected` so code
+    # that peeks at those attributes stays valid; the runner drives the
+    # full `sequence` list.
+    packet=steps[0].packet,
+    expected=steps[0].expected,
+    state=_parse_rate_limit_state(doc),
+    path=path,
+    geoip_data=_parse_geoip_data(doc),
+    conntrack_seed=_parse_conntrack_seed(
+      (doc.get("state") or {}).get("conntrack")
+    ),
+    sequence=tuple(steps),
+  )
+
+
+def load(path: Path) -> PktCase:
+  """Load a `.pkt` YAML file from disk.
+
+  Two shapes: a single `test_packet`/`expected` pair (v0.1+), or a
+  v0.4 `sequence:` of ordered packets sharing one conntrack table.
+  Both may carry a `state.conntrack` pre-seed block.
+  """
+  text = path.read_text(encoding="utf-8")
+  doc = yaml.safe_load(text)
+  _reject_unknown_keys(doc, _TOP_LEVEL_KEYS, "top level")
+  if doc.get("state") is not None:
+    _reject_unknown_keys(doc["state"], _STATE_KEYS, "state")
+
+  if doc.get("sequence") is not None:
+    if "test_packet" in doc or "expected" in doc:
+      raise ValueError(
+        "a sequence case must not also define test_packet/expected"
+      )
+    return _load_sequence(doc, path)
+
+  _reject_unknown_keys(
+    doc["test_packet"], _TEST_PACKET_KEYS, "test_packet"
+  )
+  _reject_unknown_keys(doc["expected"], _EXPECTED_KEYS, "expected")
+
+  packet = _build_from_spec(
+    doc["test_packet"]["builder"], doc["test_packet"].get("truncate_to")
+  )
+  state = _parse_rate_limit_state(doc)
+  _check_counter_changes_declared(doc, doc["expected"])
+  geoip_data = _parse_geoip_data(doc)
+  conntrack_seed = _parse_conntrack_seed(
+    (doc.get("state") or {}).get("conntrack")
+  )
 
   return PktCase(
     name=doc["name"],
@@ -683,6 +836,7 @@ def load(path: Path) -> PktCase:
     state=state,
     path=path,
     geoip_data=geoip_data,
+    conntrack_seed=conntrack_seed,
   )
 
 

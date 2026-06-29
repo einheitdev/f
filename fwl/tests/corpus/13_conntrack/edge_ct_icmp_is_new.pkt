@@ -1,0 +1,10 @@
+name: "conntrack on an untracked ICMP packet reads new"
+source_fw: |
+  @xdp(eth0)
+  allow if conntrack(pkt).state == new
+  default drop
+test_packet:
+  builder: icmp(src_ip="1.1.1.1", dst_ip="2.2.2.2", type=8)
+expected:
+  compiles: true
+  bpf_action: allow

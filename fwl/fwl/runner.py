@@ -105,6 +105,7 @@ def _interpreter_oracle(
   result = interpreter.evaluate_full(
     program, case.packet.fields, case.state,
     geoip_data=(case.geoip_data or None),
+    conntrack=interpreter.ConntrackTable(case.conntrack_seed),
   )
   if result.action != expected:
     return OracleResult(
@@ -160,6 +161,9 @@ def _bpf_oracle(
     program, case.geoip_data or {}
   ).items():
     map_init[name] = entries
+  ct_seed = _build_conntrack_map_init(case.conntrack_seed)
+  if ct_seed:
+    map_init["conntrack"] = ct_seed
   counter_slots = _parse_counter_table(c_source)
   n_slots = len(counter_slots)
   has_log = any(
@@ -222,8 +226,109 @@ def _bpf_oracle(
   return OracleResult("bpf", "pass", "")
 
 
+def _seq_spec_oracle(case: pkt.PktCase) -> OracleResult:
+  """Existence check: every sequence step needs an expected.bpf_action."""
+  for i, step in enumerate(case.sequence):
+    if "bpf_action" not in step.expected:
+      return OracleResult(
+        "spec", "fail",
+        f"sequence[{i}] ({step.name}) missing expected.bpf_action",
+      )
+  return OracleResult("spec", "pass", "")
+
+
+def _seq_interpreter_oracle(case: pkt.PktCase) -> OracleResult:
+  """Evaluate every step through one carried-over conntrack table."""
+  try:
+    program = analyzer.analyze(parser.parse(case.source_fw))
+  except FwlException as exc:
+    return OracleResult(
+      "interpreter", "error",
+      f"unexpected compile error: {exc.error.format()}",
+    )
+  ct = interpreter.ConntrackTable(case.conntrack_seed)
+  for i, step in enumerate(case.sequence):
+    want = _EXPECTED_TO_XDP[step.expected.get("bpf_action", "allow")]
+    res = interpreter.evaluate_full(
+      program, step.packet.fields, case.state,
+      geoip_data=(case.geoip_data or None), conntrack=ct,
+    )
+    if res.action != want:
+      return OracleResult(
+        "interpreter", "fail",
+        f"step {i} ({step.name}): expected {want.value}, "
+        f"got {res.action.value}",
+      )
+  return OracleResult("interpreter", "pass", "")
+
+
+def _seq_bpf_oracle(case: pkt.PktCase) -> OracleResult:
+  """Load the program once and run every step's packet against it."""
+  try:
+    program = analyzer.analyze(parser.parse(case.source_fw))
+  except FwlException:
+    return OracleResult(
+      "bpf", "skip", "skipped because compile failed (see interpreter)"
+    )
+  c_source = emitter.emit(program)
+  map_init = _build_map_init(program, case.state)
+  for name, entries in _build_geoip_map_init(
+    program, case.geoip_data or {}
+  ).items():
+    map_init[name] = entries
+  ct_seed = _build_conntrack_map_init(case.conntrack_seed)
+  if ct_seed:
+    map_init["conntrack"] = ct_seed
+  counter_slots = _parse_counter_table(c_source)
+  has_log = any(r.action == ast.Action.LOG for r in program.rules)
+  packets = [step.packet.raw for step in case.sequence]
+  try:
+    results = bpf_runner.run_sequence(
+      c_source, packets, map_init, len(counter_slots), has_log
+    )
+  except bpf_runner.BpfUnavailable as exc:
+    try:
+      bpf_runner.compile_c(c_source)
+    except subprocess.CalledProcessError as cexc:
+      stderr = cexc.stderr.decode("utf-8", "replace")
+      return OracleResult(
+        "bpf", "fail",
+        f"clang failed to compile emitter output:\n{stderr}",
+      )
+    return OracleResult(
+      "bpf", "skip",
+      f"BPF_PROG_RUN unavailable ({exc}); clang compile passed",
+    )
+  except subprocess.CalledProcessError as exc:
+    stderr = exc.stderr.decode("utf-8", "replace")
+    return OracleResult("bpf", "fail", f"clang failed:\n{stderr}")
+  for i, (step, res) in enumerate(zip(case.sequence, results)):
+    want = _EXPECTED_TO_XDP[step.expected.get("bpf_action", "allow")]
+    if res.action != want:
+      return OracleResult(
+        "bpf", "fail",
+        f"step {i} ({step.name}): expected {want.value}, "
+        f"got {res.action.value}",
+      )
+  return OracleResult("bpf", "pass", "")
+
+
+def _run_sequence_case(case: pkt.PktCase) -> CaseResult:
+  """Run all oracles against a multi-packet `sequence:` case."""
+  spec = _seq_spec_oracle(case)
+  if spec.status != "pass":
+    return CaseResult(case=case, oracles=[spec])
+  return CaseResult(case=case, oracles=[
+    spec,
+    _seq_interpreter_oracle(case),
+    _seq_bpf_oracle(case),
+  ])
+
+
 def run_case(case: pkt.PktCase) -> CaseResult:
   """Run all oracles against one .pkt case."""
+  if case.sequence is not None:
+    return _run_sequence_case(case)
   spec = _spec_oracle(case)
   if spec.status != "pass":
     return CaseResult(case=case, oracles=[spec])
@@ -282,6 +387,34 @@ def _build_map_init(
     if entries:
       result[map_name] = entries
   return result
+
+
+def _build_conntrack_map_init(
+  seed: tuple,
+) -> dict[bytes, bytes]:
+  """Translate the conntrack seed into `conntrack` map key/value bytes.
+
+  Each seed tuple `(proto, src_u32, dst_u32, sport, dport)` is packed
+  to match the BPF program's `struct fwl_conn_key` memory layout (===
+  the daemon's ConnKey): network-order addresses (big-endian, matching
+  the program's raw `ip->saddr`), host-order ports (little-endian u16
+  on the x86 test host, matching the bpf_ntohs'd port vars), the
+  protocol byte, and 3 pad bytes. The value is an ESTABLISHED
+  `struct fwl_conn_value` (state = 1).
+  """
+  import time
+  entries: dict[bytes, bytes] = {}
+  now_ns = time.monotonic_ns()
+  value = struct.pack("<QQB7x", now_ns, 1, 1)
+  for proto, src, dst, sport, dport in seed:
+    proto_num = pkt._CONNTRACK_PROTO_NUM[proto]
+    key = (
+      struct.pack(">I", src) + struct.pack(">I", dst)
+      + struct.pack("<H", sport) + struct.pack("<H", dport)
+      + struct.pack("<B", proto_num) + b"\x00\x00\x00"
+    )
+    entries[key] = value
+  return entries
 
 
 def _check_counter_changes(

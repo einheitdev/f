@@ -1,0 +1,12 @@
+name: "log fires on an invalid conntrack packet, then allow"
+source_fw: |
+  @xdp(eth0)
+  log if conntrack(pkt).state == invalid
+  allow
+test_packet:
+  builder: tcp(src_ip="9.9.9.9", dst_ip="2.2.2.2", dst_port=80, ack=true)
+expected:
+  compiles: true
+  bpf_action: allow
+  log_events:
+    - rule_index: 0

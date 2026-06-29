@@ -1,0 +1,11 @@
+name: "a TCP frame truncated before the flags byte reads invalid"
+source_fw: |
+  @xdp(eth0)
+  drop if conntrack(pkt).state == invalid
+  allow
+test_packet:
+  builder: tcp(src_ip="9.9.9.9", dst_ip="2.2.2.2", dst_port=80, syn=true)
+  truncate_to: 40
+expected:
+  compiles: true
+  bpf_action: drop

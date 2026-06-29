@@ -1,0 +1,9 @@
+name: "conntrack(pkt) without .state is a compile error"
+source_fw: |
+  @xdp(eth0)
+  allow if conntrack(pkt) == established
+  default drop
+test_packet:
+  builder: tcp(dst_port=80)
+expected:
+  compiles: false

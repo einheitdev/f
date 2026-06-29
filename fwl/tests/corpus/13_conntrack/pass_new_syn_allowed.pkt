@@ -1,0 +1,10 @@
+name: "a fresh SYN reads new and is allowed by an allow-if-new rule"
+source_fw: |
+  @xdp(eth0)
+  allow if conntrack(pkt).state == new
+  default drop
+test_packet:
+  builder: tcp(src_ip="1.1.1.1", dst_ip="2.2.2.2", dst_port=80, syn=true)
+expected:
+  compiles: true
+  bpf_action: allow

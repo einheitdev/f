@@ -1,0 +1,16 @@
+name: "conntrack established allow composes with a geoip drop rule"
+source_fw: |
+  @xdp(eth0)
+  allow if conntrack(pkt).state == established
+  drop if pkt.src_ip in geoip(RU)
+  default drop
+state:
+  conntrack:
+    - { src_ip: "5.8.1.1", dst_ip: "2.2.2.2", src_port: 51000, dst_port: 443, proto: tcp }
+geoip_data:
+  RU: ["5.8.0.0/16"]
+test_packet:
+  builder: tcp(src_ip="5.8.1.1", dst_ip="2.2.2.2", src_port=51000, dst_port=443, ack=true)
+expected:
+  compiles: true
+  bpf_action: allow
