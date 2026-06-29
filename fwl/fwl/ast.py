@@ -79,6 +79,10 @@ FIELD_ICMP_TYPE = "pkt.icmp.type"
 FIELD_ICMP_CODE = "pkt.icmp.code"
 FIELD_ICMP6_TYPE = "pkt.icmp6.type"
 FIELD_ICMP6_CODE = "pkt.icmp6.code"
+# v0.4 VLAN 802.1Q fields. L2 constructs — no protocol guard needed
+# (FWL_V04_SPEC.md "VLAN 802.1Q / Type rules").
+FIELD_VLAN_ID = "pkt.vlan_id"
+FIELD_VLAN_PRIORITY = "pkt.vlan_priority"
 
 IP_FIELDS = frozenset({FIELD_SRC_IP, FIELD_DST_IP})
 IP6_FIELDS = frozenset({FIELD_SRC_IP6, FIELD_DST_IP6})
@@ -89,6 +93,14 @@ TCP_FLAG_FIELDS = frozenset({
 })
 ICMP_FIELDS = frozenset({FIELD_ICMP_TYPE, FIELD_ICMP_CODE})
 ICMP6_FIELDS = frozenset({FIELD_ICMP6_TYPE, FIELD_ICMP6_CODE})
+VLAN_FIELDS = frozenset({FIELD_VLAN_ID, FIELD_VLAN_PRIORITY})
+
+# Per-field valid integer ranges for v0.4 VLAN fields. vlan_id is a
+# 12-bit VID (0..4095); vlan_priority is a 3-bit PCP (0..7).
+VLAN_FIELD_MAX = {
+  FIELD_VLAN_ID: 4095,
+  FIELD_VLAN_PRIORITY: 7,
+}
 
 
 @dataclass(frozen=True)

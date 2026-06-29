@@ -58,6 +58,11 @@ _ALLOWED_PROTOS: dict[str, frozenset[ast.Proto]] = {
   ast.FIELD_ICMP_CODE: frozenset({ast.Proto.ICMP}),
   ast.FIELD_ICMP6_TYPE: frozenset({ast.Proto.ICMP6}),
   ast.FIELD_ICMP6_CODE: frozenset({ast.Proto.ICMP6}),
+  # v0.4 VLAN fields are L2 — readable on any frame, no proto guard
+  # (FWL_V04_SPEC.md "VLAN 802.1Q / Type rules"). _ALL_PROTOS marks
+  # "no guard required", identical to the L3 IP-field treatment.
+  ast.FIELD_VLAN_ID: _ALL_PROTOS,
+  ast.FIELD_VLAN_PRIORITY: _ALL_PROTOS,
 }
 
 
@@ -386,6 +391,10 @@ _FIELD_LOCAL_TYPE = {
   ast.FIELD_ICMP_CODE: ast.LocalType.U16,
   ast.FIELD_ICMP6_TYPE: ast.LocalType.U16,
   ast.FIELD_ICMP6_CODE: ast.LocalType.U16,
+  # VLAN fields are u16-typed for Tier 2 binding; the tighter VID/PCP
+  # range checks are applied per-field at comparison time.
+  ast.FIELD_VLAN_ID: ast.LocalType.U16,
+  ast.FIELD_VLAN_PRIORITY: ast.LocalType.U16,
 }
 
 
@@ -483,7 +492,7 @@ def _check_tier2_comparison(
       ))
     if (lhs_type == ast.LocalType.U16
         and isinstance(cmp.operand, ast.IntLiteral)):
-      _check_port_int(cmp.operand.value, cmp.operand.span)
+      _check_u16_field_int(cmp.field, cmp.operand.value, cmp.operand.span)
     return
   if cmp.op in ("<", ">", "<=", ">="):
     rhs_type, rhs_label = _resolve_rvalue_type(cmp.operand, ctx)
@@ -507,7 +516,7 @@ def _check_tier2_comparison(
       ))
     if (lhs_type == ast.LocalType.U16
         and isinstance(cmp.operand, ast.IntLiteral)):
-      _check_port_int(cmp.operand.value, cmp.operand.span)
+      _check_u16_field_int(cmp.field, cmp.operand.value, cmp.operand.span)
     return
   raise AssertionError(f"unexpected comparison op {cmp.op}")
 
@@ -594,9 +603,12 @@ def _check_in_operand(
       return
     raise _type_error(lhs_label, "in", operand, getattr(operand, "span", None))
   if lhs_type == ast.LocalType.U16:
+    # VLAN fields carry the tighter VID/PCP range; ports use 0..65535.
+    def _range_check(value, span):
+      _check_u16_field_int(lhs_node, value, span)
     if isinstance(operand, ast.RangeLiteral):
-      _check_port_int(operand.lo, operand.span)
-      _check_port_int(operand.hi, operand.span)
+      _range_check(operand.lo, operand.span)
+      _range_check(operand.hi, operand.span)
       if operand.lo > operand.hi:
         raise FwlException(FwlError(
           category="semantic",
@@ -611,7 +623,7 @@ def _check_in_operand(
       for item in operand.items:
         if not isinstance(item, ast.IntLiteral):
           raise _type_error(lhs_label, "in", item, item.span)
-        _check_port_int(item.value, item.span)
+        _range_check(item.value, item.span)
       return
     raise _type_error(lhs_label, "in", operand, getattr(operand, "span", None))
   if lhs_type == ast.LocalType.PROTO:
@@ -949,6 +961,8 @@ _FIELD_TYPE_LABEL = {
   ast.FIELD_ICMP_CODE: "icmp code (u8)",
   ast.FIELD_ICMP6_TYPE: "icmp6 type (u8)",
   ast.FIELD_ICMP6_CODE: "icmp6 code (u8)",
+  ast.FIELD_VLAN_ID: "vlan_id (u16)",
+  ast.FIELD_VLAN_PRIORITY: "vlan_priority (u16)",
 }
 
 
@@ -989,6 +1003,44 @@ def _check_port_int(value: int, span) -> None:
         span=span,
       )
     )
+
+
+_VLAN_FIELD_LABEL = {
+  ast.FIELD_VLAN_ID: "vlan_id",
+  ast.FIELD_VLAN_PRIORITY: "vlan_priority",
+}
+
+
+def _check_vlan_int(field_name: str, value: int, span) -> None:
+  """Range-check a VLAN field literal (FWL_V04_SPEC.md compile errors).
+
+  vlan_id must be 0..4095 (12-bit VID); vlan_priority must be 0..7
+  (3-bit PCP). Applied to ==/!=/ordered operands and to every member
+  of an `in` list/range.
+  """
+  max_val = ast.VLAN_FIELD_MAX[field_name]
+  if not (0 <= value <= max_val):
+    raise FwlException(FwlError(
+      category="semantic",
+      message=(
+        f"{_VLAN_FIELD_LABEL[field_name]} value {value} outside "
+        f"valid range 0..{max_val}"
+      ),
+      span=span,
+    ))
+
+
+def _check_u16_field_int(field_node, value: int, span) -> None:
+  """Range-check an int literal against a u16 field's domain.
+
+  VLAN fields use their tighter VID/PCP ranges; every other u16
+  field (ports, u16 locals) uses the 0..65535 port range.
+  """
+  if (isinstance(field_node, ast.FieldRef)
+      and field_node.name in ast.VLAN_FIELDS):
+    _check_vlan_int(field_node.name, value, span)
+  else:
+    _check_port_int(value, span)
 
 
 def _check_u8_int(value: int, span) -> None:
@@ -1122,6 +1174,35 @@ def _check_comparison_types(cmp: ast.Comparison) -> None:
       raise _type_error(field_label, op, operand, span)
     return
 
+  if field_name in ast.VLAN_FIELDS:
+    if op in ("==", "!=", "<", ">", "<=", ">="):
+      if not isinstance(operand, ast.IntLiteral):
+        raise _type_error(field_label, op, operand, span)
+      _check_vlan_int(field_name, operand.value, operand.span)
+    elif op == "in":
+      if isinstance(operand, ast.RangeLiteral):
+        _check_vlan_int(field_name, operand.lo, operand.span)
+        _check_vlan_int(field_name, operand.hi, operand.span)
+        if operand.lo > operand.hi:
+          raise FwlException(FwlError(
+            category="semantic",
+            message=(
+              f"range lower bound ({operand.lo}) exceeds upper "
+              f"bound ({operand.hi})"
+            ),
+            span=operand.span,
+          ))
+      elif isinstance(operand, ast.ListLiteral):
+        for item in operand.items:
+          if not isinstance(item, ast.IntLiteral):
+            raise _type_error(field_label, op, item, item.span)
+          _check_vlan_int(field_name, item.value, item.span)
+      else:
+        raise _type_error(field_label, op, operand, span)
+    else:
+      raise _type_error(field_label, op, operand, span)
+    return
+
   # ICMP/ICMPv6 type and code are u8 integer fields — same comparison
   # surface as ports (==/!=/ordered/in range or list) but bounded to
   # 0..255 (FWL_V04_SPEC.md § 4.2).
@@ -1135,16 +1216,14 @@ def _check_comparison_types(cmp: ast.Comparison) -> None:
         _check_u8_int(operand.lo, operand.span)
         _check_u8_int(operand.hi, operand.span)
         if operand.lo > operand.hi:
-          raise FwlException(
-            FwlError(
-              category="semantic",
-              message=(
-                f"range lower bound ({operand.lo}) exceeds upper "
-                f"bound ({operand.hi})"
-              ),
-              span=operand.span,
-            )
-          )
+          raise FwlException(FwlError(
+            category="semantic",
+            message=(
+              f"range lower bound ({operand.lo}) exceeds upper "
+              f"bound ({operand.hi})"
+            ),
+            span=operand.span,
+          ))
       elif isinstance(operand, ast.ListLiteral):
         for item in operand.items:
           if not isinstance(item, ast.IntLiteral):

@@ -259,6 +259,8 @@ _FIELD_TO_PACKET_KEY = {
   ast.FIELD_ICMP_CODE: "icmp_code",
   ast.FIELD_ICMP6_TYPE: "icmp6_type",
   ast.FIELD_ICMP6_CODE: "icmp6_code",
+  ast.FIELD_VLAN_ID: "vlan_id",
+  ast.FIELD_VLAN_PRIORITY: "vlan_priority",
 }
 
 
@@ -624,6 +626,8 @@ _FIELD_TO_KEY = {
   ast.FIELD_ICMP_CODE: "icmp_code",
   ast.FIELD_ICMP6_TYPE: "icmp6_type",
   ast.FIELD_ICMP6_CODE: "icmp6_code",
+  ast.FIELD_VLAN_ID: "vlan_id",
+  ast.FIELD_VLAN_PRIORITY: "vlan_priority",
 }
 
 
@@ -702,8 +706,10 @@ def _eval_comparison(
     if op == "in":
       return _ip6_in_set(actual_int, operand, ctx)
 
-  # Port fields
-  if field_name in ast.PORT_FIELDS:
+  # Port fields and VLAN fields — both u16 integers with identical
+  # comparison + range/list membership semantics (FWL_V04_SPEC.md
+  # "VLAN 802.1Q / Type rules").
+  if field_name in ast.PORT_FIELDS or field_name in ast.VLAN_FIELDS:
     actual_int = int(actual)
     if op == "==":
       return actual_int == operand.value  # type: ignore[union-attr]

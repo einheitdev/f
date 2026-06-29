@@ -133,23 +133,36 @@ def _split_args(args_text: str) -> list[tuple[str, str]]:
 
 
 # v0.4 adds the six remaining TCP flags to the tcp/tcp6 builders and
-# type/code to the icmp/icmp6 builders.
+# type/code to the icmp/icmp6 builders (f-04a), plus the VLAN tag
+# fields to every builder (f-04b).
 _TCP_BUILDER_FIELDS = frozenset({
   "src_ip", "dst_ip", "src_port", "dst_port",
   "syn", "ack", "fin", "rst", "psh", "urg", "ece", "cwr",
 })
+# Shared VLAN builder fields: the outer tag (vlan_id/vlan_priority)
+# plus the optional inner tag (inner_vlan_id/inner_vlan_priority) that
+# produces a double-tagged QinQ frame for the outer-only-parse tests.
+# Every builder accepts these and inserts a 4-byte 802.1Q tag after
+# the source MAC (FWL_V04_SPEC.md "Builder additions").
+_VLAN_BUILDER_FIELDS = frozenset({
+  "vlan_id", "vlan_priority", "inner_vlan_id", "inner_vlan_priority",
+})
 _BUILDER_FIELD_TABLE: dict[str, frozenset[str]] = {
-  "tcp": _TCP_BUILDER_FIELDS,
-  "udp": frozenset({"src_ip", "dst_ip", "src_port", "dst_port"}),
-  "icmp": frozenset({"src_ip", "dst_ip", "type", "code"}),
+  "tcp": _TCP_BUILDER_FIELDS | _VLAN_BUILDER_FIELDS,
+  "udp": frozenset({"src_ip", "dst_ip", "src_port",
+                    "dst_port"}) | _VLAN_BUILDER_FIELDS,
+  "icmp": frozenset({"src_ip", "dst_ip", "type",
+                     "code"}) | _VLAN_BUILDER_FIELDS,
   # v0.2 IPv6 builders. Per PKT_V02_SPEC.md, the field names src_ip
   # and dst_ip are reused for symmetry with the v4 builders; the
   # values are RFC 4291 IPv6 strings, so the type is unambiguous to
   # the loader. src_ip6 and dst_ip6 are NOT separate fields on the v6
   # builders.
-  "tcp6": _TCP_BUILDER_FIELDS,
-  "udp6": frozenset({"src_ip", "dst_ip", "src_port", "dst_port"}),
-  "icmp6": frozenset({"src_ip", "dst_ip", "type", "code"}),
+  "tcp6": _TCP_BUILDER_FIELDS | _VLAN_BUILDER_FIELDS,
+  "udp6": frozenset({"src_ip", "dst_ip", "src_port",
+                     "dst_port"}) | _VLAN_BUILDER_FIELDS,
+  "icmp6": frozenset({"src_ip", "dst_ip", "type",
+                      "code"}) | _VLAN_BUILDER_FIELDS,
 }
 
 # TCP flag bit positions in the flags byte (TCP header offset 13).
@@ -204,12 +217,64 @@ _DEFAULT_SRC_MAC = b"\x02\x00\x00\x00\x00\x01"
 _DEFAULT_DST_MAC = b"\x02\x00\x00\x00\x00\x02"
 _ETH_P_IP = 0x0800
 _ETH_P_IPV6 = 0x86DD
+_ETH_P_8021Q = 0x8100
 _IPPROTO_TCP = 6
 _IPPROTO_UDP = 17
 _IPPROTO_ICMP = 1
 _IPPROTO_ICMPV6 = 58
 _DEFAULT_V6_SRC = "2001:db8::1"
 _DEFAULT_V6_DST = "2001:db8::2"
+
+
+def _vlan_tci(vlan_id: int, vlan_priority: int) -> int:
+  """Pack a 16-bit 802.1Q TCI: PCP(3) | DEI(1)=0 | VID(12)."""
+  return ((vlan_priority & 0x7) << 13) | (vlan_id & 0x0FFF)
+
+
+def _validated_vlan(vlan_id: Any, vlan_priority: Any) -> tuple[int, int]:
+  """Resolve + range-check a (vid, pcp) pair, defaulting absent to 0."""
+  vid = 0 if vlan_id is None else int(vlan_id)
+  pcp = 0 if vlan_priority is None else int(vlan_priority)
+  if not (0 <= vid <= 4095):
+    raise ValueError(f"vlan_id out of range 0..4095: {vid}")
+  if not (0 <= pcp <= 7):
+    raise ValueError(f"vlan_priority out of range 0..7: {pcp}")
+  return vid, pcp
+
+
+def _eth_header(
+  ether_type: int,
+  vlan_id: Any,
+  vlan_priority: Any,
+  inner_vlan_id: Any = None,
+  inner_vlan_priority: Any = None,
+) -> tuple[bytes, dict[str, int], bool]:
+  """Build the Ethernet header, inserting 802.1Q tag(s) if requested.
+
+  Returns (header_bytes, vlan_decoded, is_qinq). When either vlan_id
+  or vlan_priority is supplied, a 4-byte tag (TPID 0x8100 + TCI) is
+  inserted after the source MAC and `vlan_decoded` carries the
+  outer vlan_id/vlan_priority keys; otherwise the tag is absent and
+  `vlan_decoded` is empty (an untagged frame, unchanged from
+  pre-v0.4). When an inner tag is also supplied (QinQ), a second
+  0x8100 tag follows the outer one and `is_qinq` is True — v0.4
+  parses the outer tag only, so the caller drops the (now
+  unreachable) L3/L4 decoded fields. `ether_type` is always the real
+  L3 type (0x0800/0x86DD) and follows the tag stack.
+  """
+  has_outer = vlan_id is not None or vlan_priority is not None
+  has_inner = inner_vlan_id is not None or inner_vlan_priority is not None
+  header = _DEFAULT_DST_MAC + _DEFAULT_SRC_MAC
+  vlan_decoded: dict[str, int] = {}
+  if has_outer or has_inner:
+    vid, pcp = _validated_vlan(vlan_id, vlan_priority)
+    header += struct.pack(">HH", _ETH_P_8021Q, _vlan_tci(vid, pcp))
+    vlan_decoded = {"vlan_id": vid, "vlan_priority": pcp}
+    if has_inner:
+      ivid, ipcp = _validated_vlan(inner_vlan_id, inner_vlan_priority)
+      header += struct.pack(">HH", _ETH_P_8021Q, _vlan_tci(ivid, ipcp))
+  header += struct.pack(">H", ether_type)
+  return header, vlan_decoded, has_inner
 
 
 def _ipv4_to_bytes(addr: Any, field: str = "ip") -> bytes:
@@ -384,11 +449,11 @@ def _build_v6_packet(fields: dict[str, Any]) -> Packet:
     + _ipv6_to_bytes(src, "src_ip")
     + _ipv6_to_bytes(dst, "dst_ip")
   )
-  eth = (
-    _DEFAULT_DST_MAC
-    + _DEFAULT_SRC_MAC
-    + struct.pack(">H", _ETH_P_IPV6)
+  eth, vlan_decoded, is_qinq = _eth_header(
+    _ETH_P_IPV6, fields.get("vlan_id"), fields.get("vlan_priority"),
+    fields.get("inner_vlan_id"), fields.get("inner_vlan_priority"),
   )
+  decoded = vlan_decoded if is_qinq else {**decoded, **vlan_decoded}
   raw = eth + ipv6_header + l4
   return Packet(raw=raw, fields=decoded)
 
@@ -485,7 +550,14 @@ def build_packet(fields: dict[str, Any]) -> Packet:
   checksum = _ipv4_checksum(ip_header)
   ip_header = ip_header[:10] + struct.pack(">H", checksum) + ip_header[12:]
 
-  eth = _DEFAULT_DST_MAC + _DEFAULT_SRC_MAC + struct.pack(">H", _ETH_P_IP)
+  eth, vlan_decoded, is_qinq = _eth_header(
+    _ETH_P_IP, fields.get("vlan_id"), fields.get("vlan_priority"),
+    fields.get("inner_vlan_id"), fields.get("inner_vlan_priority"),
+  )
+  # v0.4 parses the outer tag only: behind a second tag the L3/L4
+  # headers are unreachable, so the decoded dict exposes just the
+  # outer VLAN fields (mirrors the emitter leaving v4_ok/l4_ok at 0).
+  decoded = vlan_decoded if is_qinq else {**decoded, **vlan_decoded}
   raw = eth + ip_header + l4
   return Packet(raw=raw, fields=decoded)
 
@@ -625,23 +697,29 @@ def _strip_truncated_fields(
   must reflect those gates by dropping fields the parser couldn't
   read on this truncated frame.
 
-  Layout offsets (Ethernet II, no VLAN):
-    14            end of Ethernet header
-    14 + 20 = 34  end of IPv4 fixed header (ihl=5)
-    14 + 40 = 54  end of IPv6 fixed header
-    34 + 4  = 38  TCP source/dest ports readable (v4)
-    34 + 14 = 48  TCP flag byte readable (v4)
-    54 + 4  = 58  TCP source/dest ports readable (v6)
+  Layout offsets (Ethernet II). A present 802.1Q tag shifts every
+  L3/L4 offset by 4 (`l2_end` is 18 instead of 14):
+    14 / 18       end of Ethernet header (untagged / tagged)
+    +20           end of IPv4 fixed header (ihl=5)
+    +40           end of IPv6 fixed header
+    +20           full TCP header (ports + flag byte) readable
+
+  VLAN-tag layout: TPID at 12, TCI at 14, inner EtherType at 16, so
+  the vlan fields are readable once the 4-byte tag fits
+  (truncate_to >= 16) and L3 begins at offset 18.
 
   Beyond v0.1's IHL≠5 case, the spec deferred extension headers,
-  variable-IHL, and L4-after-IPv6-extensions to v0.3, so this
-  helper assumes the v0.2 builder defaults (IHL=5, no v6 ext
-  headers).
+  variable-IHL, and L4-after-IPv6-extensions, so this helper assumes
+  the builder defaults (IHL=5, no v6 ext headers, single VLAN tag).
   """
   out = dict(fields)
   ether_type = out.get("ether_type")
   is_v6 = ether_type == 0x86DD
-  l3_end = 14 + (40 if is_v6 else 20)
+  # A present 802.1Q tag shifts every L3/L4 offset by 4 (l2_end is 18
+  # instead of 14), so all boundaries below derive from l2_end.
+  has_vlan = "vlan_id" in out or "vlan_priority" in out
+  l2_end = 18 if has_vlan else 14
+  l3_end = l2_end + (40 if is_v6 else 20)
   # L4 port/TCP-flag fields (gated by l4_ok) and ICMP type/code fields
   # (gated by icmp_ok/icmp6_ok) parse at different header sizes, so
   # they get separate truncation boundaries below.
@@ -650,7 +728,13 @@ def _strip_truncated_fields(
     "syn", "ack", "fin", "rst", "psh", "urg", "ece", "cwr",
   )
   icmp_keys = ("icmp_type", "icmp_code", "icmp6_type", "icmp6_code")
-  if truncate_to < 14:
+  # VLAN fields are readable only once the full 4-byte tag fits
+  # (bytes 12..16). A frame truncated inside the tag leaves them
+  # unreadable, mirroring the emitter's vlan_ok gate.
+  if has_vlan and truncate_to < 16:
+    out.pop("vlan_id", None)
+    out.pop("vlan_priority", None)
+  if truncate_to < l2_end:
     out.pop("ether_type", None)
   if truncate_to < l3_end:
     for key in (

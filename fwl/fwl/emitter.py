@@ -50,6 +50,14 @@ struct fwl_rl_state {
   __u64 ts;
   __u32 count;
 };
+
+// 802.1Q VLAN tag (v0.4): the 4 bytes between the Ethernet source MAC
+// and the real EtherType. `tci` packs PCP(3) | DEI(1) | VID(12);
+// `inner_proto` is the EtherType of the encapsulated L3 frame.
+struct fwl_vlanhdr {
+  __u16 tci;
+  __u16 inner_proto;
+};
 """
 
 
@@ -397,6 +405,20 @@ def _emit_parse_prelude(program: ast.Program) -> str:
       decls.append("__u8 icmp6_type = 0;")
     if ast.FIELD_ICMP6_CODE in fields:
       decls.append("__u8 icmp6_code = 0;")
+  # v0.4 VLAN. vlan_ok gates vlan-field comparisons so an untagged
+  # frame (where the tag never parsed) cannot spuriously match
+  # `pkt.vlan_id == 0`, mirroring the v4_ok/v6_ok/l4_ok pattern. Only
+  # declared when a vlan field is referenced; the tag-skip dispatch
+  # itself runs in every prelude (so IP rules see through the tag).
+  needs_vlan_id = ast.FIELD_VLAN_ID in fields
+  needs_vlan_priority = ast.FIELD_VLAN_PRIORITY in fields
+  needs_vlan = needs_vlan_id or needs_vlan_priority
+  if needs_vlan:
+    decls.append("__u8 vlan_ok = 0;")
+  if needs_vlan_id:
+    decls.append("__u16 vlan_id = 0;")
+  if needs_vlan_priority:
+    decls.append("__u8 vlan_priority = 0;")
 
   decl_block = "\n".join("  " + d for d in decls)
 
@@ -488,6 +510,35 @@ def _emit_parse_prelude(program: ast.Program) -> str:
   if v6_active:
     v6_branch = _emit_v6_branch(fields, needs_l4, needs_tcp, needs_icmp6)
 
+  # v0.4 VLAN dispatch. Emitted in EVERY prelude (not just programs
+  # that read vlan fields) so an existing IPv4/IPv6 rule still matches
+  # a tagged frame: when the outer EtherType is 0x8100 we bounds-check
+  # the 4-byte tag, advance the L3 pointer past it (offset 14 -> 18),
+  # and re-read the *real* EtherType from the tag. The vlan-field
+  # reads + vlan_ok are emitted only when a vlan field is referenced.
+  vlan_reads: list[str] = []
+  if needs_vlan:
+    vlan_reads.append("        vlan_ok = 1;")
+  if needs_vlan_id:
+    vlan_reads.append(
+      "        vlan_id = bpf_ntohs(vh->tci) & 0x0FFF;"
+    )
+  if needs_vlan_priority:
+    vlan_reads.append(
+      "        vlan_priority = (bpf_ntohs(vh->tci) >> 13) & 0x7;"
+    )
+  vlan_read_block = "\n".join(vlan_reads)
+  if vlan_read_block:
+    vlan_read_block += "\n"
+  vlan_block = f"""
+    if (l3_proto == bpf_htons(ETH_P_8021Q)) {{
+      struct fwl_vlanhdr *vh = (void *)(eth + 1);
+      if ((void *)(vh + 1) <= data_end) {{
+{vlan_read_block}        l3_proto = vh->inner_proto;
+        l3 = (void *)(vh + 1);
+      }}
+    }}"""
+
   # Non-IP frame early-out. Any program that references an IP-aware
   # field (and therefore generates this prelude) cannot meaningfully
   # filter on ARP, NDP, LLDP, or any other L2 control protocol — its
@@ -499,21 +550,28 @@ def _emit_parse_prelude(program: ast.Program) -> str:
   # soak (planning/SOAK_INCIDENTS.md Incident #3, 2026-05-02). Treated
   # as an intentional v0.2 semantic improvement per the v4_ok/l4_ok
   # precedent recorded in CLAUDE.md "Operating reminders".
+  #
+  # v0.4: when the program reads vlan fields, vlan_ok joins the gate
+  # so a tagged non-IP frame (or a tagged frame truncated before L3)
+  # still reaches the vlan-matching rules instead of early-passing.
+  vlan_gate = " && !vlan_ok" if needs_vlan else ""
   return f"""\
 {decl_block}
   void *data = (void *)(long)ctx->data;
   void *data_end = (void *)(long)ctx->data_end;
   struct ethhdr *eth = data;
   if ((void *)(eth + 1) <= data_end) {{
-    if (eth->h_proto == bpf_htons(ETH_P_IP)) {{
-      struct iphdr *ip = (void *)(eth + 1);
+    __u16 l3_proto = eth->h_proto;
+    void *l3 = (void *)(eth + 1);{vlan_block}
+    if (l3_proto == bpf_htons(ETH_P_IP)) {{
+      struct iphdr *ip = l3;
       if ((void *)(ip + 1) <= data_end) {{
         v4_ok = 1;
         proto = ip->protocol;{ip_read_block}{l4_block}
       }}
     }}{v6_branch}
   }}
-  if (!v4_ok && !v6_ok) return XDP_PASS;
+  if (!v4_ok && !v6_ok{vlan_gate}) return XDP_PASS;
 
 """
 
@@ -597,6 +655,8 @@ def _emit_v6_branch(
     l4_block = tcp_block + udp_block
 
   # ICMPv6 type/code parse at the fixed offset (no ext-header chasing).
+  # `icmp6` derives from `ip6` (== `l3`), so it lands at the correct
+  # VLAN-shifted offset on tagged frames.
   icmp6_block = ""
   if needs_icmp6:
     icmp6_reads = []
@@ -615,8 +675,11 @@ def _emit_v6_branch(
         }}"""
   l4_block = l4_block + icmp6_block
 
-  return f""" else if (eth->h_proto == bpf_htons(ETH_P_IPV6)) {{
-      struct ipv6hdr *ip6 = (void *)(eth + 1);
+  # `l3` / `l3_proto` are the VLAN-aware L3 pointer + EtherType the
+  # prelude computes once (offset 14 untagged, 18 tagged); deriving
+  # ip6 from `l3` keeps the v6 path correct on tagged frames.
+  return f""" else if (l3_proto == bpf_htons(ETH_P_IPV6)) {{
+      struct ipv6hdr *ip6 = l3;
       if ((void *)(ip6 + 1) <= data_end) {{
         v6_ok = 1;
         proto = ip6->nexthdr;{read_block}{l4_block}
@@ -694,6 +757,8 @@ _FIELD_TO_C = {
   ast.FIELD_ICMP_CODE: "icmp_code",
   ast.FIELD_ICMP6_TYPE: "icmp6_type",
   ast.FIELD_ICMP6_CODE: "icmp6_code",
+  ast.FIELD_VLAN_ID: "vlan_id",
+  ast.FIELD_VLAN_PRIORITY: "vlan_priority",
 }
 
 
@@ -710,6 +775,8 @@ def _emit_comparison(cmp: ast.Comparison) -> str:
     return _emit_port_compare(cmp)
   if field_name in ast.ICMP_FIELDS or field_name in ast.ICMP6_FIELDS:
     return _emit_icmp_compare(cmp)
+  if field_name in ast.VLAN_FIELDS:
+    return _emit_vlan_compare(cmp)
   raise NotImplementedError(
     f"emitter: comparison on {field_name} not supported"
   )
@@ -943,6 +1010,24 @@ def _emit_icmp_compare(cmp: ast.Comparison) -> str:
   # Unreachable: the analyzer restricts ICMP type/code to exactly the
   # comparison ops handled above.
   raise AssertionError(f"unexpected icmp op {cmp.op}")
+
+
+def _emit_vlan_compare(cmp: ast.Comparison) -> str:
+  """VLAN field comparisons (== / != / < / > / <= / >= / in).
+
+  Integer comparisons over u16 vlan_id / u8 vlan_priority. Gated on
+  `vlan_ok` so a frame with no 802.1Q tag (where the vlan locals stay
+  at their zero default) cannot spuriously match `pkt.vlan_id == 0` or
+  `pkt.vlan_id != 10`. Membership reuses the port `in` helper — the
+  operand shapes (integer list / lo..hi range) are identical.
+  """
+  c_field = _FIELD_TO_C[cmp.field.name]
+  if cmp.op == "in":
+    return f"(vlan_ok && {_emit_port_in(c_field, cmp.operand)})"
+  # The analyzer admits only ==/!=/</>/<=/>= and `in` for vlan
+  # fields, so any remaining op is one of the integer comparators.
+  val = cmp.operand.value  # type: ignore[union-attr]
+  return f"(vlan_ok && ({c_field} {cmp.op} {val}))"
 
 
 def _emit_rule(
@@ -1391,6 +1476,8 @@ _FIELD_LOCAL_TYPE = {
   ast.FIELD_ICMP_CODE: ast.LocalType.U16,
   ast.FIELD_ICMP6_TYPE: ast.LocalType.U16,
   ast.FIELD_ICMP6_CODE: ast.LocalType.U16,
+  ast.FIELD_VLAN_ID: ast.LocalType.U16,
+  ast.FIELD_VLAN_PRIORITY: ast.LocalType.U16,
 }
 
 
@@ -1543,6 +1630,10 @@ def _emit_field_read_scalar(field_name: str) -> str:
     field_name in ast.ICMP_FIELDS or field_name in ast.ICMP6_FIELDS
   ):
     return _FIELD_TO_C[field_name]
+  if field_name == ast.FIELD_VLAN_ID:
+    return "vlan_id"
+  if field_name == ast.FIELD_VLAN_PRIORITY:
+    return "vlan_priority"
   raise NotImplementedError(f"emitter: tier2 field read {field_name}")
 
 

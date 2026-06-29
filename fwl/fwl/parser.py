@@ -265,6 +265,7 @@ class _ToAst(Transformer):
   def TCP_FLAG_FIELD(self, tok): return tok
   def ICMP_FIELD(self, tok): return tok
   def ICMP6_FIELD(self, tok): return tok
+  def VLAN_FIELD(self, tok): return tok
   def PROTO_KEYWORD(self, tok): return tok
   def IPV4(self, tok): return tok
   def IPV6(self, tok): return tok
