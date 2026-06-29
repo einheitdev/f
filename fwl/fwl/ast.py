@@ -37,9 +37,22 @@ class Action(Enum):
   # bpf_redirect_map(). The target zone is carried on Rule.redirect_zone
   # / ActionStmt.redirect_zone (FWL_V04_SPEC.md § Zones / Redirect).
   REDIRECT = "redirect"
+  # Phase 5 NAT: `masquerade`, `snat to <ip>`, `dnat to <ip>:<port>`.
+  # Non-terminal rewrite actions — they translate the packet in place
+  # and fall through, so a following terminal (redirect/allow) emits the
+  # rewritten frame (FWL_V04_SPEC.md § NAT). masquerade/snat rewrite the
+  # source; dnat rewrites the destination. The target address/port are
+  # carried on Rule.nat_addr / Rule.nat_port (ActionStmt likewise).
+  MASQUERADE = "masquerade"
+  SNAT = "snat"
+  DNAT = "dnat"
 
 
 TERMINAL_ACTIONS = frozenset({Action.ALLOW, Action.DROP, Action.REDIRECT})
+
+# NAT rewrite actions — non-terminal: they translate the packet and fall
+# through to the next rule/statement (the terminal action emits it).
+NAT_ACTIONS = frozenset({Action.MASQUERADE, Action.SNAT, Action.DNAT})
 
 
 class Proto(Enum):
@@ -389,6 +402,13 @@ class Rule:
   # Set only for REDIRECT actions: the destination zone name
   # (FWL_V04_SPEC.md § Zones / Redirect).
   redirect_zone: str | None = None
+  # Phase 5 NAT. `nat_addr` is the rewrite target IPv4 as a host-order
+  # u32: the new source for SNAT, the new destination for DNAT. None for
+  # MASQUERADE (the source is the runtime interface address) and every
+  # non-NAT action. `nat_port` is the new destination port for DNAT
+  # (None otherwise).
+  nat_addr: int | None = None
+  nat_port: int | None = None
 
 
 @dataclass(frozen=True)
@@ -499,6 +519,11 @@ class ActionStmt:
   counter_name: str | None = None
   # Set only for REDIRECT actions in a Tier 2 body: destination zone.
   redirect_zone: str | None = None
+  # Phase 5 NAT (Tier 2): rewrite target IPv4 (host-order u32) for
+  # SNAT/DNAT, and destination port for DNAT. None for MASQUERADE and
+  # non-NAT actions. Mirrors Rule.nat_addr / Rule.nat_port.
+  nat_addr: int | None = None
+  nat_port: int | None = None
 
 
 @dataclass(frozen=True)

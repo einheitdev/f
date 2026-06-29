@@ -25,6 +25,7 @@
 #include "f/rule_table.h"
 #include "f/slow_path.h"
 #include "f/types.h"
+#include "f/watcher.h"
 
 namespace f {
 
@@ -54,8 +55,14 @@ struct Engine {
   std::unique_ptr<zmq::context_t> zmq_ctx;
   std::unique_ptr<zmq::socket_t> ctrl_socket;
 
-  // BPF handles.
+  // BPF handles (single-program path).
   BpfHandles bpf;
+
+  // v0.4 § 6.2: handles for a loaded multi-zone bundle. Empty on the
+  // single-program path; populated when EngineInit cold-boots a
+  // multi-zone bundle or ApplyBundle hot-loads one. Kept so a later
+  // reload can detach the per-zone programs before re-attaching.
+  ZoneBundleHandles zone_bundle;
 
   // Pin path for BPF maps.
   std::string pin_path = "/sys/fs/bpf/f";
@@ -71,6 +78,10 @@ struct Engine {
   // Slow path.
   SlowPath slow_path;
   std::jthread slow_path_thread;
+
+  // Source file-watcher / hot-reload state (ReloadFromSource reads
+  // source_path, compiled_dir, fwl_path from here).
+  Watcher watcher;
 
   // Uptime tracking.
   uint64_t start_time_s = 0;

@@ -117,6 +117,7 @@ add_bpf_object(fw bpf/fw.bpf.c)
 add_library(libf-engine STATIC
   src/bpf_loader.cc
   src/engine.cc
+  src/reload.cc
   src/slow_path.cc
   src/components.cc
 )

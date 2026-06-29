@@ -260,9 +260,52 @@ auto EngineInit(Engine& e,
   e.start_time_s = CurrentTimeS();
   e.state.store(EngineState::kStarting);
 
+  // v0.4 § 6.2 cold-boot: when the operator has staged a *multi-zone*
+  // bundle at <bundle_dir>/current, load every zone program and attach
+  // them per-zone from the manifest's interface lists. This is the
+  // multi-program analogue of the single-program path below; the
+  // per-zone objects carry their policy compiled in and share the
+  // bpffs-pinned conntrack map, so there is no single fw.bpf.o to pin
+  // or attach.
+  std::string current_dir;
+  if (!bundle_dir.empty()) {
+    current_dir =
+        (std::filesystem::path(bundle_dir) / "current").string();
+  }
+  bool multi_zone =
+      !current_dir.empty() && IsMultiZoneBundle(current_dir);
+  if (multi_zone) {
+    spdlog::info("Cold-boot: loading multi-zone bundle from {}...",
+                 current_dir);
+    auto zb = LoadZoneBundle(current_dir, e.pin_path);
+    if (!zb) {
+      return MakeError(EngineError::kBpfLoadFailed,
+          std::format("LoadZoneBundle: {}", zb.error().message));
+    }
+    e.zone_bundle = *zb;
+    e.conntrack.map_fd = e.zone_bundle.conntrack_fd;
+    // Record the attached interfaces for status reporting.
+    for (const auto& prog : e.zone_bundle.programs) {
+      for (int idx : prog.ifindexes) {
+        if (e.ifaces.count >=
+            sizeof(e.ifaces.interfaces) /
+                sizeof(e.ifaces.interfaces[0])) {
+          break;
+        }
+        auto& entry = e.ifaces.interfaces[e.ifaces.count];
+        entry.ifindex = idx;
+        if_indextoname(static_cast<unsigned int>(idx), entry.name);
+        e.ifaces.count++;
+      }
+    }
+    spdlog::info("Multi-zone bundle loaded: {} zone program(s).",
+                 e.zone_bundle.programs.size());
+  }
+
   // Load BPF program. When the operator has staged a bundle at
   // <bundle_dir>/current, the cold-boot path picks it up; otherwise
   // we fall back to the built-in search list.
+  if (!multi_zone) {
   spdlog::info("Loading BPF program...");
   auto bpf_res = LoadProgram(bundle_dir);
   if (!bpf_res) {
@@ -318,6 +361,7 @@ auto EngineInit(Engine& e,
     spdlog::info("XDP attached to {} (ifindex={}).",
                  name, idx);
   }
+  }  // end single-program path (!multi_zone)
 
   // ZMQ control socket.
   try {

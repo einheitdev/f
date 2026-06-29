@@ -12,6 +12,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include "f/bpf_loader.h"
 #include "f/engine.h"
 #include "f/reload.h"
 
@@ -127,6 +128,45 @@ TEST(ReloadApplyBundle, ParsesRulesAndVersion) {
   EXPECT_EQ(res->rules_installed, 0u);
   EXPECT_FALSE(res->program_updated);
   fs::remove_all(tmp);
+}
+
+// v0.4 § 6.2: the routing signal ApplyBundle/EngineInit use to send a
+// bundle to LoadZoneBundle (multi-zone) vs the single-program path.
+TEST(ZoneBundleRouting, MultiZoneManifestDetected) {
+  auto tmp = fs::temp_directory_path() / "fwl_multizone_detect";
+  fs::remove_all(tmp);
+  json manifest = {
+      {"version", "0.4"},
+      {"zones",
+       {{{"name", "wan"}, {"interfaces", {"wan0"}}},
+        {{"name", "lan"}, {"interfaces", {"lan0"}}}}},
+      {"programs",
+       {{{"zone", "wan"}, {"object", "wan.bpf.o"}, {"redirects_to", json::array()}},
+        {{"zone", "lan"}, {"object", "lan.bpf.o"}, {"redirects_to", {"wan"}}}}},
+  };
+  WriteFile(tmp / "manifest.json", manifest.dump());
+  EXPECT_TRUE(IsMultiZoneBundle(tmp.string()));
+  fs::remove_all(tmp);
+}
+
+TEST(ZoneBundleRouting, SingleProgramManifestNotMultiZone) {
+  auto tmp = fs::temp_directory_path() / "fwl_singleprog_detect";
+  fs::remove_all(tmp);
+  // The legacy single-program manifest has no zones/programs arrays.
+  json manifest = {
+      {"version", "20260414T000000Z"},
+      {"has_program", true},
+      {"program", {{"path", "main.bpf.o"}}},
+  };
+  WriteFile(tmp / "manifest.json", manifest.dump());
+  EXPECT_FALSE(IsMultiZoneBundle(tmp.string()));
+  fs::remove_all(tmp);
+}
+
+TEST(ZoneBundleRouting, MissingManifestIsNotMultiZone) {
+  auto tmp = fs::temp_directory_path() / "fwl_nomanifest_detect";
+  fs::remove_all(tmp);
+  EXPECT_FALSE(IsMultiZoneBundle(tmp.string()));
 }
 
 TEST(ReloadRunCompiler, MissingBinarySurfacesSpawnError) {

@@ -194,6 +194,37 @@ auto ApplyBundle(Engine& e, std::string_view bundle_dir)
                      "manifest missing version");
   }
 
+  // v0.4 § 6.2: a multi-zone bundle carries its policy compiled into
+  // per-zone BPF objects (one `<zone>.bpf.o` per @xdp block) and shared
+  // bpffs-pinned maps — there is no rules.json / map-based rule set to
+  // apply. Route it to the zone loader instead of the single-program
+  // rule-application path below.
+  if (IsMultiZoneBundle(dir.string())) {
+    // Detach a previously loaded bundle so the per-zone re-attach below
+    // does not collide with the old programs (hot-reload).
+    if (!e.zone_bundle.programs.empty()) {
+      DetachZoneBundle(e.zone_bundle);
+      e.zone_bundle = ZoneBundleHandles{};
+    }
+    auto loaded = LoadZoneBundle(dir.string(), e.pin_path);
+    if (!loaded) {
+      return MakeError(ReloadError::kApplyFailed,
+                       std::format("LoadZoneBundle: {}",
+                                   loaded.error().message));
+    }
+    e.zone_bundle = *loaded;
+    if (e.zone_bundle.conntrack_fd >= 0) {
+      e.conntrack.map_fd = e.zone_bundle.conntrack_fd;
+    }
+    ReloadResult out{};
+    out.version = manifest["version"].get<std::string>();
+    out.rules_installed = 0;
+    out.program_updated = true;
+    spdlog::info("reload: multi-zone bundle, {} zone program(s)",
+                 e.zone_bundle.programs.size());
+    return out;
+  }
+
   // Read rules.json.
   auto rules_txt = ReadFileAll(dir / "rules.json");
   if (!rules_txt) {

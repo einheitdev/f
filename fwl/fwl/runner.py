@@ -128,12 +128,18 @@ def _interpreter_oracle(
     program, case.packet.fields, case.state,
     geoip_data=(case.geoip_data or None),
     conntrack=interpreter.ConntrackTable(case.conntrack_seed),
+    nat=_build_nat_state(case),
   )
   if result.action != expected:
     return OracleResult(
       "interpreter", "fail",
       f"expected {expected.value}, got {result.action.value}",
     )
+  op_diff = _check_output_packet(
+    case.expected.get("output_packet"), result.output_packet, "interpreter"
+  )
+  if op_diff:
+    return OracleResult("interpreter", "fail", op_diff)
   want_zone = case.expected.get("redirect_zone")
   if want_zone is not None and result.redirect_zone != want_zone:
     return OracleResult(
@@ -193,6 +199,8 @@ def _bpf_oracle(
   ct_seed = _build_conntrack_map_init(case.conntrack_seed)
   if ct_seed:
     map_init["conntrack"] = ct_seed
+  for name, entries in _build_nat_map_init(case).items():
+    map_init[name] = entries
   counter_slots = _parse_counter_table(c_source)
   n_slots = len(counter_slots)
   has_log = any(
@@ -243,6 +251,19 @@ def _bpf_oracle(
       "bpf", "fail",
       f"expected {expected.value}, got {result.action.value}",
     )
+
+  want_op = case.expected.get("output_packet")
+  if want_op is not None:
+    op_diff = _check_output_packet(
+      want_op, _decode_output_packet(result.output_packet), "bpf"
+    )
+    if op_diff:
+      return OracleResult("bpf", "fail", op_diff)
+    # A rewrite that asserts output fields must also leave valid
+    # checksums — the wire-correctness a stub cannot fake.
+    csum_diff = _checksum_diag(result.output_packet)
+    if csum_diff:
+      return OracleResult("bpf", "fail", csum_diff)
 
   expected_cc = case.expected.get("counter_changes", {})
   if expected_cc and counter_slots:
@@ -460,6 +481,138 @@ def _build_conntrack_map_init(
     )
     entries[key] = value
   return entries
+
+
+_NAT_TYPE_NUM = {"snat": 1, "dnat": 2}
+
+
+def _build_nat_state(case: pkt.PktCase):
+  """Build the interpreter's NatState from the .pkt's state.nat block.
+
+  Returns None when the case declares no NAT state (so the interpreter
+  runs unchanged)."""
+  if case.nat_masq_ip is None and not case.nat_mappings:
+    return None  # no state.nat block: interpreter runs without NAT seed
+  reply = {}
+  for proto, src, dst, sport, dport, new, new_port, kind in case.nat_mappings:
+    reply[(proto, src, dst, sport, dport)] = (kind, new, new_port)
+  return interpreter.NatState(masq_ip=case.nat_masq_ip, mappings=reply)
+
+
+def _build_nat_map_init(case: pkt.PktCase) -> dict[str, dict[bytes, bytes]]:
+  """Seed `fwl_nat` (reply mappings) and `fwl_nat_cfg` (masquerade IP)
+  from the .pkt's state.nat block, byte-matching the emitted structs."""
+  out: dict[str, dict[bytes, bytes]] = {}
+  if case.nat_masq_ip is not None:
+    out["fwl_nat_cfg"] = {
+      struct.pack("<I", 0): struct.pack(">I", case.nat_masq_ip)
+    }
+  if case.nat_mappings:
+    entries: dict[bytes, bytes] = {}
+    for proto, src, dst, sport, dport, new, new_port, kind in \
+        case.nat_mappings:
+      proto_num = pkt._CONNTRACK_PROTO_NUM[proto]
+      key = (struct.pack(">I", src) + struct.pack(">I", dst)
+             + struct.pack("<H", sport) + struct.pack("<H", dport)
+             + struct.pack("<B", proto_num) + b"\x00\x00\x00")
+      value = (struct.pack(">I", new) + struct.pack("<H", new_port)
+               + struct.pack("<B", _NAT_TYPE_NUM[kind]) + b"\x00")
+      entries[key] = value
+    out["fwl_nat"] = entries
+  return out
+
+
+def _decode_output_packet(raw: bytes) -> dict[str, Any]:
+  """Decode an output frame's NAT-relevant fields (IPv4, plain or one
+  802.1Q tag). Returns {src_ip, dst_ip, src_port, dst_port}."""
+  out: dict[str, Any] = {}
+  if len(raw) < 14:
+    return out
+  off = 14
+  ethertype = (raw[12] << 8) | raw[13]
+  if ethertype == 0x8100 and len(raw) >= 18:
+    off = 18
+  if len(raw) < off + 20:
+    return out
+  ihl = (raw[off] & 0x0F) * 4
+  out["src_ip"] = ".".join(str(b) for b in raw[off + 12:off + 16])
+  out["dst_ip"] = ".".join(str(b) for b in raw[off + 16:off + 20])
+  l4 = off + ihl
+  if len(raw) >= l4 + 4:
+    out["src_port"] = (raw[l4] << 8) | raw[l4 + 1]
+    out["dst_port"] = (raw[l4 + 2] << 8) | raw[l4 + 3]
+  return out
+
+
+def _ones_sum(data: bytes) -> int:
+  """16-bit one's-complement sum of `data` (folded), the Internet
+  checksum primitive."""
+  if len(data) % 2:
+    data = data + b"\x00"
+  s = 0
+  for i in range(0, len(data), 2):
+    s += (data[i] << 8) | data[i + 1]
+  while s >> 16:
+    s = (s & 0xFFFF) + (s >> 16)
+  return s
+
+
+def _checksum_diag(raw: bytes) -> str | None:
+  """Validate the IPv4 header checksum and the TCP/UDP checksum of an
+  output frame (plain or one 802.1Q tag). Returns a diagnostic string on
+  any invalid checksum, or None when all are valid / not applicable.
+
+  This is the automatic guard behind the `checksum_verify` story: a NAT
+  rewrite that corrupts a checksum is silently dropped on the wire, so
+  the BPF oracle proves every rewritten frame is internally consistent.
+  """
+  if len(raw) < 14:
+    return None  # not even an Ethernet header
+  off = 14
+  if ((raw[12] << 8) | raw[13]) == 0x8100 and len(raw) >= 18:
+    off = 18
+  if len(raw) < off + 20:
+    return None  # no IPv4 header to check
+  ihl = (raw[off] & 0x0F) * 4
+  if ihl < 20 or len(raw) < off + ihl:
+    return None  # malformed / truncated IP header — not our concern
+  # IP header checksum: the sum over the header (check field included)
+  # must be 0xFFFF.
+  if _ones_sum(raw[off:off + ihl]) != 0xFFFF:
+    return "IP header checksum invalid after rewrite"
+  proto = raw[off + 9]
+  l4 = off + ihl
+  seg = raw[l4:]
+  if proto == 6 and len(seg) >= 20 or proto == 17 and len(seg) >= 8:
+    if proto == 17:
+      stored = (seg[6] << 8) | seg[7]
+      if stored == 0:
+        return None  # UDP with no checksum
+    # Pseudo-header: src, dst, zero, proto, L4 length.
+    pseudo = (raw[off + 12:off + 16] + raw[off + 16:off + 20]
+              + bytes([0, proto]) + len(seg).to_bytes(2, "big"))
+    if _ones_sum(pseudo + seg) != 0xFFFF:
+      name = "TCP" if proto == 6 else "UDP"
+      return f"{name} checksum invalid after rewrite"
+  return None  # all checksums valid
+
+
+def _check_output_packet(expected_op, got, oracle: str) -> str | None:
+  """Compare the rewritten packet fields against expected.output_packet.
+
+  Only the fields the .pkt lists are checked. Returns a diff string on
+  mismatch, or None on agreement (or when nothing is expected)."""
+  if not expected_op:
+    return None  # nothing to check
+  if got is None:
+    return (f"expected output_packet {expected_op} but {oracle} produced "
+            f"no rewrite")
+  for field, want in expected_op.items():
+    have = got.get(field)
+    if have != want:
+      return (f"output_packet.{field}: expected {want!r}, got {have!r} "
+              f"({oracle})")
+  return None  # all expected fields matched
 
 
 def _check_counter_changes(

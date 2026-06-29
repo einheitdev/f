@@ -66,6 +66,9 @@ action_stmt   : ALLOW                  _NL+  -> action_allow
               | LOG                    _NL+  -> action_log
               | COUNT IDENTIFIER       _NL+  -> action_count
               | REDIRECT TO IDENTIFIER _NL+  -> action_redirect
+              | MASQUERADE             _NL+  -> action_masquerade
+              | SNAT TO IPV4           _NL+  -> action_snat
+              | DNAT TO IPV4 ":" INTEGER _NL+ -> action_dnat
 
 assign_stmt   : IDENTIFIER "=" scalar_expr _NL+
 
@@ -83,7 +86,7 @@ RL_FIELD.10   : "src_ip" | "dst_ip" | "src_port" | "dst_port"
 
 default_rule  : "default" terminal_action
 
-action        : terminal_action | nonterminal_action | redirect_action
+action        : terminal_action | nonterminal_action | redirect_action | nat_action
 
 terminal_action    : ALLOW | DROP
 nonterminal_action : log_action | COUNT IDENTIFIER
@@ -91,6 +94,14 @@ nonterminal_action : log_action | COUNT IDENTIFIER
 // terminal_action so `default redirect to <zone>` stays a syntax error
 // (default admits only allow/drop).
 redirect_action    : REDIRECT TO IDENTIFIER
+// Phase 5 NAT: `masquerade` / `snat to <ip>` / `dnat to <ip>:<port>`.
+// Non-terminal rewrite actions — they translate the packet in place
+// (src for snat/masquerade, dst for dnat) and fall through, so a
+// following `redirect to <zone>` emits the rewritten frame. Kept off
+// terminal_action so `default masquerade` is a syntax error.
+nat_action         : MASQUERADE
+                   | SNAT TO IPV4
+                   | DNAT TO IPV4 ":" INTEGER
 
 log_action        : LOG
                   | LOG "(" "sample" "=" INTEGER ")"
@@ -250,6 +261,12 @@ DEF.10           : /def(?![a-z0-9_])/
 ZONE.10          : /zone(?![a-z0-9_])/
 REDIRECT.10      : /redirect(?![a-z0-9_])/
 TO.10            : /to(?![a-z0-9_])/
+
+// Phase 5 NAT action keywords. Reserved words (negative-lookahead so
+// `masqueraded`, `snatted` still lex as IDENTIFIER).
+MASQUERADE.10    : /masquerade(?![a-z0-9_])/
+SNAT.10          : /snat(?![a-z0-9_])/
+DNAT.10          : /dnat(?![a-z0-9_])/
 
 // v0.4 conntrack state keywords. Reserved words (like the proto
 // keywords): negative-lookahead so `established_flows` still lexes as
