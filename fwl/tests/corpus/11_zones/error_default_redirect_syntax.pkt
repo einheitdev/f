@@ -1,0 +1,16 @@
+name: '`default redirect to <zone>` is a syntax error'
+source_fw: 'zone wan = [wan0]
+
+  zone lan = [lan0, lan1, lan2, lan3]
+
+  @xdp(lan)
+
+  allow
+
+  default redirect to wan
+
+  '
+test_packet:
+  builder: tcp()
+expected:
+  compiles: false

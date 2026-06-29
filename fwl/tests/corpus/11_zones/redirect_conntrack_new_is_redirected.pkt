@@ -1,0 +1,19 @@
+name: a NEW flow on lan is redirected to wan
+source_fw: 'zone wan = [wan0]
+
+  zone lan = [lan0, lan1, lan2, lan3]
+
+  @xdp(lan)
+
+  redirect to wan if conntrack(pkt).state == new
+
+  drop
+
+  '
+ingress_zone: lan
+test_packet:
+  builder: tcp(src_ip="10.0.0.5", dst_ip="1.2.3.4", src_port=40000, dst_port=80, syn=true)
+expected:
+  compiles: true
+  bpf_action: redirect
+  redirect_zone: wan

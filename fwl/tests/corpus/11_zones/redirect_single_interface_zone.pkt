@@ -1,0 +1,19 @@
+name: redirect to a single-interface zone returns XDP_REDIRECT
+source_fw: 'zone wan = [wan0]
+
+  zone lan = [lan0]
+
+  zone dmz = [dmz0]
+
+  @xdp(lan)
+
+  redirect to wan
+
+  '
+ingress_zone: lan
+test_packet:
+  builder: tcp(src_ip="10.0.0.5", dst_ip="8.8.8.8", dst_port=443, syn=true)
+expected:
+  compiles: true
+  bpf_action: redirect
+  redirect_zone: wan

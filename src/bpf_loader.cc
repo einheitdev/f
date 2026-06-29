@@ -11,10 +11,14 @@
 #include <cstring>
 #include <filesystem>
 #include <format>
+#include <fstream>
+#include <map>
+#include <sstream>
 #include <string>
 #include <system_error>
 #include <vector>
 
+#include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
 
 #include "f/types.h"
@@ -208,6 +212,153 @@ auto UnpinMaps(std::string_view pin_path)
                     pin_path, ec.message()));
   }
   return {};
+}
+
+// --- v0.4 § 6.2 multi-zone bundle loading ---------------------------
+
+namespace {
+
+// Loaded zone objects are kept alive for the daemon's lifetime, exactly
+// like the single-program g_obj. Closing them would detach the maps.
+std::vector<struct bpf_object*> g_zone_objs;
+
+// Resolve a zone's interface names to ifindexes. Absent interfaces
+// (if_nametoindex == 0) are skipped with a warning rather than failing
+// the load — a zone's NIC may appear after boot.
+auto ResolveZoneIfindexes(const std::vector<std::string>& ifaces)
+    -> std::vector<int> {
+  std::vector<int> out;
+  for (const auto& name : ifaces) {
+    unsigned int idx = if_nametoindex(name.c_str());
+    if (idx == 0) {
+      spdlog::warn("zone interface '{}' not present yet; skipping", name);
+      continue;
+    }
+    out.push_back(static_cast<int>(idx));
+  }
+  return out;
+}
+
+}  // namespace
+
+auto LoadZoneBundle(std::string_view bundle_dir,
+                    std::string_view pin_root)
+    -> std::expected<ZoneBundleHandles, Error<BpfError>> {
+  using nlohmann::json;
+  std::filesystem::path dir(bundle_dir);
+
+  std::ifstream mf(dir / "manifest.json");
+  if (!mf) {
+    return MakeError(BpfError::kLoadFailed,
+        std::format("open {}/manifest.json failed", bundle_dir));
+  }
+  std::stringstream ss;
+  ss << mf.rdbuf();
+  json manifest;
+  try {
+    manifest = json::parse(ss.str());
+  } catch (const std::exception& e) {
+    return MakeError(BpfError::kLoadFailed,
+        std::format("parse manifest.json: {}", e.what()));
+  }
+
+  // zone name -> resolved ifindexes (egress targets for redirect, and
+  // ingress interfaces to attach each program to).
+  std::map<std::string, std::vector<int>> zone_ifindexes;
+  for (const auto& z : manifest.value("zones", json::array())) {
+    std::vector<std::string> ifaces;
+    for (const auto& i : z.value("interfaces", json::array())) {
+      ifaces.push_back(i.get<std::string>());
+    }
+    zone_ifindexes[z.at("name").get<std::string>()] =
+        ResolveZoneIfindexes(ifaces);
+  }
+
+  // Common pin root so LIBBPF_PIN_BY_NAME maps (conntrack, devmaps)
+  // resolve to one kernel map across every zone object.
+  std::string pin_root_str(pin_root);
+  std::filesystem::create_directories(pin_root_str);
+
+  ZoneBundleHandles handles;
+  for (const auto& p : manifest.value("programs", json::array())) {
+    if (p.value("object", json()).is_null()) {
+      // The bundle was emitted without a compiled object (clang
+      // unavailable at compile time); nothing to load for this zone.
+      spdlog::warn("zone '{}' has no compiled object; skipping",
+                   p.value("zone", std::string{}));
+      continue;
+    }
+    std::string zone = p.at("zone").get<std::string>();
+    std::string obj_name = p.at("object").get<std::string>();
+    std::string obj_path = (dir / obj_name).string();
+
+    LIBBPF_OPTS(bpf_object_open_opts, open_opts);
+    open_opts.pin_root_path = pin_root_str.c_str();
+    struct bpf_object* obj =
+        bpf_object__open_file(obj_path.c_str(), &open_opts);
+    if (!obj) {
+      return MakeError(BpfError::kLoadFailed,
+          std::format("open {} failed", obj_path));
+    }
+    int err = bpf_object__load(obj);
+    if (err) {
+      bpf_object__close(obj);
+      return MakeError(BpfError::kLoadFailed,
+          std::format("load {} failed: {}", obj_path,
+                      std::strerror(-err)));
+    }
+    g_zone_objs.push_back(obj);
+
+    struct bpf_program* prog =
+        bpf_object__find_program_by_name(obj, "fwl_prog");
+    if (!prog) {
+      return MakeError(BpfError::kLoadFailed,
+          std::format("fwl_prog not found in {}", obj_path));
+    }
+
+    ZoneProgramHandle zh;
+    zh.zone = zone;
+    zh.prog_fd = bpf_program__fd(prog);
+
+    // Capture the shared conntrack fd from whichever zone defines it.
+    if (handles.conntrack_fd < 0) {
+      int ct = FindMap(obj, "conntrack");
+      if (ct >= 0) handles.conntrack_fd = ct;
+    }
+
+    // Populate each redirect destination's devmap with that zone's
+    // egress ifindexes (key i -> ifindex of the i-th interface).
+    for (const auto& dest : p.value("redirects_to", json::array())) {
+      std::string dest_zone = dest.get<std::string>();
+      std::string map_name = "fwl_devmap_" + dest_zone;
+      int map_fd = FindMap(obj, map_name.c_str());
+      if (map_fd < 0) continue;
+      const auto& targets = zone_ifindexes[dest_zone];
+      for (uint32_t i = 0; i < targets.size(); ++i) {
+        uint32_t key = i;
+        uint32_t val = static_cast<uint32_t>(targets[i]);
+        bpf_map_update_elem(map_fd, &key, &val, BPF_ANY);
+      }
+      spdlog::info("zone '{}' devmap -> '{}' ({} ifaces)", zone,
+                   dest_zone, targets.size());
+    }
+
+    // Attach the program to every interface in its own zone.
+    for (int ifindex : zone_ifindexes[zone]) {
+      int aerr = bpf_xdp_attach(ifindex, zh.prog_fd, 0, nullptr);
+      if (aerr) {
+        return MakeError(BpfError::kAttachFailed,
+            std::format("attach zone '{}' to ifindex {} failed: {}",
+                        zone, ifindex, std::strerror(-aerr)));
+      }
+      zh.ifindexes.push_back(ifindex);
+    }
+    spdlog::info("loaded zone '{}' ({}) on {} interface(s)", zone,
+                 obj_name, zh.ifindexes.size());
+    handles.programs.push_back(std::move(zh));
+  }
+
+  return handles;
 }
 
 }  // namespace f

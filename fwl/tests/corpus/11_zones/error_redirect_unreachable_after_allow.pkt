@@ -1,0 +1,7 @@
+name: a redirect after an unconditional allow is unreachable
+source_fw: "zone wan = [wan0]\nzone lan = [lan0, lan1, lan2, lan3]\n@xdp(lan)\ndef\
+  \ f(pkt):\n  allow\n  redirect to wan\n"
+test_packet:
+  builder: tcp()
+expected:
+  compiles: false

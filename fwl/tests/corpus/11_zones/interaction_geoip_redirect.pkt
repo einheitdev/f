@@ -1,0 +1,22 @@
+name: redirect when the source is in a geoip country set
+source_fw: 'zone wan = [wan0]
+
+  zone lan = [lan0, lan1, lan2, lan3]
+
+  @xdp(lan)
+
+  redirect to wan if pkt.src_ip in geoip(DE)
+
+  drop
+
+  '
+ingress_zone: lan
+geoip_data:
+  DE:
+  - 10.0.0.0/8
+test_packet:
+  builder: tcp(src_ip="10.0.0.5", dst_ip="1.1.1.1", dst_port=80)
+expected:
+  compiles: true
+  bpf_action: redirect
+  redirect_zone: wan

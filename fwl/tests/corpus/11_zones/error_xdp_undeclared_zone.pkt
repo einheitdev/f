@@ -1,0 +1,12 @@
+name: '@xdp naming an undeclared zone is a compile error'
+source_fw: 'zone wan = [wan0]
+
+  @xdp(dmz)
+
+  allow
+
+  '
+test_packet:
+  builder: tcp()
+expected:
+  compiles: false

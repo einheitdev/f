@@ -32,9 +32,14 @@ class Action(Enum):
   DROP = "drop"
   LOG = "log"
   COUNT = "count"
+  # v0.4 Phase 6.3: `redirect to <zone>` — a terminal action that sends
+  # the packet out the destination zone's interface(s) via
+  # bpf_redirect_map(). The target zone is carried on Rule.redirect_zone
+  # / ActionStmt.redirect_zone (FWL_V04_SPEC.md § Zones / Redirect).
+  REDIRECT = "redirect"
 
 
-TERMINAL_ACTIONS = frozenset({Action.ALLOW, Action.DROP})
+TERMINAL_ACTIONS = frozenset({Action.ALLOW, Action.DROP, Action.REDIRECT})
 
 
 class Proto(Enum):
@@ -105,6 +110,11 @@ FIELD_VLAN_PRIORITY = "pkt.vlan_priority"
 # (a non-IP or IPv6 frame reads NEW). Carried as a constant so the
 # field tables and walks can name it uniformly (FWL_V04_SPEC.md § 4.3).
 FIELD_CT_STATE = "conntrack(pkt).state"
+# v0.4 Phase 6.4 zone field. `pkt.zone` is a compile-time constant
+# within each @xdp(<zone>) block — the compiler knows which zone the
+# program belongs to. Type: zone enum. Comparisons: ==, !=, in [...]
+# against declared zone names (FWL_V04_SPEC.md § Zones / pkt.zone).
+FIELD_ZONE = "pkt.zone"
 
 IP_FIELDS = frozenset({FIELD_SRC_IP, FIELD_DST_IP})
 IP6_FIELDS = frozenset({FIELD_SRC_IP6, FIELD_DST_IP6})
@@ -320,9 +330,28 @@ class ConntrackStateCompare:
   span: Span
 
 
+@dataclass(frozen=True)
+class ZoneCompare:
+  """`pkt.zone` compared against declared zone name(s) (v0.4 § 6.4).
+
+  A self-contained Condition (like ConntrackStateCompare): pkt.zone is
+  its own type (the zone enum) and resolves to a compile-time constant
+  — the @xdp(<zone>) block the comparison lives in fixes pkt.zone's
+  value, so the emitter folds the comparison to 1 or 0.
+
+  `op` is '==', '!=', or 'in'. For ==/!= `zones` holds exactly one zone
+  name; for `in` it holds the (de-duplicated, source-order) list of
+  names on the right of `in [ ... ]`. Names are validated against the
+  program's zone declarations by the analyzer.
+  """
+  op: str
+  zones: tuple[str, ...]
+  span: Span
+
+
 Condition = Union[
   Comparison, BoolField, NotOp, AndOp, OrOp,
-  "CountCompare", ConntrackStateCompare,
+  "CountCompare", ConntrackStateCompare, ZoneCompare,
 ]
 
 
@@ -357,6 +386,9 @@ class Rule:
   span: Span
   counter_name: str | None = None
   log_sample: int | None = None
+  # Set only for REDIRECT actions: the destination zone name
+  # (FWL_V04_SPEC.md § Zones / Redirect).
+  redirect_zone: str | None = None
 
 
 @dataclass(frozen=True)
@@ -465,6 +497,8 @@ class ActionStmt:
   action: Action
   span: Span
   counter_name: str | None = None
+  # Set only for REDIRECT actions in a Tier 2 body: destination zone.
+  redirect_zone: str | None = None
 
 
 @dataclass(frozen=True)
@@ -512,17 +546,69 @@ class FunctionDef:
 
 
 @dataclass(frozen=True)
-class Program:
-  """A complete FWL program.
+class ZoneDecl:
+  """A `zone <name> = [<iface>, ...]` declaration (v0.4 § 6.1).
 
-  v0.1 / v0.2 Tier 1: `hook` + `rules` + optional `default`.
-  v0.2 Tier 2: `hook` + `function`. The two shapes are mutually
-  exclusive — the analyzer reports the spec's "Tier 1 rule sequence
-  or a single Tier 2 function, not a mix" error if both fields are
-  populated. A Tier 1 program leaves `function` as None; a Tier 2
-  program leaves `rules` empty and `default` as None.
+  Declared at the top of a .fw file, before any @xdp block. `name` is
+  the zone identifier; `interfaces` is the ordered tuple of interface
+  names (resolved to ifindexes by the daemon at load time). The
+  analyzer rejects empty zones, duplicate zone names, and an interface
+  appearing in more than one zone.
+  """
+  name: str
+  interfaces: tuple[str, ...]
+  span: Span
+
+
+@dataclass(frozen=True)
+class ZoneProgram:
+  """One @xdp(<zone>) block — the policy for a single zone (v0.4 § 6.2).
+
+  Holds exactly what a v0.2 `Program` did: a hook plus either a Tier 1
+  rule sequence (`rules` + optional `default`) or a single Tier 2
+  `function`. `hook.interface` carries the @xdp argument — a zone name
+  when the file declares zones, or a bare interface name in the
+  degenerate single-block case (one implicit zone). Each zone compiles
+  to its own BPF program.
   """
   hook: Hook
   rules: list[Rule] = field(default_factory=list)
   default: DefaultRule | None = None
   function: FunctionDef | None = None
+
+  @property
+  def zone_name(self) -> str:
+    """The zone this program is attached to (the @xdp argument)."""
+    return self.hook.interface
+
+
+@dataclass(frozen=True)
+class Program:
+  """A complete FWL compilation unit (v0.4 § 6.1-6.2).
+
+  A unit is an ordered list of zone declarations plus one or more
+  `ZoneProgram` blocks (one per @xdp). The v0.1-v0.3 single-`@xdp`
+  shape is the degenerate case: zero zone declarations and exactly one
+  ZoneProgram. The `hook`/`rules`/`default`/`function` properties
+  delegate to that single program so the analyzer, emitter, and
+  interpreter's per-program code keeps working unchanged on
+  single-zone files; multi-zone code iterates `programs` directly.
+  """
+  programs: list[ZoneProgram] = field(default_factory=list)
+  zones: list[ZoneDecl] = field(default_factory=list)
+
+  @property
+  def hook(self) -> Hook:
+    return self.programs[0].hook
+
+  @property
+  def rules(self) -> list[Rule]:
+    return self.programs[0].rules
+
+  @property
+  def default(self) -> DefaultRule | None:
+    return self.programs[0].default
+
+  @property
+  def function(self) -> FunctionDef | None:
+    return self.programs[0].function

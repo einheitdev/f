@@ -1,0 +1,19 @@
+name: redirect applies to a v6-active IPv6 flow
+source_fw: 'zone wan = [wan0]
+
+  zone lan = [lan0, lan1, lan2, lan3]
+
+  @xdp(lan)
+
+  redirect to wan if pkt.src_ip6 in 2001:db8::/32
+
+  drop
+
+  '
+ingress_zone: lan
+test_packet:
+  builder: tcp6(src_ip="2001:db8::5", dst_ip="2001:db8::1", dst_port=443)
+expected:
+  compiles: true
+  bpf_action: redirect
+  redirect_zone: wan

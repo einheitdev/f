@@ -1,0 +1,14 @@
+name: duplicate zone name is a compile error
+source_fw: 'zone wan = [wan0]
+
+  zone wan = [wan1]
+
+  @xdp(wan)
+
+  allow
+
+  '
+test_packet:
+  builder: tcp()
+expected:
+  compiles: false

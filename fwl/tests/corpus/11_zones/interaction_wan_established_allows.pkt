@@ -1,0 +1,29 @@
+name: established return traffic on wan is allowed
+source_fw: 'zone wan = [wan0]
+
+  zone lan = [lan0, lan1, lan2, lan3]
+
+  @xdp(wan)
+
+  allow if conntrack(pkt).state == established
+
+  drop
+
+  @xdp(lan)
+
+  redirect to wan
+
+  '
+ingress_zone: wan
+state:
+  conntrack:
+  - src_ip: 10.0.0.5
+    dst_ip: 1.2.3.4
+    src_port: 40000
+    dst_port: 80
+    proto: tcp
+test_packet:
+  builder: tcp(src_ip="1.2.3.4", dst_ip="10.0.0.5", src_port=80, dst_port=40000, ack=true)
+expected:
+  compiles: true
+  bpf_action: allow

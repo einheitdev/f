@@ -1,0 +1,27 @@
+name: 'three-zone unit: dmz ingress redirects to wan'
+source_fw: 'zone wan = [wan0]
+
+  zone lan = [lan0]
+
+  zone dmz = [dmz0]
+
+  @xdp(wan)
+
+  drop
+
+  @xdp(lan)
+
+  redirect to wan
+
+  @xdp(dmz)
+
+  redirect to wan
+
+  '
+ingress_zone: dmz
+test_packet:
+  builder: tcp(src_ip="10.1.0.5", dst_ip="8.8.4.4", dst_port=443)
+expected:
+  compiles: true
+  bpf_action: redirect
+  redirect_zone: wan

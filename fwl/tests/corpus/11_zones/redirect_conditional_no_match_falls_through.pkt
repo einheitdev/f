@@ -1,0 +1,18 @@
+name: conditional redirect falls through to drop when no match
+source_fw: 'zone wan = [wan0]
+
+  zone lan = [lan0, lan1, lan2, lan3]
+
+  @xdp(lan)
+
+  redirect to wan if pkt.proto == tcp and pkt.dst_port == 80
+
+  drop
+
+  '
+ingress_zone: lan
+test_packet:
+  builder: tcp(src_ip="10.0.0.9", dst_ip="1.2.3.4", dst_port=22)
+expected:
+  compiles: true
+  bpf_action: drop

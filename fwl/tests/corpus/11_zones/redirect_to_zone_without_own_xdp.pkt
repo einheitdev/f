@@ -1,0 +1,19 @@
+name: redirect to a declared zone that has no @xdp block
+source_fw: 'zone wan = [wan0]
+
+  zone lan = [lan0]
+
+  zone dmz = [dmz0]
+
+  @xdp(lan)
+
+  redirect to dmz
+
+  '
+ingress_zone: lan
+test_packet:
+  builder: tcp(src_ip="10.0.0.5", dst_ip="10.1.0.5", dst_port=8080)
+expected:
+  compiles: true
+  bpf_action: redirect
+  redirect_zone: dmz

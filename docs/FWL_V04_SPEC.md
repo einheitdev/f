@@ -582,6 +582,188 @@ exercised by the three-oracle runner:
       expected: { bpf_action: allow }
   ```
 
+## Zones, Per-Zone @xdp, Redirect & `pkt.zone`
+
+The zone model abstracts policy over physical interfaces. The operator
+declares named zones (`wan`, `lan`, `dmz`) bound to interface lists,
+writes one `@xdp(<zone>)` block per zone, and forwards traffic between
+zones with `redirect to <zone>`. This is the first construct where one
+`.fw` file compiles to **multiple** BPF programs — one per zone —
+cooperating through bpffs-pinned shared maps.
+
+### 6.1 Zone declarations
+
+#### Construct
+
+```
+zone wan = [wan0]
+zone lan = [lan0, lan1, lan2, lan3]
+zone dmz = [dmz0]
+```
+
+Zero or more `zone` declarations appear at the top of the file, before
+any `@xdp` block. A zone names a set of one or more interfaces; every
+interface in a zone gets the same program attached. Interface names are
+resolved to ifindexes by the daemon at load time (a missing interface is
+a load-time error, not a compile error — interfaces may appear after
+boot).
+
+#### Type rules
+
+A zone name is a compile-time identifier, not a runtime value. It
+appears only in `@xdp(<zone>)` declarations, `redirect to <zone>`
+actions, and `pkt.zone` comparisons — never as a packet-field operand.
+
+#### Compile errors
+
+- **Empty zone**: `zone wan = []` — a zone needs ≥ 1 interface.
+- **Duplicate zone name**: two `zone <name> = ...` with the same name.
+- **Overlapping interface**: one interface listed in two zones.
+
+### 6.2 Per-zone `@xdp` blocks
+
+#### Construct
+
+```
+zone wan = [wan0]
+zone lan = [lan0, lan1, lan2, lan3]
+
+@xdp(wan)
+def from_wan(pkt):
+  if conntrack(pkt).state == established:
+    allow
+  drop
+
+@xdp(lan)
+redirect to wan
+```
+
+Each `@xdp(<zone>)` block defines the policy for traffic arriving on
+that zone's interfaces. A block is either a Tier 1 rule sequence
+(optionally with `default`) or a single Tier 2 `def`, exactly as in
+v0.2 — the two tiers stay mutually exclusive **per block**. The
+single-`@xdp` file with no zone declarations is the degenerate case: one
+implicit zone whose name is the `@xdp` argument.
+
+#### Compilation model
+
+- Each zone compiles to its own BPF program (its own `<zone>.bpf.c` →
+  `<zone>.bpf.o`), named `fwl_prog` within its object. The daemon
+  attaches each object to every interface in its zone.
+- Shared state is held in bpffs-**pinned** maps (`LIBBPF_PIN_BY_NAME`):
+  above all the `conntrack` map, so a flow established on one zone is
+  `established` for every other zone — the requirement that makes a
+  stateful gateway work. Loading every zone object under a common pin
+  root resolves the pinned maps to one kernel map each. `fwl compile
+  --bundle <dir>` emits the per-zone sources, objects, a shared header,
+  and a `manifest.json` describing zones, objects, redirect topology,
+  and the pinned maps.
+
+#### Compile errors
+
+- `@xdp(<name>)` naming an undeclared zone (when the file declares
+  zones).
+- More than one `@xdp` block targeting the same zone.
+
+A declared zone need not have its own `@xdp` block — it may exist only
+as a redirect destination.
+
+### 6.3 Redirect action
+
+#### Construct
+
+```
+redirect to <zone>
+```
+
+A terminal action (like `allow`/`drop`) that forwards the packet out one
+of the destination zone's interfaces and returns `XDP_REDIRECT`. Valid
+as a Tier 1 rule action (`redirect to wan if <cond>`) and as a Tier 2
+action statement. **Not** valid as a `default` action — `default` admits
+only `allow`/`drop` — so `default redirect to <zone>` is a syntax error.
+
+#### Semantics
+
+The emitter declares one `BPF_MAP_TYPE_DEVMAP` per destination zone
+(`fwl_devmap_<zone>`) and emits `bpf_redirect_map(&fwl_devmap_<zone>, 0,
+0)`. The daemon populates the devmap with the destination zone's egress
+ifindex(es) at load time; for a multi-interface zone the switch chip's
+FDB/MAC learning picks the physical egress port. `redirect` does not
+open a conntrack entry in v0.4 (NAT-driven flow creation is Phase 5).
+
+#### Edge cases
+
+- **Hairpin** (`redirect to <ingress zone>`) is permitted — it forwards
+  back out the arriving zone (an unusual but valid configuration).
+- **Redirect destination down**: the kernel drops the frame at
+  `xdp_do_redirect`; no crash.
+- **Redirect without prior NAT** is valid — pure L2/L3 forwarding.
+
+#### Compile errors
+
+- `redirect to <unknown_zone>` — destination not a declared zone.
+- `redirect to <zone>` in a file that declares no zones.
+
+### 6.4 `pkt.zone` field
+
+#### Construct
+
+```
+@xdp(lan)
+allow if pkt.zone == lan      # constant-true in this block
+drop
+```
+
+`pkt.zone` is a **compile-time constant** within an `@xdp` block — the
+compiler knows the block's zone, so the comparison folds to `1`/`0` in
+the emitted C and to a fixed boolean in the interpreter. Useful in
+shared helpers (future multi-def, § 6.5) that branch on ingress zone.
+
+#### Type rules
+
+Type: zone enum. Operators: `==`, `!=`, and `in [<zone>, ...]`. The RHS
+zone names must be declared. Ordered operators (`<`, `>`, `<=`, `>=`)
+are a compile error.
+
+#### Compile errors
+
+- `pkt.zone` compared against an undeclared zone.
+- `pkt.zone` with an ordered operator.
+- `pkt.zone` in a file that declares no zones.
+
+### Examples
+
+```
+# Stateful gateway: the LAN forwards everything to the WAN; the WAN
+# only lets established return traffic back in.
+zone wan = [wan0]
+zone lan = [lan0, lan1, lan2, lan3]
+
+@xdp(wan)
+allow if conntrack(pkt).state == established
+drop
+
+@xdp(lan)
+redirect to wan
+```
+
+```
+# Port-forward-style steering with a per-zone branch.
+zone wan = [wan0]
+zone lan = [lan0]
+zone dmz = [dmz0]
+
+@xdp(wan)
+redirect to dmz if pkt.proto == tcp and pkt.dst_port in [80, 443]
+drop
+
+@xdp(dmz)
+def from_dmz(pkt):
+  if pkt.zone == dmz:
+    redirect to wan
+  drop
+```
+
 ## Compilation
 
 The two constructs activate parse paths the same way v0.2 fields do:

@@ -1,0 +1,22 @@
+name: an unsolicited NEW flow on wan is dropped
+source_fw: 'zone wan = [wan0]
+
+  zone lan = [lan0, lan1, lan2, lan3]
+
+  @xdp(wan)
+
+  allow if conntrack(pkt).state == established
+
+  drop
+
+  @xdp(lan)
+
+  redirect to wan
+
+  '
+ingress_zone: wan
+test_packet:
+  builder: tcp(src_ip="6.6.6.6", dst_ip="10.0.0.5", src_port=1234, dst_port=22, syn=true)
+expected:
+  compiles: true
+  bpf_action: drop

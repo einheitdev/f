@@ -1,0 +1,17 @@
+name: redirect to a 4-interface zone returns XDP_REDIRECT
+source_fw: 'zone wan = [wan0]
+
+  zone lan = [lan0, lan1, lan2, lan3]
+
+  @xdp(wan)
+
+  redirect to lan
+
+  '
+ingress_zone: wan
+test_packet:
+  builder: tcp(src_ip="8.8.8.8", dst_ip="10.0.0.5", dst_port=51000)
+expected:
+  compiles: true
+  bpf_action: redirect
+  redirect_zone: lan

@@ -1,0 +1,14 @@
+name: an interface in two zones is a compile error
+source_fw: 'zone wan = [eth0]
+
+  zone lan = [eth0]
+
+  @xdp(wan)
+
+  allow
+
+  '
+test_packet:
+  builder: tcp()
+expected:
+  compiles: false

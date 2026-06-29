@@ -1,0 +1,19 @@
+name: redirect gated on a VLAN id
+source_fw: 'zone wan = [wan0]
+
+  zone lan = [lan0, lan1, lan2, lan3]
+
+  @xdp(lan)
+
+  redirect to wan if pkt.vlan_id == 10
+
+  drop
+
+  '
+ingress_zone: lan
+test_packet:
+  builder: tcp(src_ip="10.0.0.5", dst_ip="1.1.1.1", dst_port=80, vlan_id=10)
+expected:
+  compiles: true
+  bpf_action: redirect
+  redirect_zone: wan

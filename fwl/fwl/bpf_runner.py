@@ -543,10 +543,12 @@ def _bpf_prog_test_run(prog_fd: int, packet: bytes) -> XdpAction:
     raise OSError(err, f"BPF_PROG_TEST_RUN failed: errno={err}")
 
   retval = attr.retval
-  # XDP_DROP=1, XDP_PASS=2, XDP_TX=3, XDP_REDIRECT=4. v0.1 only ever
-  # produces PASS or DROP.
+  # XDP_DROP=1, XDP_PASS=2, XDP_TX=3, XDP_REDIRECT=4. v0.4 `redirect to`
+  # produces XDP_REDIRECT (§ 6.3); v0.1-v0.3 only ever PASS or DROP.
   if retval == 1:
     return XdpAction.DROP
   if retval == 2:
     return XdpAction.PASS
+  if retval == 4:
+    return XdpAction.REDIRECT
   raise RuntimeError(f"unexpected XDP retval {retval}")
