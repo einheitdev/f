@@ -179,6 +179,30 @@ def run_full(
   )
 
 
+def run_sequence(
+  c_source: str,
+  packets: list[bytes],
+  map_init: dict[str, dict[bytes, bytes]] | None = None,
+  counter_slots: int = 0,
+  has_log: bool = False,
+) -> list[RunResult]:
+  """Compile + load `c_source` once and run each packet in order.
+
+  The loaded object — and therefore its `conntrack` map — persists
+  across packets, so an allowed NEW packet's created entry is visible
+  to a later packet in the same list (v0.4 multi-packet sequences).
+  """
+  if not _can_load_bpf():
+    raise BpfUnavailable(
+      "kernel BPF load unavailable: not root and "
+      "unprivileged_bpf_disabled is set"
+    )
+  result = compile_c(c_source)
+  return _load_and_run_seq(
+    result.obj_path, packets, map_init or {}, counter_slots, has_log,
+  )
+
+
 def num_possible_cpus() -> int:
   """Return the kernel's nr_cpus_possible (per-CPU map sizing key).
 
@@ -198,19 +222,18 @@ def num_possible_cpus() -> int:
   return count
 
 
-def _load_and_run(
-  obj_path: Path,
-  packet: bytes,
-  map_init: dict[str, dict[bytes, bytes]],
-  counter_slots: int = 0,
-  has_log: bool = False,
-) -> RunResult:
-  """Load `obj_path` via libbpf and BPF_PROG_RUN against `packet`."""
+def _open_libbpf():
+  """Load libbpf and bind the ctypes signatures the runner uses."""
   try:
     libbpf = ctypes.CDLL("libbpf.so.1", use_errno=True)
   except OSError as exc:
     raise BpfUnavailable(f"cannot load libbpf: {exc}") from exc
+  _bind_libbpf_signatures(libbpf)
+  return libbpf
 
+
+def _bind_libbpf_signatures(libbpf) -> None:
+  """Set restype/argtypes on the libbpf entry points the runner calls."""
   libbpf.bpf_object__open_file.restype = ctypes.c_void_p
   libbpf.bpf_object__open_file.argtypes = [
     ctypes.c_char_p, ctypes.c_void_p
@@ -249,6 +272,37 @@ def _load_and_run(
   libbpf.ring_buffer__free.restype = None
   libbpf.ring_buffer__free.argtypes = [ctypes.c_void_p]
 
+
+def _load_and_run(
+  obj_path: Path,
+  packet: bytes,
+  map_init: dict[str, dict[bytes, bytes]],
+  counter_slots: int = 0,
+  has_log: bool = False,
+) -> RunResult:
+  """Load `obj_path` via libbpf and BPF_PROG_RUN against `packet`."""
+  results = _load_and_run_seq(
+    obj_path, [packet], map_init, counter_slots, has_log
+  )
+  return results[0]
+
+
+def _load_and_run_seq(
+  obj_path: Path,
+  packets: list[bytes],
+  map_init: dict[str, dict[bytes, bytes]],
+  counter_slots: int = 0,
+  has_log: bool = False,
+) -> list[RunResult]:
+  """Load `obj_path` once and BPF_PROG_RUN each packet in order.
+
+  Map state (notably the `conntrack` map) persists across runs in the
+  same loaded object, so a multi-packet conntrack sequence — first
+  packet creates an entry, a later packet matches it — is exercised
+  end to end. Counter deltas and log events are read after each run,
+  so each step's RunResult reports only that step's side effects.
+  """
+  libbpf = _open_libbpf()
   obj = libbpf.bpf_object__open_file(
     str(obj_path).encode("utf-8"), None
   )
@@ -266,10 +320,6 @@ def _load_and_run(
     for map_name, entries in map_init.items():
       _populate_map(libbpf, obj, map_name, entries)
 
-    log_events: list[LogEvent] = []
-    if has_log:
-      rb = _setup_ring_buffer(libbpf, obj, log_events)
-
     prog = libbpf.bpf_object__find_program_by_name(
       obj, b"fwl_prog"
     )
@@ -278,22 +328,28 @@ def _load_and_run(
         "BPF program 'fwl_prog' not found in object"
       )
     prog_fd = libbpf.bpf_program__fd(prog)
-    action = _bpf_prog_test_run(prog_fd, packet)
 
-    if rb:
-      libbpf.ring_buffer__consume(rb)
+    results: list[RunResult] = []
+    for packet in packets:
+      log_events: list[LogEvent] = []
+      rb = _setup_ring_buffer(libbpf, obj, log_events) if has_log else None
+      action = _bpf_prog_test_run(prog_fd, packet)
+      if rb:
+        libbpf.ring_buffer__consume(rb)
+        libbpf.ring_buffer__free(rb)
+        rb = None
 
-    counter_deltas: dict[int, int] = {}
-    if counter_slots > 0:
-      counter_deltas = _read_counter_deltas(
-        libbpf, obj, counter_slots
-      )
-
-    return RunResult(
-      action=action,
-      counter_deltas=counter_deltas,
-      log_events=log_events,
-    )
+      counter_deltas: dict[int, int] = {}
+      if counter_slots > 0:
+        counter_deltas = _read_counter_deltas(
+          libbpf, obj, counter_slots
+        )
+      results.append(RunResult(
+        action=action,
+        counter_deltas=counter_deltas,
+        log_events=log_events,
+      ))
+    return results
   finally:
     if rb:
       libbpf.ring_buffer__free(rb)

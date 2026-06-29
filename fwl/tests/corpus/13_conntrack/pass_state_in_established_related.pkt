@@ -1,0 +1,13 @@
+name: "state in [established, related] matches a seeded established entry"
+source_fw: |
+  @xdp(eth0)
+  allow if conntrack(pkt).state in [established, related]
+  default drop
+state:
+  conntrack:
+    - { src_ip: "1.2.3.4", dst_ip: "2.2.2.2", src_port: 12345, dst_port: 80, proto: tcp }
+test_packet:
+  builder: tcp(src_ip="1.2.3.4", dst_ip="2.2.2.2", src_port=12345, dst_port=80, ack=true)
+expected:
+  compiles: true
+  bpf_action: allow

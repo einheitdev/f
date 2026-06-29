@@ -1,0 +1,13 @@
+name: "a UDP query's reply matches the entry the query created"
+source_fw: |
+  @xdp(eth0)
+  allow if conntrack(pkt).state == established
+  allow if pkt.proto == udp and pkt.dst_port == 53
+  default drop
+sequence:
+  - name: DNS query out (new, allowed -> creates entry)
+    builder: udp(src_ip="1.1.1.1", dst_ip="8.8.8.8", src_port=40002, dst_port=53)
+    expected: { bpf_action: allow }
+  - name: DNS reply (established via reverse 5-tuple)
+    builder: udp(src_ip="8.8.8.8", dst_ip="1.1.1.1", src_port=53, dst_port=40002)
+    expected: { bpf_action: allow }

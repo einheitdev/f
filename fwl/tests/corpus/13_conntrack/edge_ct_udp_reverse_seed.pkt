@@ -1,0 +1,13 @@
+name: "a seeded UDP entry is matched by the reverse-direction datagram"
+source_fw: |
+  @xdp(eth0)
+  allow if conntrack(pkt).state == established
+  default drop
+state:
+  conntrack:
+    - { src_ip: "1.1.1.1", dst_ip: "8.8.8.8", src_port: 40010, dst_port: 53, proto: udp }
+test_packet:
+  builder: udp(src_ip="8.8.8.8", dst_ip="1.1.1.1", src_port=53, dst_port=40010)
+expected:
+  compiles: true
+  bpf_action: allow

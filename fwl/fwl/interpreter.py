@@ -50,11 +50,127 @@ _TERMINAL_ACTION_TO_XDP = {
 }
 
 
+# --- v0.4 conntrack state model -------------------------------------
+#
+# The interpreter is the conntrack oracle: it carries a table of
+# forward 5-tuple keys and decides new/established/invalid the same way
+# the emitted BPF program does (FWL_V04_SPEC.md § 4.3 "Semantics"),
+# without sharing code with the emitter. v0.4 tracks IPv4 only — the
+# daemon's `conntrack` map is keyed on 32-bit addresses — so an IPv6
+# or non-IP frame is always NEW and never creates an entry. RELATED is
+# never produced (ICMP-error tracking is deferred).
+
+
+# Sentinel for "this frame is not conntracked" — an IPv6 frame (v0.4
+# conntrack is IPv4-only) or a frame with no readable IPv4 5-tuple.
+_UNTRACKED = None
+
+
+def _ct_key(packet: dict[str, Any]) -> tuple | None:
+  """Forward 5-tuple key for `packet`, or `_UNTRACKED` when untracked.
+
+  Untracked covers IPv6 frames (v0.4 conntrack is IPv4-only) and frames
+  with no readable IPv4 5-tuple (non-IP or truncated below L3). Ports
+  default to 0 for ICMP and any frame without an L4 header, mirroring
+  the BPF key (where the port fields stay 0).
+  """
+  src = packet.get("src_ip")
+  dst = packet.get("dst_ip")
+  proto = packet.get("proto")
+  if (packet.get("ether_type") == 0x86DD
+      or src is None or dst is None or proto is None):
+    return _UNTRACKED
+  sport = int(packet.get("src_port") or 0)
+  dport = int(packet.get("dst_port") or 0)
+  return (proto, _ipv4_to_int(src), _ipv4_to_int(dst), sport, dport)
+
+
+class ConntrackTable:
+  """Mutable set of forward 5-tuple keys, the interpreter's CT state.
+
+  A connection is ESTABLISHED when the packet's forward key or its
+  reverse (src/dst and sport/dport swapped) is present — matching the
+  BPF lookup's forward-then-reverse probe. `create` adds the forward
+  key, the side effect an allowed NEW packet produces.
+  """
+  def __init__(self, entries=None):
+    self._fwd: set[tuple] = set(entries or ())
+
+  def state_for(self, packet: dict[str, Any]) -> ast.CtState:
+    """Classify `packet` against the current table."""
+    key = _ct_key(packet)
+    if key is None:
+      return ast.CtState.NEW
+    proto, src, dst, sport, dport = key
+    rev = (proto, dst, src, dport, sport)
+    if key in self._fwd or rev in self._fwd:
+      return ast.CtState.ESTABLISHED
+    # A TCP segment with no SYN for an untracked flow is a state-machine
+    # violation (data/ACK/RST without a handshake we ever saw).
+    if proto == "tcp" and not packet.get("syn", False):
+      return ast.CtState.INVALID
+    return ast.CtState.NEW
+
+  def create(self, packet: dict[str, Any]) -> None:
+    """Insert `packet`'s forward key (no-op for untracked frames)."""
+    key = _ct_key(packet)
+    if key is not None:
+      self._fwd.add(key)
+
+
+def _program_uses_conntrack(program: ast.Program) -> bool:
+  """True iff any rule or Tier 2 statement reads conntrack(pkt).state.
+
+  Duplicated from the emitter's equivalent walk rather than imported:
+  the oracle-independence rule (F_DEVELOPMENT_METHODOLOGY.md:307-311)
+  keeps the interpreter from sharing the emitter's analysis, exactly
+  as `_program_touches_v6_surface` mirrors `emitter._is_v6_active`.
+  """
+  for rule in program.rules:
+    if _condition_uses_conntrack(rule.condition):
+      return True
+  if program.function is not None:
+    if _stmts_use_conntrack(program.function.body):
+      return True
+  return False
+
+
+def _stmts_use_conntrack(stmts) -> bool:
+  for s in stmts:
+    if isinstance(s, ast.AssignStmt):
+      if _condition_uses_conntrack(s.rhs):
+        return True
+    elif isinstance(s, ast.IfStmt):
+      if _condition_uses_conntrack(s.cond):
+        return True
+      if _stmts_use_conntrack(s.body):
+        return True
+      for cond, body in s.elif_branches:
+        if _condition_uses_conntrack(cond):
+          return True
+        if _stmts_use_conntrack(body):
+          return True
+      if s.else_body is not None and _stmts_use_conntrack(s.else_body):
+        return True
+  return False
+
+
+def _condition_uses_conntrack(node) -> bool:
+  if isinstance(node, ast.ConntrackStateCompare):
+    return True
+  if isinstance(node, ast.NotOp):
+    return _condition_uses_conntrack(node.inner)
+  if isinstance(node, (ast.AndOp, ast.OrOp)):
+    return any(_condition_uses_conntrack(c) for c in node.operands)
+  return False
+
+
 def evaluate(
   program: ast.Program,
   packet: dict[str, Any],
   state: dict[int, dict[Any, int]] | None = None,
   geoip_data: dict[str, list[str]] | None = None,
+  conntrack: ConntrackTable | None = None,
 ) -> XdpAction:
   """Run `program` against `packet` and return the resulting XDP action.
 
@@ -81,7 +197,9 @@ def evaluate(
   matches the BPF emitter's behaviour: a v0.1-shaped program produces
   no v6 parse path, so v6 frames hit the default action.
   """
-  return evaluate_full(program, packet, state, geoip_data).action
+  return evaluate_full(
+    program, packet, state, geoip_data, conntrack
+  ).action
 
 
 def evaluate_full(
@@ -89,20 +207,37 @@ def evaluate_full(
   packet: dict[str, Any],
   state: dict[int, dict[Any, int]] | None = None,
   geoip_data: dict[str, list[str]] | None = None,
+  conntrack: ConntrackTable | None = None,
 ) -> EvalResult:
   """Run `program` against `packet` and return full results.
 
   Like evaluate() but also returns counter_changes and log_events.
+
+  v0.4: when the program reads `conntrack(pkt).state`, the `conntrack`
+  table supplies the connection state (built from the .pkt's
+  `state.conntrack` seed and/or carried across a multi-packet
+  sequence). An explicit `allow` of a NEW IPv4 packet inserts the
+  forward 5-tuple into the table — the side effect a later packet in
+  the sequence observes as ESTABLISHED. The implicit fall-through
+  XDP_PASS does not create an entry (only an explicit allow rule or
+  `default allow` does).
   """
   state = state or {}
   geoip_data = geoip_data or {}
   packet = _gate_v6_packet_for_v01_program(program, packet)
-  ctx = _Ctx(geoip_data=geoip_data)
+  uses_ct = _program_uses_conntrack(program)
+  ct = conntrack if conntrack is not None else ConntrackTable()
+  ct_state = ct.state_for(packet)
+  ctx = _Ctx(geoip_data=geoip_data, ct_state=ct_state)
   counters: dict[str, int] = {}
   log_events: list[LogEvent] = []
   if program.function is not None:
     result = _exec_tier2(program.function, packet, ctx, state)
     action = result if result is not None else XdpAction.PASS
+    # An explicit `allow` statement (result is PASS, not the
+    # fall-through None) of a NEW packet creates conntrack state.
+    if uses_ct and result is XdpAction.PASS and ct_state == ast.CtState.NEW:
+      ct.create(packet)
     return EvalResult(action=action)
   for idx, rule in enumerate(program.rules):
     if rule.condition is not None and not _eval(
@@ -113,6 +248,9 @@ def evaluate_full(
       if not _rate_limit_allows(rule.modifier, idx, packet, state):
         continue
     if rule.action in _TERMINAL_ACTION_TO_XDP:
+      if (uses_ct and rule.action == ast.Action.ALLOW
+          and ct_state == ast.CtState.NEW):
+        ct.create(packet)
       return EvalResult(
         action=_TERMINAL_ACTION_TO_XDP[rule.action],
         counter_changes=counters,
@@ -130,6 +268,12 @@ def evaluate_full(
         log_events.append(_build_log_event(idx, packet))
   if program.default is not None:
     action = _TERMINAL_ACTION_TO_XDP[program.default.action]
+    # An explicit `default allow` of a NEW packet creates state, the
+    # same as an explicit allow rule. The implicit fall-through PASS
+    # (no `default` clause) does not.
+    if (uses_ct and program.default.action == ast.Action.ALLOW
+        and ct_state == ast.CtState.NEW):
+      ct.create(packet)
   else:
     action = XdpAction.PASS
   return EvalResult(
@@ -221,6 +365,8 @@ def _eval_scalar(
     return bool(val) if val is not None else False
   if isinstance(expr, ast.Comparison):
     return _eval_tier2_comparison(expr, packet, ctx, locals_)
+  if isinstance(expr, ast.ConntrackStateCompare):
+    return _eval_ct_state_compare(expr, ctx.ct_state)
   if isinstance(expr, ast.NotOp):
     return not _eval_scalar(expr.inner, packet, ctx, locals_)
   if isinstance(expr, ast.AndOp):
@@ -550,8 +696,17 @@ class _Ctx:
   Ctx avoids threading more positional arguments through every node-
   evaluation function.
   """
-  def __init__(self, *, geoip_data: dict[str, list[str]]):
+  def __init__(
+    self,
+    *,
+    geoip_data: dict[str, list[str]],
+    ct_state: ast.CtState = ast.CtState.NEW,
+  ):
     self.geoip_data = geoip_data
+    # The conntrack state of the packet under evaluation, computed once
+    # from the conntrack table (v0.4). Every conntrack(pkt).state read
+    # in this packet's evaluation sees the same value.
+    self.ct_state = ct_state
     # Per-call resolved prefix lists keyed by the GeoIp call_index.
     # Memoising keeps repeated lookups cheap when a rule fires per
     # packet across a corpus run.
@@ -582,6 +737,8 @@ def _eval(
     val = node.operand.value  # type: ignore[union-attr]
     op_fn = _COUNT_OPS.get(node.op)
     return op_fn(cur, val) if op_fn else False
+  if isinstance(node, ast.ConntrackStateCompare):
+    return _eval_ct_state_compare(node, ctx.ct_state)
   if isinstance(node, ast.BoolField):
     return bool(packet.get(_field_key(node.field.name), False))
   if isinstance(node, ast.NotOp):
@@ -599,6 +756,19 @@ def _eval(
   raise NotImplementedError(
     f"interpreter: unsupported node {type(node).__name__}"
   )
+
+
+def _eval_ct_state_compare(
+  node: ast.ConntrackStateCompare, ct_state: ast.CtState
+) -> bool:
+  """Evaluate `conntrack(pkt).state <op> ...` against the packet's state."""
+  if node.op == "==":
+    return ct_state == node.states[0]
+  if node.op == "!=":
+    return ct_state != node.states[0]
+  if node.op == "in":
+    return ct_state in node.states
+  raise AssertionError(f"unexpected ct_state op {node.op}")
 
 
 def _field_key(name: str) -> str:

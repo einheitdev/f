@@ -1,0 +1,10 @@
+name: "a new packet does not match established and hits the default drop"
+source_fw: |
+  @xdp(eth0)
+  allow if conntrack(pkt).state == established
+  default drop
+test_packet:
+  builder: tcp(src_ip="1.1.1.1", dst_ip="2.2.2.2", dst_port=80, syn=true)
+expected:
+  compiles: true
+  bpf_action: drop

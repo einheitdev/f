@@ -1,0 +1,10 @@
+name: "an untracked non-SYN TCP segment reads invalid and is dropped"
+source_fw: |
+  @xdp(eth0)
+  drop if conntrack(pkt).state == invalid
+  allow
+test_packet:
+  builder: tcp(src_ip="9.9.9.9", dst_ip="2.2.2.2", dst_port=80, ack=true)
+expected:
+  compiles: true
+  bpf_action: drop

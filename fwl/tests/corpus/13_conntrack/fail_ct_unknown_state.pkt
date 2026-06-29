@@ -1,0 +1,9 @@
+name: "an unknown conntrack state keyword is a compile error"
+source_fw: |
+  @xdp(eth0)
+  allow if conntrack(pkt).state == bogus
+  default drop
+test_packet:
+  builder: tcp(dst_port=80)
+expected:
+  compiles: false

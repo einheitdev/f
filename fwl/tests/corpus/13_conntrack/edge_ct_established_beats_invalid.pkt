@@ -1,0 +1,14 @@
+name: "a non-SYN packet that matches an entry is established, not invalid"
+source_fw: |
+  @xdp(eth0)
+  drop if conntrack(pkt).state == invalid
+  allow if conntrack(pkt).state == established
+  default drop
+state:
+  conntrack:
+    - { src_ip: "1.2.3.4", dst_ip: "2.2.2.2", src_port: 12345, dst_port: 80, proto: tcp }
+test_packet:
+  builder: tcp(src_ip="1.2.3.4", dst_ip="2.2.2.2", src_port=12345, dst_port=80, ack=true)
+expected:
+  compiles: true
+  bpf_action: allow

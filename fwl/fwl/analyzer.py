@@ -341,6 +341,9 @@ def _infer_scalar_type(
   if isinstance(expr, (ast.AndOp, ast.OrOp, ast.NotOp)):
     _check_condition(expr, ctx, guards)
     return ast.LocalType.BOOL
+  if isinstance(expr, ast.ConntrackStateCompare):
+    _check_ct_state_compare(expr)
+    return ast.LocalType.BOOL
   if isinstance(expr, ast.RateLimitCall):
     raise FwlException(FwlError(
       category="semantic",
@@ -406,6 +409,9 @@ def _check_condition(
     _check_tier2_comparison(cond, ctx, guards)
     return
   if isinstance(cond, ast.BoolField):
+    return
+  if isinstance(cond, ast.ConntrackStateCompare):
+    _check_ct_state_compare(cond)
     return
   if isinstance(cond, ast.LocalRead):
     if cond.name not in ctx.locals:
@@ -1361,6 +1367,29 @@ def _bind_geoip(node: ast.GeoIp, family: str) -> None:
   node.family = family
 
 
+def _check_ct_state_compare(node: ast.ConntrackStateCompare) -> None:
+  """Validate a `conntrack(pkt).state` comparison (FWL_V04_SPEC.md § 4.3).
+
+  ct_state admits only equality (==/!=) and set membership (in). The
+  grammar routes `in` through its own dedicated production, so `op`
+  here is `in` or one of the comp_op operators; the ordered operators
+  (<, >, <=, >=) are rejected with a typed message rather than the
+  bare syntax error a dedicated `==`/`!=` grammar rule would give.
+  No protocol guard is required — conntrack is read on any frame (a
+  non-IP or IPv6 frame reads NEW), so this returns without touching
+  the guard state.
+  """
+  if node.op not in ("==", "!=", "in"):
+    raise FwlException(FwlError(
+      category="semantic",
+      message=(
+        f"conntrack(pkt).state supports only '==', '!=' and 'in'; "
+        f"got '{node.op}'"
+      ),
+      span=node.span,
+    ))
+
+
 def _check(node: ast.Condition, possible: Possible) -> Possible:
   """Walk a condition node enforcing protocol guards.
 
@@ -1379,6 +1408,10 @@ def _check(node: ast.Condition, possible: Possible) -> Possible:
     return possible
 
   if isinstance(node, ast.CountCompare):
+    return possible
+
+  if isinstance(node, ast.ConntrackStateCompare):
+    _check_ct_state_compare(node)
     return possible
 
   if isinstance(node, ast.BoolField):

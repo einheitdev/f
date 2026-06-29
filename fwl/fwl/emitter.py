@@ -85,6 +85,51 @@ _TERMINAL_ACTION_TO_RETURN = {
 }
 
 
+# Numeric encoding of conntrack states in the emitted C. NEW is 0 so an
+# unparsed (non-IP / IPv6) frame's zero-initialized `ct_state` reads as
+# NEW for free. ESTABLISHED/RELATED/INVALID follow; RELATED is never
+# produced in v0.4 (deferred), but the keyword is encoded for the rare
+# `== related` comparison (which thus never matches).
+_CT_STATE_TO_INT = {
+  ast.CtState.NEW: 0,
+  ast.CtState.ESTABLISHED: 1,
+  ast.CtState.RELATED: 2,
+  ast.CtState.INVALID: 3,
+}
+
+
+# The conntrack map's key/value structs and the map declaration. The
+# layout MUST byte-match include/f/types.h (struct ConnKey / ConnValue)
+# so the emitted program references the daemon's pinned `conntrack` map.
+# Addresses are network byte order (raw ip->saddr); ports are host byte
+# order (the prelude's bpf_ntohs'd src_port/dst_port). Emitted only when
+# the program reads conntrack(pkt).state.
+_CONNTRACK_DECL = """\
+struct fwl_conn_key {
+  __u32 src_addr;
+  __u32 dst_addr;
+  __u16 src_port;
+  __u16 dst_port;
+  __u8  proto;
+  __u8  pad[3];
+};
+
+struct fwl_conn_value {
+  __u64 last_seen_ns;
+  __u64 packets;
+  __u8  state;
+  __u8  pad[7];
+};
+
+struct {
+  __uint(type, BPF_MAP_TYPE_HASH);
+  __uint(max_entries, 65536);
+  __type(key, struct fwl_conn_key);
+  __type(value, struct fwl_conn_value);
+} conntrack SEC(".maps");
+"""
+
+
 _LOG_EVENT_DECL = """\
 struct fwl_log_event {
   __u64 timestamp_ns;
@@ -163,7 +208,61 @@ def _referenced_fields(program: ast.Program) -> set[str]:
       ast.FIELD_SRC_PORT, ast.FIELD_DST_PORT,
       ast.FIELD_TCP_SYN, ast.FIELD_TCP_ACK,
     })
+  # Conntrack builds its 5-tuple from the L4 ports and tests the SYN
+  # flag for the `invalid` classification, so reading conntrack(pkt)
+  # forces those reads into the prelude even when no rule names them.
+  if _program_uses_conntrack(program):
+    fields.update({
+      ast.FIELD_SRC_PORT, ast.FIELD_DST_PORT, ast.FIELD_TCP_SYN,
+    })
   return fields
+
+
+def _program_uses_conntrack(program: ast.Program) -> bool:
+  """True iff any rule or Tier 2 statement reads conntrack(pkt).state.
+
+  Mirrors interpreter._program_uses_conntrack; kept separate per the
+  oracle-independence rule (the emitter and interpreter do not share
+  analysis code), exactly as _is_v6_active mirrors the interpreter's
+  _program_touches_v6_surface.
+  """
+  for rule in program.rules:
+    if _cond_uses_conntrack(rule.condition):
+      return True
+  if program.function is not None:
+    if _stmts_use_conntrack(program.function.body):
+      return True
+  return False
+
+
+def _stmts_use_conntrack(stmts) -> bool:
+  for s in stmts:
+    if isinstance(s, ast.AssignStmt):
+      if _cond_uses_conntrack(s.rhs):
+        return True
+    elif isinstance(s, ast.IfStmt):
+      if _cond_uses_conntrack(s.cond):
+        return True
+      if _stmts_use_conntrack(s.body):
+        return True
+      for cond, body in s.elif_branches:
+        if _cond_uses_conntrack(cond):
+          return True
+        if _stmts_use_conntrack(body):
+          return True
+      if s.else_body is not None and _stmts_use_conntrack(s.else_body):
+        return True
+  return False
+
+
+def _cond_uses_conntrack(node) -> bool:
+  if isinstance(node, ast.ConntrackStateCompare):
+    return True
+  if isinstance(node, ast.NotOp):
+    return _cond_uses_conntrack(node.inner)
+  if isinstance(node, (ast.AndOp, ast.OrOp)):
+    return any(_cond_uses_conntrack(c) for c in node.operands)
+  return False
 
 
 def _collect_tier2_field_refs(stmts, fields: set[str]) -> bool:
@@ -356,6 +455,7 @@ def _emit_parse_prelude(program: ast.Program) -> str:
   needs_icmp = _needs_icmp(fields)
   needs_icmp6 = _needs_icmp6(fields)
   v6_active = _is_v6_active(program)
+  uses_ct = _program_uses_conntrack(program)
 
   decls: list[str] = ["__u8 proto = 0;"]
   # v4_ok gates every v4-field comparison so that v6-packet (or non-IP
@@ -419,6 +519,17 @@ def _emit_parse_prelude(program: ast.Program) -> str:
     decls.append("__u16 vlan_id = 0;")
   if needs_vlan_priority:
     decls.append("__u8 vlan_priority = 0;")
+  # v0.4 conntrack scratch. ct_state defaults 0 (NEW) so a non-IP or
+  # IPv6 frame — where the v4 ct lookup never runs — reads NEW for
+  # free. ct_v4 gates entry creation to IPv4 packets; the ct_k_*
+  # fields stash the forward 5-tuple so an allow can recreate the key
+  # at the function tail (where `ip` is out of scope).
+  if uses_ct:
+    decls.append("__u8 ct_state = 0;")
+    decls.append("__u8 ct_v4 = 0;")
+    decls.append("__u32 ct_k_src = 0, ct_k_dst = 0;")
+    decls.append("__u16 ct_k_sport = 0, ct_k_dport = 0;")
+    decls.append("__u8 ct_k_proto = 0;")
 
   decl_block = "\n".join("  " + d for d in decls)
 
@@ -506,6 +617,40 @@ def _emit_parse_prelude(program: ast.Program) -> str:
 {{{tcp_block}{udp_block}{icmp_block}
         }}"""
 
+  # v0.4 conntrack lookup, emitted inside the IPv4 branch where `ip` is
+  # in scope. Builds the forward + reverse 5-tuple keys from the
+  # network-order addresses (raw ip->saddr/daddr — NOT the host-order
+  # src_ip var) and the host-order ports, probes the conntrack map
+  # forward-then-reverse, and classifies the state: a hit (either
+  # direction) is ESTABLISHED; a SYN-less TCP miss is INVALID; anything
+  # else stays NEW. v0.4 tracks IPv4 only, so the v6 branch leaves
+  # ct_state at its NEW default.
+  ct_block = ""
+  if uses_ct:
+    ct_block = """
+        ct_v4 = 1;
+        ct_k_src = ip->saddr;
+        ct_k_dst = ip->daddr;
+        ct_k_sport = src_port;
+        ct_k_dport = dst_port;
+        ct_k_proto = proto;
+        struct fwl_conn_key _ct_f = {
+          .src_addr = ip->saddr, .dst_addr = ip->daddr,
+          .src_port = src_port, .dst_port = dst_port, .proto = proto,
+        };
+        struct fwl_conn_key _ct_r = {
+          .src_addr = ip->daddr, .dst_addr = ip->saddr,
+          .src_port = dst_port, .dst_port = src_port, .proto = proto,
+        };
+        struct fwl_conn_value *_ct_v =
+          bpf_map_lookup_elem(&conntrack, &_ct_f);
+        if (!_ct_v) _ct_v = bpf_map_lookup_elem(&conntrack, &_ct_r);
+        if (_ct_v) {
+          ct_state = 1;
+        } else if (proto == IPPROTO_TCP && !tcp_syn) {
+          ct_state = 3;
+        }"""
+
   v6_branch = ""
   if v6_active:
     v6_branch = _emit_v6_branch(fields, needs_l4, needs_tcp, needs_icmp6)
@@ -567,7 +712,7 @@ def _emit_parse_prelude(program: ast.Program) -> str:
       struct iphdr *ip = l3;
       if ((void *)(ip + 1) <= data_end) {{
         v4_ok = 1;
-        proto = ip->protocol;{ip_read_block}{l4_block}
+        proto = ip->protocol;{ip_read_block}{l4_block}{ct_block}
       }}
     }}{v6_branch}
   }}
@@ -696,6 +841,8 @@ def _emit_condition(
     return _emit_comparison(node)
   if isinstance(node, ast.CountCompare):
     return _emit_count_compare(node, counter_slots or {})
+  if isinstance(node, ast.ConntrackStateCompare):
+    return _emit_ct_state_compare(node)
   if isinstance(node, ast.BoolField):
     return _emit_bool_field(node)
   if isinstance(node, ast.NotOp):
@@ -729,6 +876,23 @@ def _emit_count_compare(
     f"__u64 *_cv = bpf_map_lookup_elem(&fwl_counters, &_ck); "
     f"_cv ? (*_cv {node.op} {val}) : (0 {node.op} {val}); }})"
   )
+
+
+def _emit_ct_state_compare(node: ast.ConntrackStateCompare) -> str:
+  """Emit a C boolean expression for a conntrack(pkt).state comparison.
+
+  `ct_state` is the u8 the prelude computed (0=new, 1=established,
+  2=related, 3=invalid). No `*_ok` gate is needed: a non-IP or IPv6
+  frame leaves ct_state at 0 (NEW), which is the correct conntrack
+  reading for an untracked frame.
+  """
+  if node.op == "==":
+    return f"(ct_state == {_CT_STATE_TO_INT[node.states[0]]})"
+  if node.op == "!=":
+    return f"(ct_state != {_CT_STATE_TO_INT[node.states[0]]})"
+  # `in`: OR over the listed states.
+  parts = [f"(ct_state == {_CT_STATE_TO_INT[s]})" for s in node.states]
+  return "(" + " || ".join(parts) + ")"
 
 
 def _emit_bool_field(node: ast.BoolField) -> str:
@@ -1030,25 +1194,55 @@ def _emit_vlan_compare(cmp: ast.Comparison) -> str:
   return f"(vlan_ok && ({c_field} {cmp.op} {val}))"
 
 
+def _emit_ct_create(indent: str = "    ") -> str:
+  """Conntrack entry-creation snippet (the body before an allow return).
+
+  Inserts the forward 5-tuple when the packet is an allowed NEW IPv4
+  flow (`ct_v4 && ct_state == 0`). BPF_NOEXIST keeps it idempotent and
+  lets the daemon's slow path win an insert race. Mirrors the
+  interpreter's `ConntrackTable.create` on an explicit allow.
+  """
+  return (
+    f"if (ct_v4 && ct_state == 0) {{\n"
+    f"{indent}  struct fwl_conn_key _ct_ck = {{\n"
+    f"{indent}    .src_addr = ct_k_src, .dst_addr = ct_k_dst,\n"
+    f"{indent}    .src_port = ct_k_sport, .dst_port = ct_k_dport,\n"
+    f"{indent}    .proto = ct_k_proto,\n"
+    f"{indent}  }};\n"
+    f"{indent}  struct fwl_conn_value _ct_cv = {{\n"
+    f"{indent}    .last_seen_ns = bpf_ktime_get_ns(),"
+    f" .packets = 1, .state = 1,\n"
+    f"{indent}  }};\n"
+    f"{indent}  bpf_map_update_elem("
+    f"&conntrack, &_ct_ck, &_ct_cv, BPF_NOEXIST);\n"
+    f"{indent}}}\n"
+    f"{indent}"
+  )
+
+
 def _emit_rule(
-  rule: ast.Rule, idx: int, counter_slots: dict[str, int]
+  rule: ast.Rule, idx: int, counter_slots: dict[str, int],
+  ct_create: str = "",
 ) -> str:
   """Emit C statements for one rule.
 
   Terminal actions return; non-terminal actions execute their side
   effect and fall through to the next rule. A rate_limit modifier
   gates the entire rule body — when blocked, neither the action's
-  side effect nor return fires.
+  side effect nor return fires. `ct_create` (non-empty only when the
+  program reads conntrack) is the entry-creation snippet prepended to
+  an `allow` return so an allowed NEW flow is tracked.
   """
   overflow_slot = counter_slots.get(RATE_LIMIT_OVERFLOW_COUNTER)
   if rule.action in _TERMINAL_ACTION_TO_RETURN:
     ret = _TERMINAL_ACTION_TO_RETURN[rule.action]
+    create = ct_create if rule.action == ast.Action.ALLOW else ""
     if rule.modifier is not None:
       fire_block = _emit_rate_limit_gate(
-        rule.modifier, idx, ret, overflow_slot
+        rule.modifier, idx, ret, overflow_slot, create
       )
     else:
-      fire_block = f"return {ret};"
+      fire_block = f"{create}return {ret};"
   else:
     # Non-terminal: emit the side effect, no return.
     if rule.action == ast.Action.LOG:
@@ -1157,6 +1351,7 @@ def _emit_rate_limit_side_effect(
 def _emit_rate_limit_gate(
   mod: ast.RateLimit, idx: int, ret: str,
   overflow_slot: int | None,
+  ct_create: str = "",
 ) -> str:
   """Emit a rate-limit gate that returns `ret` only when rate exceeded.
 
@@ -1183,7 +1378,7 @@ def _emit_rate_limit_gate(
     int upd_rc = bpf_map_update_elem(
       &fwl_rl_map_{idx}, &rl_key, &new_st, BPF_ANY);{ovf}
     if (cur >= {mod.threshold}) {{
-      return {ret};
+      {ct_create}return {ret};
     }}"""
 
 
@@ -1325,6 +1520,9 @@ def emit(program: ast.Program) -> str:
   prelude = _emit_parse_prelude(program)
   rl_maps = _emit_rl_maps(program)
   geoip_block = _emit_geoip_maps_and_helpers(program)
+  uses_ct = _program_uses_conntrack(program)
+  conntrack_decl = _CONNTRACK_DECL if uses_ct else ""
+  ct_create = _emit_ct_create() if uses_ct else ""
 
   counter_slots = _allocate_counter_slots(program)
   has_log = _program_uses_log(program)
@@ -1355,23 +1553,32 @@ def emit(program: ast.Program) -> str:
     counter_table = ""
 
   if program.function is not None:
-    body, final_return = _emit_tier2_body(
-      program.function, counter_slots, program
+    body, _ = _emit_tier2_body(
+      program.function, counter_slots, program, ct_create
     )
+    # Tier 2 fall-through is an implicit XDP_PASS (no rule "allowed"
+    # the packet), so it does not create conntrack state.
+    final_stmt = "return XDP_PASS;"
   else:
     body = "".join(
-      _emit_rule(r, i, counter_slots) for i, r in enumerate(program.rules)
+      _emit_rule(r, i, counter_slots, ct_create)
+      for i, r in enumerate(program.rules)
     )
     if program.default is not None:
-      final_return = _TERMINAL_ACTION_TO_RETURN[program.default.action]
+      ret = _TERMINAL_ACTION_TO_RETURN[program.default.action]
+      # An explicit `default allow` creates state like any allow; an
+      # explicit `default drop` (or the implicit fall-through below)
+      # does not.
+      create = ct_create if program.default.action == ast.Action.ALLOW else ""
+      final_stmt = f"{create}return {ret};"
     else:
-      final_return = "XDP_PASS"
+      final_stmt = "return XDP_PASS;"
 
   return f"""{_HEADER}
-{log_decl}{log_sample_decl}{counter_decl}{rl_maps}{geoip_block}
+{log_decl}{log_sample_decl}{counter_decl}{rl_maps}{geoip_block}{conntrack_decl}
 SEC("xdp")
 int fwl_prog(struct xdp_md *ctx) {{
-{prelude}{body}  return {final_return};
+{prelude}{body}  {final_stmt}
 }}
 
 char _license[] SEC("license") = "GPL";
@@ -1485,6 +1692,7 @@ def _emit_tier2_body(
   func: ast.FunctionDef,
   counter_slots: dict[str, int],
   program: ast.Program,
+  ct_create: str = "",
 ) -> tuple[str, str]:
   """Emit the body of a Tier 2 function. Returns (body, final_return)."""
   locals_: dict[str, ast.LocalType] = {}
@@ -1500,16 +1708,19 @@ def _emit_tier2_body(
   decl_block = "\n".join(decls)
   if decl_block:
     decl_block += "\n"
-  ctx = _Tier2EmitCtx(locals=locals_, counter_slots=counter_slots)
+  ctx = _Tier2EmitCtx(
+    locals=locals_, counter_slots=counter_slots, ct_create=ct_create
+  )
   body_text = _emit_tier2_stmts(func.body, ctx, indent="  ")
   return decl_block + body_text, "XDP_PASS"
 
 
 class _Tier2EmitCtx:
   """Mutable context threaded through Tier 2 emission."""
-  def __init__(self, *, locals, counter_slots):
+  def __init__(self, *, locals, counter_slots, ct_create=""):
     self.locals = locals
     self.counter_slots = counter_slots
+    self.ct_create = ct_create
 
 
 def _emit_tier2_stmts(stmts, ctx: _Tier2EmitCtx, indent: str) -> str:
@@ -1522,7 +1733,7 @@ def _emit_tier2_stmts(stmts, ctx: _Tier2EmitCtx, indent: str) -> str:
 def _emit_tier2_stmt(stmt, ctx: _Tier2EmitCtx, indent: str) -> str:
   if isinstance(stmt, ast.ActionStmt):
     if stmt.action == ast.Action.ALLOW:
-      return f"{indent}return XDP_PASS;\n"
+      return f"{indent}{ctx.ct_create}return XDP_PASS;\n"
     if stmt.action == ast.Action.DROP:
       return f"{indent}return XDP_DROP;\n"
     if stmt.action == ast.Action.LOG:
@@ -1596,6 +1807,8 @@ def _emit_scalar(expr, ctx: _Tier2EmitCtx) -> str:
     return _emit_field_read_scalar(expr.field.name)
   if isinstance(expr, ast.Comparison):
     return _emit_tier2_comparison(expr, ctx)
+  if isinstance(expr, ast.ConntrackStateCompare):
+    return _emit_ct_state_compare(expr)
   if isinstance(expr, ast.AndOp):
     parts = [f"({_emit_scalar(c, ctx)})" for c in expr.operands]
     return "(" + " && ".join(parts) + ")"

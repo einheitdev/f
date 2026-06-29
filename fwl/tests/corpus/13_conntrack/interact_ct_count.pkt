@@ -1,0 +1,16 @@
+name: "count() bumps on an established conntrack match"
+source_fw: |
+  @xdp(eth0)
+  count ct_hits if conntrack(pkt).state == established
+  allow if conntrack(pkt).state == established
+  default drop
+state:
+  conntrack:
+    - { src_ip: "1.2.3.4", dst_ip: "2.2.2.2", src_port: 54000, dst_port: 80, proto: tcp }
+test_packet:
+  builder: tcp(src_ip="1.2.3.4", dst_ip="2.2.2.2", src_port=54000, dst_port=80, ack=true)
+expected:
+  compiles: true
+  bpf_action: allow
+  counter_changes:
+    ct_hits: 1

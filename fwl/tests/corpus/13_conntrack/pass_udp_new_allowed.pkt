@@ -1,0 +1,10 @@
+name: "an untracked UDP datagram reads new and is allowed"
+source_fw: |
+  @xdp(eth0)
+  allow if conntrack(pkt).state == new
+  default drop
+test_packet:
+  builder: udp(src_ip="1.1.1.1", dst_ip="8.8.8.8", dst_port=53)
+expected:
+  compiles: true
+  bpf_action: allow

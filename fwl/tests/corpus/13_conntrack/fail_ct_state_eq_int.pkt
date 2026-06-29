@@ -1,0 +1,9 @@
+name: "comparing ct_state against an integer is rejected"
+source_fw: |
+  @xdp(eth0)
+  allow if conntrack(pkt).state == 1
+  default drop
+test_packet:
+  builder: tcp(dst_port=80)
+expected:
+  compiles: false

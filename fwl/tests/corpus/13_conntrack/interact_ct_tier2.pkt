@@ -1,0 +1,16 @@
+name: "conntrack(pkt).state inside a Tier 2 function"
+source_fw: |
+  @xdp(eth0)
+  def filter(pkt):
+    if conntrack(pkt).state == established:
+      allow
+    if pkt.proto == tcp and pkt.tcp.syn and pkt.dst_port == 80:
+      allow
+    drop
+sequence:
+  - name: SYN out (new, allowed -> creates entry)
+    builder: tcp(src_ip="1.1.1.1", dst_ip="2.2.2.2", src_port=52000, dst_port=80, syn=true)
+    expected: { bpf_action: allow }
+  - name: reply (established)
+    builder: tcp(src_ip="2.2.2.2", dst_ip="1.1.1.1", src_port=80, dst_port=52000, syn=true, ack=true)
+    expected: { bpf_action: allow }

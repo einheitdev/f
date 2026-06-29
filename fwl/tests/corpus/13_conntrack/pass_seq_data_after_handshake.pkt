@@ -1,0 +1,13 @@
+name: "same-direction data after an allowed SYN reads established"
+source_fw: |
+  @xdp(eth0)
+  allow if conntrack(pkt).state == established
+  allow if pkt.proto == tcp and pkt.tcp.syn and pkt.dst_port == 80
+  default drop
+sequence:
+  - name: client SYN out (creates entry)
+    builder: tcp(src_ip="1.1.1.1", dst_ip="2.2.2.2", src_port=40001, dst_port=80, syn=true)
+    expected: { bpf_action: allow }
+  - name: client data (same direction, no SYN, established)
+    builder: tcp(src_ip="1.1.1.1", dst_ip="2.2.2.2", src_port=40001, dst_port=80, ack=true, psh=true)
+    expected: { bpf_action: allow }

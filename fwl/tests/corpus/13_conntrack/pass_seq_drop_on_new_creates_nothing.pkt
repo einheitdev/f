@@ -1,0 +1,12 @@
+name: "a dropped new packet creates no entry, so the reply is dropped too"
+source_fw: |
+  @xdp(eth0)
+  allow if conntrack(pkt).state == established
+  default drop
+sequence:
+  - name: new SYN, only established is allowed -> dropped, no entry created
+    builder: tcp(src_ip="1.1.1.1", dst_ip="2.2.2.2", src_port=40003, dst_port=80, syn=true)
+    expected: { bpf_action: drop }
+  - name: would-be reply still finds no entry -> new -> dropped
+    builder: tcp(src_ip="2.2.2.2", dst_ip="1.1.1.1", src_port=80, dst_port=40003, syn=true, ack=true)
+    expected: { bpf_action: drop }

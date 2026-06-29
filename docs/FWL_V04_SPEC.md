@@ -23,6 +23,12 @@ typed packet accessor with a protocol guard requirement, evaluated by
 three independent oracles (the spec, the AST interpreter, and
 `BPF_PROG_TEST_RUN`).
 
+v0.4 also adds two larger surfaces documented in their own sections
+below: **VLAN 802.1Q** matching (`pkt.vlan_id`, `pkt.vlan_priority`)
+and **stateful conntrack** (`conntrack(pkt).state`). Conntrack is the
+first construct with a side effect — an allowed `new` packet creates
+the connection-tracking entry a later packet reads as `established`.
+
 ## Surface deltas relative to v0.2
 
 | Area | v0.2 | v0.4 |
@@ -410,6 +416,172 @@ interpreter oracle reads the same values the BPF parser sees. A
 builder call with neither parameter produces an untagged frame
 (unchanged from v0.2).
 
+## Conntrack — `conntrack(pkt).state`
+
+### Construct
+
+A single new accessor exposes the daemon's connection-tracking table
+to the language:
+
+```
+conntrack(pkt).state
+```
+
+`conntrack(pkt)` denotes the connection-tracking view of the packet;
+`.state` reads its state as a `ct_state`-typed value compared against
+state keywords. A bare `conntrack(pkt)` (without `.state`) is not a
+valid expression.
+
+The four states:
+
+| State | Meaning |
+|-------|---------|
+| `new` | the packet's 5-tuple is absent from the conntrack table |
+| `established` | the 5-tuple was found (forward **or** reverse direction) |
+| `related` | reserved; **never produced in v0.4** (see deferrals) |
+| `invalid` | a TCP state-machine violation: a non-SYN segment for an untracked flow |
+
+### Type rules
+
+- `conntrack(pkt).state` has type `ct_state`. The only operators are
+  `==`, `!=`, and `in` over a list of state keywords:
+  ```
+  allow if conntrack(pkt).state == established
+  drop  if conntrack(pkt).state == invalid
+  allow if conntrack(pkt).state in [established, related]
+  ```
+  Ordered comparisons (`<`, `>`, `<=`, `>=`) are a compile error.
+- The right-hand side must be a state keyword (`new`, `established`,
+  `related`, `invalid`). Comparing against a proto keyword, integer, or
+  any other operand is a compile error.
+- **No protocol guard is required.** Conntrack is evaluated on every
+  frame; a non-IP or IPv6 frame simply reads `new` (see Semantics).
+  Like the L3 IP fields and the VLAN fields, `conntrack(pkt).state` is
+  legal in any context, including before any `pkt.proto ==` test.
+- The state keywords (`new`, `established`, `related`, `invalid`) are
+  reserved words, like the proto keywords (`tcp`, `udp`, ...). An
+  identifier that merely starts with one (e.g. a counter named
+  `established_flows`) is unaffected.
+- There is no `ct_state` Tier 2 local: `conntrack(pkt).state` cannot be
+  hoisted into a variable (`x = conntrack(pkt).state` is invalid). It
+  may be compared directly inside Tier 2 `if` conditions.
+
+### Semantics
+
+- **5-tuple.** The lookup key is `(src addr, dst addr, src port, dst
+  port, protocol)`, extracted from the variable `l3` pointer so it is
+  correct on VLAN-tagged frames. Addresses are network byte order, ports
+  host byte order — byte-matching the daemon's `conntrack` map
+  (`struct ConnKey` in `include/f/types.h`). For ICMP (and any frame
+  with no L4 header) the ports are 0.
+- **Lookup.** A single hash-map probe on the forward key; on a miss, a
+  second probe on the reverse key (src/dst addresses and ports swapped).
+  A hit in **either** direction is `established` — this is what lets a
+  reply match the entry its initiating packet created.
+- **Classification.** Forward-or-reverse hit → `established`. Otherwise a
+  TCP segment with no SYN flag → `invalid` (data/ACK/RST for a flow whose
+  handshake was never seen). Everything else → `new`. `established` takes
+  precedence over `invalid`.
+- **Entry creation (side effect).** When a packet reads `new` **and** an
+  explicit `allow` rule (or an explicit `default allow`) permits it, the
+  forward 5-tuple is inserted into the conntrack table (via
+  `BPF_NOEXIST`). A `drop` on a `new` packet creates **nothing**, and the
+  implicit fall-through `XDP_PASS` (a program with no matching rule and no
+  `default`) does **not** create an entry — only an explicit allow does.
+  This is the first FWL construct whose evaluation of one packet changes
+  the state a later packet sees.
+- **IPv4 only.** v0.4 conntrack tracks IPv4 flows (the daemon's `ConnKey`
+  is keyed on 32-bit addresses). On an IPv6 frame `conntrack(pkt).state`
+  is always `new`, and an allowed IPv6 packet creates no entry. A program
+  may freely mix conntrack rules with IPv6 rules; the IPv6 packets simply
+  read `new`.
+
+### Edge cases
+
+- *Non-IP / IPv6 frame.* Reads `new`; creates no entry.
+- *ICMP packet.* Tracked as a 5-tuple with ports 0; an untracked ICMP
+  packet is `new` (never `invalid` — `invalid` is TCP-only).
+- *UDP.* An untracked UDP datagram is `new`; its reply matches via the
+  reverse key once the query created the entry.
+- *Truncated TCP.* A frame cut before the flags byte cannot prove a SYN,
+  so an untracked truncated-TCP segment reads `invalid` (the `l4_ok` /
+  flag reads never happen).
+- *`established` vs `invalid`.* A non-SYN packet that matches an existing
+  entry is `established`, not `invalid` — the table lookup wins.
+- *`related`.* No packet is ever classified `related` in v0.4, so
+  `conntrack(pkt).state == related` never matches and
+  `in [established, related]` is effectively `== established`.
+- *5-tuple specificity.* A packet to a different port (or address, or
+  protocol) than a tracked flow does not match it — it reads `new`.
+
+### Compile errors
+
+| Condition | Error |
+|---|---|
+| `conntrack(pkt).state < established` | ordered comparison rejected: only `==`, `!=`, `in` |
+| `conntrack(pkt).state == tcp` | wrong RHS type (a state keyword is required) |
+| `conntrack(pkt).state == 1` | wrong RHS type (a state keyword is required) |
+| `conntrack(pkt) == established` | `conntrack(pkt)` is not an expression — access `.state` |
+| `conntrack(pkt).state == bogus` | unknown state keyword |
+
+### Examples
+
+```
+# Stateful allow: established flows pass; new SSH connections are
+# rate-limited; everything else is dropped.
+@xdp(eth0)
+allow if conntrack(pkt).state == established
+drop  if pkt.proto == tcp and pkt.dst_port == 22 limited by rate_limit(5, per=src_ip)
+allow if pkt.proto == tcp and pkt.tcp.syn and pkt.dst_port in [80, 443]
+default drop
+
+# Drop state-machine violations early.
+@xdp(eth0)
+drop if conntrack(pkt).state == invalid
+allow if conntrack(pkt).state in [established, related]
+allow if pkt.proto == tcp and pkt.tcp.syn
+default drop
+
+# Tier 2.
+@xdp(eth0)
+def filter(pkt):
+  if conntrack(pkt).state == established:
+    allow
+  if pkt.proto == tcp and pkt.tcp.syn and pkt.dst_port == 80:
+    allow
+  drop
+```
+
+### PKT format additions
+
+The `.pkt` test format gains two v0.4 extensions for conntrack, both
+exercised by the three-oracle runner:
+
+- **`state.conntrack`** — a list of pre-seeded forward 5-tuple entries
+  (analogous to `state.rate_limit`). Each entry has `src_ip`, `dst_ip`,
+  `proto` (required) and optional `src_port`/`dst_port` (default 0). The
+  interpreter starts its conntrack table with these entries; the BPF
+  oracle seeds the `conntrack` map. v0.4 entries are IPv4 only.
+  ```yaml
+  state:
+    conntrack:
+      - { src_ip: "1.2.3.4", dst_ip: "2.2.2.2", src_port: 12345, dst_port: 80, proto: tcp }
+  ```
+- **`sequence`** — an ordered list of packets sharing one conntrack
+  table, replacing the single `test_packet`/`expected` pair. The runner
+  loads the BPF program **once** and runs each step against it, so an
+  allowed `new` packet's created entry is visible to a later step. Each
+  step carries its own `expected`.
+  ```yaml
+  sequence:
+    - name: client SYN out
+      builder: tcp(src_ip="1.1.1.1", dst_ip="2.2.2.2", src_port=40000, dst_port=80, syn=true)
+      expected: { bpf_action: allow }
+    - name: server reply (established via reverse 5-tuple)
+      builder: tcp(src_ip="2.2.2.2", dst_ip="1.1.1.1", src_port=80, dst_port=40000, syn=true, ack=true)
+      expected: { bpf_action: allow }
+  ```
+
 ## Compilation
 
 The two constructs activate parse paths the same way v0.2 fields do:
@@ -447,3 +619,13 @@ behaviour on every packet is unchanged.
 - The DEI bit as a readable field.
 - VLAN rewriting / pushing / popping (read-only matching only).
 - `0x88A8` TPID recognition (only `0x8100` triggers VLAN parsing).
+- **Conntrack `related`** — ICMP-error tracking (an ICMP error whose
+  embedded 5-tuple matches an established flow) is deferred. The
+  `related` keyword is accepted in the language, but no packet is ever
+  classified `related` in v0.4, so `== related` never matches.
+- **IPv6 conntrack** — v0.4 tracks IPv4 flows only (the daemon's
+  `ConnKey` is 32-bit). IPv6 packets read `new` and create no entry.
+- **Conntrack on fragments** — no special handling; only the first
+  fragment carries the L4 header that the 5-tuple needs.
+- **Configurable UDP/TCP conntrack timeouts in the language** — timeouts
+  live in the daemon (`fd.yaml`) and its GC, not the `.fw` surface.

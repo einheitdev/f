@@ -108,6 +108,13 @@ _PROTO_FROM_KEYWORD = {
   "icmp6": ast.Proto.ICMP6,
 }
 
+_CT_STATE_FROM_KEYWORD = {
+  "new": ast.CtState.NEW,
+  "established": ast.CtState.ESTABLISHED,
+  "related": ast.CtState.RELATED,
+  "invalid": ast.CtState.INVALID,
+}
+
 # RFC 4291 §2.5.5.2: IPv4-mapped IPv6 addresses occupy ::ffff:0:0/96.
 # RFC 5952 §5 mandates the dotted-quad form for that block. Other
 # special blocks (the deprecated IPv4-compatible ::/96 block, link-
@@ -266,6 +273,8 @@ class _ToAst(Transformer):
   def ICMP_FIELD(self, tok): return tok
   def ICMP6_FIELD(self, tok): return tok
   def VLAN_FIELD(self, tok): return tok
+  def CT_STATE_FIELD(self, tok): return tok
+  def CT_STATE_KEYWORD(self, tok): return tok
   def PROTO_KEYWORD(self, tok): return tok
   def IPV4(self, tok): return tok
   def IPV6(self, tok): return tok
@@ -461,6 +470,31 @@ class _ToAst(Transformer):
     span = getattr(lvalue, "span", None) or _span(lvalue)
     return ast.Comparison(
       field=lvalue, op="in", operand=operand, span=span
+    )
+
+  def ct_state_list(self, children) -> tuple[ast.CtState, ...]:
+    """`[ <state>, ... ]` on the right of `conntrack(pkt).state in`."""
+    return tuple(_CT_STATE_FROM_KEYWORD[str(tok)] for tok in children)
+
+  def ct_compare(self, children) -> ast.ConntrackStateCompare:
+    """`conntrack(pkt).state <op> <state>` for op in ==/!=/<...>.
+
+    The analyzer rejects ordered ops (only ==/!= are valid); the
+    parser accepts the shared comp_op so that rejection carries a
+    semantic message rather than a bare syntax error.
+    """
+    ct_tok, op, kw_tok = children
+    return ast.ConntrackStateCompare(
+      op=op,
+      states=(_CT_STATE_FROM_KEYWORD[str(kw_tok)],),
+      span=_span(ct_tok),
+    )
+
+  def ct_in(self, children) -> ast.ConntrackStateCompare:
+    """`conntrack(pkt).state in [ <state>, ... ]`."""
+    ct_tok, states = children
+    return ast.ConntrackStateCompare(
+      op="in", states=states, span=_span(ct_tok)
     )
 
   def count_call(self, children) -> ast.CountCall:
