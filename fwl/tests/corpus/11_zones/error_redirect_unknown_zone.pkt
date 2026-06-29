@@ -1,0 +1,14 @@
+name: redirect to an undeclared zone is a compile error
+source_fw: 'zone wan = [wan0]
+
+  zone lan = [lan0, lan1, lan2, lan3]
+
+  @xdp(lan)
+
+  redirect to dmz
+
+  '
+test_packet:
+  builder: tcp()
+expected:
+  compiles: false

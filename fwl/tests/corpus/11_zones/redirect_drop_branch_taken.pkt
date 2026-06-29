@@ -1,0 +1,20 @@
+name: the drop rule before the redirect wins for udp
+source_fw: 'zone wan = [wan0]
+
+  zone lan = [lan0, lan1, lan2, lan3]
+
+  @xdp(lan)
+
+  drop if pkt.proto == udp
+
+  redirect to wan if pkt.proto == tcp
+
+  drop
+
+  '
+ingress_zone: lan
+test_packet:
+  builder: udp(src_ip="10.0.0.5", dst_ip="1.1.1.1", dst_port=53)
+expected:
+  compiles: true
+  bpf_action: drop

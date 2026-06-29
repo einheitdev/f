@@ -25,7 +25,19 @@
 // `def` block. The analyzer rejects mixed Tier 1 + Tier 2 with the
 // spec's "v0.2 program is either a Tier 1 rule sequence or a single
 // Tier 2 function" error.
-program       : hook_decl body_item*
+// v0.4 § 6.1-6.2: a unit is zero or more `zone` declarations followed
+// by one or more @xdp blocks (one per zone). The v0.1-v0.3 single-block
+// shape is the degenerate case: no zone decls, one xdp_block. The
+// FwlIndenter drops top-level _NL so zone decls and block boundaries
+// are self-delimiting (each starts with a distinct keyword/`@xdp`).
+program       : zone_decl* xdp_block+
+
+xdp_block     : hook_decl body_item*
+
+// `zone <name> = [<iface>, ...]`. An empty bracket list is admitted by
+// the grammar so the analyzer can report a typed "empty zone" error
+// rather than a bare syntax error.
+zone_decl     : ZONE IDENTIFIER "=" "[" (IDENTIFIER ("," IDENTIFIER)*)? "]"
 
 body_item     : rule | default_rule | function_def
 
@@ -53,6 +65,7 @@ action_stmt   : ALLOW                  _NL+  -> action_allow
               | DROP                   _NL+  -> action_drop
               | LOG                    _NL+  -> action_log
               | COUNT IDENTIFIER       _NL+  -> action_count
+              | REDIRECT TO IDENTIFIER _NL+  -> action_redirect
 
 assign_stmt   : IDENTIFIER "=" scalar_expr _NL+
 
@@ -70,10 +83,14 @@ RL_FIELD.10   : "src_ip" | "dst_ip" | "src_port" | "dst_port"
 
 default_rule  : "default" terminal_action
 
-action        : terminal_action | nonterminal_action
+action        : terminal_action | nonterminal_action | redirect_action
 
 terminal_action    : ALLOW | DROP
 nonterminal_action : log_action | COUNT IDENTIFIER
+// v0.4 § 6.3: `redirect to <zone>` — terminal, but kept off
+// terminal_action so `default redirect to <zone>` stays a syntax error
+// (default admits only allow/drop).
+redirect_action    : REDIRECT TO IDENTIFIER
 
 log_action        : LOG
                   | LOG "(" "sample" "=" INTEGER ")"
@@ -116,8 +133,14 @@ comparison    : lvalue comp_op rvalue          -> value_compare
               | count_call comp_op rvalue      -> count_compare
               | CT_STATE_FIELD comp_op CT_STATE_KEYWORD   -> ct_compare
               | CT_STATE_FIELD "in" ct_state_list         -> ct_in
+              | ZONE_FIELD comp_op IDENTIFIER             -> zone_compare
+              | ZONE_FIELD "in" zone_name_list            -> zone_in
 
 ct_state_list : "[" CT_STATE_KEYWORD ("," CT_STATE_KEYWORD)* "]"
+
+// v0.4 § 6.4: `pkt.zone in [<zone>, ...]` — zone names are bare
+// identifiers validated against the unit's zone declarations.
+zone_name_list : "[" IDENTIFIER ("," IDENTIFIER)* "]"
 
 count_call    : COUNT "(" IDENTIFIER ")"
 
@@ -202,6 +225,11 @@ VLAN_FIELD.10      : "pkt.vlan_priority" | "pkt.vlan_id"
 // syntax error — the spec's "must access .state" compile error.
 CT_STATE_FIELD.13  : /conntrack[ \t]*\([ \t]*pkt[ \t]*\)[ \t]*\.[ \t]*state(?![a-z0-9_])/
 
+// v0.4 § 6.4 zone field. A single multi-segment terminal (like the
+// pkt.* fields); nothing else starts with "pkt.zone", and the negative
+// lookahead keeps a hypothetical "pkt.zone_id" from mis-lexing.
+ZONE_FIELD.13      : /pkt\.zone(?![a-z0-9_])/
+
 // Keywords use a negative-lookahead so they only match when not
 // followed by an identifier character — `tcp_traffic` lexes as
 // IDENTIFIER, bare `tcp ` lexes as PROTO_KEYWORD. Higher priority
@@ -217,6 +245,11 @@ LOG.10           : /log(?![a-z0-9_])/
 COUNT.10         : /count(?![a-z0-9_])/
 GEOIP.10         : /geoip(?![a-z0-9_])/
 DEF.10           : /def(?![a-z0-9_])/
+// v0.4 § 6.1-6.3 keywords. Reserved words (negative-lookahead so
+// `zoned`, `redirected`, `tomorrow` still lex as IDENTIFIER).
+ZONE.10          : /zone(?![a-z0-9_])/
+REDIRECT.10      : /redirect(?![a-z0-9_])/
+TO.10            : /to(?![a-z0-9_])/
 
 // v0.4 conntrack state keywords. Reserved words (like the proto
 // keywords): negative-lookahead so `established_flows` still lexes as

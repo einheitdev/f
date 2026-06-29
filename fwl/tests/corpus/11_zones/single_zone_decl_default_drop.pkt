@@ -1,0 +1,16 @@
+name: one-zone program drops non-tcp via default
+source_fw: 'zone edge = [eth0]
+
+  @xdp(edge)
+
+  allow if pkt.proto == tcp
+
+  default drop
+
+  '
+ingress_zone: edge
+test_packet:
+  builder: udp(src_ip="1.1.1.1", dst_ip="2.2.2.2", dst_port=53)
+expected:
+  compiles: true
+  bpf_action: drop

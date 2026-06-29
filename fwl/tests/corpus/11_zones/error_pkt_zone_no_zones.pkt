@@ -1,0 +1,12 @@
+name: pkt.zone in a file with no zone declarations is an error
+source_fw: '@xdp(eth0)
+
+  allow if pkt.zone == eth0
+
+  drop
+
+  '
+test_packet:
+  builder: tcp()
+expected:
+  compiles: false

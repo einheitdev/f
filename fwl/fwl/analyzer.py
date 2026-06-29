@@ -80,14 +80,200 @@ def analyze(program: ast.Program) -> ast.Program:
   Returns the same program object on success. Raises FwlException
   with category="semantic" on the first violation.
 
+  v0.4 multi-zone: validates the zone declarations, the @xdp-to-zone
+  bindings, and the `redirect to <zone>` / `pkt.zone` references against
+  the declared zones, then runs the per-zone Tier 1/Tier 2 analysis on
+  each @xdp block. The v0.1-v0.3 single-block file is the degenerate
+  case (no zone decls, one ZoneProgram).
+
   v0.2 mutation contract: GeoIp operand nodes have `call_index` and
   `family` written during this pass; RateLimitCall nodes have
-  `call_index` written. Every other AST node stays immutable. See
-  ast.GeoIp's docstring for the rationale.
+  `call_index` written. Every other AST node stays immutable.
+  """
+  declared = _collect_declared_zones(program)
+  _check_xdp_zone_bindings(program, declared)
+  for zp in program.programs:
+    _check_zone_references(zp, declared)
+    _analyze_program(zp)
+  return program
 
-  Tier 1 vs Tier 2 mutual exclusion is enforced here: a program with
-  both `rules`/`default` and `function` set raises the spec's
-  "Tier 1 rule sequence or a single Tier 2 function, not a mix" error.
+
+def _collect_declared_zones(
+  program: ast.Program,
+) -> dict[str, ast.ZoneDecl]:
+  """Validate zone declarations, returning a name -> ZoneDecl map.
+
+  Compile errors (FWL_V04_SPEC.md § 6.1): an empty zone, a duplicate
+  zone name, or an interface that appears in more than one zone.
+  """
+  by_name: dict[str, ast.ZoneDecl] = {}
+  iface_owner: dict[str, str] = {}
+  for zone in program.zones:
+    if not zone.interfaces:
+      raise FwlException(FwlError(
+        category="semantic",
+        message=f"zone '{zone.name}' is empty; a zone needs >= 1 interface",
+        span=zone.span,
+      ))
+    if zone.name in by_name:
+      raise FwlException(FwlError(
+        category="semantic",
+        message=f"duplicate zone name '{zone.name}'",
+        span=zone.span,
+      ))
+    by_name[zone.name] = zone
+    for iface in zone.interfaces:
+      if iface in iface_owner:
+        raise FwlException(FwlError(
+          category="semantic",
+          message=(
+            f"interface '{iface}' is in both zone '{iface_owner[iface]}' "
+            f"and zone '{zone.name}'; an interface belongs to one zone"
+          ),
+          span=zone.span,
+        ))
+      iface_owner[iface] = zone.name
+  return by_name
+
+
+def _check_xdp_zone_bindings(
+  program: ast.Program, declared: dict[str, ast.ZoneDecl]
+) -> None:
+  """Validate each @xdp block's zone binding.
+
+  When the file declares zones, every @xdp argument must name a
+  declared zone, and no two @xdp blocks may target the same zone. In
+  the degenerate no-zones file the @xdp argument is a bare interface
+  name (one implicit zone) and is accepted as-is.
+  """
+  seen: set[str] = set()
+  for zp in program.programs:
+    target = zp.hook.interface
+    if declared and target not in declared:
+      raise FwlException(FwlError(
+        category="semantic",
+        message=(
+          f"@xdp({target}) names '{target}', which is not a declared "
+          f"zone"
+        ),
+        span=zp.hook.span,
+      ))
+    if target in seen:
+      raise FwlException(FwlError(
+        category="semantic",
+        message=f"more than one @xdp block targets zone '{target}'",
+        span=zp.hook.span,
+      ))
+    seen.add(target)
+
+
+def _check_zone_references(
+  zp: ast.ZoneProgram, declared: dict[str, ast.ZoneDecl]
+) -> None:
+  """Validate `redirect to <zone>` and `pkt.zone` references in a block.
+
+  Every redirect target and every zone name compared against pkt.zone
+  must be a declared zone (FWL_V04_SPEC.md § 6.3-6.4). A redirect or
+  pkt.zone reference in a file with no zone declarations is a compile
+  error (there are no zones to name).
+  """
+  for rule in zp.rules:
+    if rule.action == ast.Action.REDIRECT:
+      _check_redirect_target(rule.redirect_zone, declared, rule.span)
+    _check_zone_compares(rule.condition, declared)
+  if zp.default is not None and zp.default.action == ast.Action.REDIRECT:
+    # default admits only allow/drop at the grammar level, so this is
+    # defensive — a redirect can never reach here.
+    _check_redirect_target(None, declared, zp.default.span)
+  if zp.function is not None:
+    _check_zone_refs_stmts(zp.function.body, declared)
+
+
+def _check_redirect_target(
+  zone_name: str | None, declared: dict[str, ast.ZoneDecl], span
+) -> None:
+  """Raise if a redirect names a missing/undeclared zone."""
+  if not declared:
+    raise FwlException(FwlError(
+      category="semantic",
+      message=(
+        "'redirect to' requires zone declarations; this file declares "
+        "none"
+      ),
+      span=span,
+    ))
+  if zone_name not in declared:
+    raise FwlException(FwlError(
+      category="semantic",
+      message=f"redirect to undeclared zone '{zone_name}'",
+      span=span,
+    ))
+
+
+def _check_zone_compares(
+  node, declared: dict[str, ast.ZoneDecl]
+) -> None:
+  """Walk a condition validating every ZoneCompare's zone names."""
+  if node is None:
+    return
+  if isinstance(node, ast.ZoneCompare):
+    if node.op not in ("==", "!=", "in"):
+      raise FwlException(FwlError(
+        category="semantic",
+        message=(
+          f"pkt.zone supports only '==', '!=' and 'in'; got '{node.op}'"
+        ),
+        span=node.span,
+      ))
+    if not declared:
+      raise FwlException(FwlError(
+        category="semantic",
+        message="pkt.zone used in a file that declares no zones",
+        span=node.span,
+      ))
+    for name in node.zones:
+      if name not in declared:
+        raise FwlException(FwlError(
+          category="semantic",
+          message=f"pkt.zone compared against undeclared zone '{name}'",
+          span=node.span,
+        ))
+    return
+  if isinstance(node, ast.NotOp):
+    _check_zone_compares(node.inner, declared)
+  elif isinstance(node, (ast.AndOp, ast.OrOp)):
+    for c in node.operands:
+      _check_zone_compares(c, declared)
+
+
+def _check_zone_refs_stmts(
+  stmts, declared: dict[str, ast.ZoneDecl]
+) -> None:
+  """Walk Tier 2 statements validating redirect + pkt.zone references."""
+  for s in stmts:
+    if isinstance(s, ast.ActionStmt):
+      if s.action == ast.Action.REDIRECT:
+        _check_redirect_target(s.redirect_zone, declared, s.span)
+    elif isinstance(s, ast.AssignStmt):
+      _check_zone_compares(s.rhs, declared)
+    elif isinstance(s, ast.IfStmt):
+      _check_zone_compares(s.cond, declared)
+      _check_zone_refs_stmts(s.body, declared)
+      for cond, body in s.elif_branches:
+        _check_zone_compares(cond, declared)
+        _check_zone_refs_stmts(body, declared)
+      if s.else_body is not None:
+        _check_zone_refs_stmts(s.else_body, declared)
+
+
+def _analyze_program(program) -> object:
+  """Per-@xdp-block analysis (Tier 1/Tier 2 dispatch).
+
+  `program` is a ZoneProgram (or, in the single-block degenerate case,
+  a Program delegating to it). Tier 1 vs Tier 2 mutual exclusion is
+  enforced here: a block with both `rules`/`default` and `function`
+  set raises the spec's "Tier 1 rule sequence or a single Tier 2
+  function, not a mix" error.
   """
   # Mutual exclusion: per FWL_V02_SPEC.md § Tier 2 / Edge cases.
   has_tier1 = bool(program.rules) or program.default is not None
@@ -107,7 +293,7 @@ def analyze(program: ast.Program) -> ast.Program:
   return _analyze_tier1(program)
 
 
-def _analyze_tier1(program: ast.Program) -> ast.Program:
+def _analyze_tier1(program) -> object:
   """Tier 1 analyzer pass — runs on rules + optional default."""
   # Source-order pass to assign geoip call indices. Walking before
   # the type-check pass guarantees the indices match the bundle
@@ -344,6 +530,8 @@ def _infer_scalar_type(
   if isinstance(expr, ast.ConntrackStateCompare):
     _check_ct_state_compare(expr)
     return ast.LocalType.BOOL
+  if isinstance(expr, ast.ZoneCompare):
+    return ast.LocalType.BOOL
   if isinstance(expr, ast.RateLimitCall):
     raise FwlException(FwlError(
       category="semantic",
@@ -412,6 +600,9 @@ def _check_condition(
     return
   if isinstance(cond, ast.ConntrackStateCompare):
     _check_ct_state_compare(cond)
+    return
+  if isinstance(cond, ast.ZoneCompare):
+    # Validated in _check_zone_references; bool-valued constant.
     return
   if isinstance(cond, ast.LocalRead):
     if cond.name not in ctx.locals:
@@ -1412,6 +1603,11 @@ def _check(node: ast.Condition, possible: Possible) -> Possible:
 
   if isinstance(node, ast.ConntrackStateCompare):
     _check_ct_state_compare(node)
+    return possible
+
+  if isinstance(node, ast.ZoneCompare):
+    # Zone names + op are validated in _check_zone_references; pkt.zone
+    # is a compile-time constant with no protocol-guard impact.
     return possible
 
   if isinstance(node, ast.BoolField):

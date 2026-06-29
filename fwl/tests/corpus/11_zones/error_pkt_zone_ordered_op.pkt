@@ -1,0 +1,16 @@
+name: pkt.zone with an ordered operator is an error
+source_fw: 'zone wan = [wan0]
+
+  zone lan = [lan0, lan1, lan2, lan3]
+
+  @xdp(lan)
+
+  allow if pkt.zone < wan
+
+  drop
+
+  '
+test_packet:
+  builder: tcp()
+expected:
+  compiles: false

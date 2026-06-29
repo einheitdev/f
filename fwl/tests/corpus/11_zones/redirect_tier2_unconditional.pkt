@@ -1,0 +1,10 @@
+name: a Tier 2 redirect statement returns XDP_REDIRECT
+source_fw: "zone wan = [wan0]\nzone lan = [lan0]\nzone dmz = [dmz0]\n@xdp(lan)\ndef\
+  \ from_lan(pkt):\n  redirect to wan\n"
+ingress_zone: lan
+test_packet:
+  builder: udp(src_ip="10.0.0.2", dst_ip="9.9.9.9", dst_port=53)
+expected:
+  compiles: true
+  bpf_action: redirect
+  redirect_zone: wan

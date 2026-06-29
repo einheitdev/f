@@ -1,0 +1,21 @@
+name: redirect only when pkt.zone matches (always, in-block)
+source_fw: 'zone wan = [wan0]
+
+  zone lan = [lan0]
+
+  zone dmz = [dmz0]
+
+  @xdp(dmz)
+
+  redirect to wan if pkt.zone == dmz and pkt.proto == tcp
+
+  drop
+
+  '
+ingress_zone: dmz
+test_packet:
+  builder: tcp(src_ip="10.1.0.5", dst_ip="1.1.1.1", dst_port=80)
+expected:
+  compiles: true
+  bpf_action: redirect
+  redirect_zone: wan

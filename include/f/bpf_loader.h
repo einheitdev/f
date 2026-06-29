@@ -8,6 +8,7 @@
 #include <expected>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "f/error.h"
 
@@ -71,6 +72,42 @@ auto PinMaps(const BpfHandles& h,
 /// Remove pinned maps from bpffs.
 auto UnpinMaps(std::string_view pin_path)
     -> std::expected<void, Error<BpfError>>;
+
+// --- v0.4 § 6.2 multi-zone bundle loading ---------------------------
+
+/// One loaded zone program within a multi-zone bundle.
+struct ZoneProgramHandle {
+  std::string zone;            ///< zone name (the @xdp argument)
+  int prog_fd = -1;            ///< the XDP program fd (fwl_prog)
+  std::vector<int> ifindexes;  ///< interfaces it was attached to
+};
+
+/// Result of loading a multi-zone bundle: one entry per @xdp block.
+struct ZoneBundleHandles {
+  std::vector<ZoneProgramHandle> programs;
+  /// The shared, bpffs-pinned conntrack map fd (cross-zone state), or
+  /// -1 when no zone program uses conntrack.
+  int conntrack_fd = -1;
+};
+
+/// Load every zone program in a `fwl compile --bundle` directory.
+///
+/// Reads `<bundle_dir>/manifest.json` (zones, per-zone `<zone>.bpf.o`,
+/// and redirect topology), opens each object under the common
+/// `pin_root` so the `LIBBPF_PIN_BY_NAME` shared maps — above all
+/// `conntrack` — resolve to a single kernel map across every zone
+/// program, loads it, populates each `fwl_devmap_<dest>` with the
+/// destination zone's interface ifindexes, and attaches the program to
+/// every interface in its own zone. A zone interface that does not yet
+/// exist on the host is skipped with a warning (interfaces may appear
+/// after boot), not treated as a fatal error.
+///
+/// This is the multi-program analogue of LoadProgram + AttachXdp; the
+/// per-program load/attach/devmap mechanism is exercised end-to-end by
+/// tests/system/zone_redirect_netns.sh.
+auto LoadZoneBundle(std::string_view bundle_dir,
+                    std::string_view pin_root)
+    -> std::expected<ZoneBundleHandles, Error<BpfError>>;
 
 }  // namespace f
 

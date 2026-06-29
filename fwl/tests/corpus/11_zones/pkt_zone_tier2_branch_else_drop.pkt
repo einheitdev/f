@@ -1,0 +1,9 @@
+name: Tier 2 pkt.zone branch not taken falls to drop
+source_fw: "zone wan = [wan0]\nzone lan = [lan0]\nzone dmz = [dmz0]\n@xdp(lan)\ndef\
+  \ f(pkt):\n  if pkt.zone == wan:\n    redirect to wan\n  drop\n"
+ingress_zone: lan
+test_packet:
+  builder: tcp(src_ip="10.0.0.5", dst_ip="1.1.1.1", dst_port=80)
+expected:
+  compiles: true
+  bpf_action: drop

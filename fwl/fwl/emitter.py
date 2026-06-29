@@ -835,31 +835,52 @@ def _emit_v6_branch(
 def _emit_condition(
   node: ast.Condition,
   counter_slots: dict[str, int] | None = None,
+  zone_name: str | None = None,
 ) -> str:
-  """Emit a C boolean expression for `node`. Parens for safety."""
+  """Emit a C boolean expression for `node`. Parens for safety.
+
+  `zone_name` is the zone of the @xdp block being emitted; it folds
+  any `pkt.zone` comparison to a compile-time 1/0 (v0.4 § 6.4).
+  """
   if isinstance(node, ast.Comparison):
     return _emit_comparison(node)
   if isinstance(node, ast.CountCompare):
     return _emit_count_compare(node, counter_slots or {})
   if isinstance(node, ast.ConntrackStateCompare):
     return _emit_ct_state_compare(node)
+  if isinstance(node, ast.ZoneCompare):
+    return _emit_zone_compare(node, zone_name)
   if isinstance(node, ast.BoolField):
     return _emit_bool_field(node)
   if isinstance(node, ast.NotOp):
-    return f"!({_emit_condition(node.inner, counter_slots)})"
+    return f"!({_emit_condition(node.inner, counter_slots, zone_name)})"
   if isinstance(node, ast.AndOp):
     parts = [
-      _emit_condition(c, counter_slots) for c in node.operands
+      _emit_condition(c, counter_slots, zone_name) for c in node.operands
     ]
     return "(" + " && ".join(parts) + ")"
   if isinstance(node, ast.OrOp):
     parts = [
-      _emit_condition(c, counter_slots) for c in node.operands
+      _emit_condition(c, counter_slots, zone_name) for c in node.operands
     ]
     return "(" + " || ".join(parts) + ")"
   raise NotImplementedError(
     f"emitter: unsupported condition {type(node).__name__}"
   )
+
+
+def _emit_zone_compare(node: ast.ZoneCompare, zone_name: str | None) -> str:
+  """Fold a `pkt.zone` comparison to a compile-time 1/0 (v0.4 § 6.4).
+
+  pkt.zone is a constant within an @xdp block — the compiler knows the
+  block's zone — so the comparison resolves entirely at compile time.
+  """
+  if node.op == "==":
+    return "1" if zone_name == node.zones[0] else "0"
+  if node.op == "!=":
+    return "1" if zone_name != node.zones[0] else "0"
+  # `in`: membership against the listed zone names.
+  return "1" if zone_name in node.zones else "0"
 
 
 def _emit_count_compare(
@@ -1220,9 +1241,20 @@ def _emit_ct_create(indent: str = "    ") -> str:
   )
 
 
+def _redirect_return(zone: str) -> str:
+  """C expression that redirects out the destination zone (v0.4 § 6.3).
+
+  Uses bpf_redirect_map() against the zone's devmap (key 0 = the
+  zone's first/representative egress ifindex, which the daemon
+  populates at load time). For a multi-interface zone the switch chip's
+  FDB picks the physical egress port. Returns XDP_REDIRECT.
+  """
+  return f"bpf_redirect_map(&fwl_devmap_{zone}, 0, 0)"
+
+
 def _emit_rule(
   rule: ast.Rule, idx: int, counter_slots: dict[str, int],
-  ct_create: str = "",
+  ct_create: str = "", zone_name: str | None = None,
 ) -> str:
   """Emit C statements for one rule.
 
@@ -1234,8 +1266,13 @@ def _emit_rule(
   an `allow` return so an allowed NEW flow is tracked.
   """
   overflow_slot = counter_slots.get(RATE_LIMIT_OVERFLOW_COUNTER)
-  if rule.action in _TERMINAL_ACTION_TO_RETURN:
-    ret = _TERMINAL_ACTION_TO_RETURN[rule.action]
+  if rule.action in ast.TERMINAL_ACTIONS:
+    if rule.action == ast.Action.REDIRECT:
+      ret = _redirect_return(rule.redirect_zone)
+    else:
+      ret = _TERMINAL_ACTION_TO_RETURN[rule.action]
+    # Only an `allow` creates conntrack state. A `redirect` forwards the
+    # frame but (pre-NAT, v0.4 § 6) does not yet open a tracked flow.
     create = ct_create if rule.action == ast.Action.ALLOW else ""
     if rule.modifier is not None:
       fire_block = _emit_rate_limit_gate(
@@ -1263,7 +1300,7 @@ def _emit_rule(
 
   if rule.condition is None:
     return f"  {{\n    {fire_block}\n  }}\n"
-  expr = _emit_condition(rule.condition, counter_slots)
+  expr = _emit_condition(rule.condition, counter_slots, zone_name)
   return f"  if ({expr}) {{\n    {fire_block}\n  }}\n"
 
 
@@ -1511,71 +1548,149 @@ static __always_inline int fwl_geoip_{call.call_index}_v6(
   return "\n".join(blocks)
 
 
+def _collect_redirect_zones(zp: ast.ZoneProgram) -> list[str]:
+  """Ordered, de-duplicated list of zones `zp` redirects to (v0.4 § 6.3)."""
+  out: list[str] = []
+  seen: set[str] = set()
+
+  def _add(z):
+    if z and z not in seen:
+      seen.add(z)
+      out.append(z)
+
+  for rule in zp.rules:
+    if rule.action == ast.Action.REDIRECT:
+      _add(rule.redirect_zone)
+  if zp.function is not None:
+    _collect_redirect_zones_stmts(zp.function.body, _add)
+  return out
+
+
+def _collect_redirect_zones_stmts(stmts, add) -> None:
+  for s in stmts:
+    if isinstance(s, ast.ActionStmt) and s.action == ast.Action.REDIRECT:
+      add(s.redirect_zone)
+    elif isinstance(s, ast.IfStmt):
+      _collect_redirect_zones_stmts(s.body, add)
+      for _, body in s.elif_branches:
+        _collect_redirect_zones_stmts(body, add)
+      if s.else_body is not None:
+        _collect_redirect_zones_stmts(s.else_body, add)
+
+
+def _emit_devmaps(zones: list[str], pinned: bool) -> str:
+  """Emit one BPF_MAP_TYPE_DEVMAP per redirect-destination zone.
+
+  The daemon populates each devmap at load time with the destination
+  zone's interface ifindex(es). The BPF program calls
+  bpf_redirect_map(&fwl_devmap_<zone>, 0, 0) (v0.4 § 6.3). In a
+  multi-zone bundle the devmaps are pinned by name so the daemon can
+  populate them once and every zone program sees the same map.
+  """
+  pin = (
+    "\n  __uint(pinning, LIBBPF_PIN_BY_NAME);" if pinned else ""
+  )
+  blocks: list[str] = []
+  for z in zones:
+    blocks.append(f"""\
+struct {{
+  __uint(type, BPF_MAP_TYPE_DEVMAP);
+  __type(key, __u32);
+  __type(value, __u32);
+  __uint(max_entries, 64);{pin}
+}} fwl_devmap_{z} SEC(".maps");
+""")
+  return "\n".join(blocks)
+
+
 def emit(program: ast.Program) -> str:
-  """Emit BPF C source for `program`.
+  """Emit BPF C source for the first @xdp block of `program`.
+
+  This is the single-object entry point used by `fwl compile -o` and
+  by the test runner's BPF oracle (one zone program per object,
+  maps defined inline, no bpffs pinning). For a multi-zone bundle with
+  bpffs-pinned shared maps, see `emit_bundle`.
+  """
+  return _emit_zone_source(program.programs[0], pinned_shared=False)
+
+
+def _emit_zone_source(
+  zp: ast.ZoneProgram, *, pinned_shared: bool,
+) -> str:
+  """Emit one zone's complete BPF C source.
+
+  `zp` is a single @xdp block. `pinned_shared` controls whether the
+  shared maps (conntrack, counters, rate-limit, log, geoip, devmaps)
+  carry LIBBPF_PIN_BY_NAME so they resolve to one bpffs-pinned kernel
+  map across every zone program in a bundle (v0.4 § 6.2).
 
   Tier 1: prelude + per-rule blocks + final return.
   Tier 2: prelude + locals declaration + statement-by-statement body.
   """
-  prelude = _emit_parse_prelude(program)
-  rl_maps = _emit_rl_maps(program)
-  geoip_block = _emit_geoip_maps_and_helpers(program)
-  uses_ct = _program_uses_conntrack(program)
-  conntrack_decl = _CONNTRACK_DECL if uses_ct else ""
+  zone_name = zp.zone_name
+  prelude = _emit_parse_prelude(zp)
+  rl_maps = _emit_rl_maps(zp)
+  geoip_block = _emit_geoip_maps_and_helpers(zp)
+  uses_ct = _program_uses_conntrack(zp)
+  conntrack_decl = _maybe_pin(_CONNTRACK_DECL, pinned_shared) if uses_ct else ""
   ct_create = _emit_ct_create() if uses_ct else ""
+  devmaps = _emit_devmaps(_collect_redirect_zones(zp), pinned_shared)
 
-  counter_slots = _allocate_counter_slots(program)
-  has_log = _program_uses_log(program)
+  counter_slots = _allocate_counter_slots(zp)
+  has_log = _program_uses_log(zp)
 
-  log_decl = _LOG_EVENT_DECL if has_log else ""
+  log_decl = _maybe_pin(_LOG_EVENT_DECL, pinned_shared) if has_log else ""
   sampled = sum(
-    1 for r in program.rules
+    1 for r in zp.rules
     if r.action == ast.Action.LOG
     and r.log_sample is not None and r.log_sample > 1
   )
   log_sample_decl = ""
   if sampled > 0:
-    log_sample_decl = (
+    log_sample_decl = _maybe_pin(
       "struct {\n"
       "  __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);\n"
       "  __type(key, __u32);\n"
       "  __type(value, __u64);\n"
-      f"  __uint(max_entries, {len(program.rules)});\n"
-      "} fwl_log_sample SEC(\".maps\");\n"
+      f"  __uint(max_entries, {len(zp.rules)});\n"
+      "} fwl_log_sample SEC(\".maps\");\n",
+      pinned_shared,
     )
   if counter_slots:
-    counter_decl = _COUNTER_MAP_DECL_TEMPLATE.format(
-      n_slots=max(len(counter_slots), 1)
+    counter_decl = _maybe_pin(
+      _COUNTER_MAP_DECL_TEMPLATE.format(n_slots=max(len(counter_slots), 1)),
+      pinned_shared,
     )
     counter_table = _emit_counter_table(counter_slots)
   else:
     counter_decl = ""
     counter_table = ""
 
-  if program.function is not None:
+  if zp.function is not None:
     body, _ = _emit_tier2_body(
-      program.function, counter_slots, program, ct_create
+      zp.function, counter_slots, zp, ct_create, zone_name
     )
     # Tier 2 fall-through is an implicit XDP_PASS (no rule "allowed"
     # the packet), so it does not create conntrack state.
     final_stmt = "return XDP_PASS;"
   else:
     body = "".join(
-      _emit_rule(r, i, counter_slots, ct_create)
-      for i, r in enumerate(program.rules)
+      _emit_rule(r, i, counter_slots, ct_create, zone_name)
+      for i, r in enumerate(zp.rules)
     )
-    if program.default is not None:
-      ret = _TERMINAL_ACTION_TO_RETURN[program.default.action]
+    if zp.default is not None:
+      ret = _TERMINAL_ACTION_TO_RETURN[zp.default.action]
       # An explicit `default allow` creates state like any allow; an
       # explicit `default drop` (or the implicit fall-through below)
       # does not.
-      create = ct_create if program.default.action == ast.Action.ALLOW else ""
+      create = ct_create if zp.default.action == ast.Action.ALLOW else ""
       final_stmt = f"{create}return {ret};"
     else:
       final_stmt = "return XDP_PASS;"
 
   return f"""{_HEADER}
-{log_decl}{log_sample_decl}{counter_decl}{rl_maps}{geoip_block}{conntrack_decl}
+{log_decl}{log_sample_decl}{counter_decl}{rl_maps}{geoip_block}\
+{conntrack_decl}{devmaps}
 SEC("xdp")
 int fwl_prog(struct xdp_md *ctx) {{
 {prelude}{body}  {final_stmt}
@@ -1583,6 +1698,90 @@ int fwl_prog(struct xdp_md *ctx) {{
 
 char _license[] SEC("license") = "GPL";
 {counter_table}"""
+
+
+def _maybe_pin(map_decl: str, pinned: bool) -> str:
+  """Add LIBBPF_PIN_BY_NAME to a `} name SEC(".maps");` declaration.
+
+  Inserts the pinning attribute on the last map-struct body before its
+  closing brace so the map is shared by name across the bundle's zone
+  programs (bpffs pinning, v0.4 § 6.2). A no-op when `pinned` is False
+  (single-object emission, e.g. the test runner).
+  """
+  if not pinned:
+    return map_decl
+  out: list[str] = []
+  for block in map_decl.split("\n\n"):
+    if 'SEC(".maps")' in block and "LIBBPF_PIN_BY_NAME" not in block:
+      idx = block.rfind("\n}")
+      if idx != -1:
+        block = (
+          block[:idx]
+          + "\n  __uint(pinning, LIBBPF_PIN_BY_NAME);"
+          + block[idx:]
+        )
+    out.append(block)
+  return "\n\n".join(out)
+
+
+def emit_bundle(program: ast.Program) -> dict[str, str]:
+  """Emit a multi-zone bundle: one BPF C file per @xdp block (v0.4 § 6.2).
+
+  Returns a mapping of filename -> C source:
+    - `<zone>.bpf.c` per zone program — its prelude, rules/function,
+      redirect devmaps, and the shared maps it uses (conntrack,
+      counters, rate-limit, log, geoip) carrying LIBBPF_PIN_BY_NAME.
+    - `fwl_shared.h` — a manifest header documenting the pinned maps
+      every zone program shares via bpffs (the cross-zone state).
+
+  Each zone compiles to its own .bpf.o. The daemon loads them with a
+  common bpffs pin root so libbpf resolves the pin-by-name shared maps
+  (above all, `conntrack`) to a single kernel map — established flows
+  tracked on one zone are visible to every other zone. The single-zone
+  degenerate case still goes through `emit()` (no pinning).
+  """
+  files: dict[str, str] = {}
+  for zp in program.programs:
+    files[f"{zp.zone_name}.bpf.c"] = _emit_zone_source(
+      zp, pinned_shared=True
+    )
+  files["fwl_shared.h"] = _emit_shared_header(program)
+  return files
+
+
+def _emit_shared_header(program: ast.Program) -> str:
+  """Emit a header documenting the bundle's bpffs-pinned shared maps.
+
+  The maps are defined (pin-by-name) inside each zone's .bpf.c; this
+  header is the human/daemon-facing manifest of which maps are shared
+  and which zones redirect where, so the loader knows what to pin and
+  populate.
+  """
+  zone_lines = "\n".join(
+    f"//   zone {z.name} = [{', '.join(z.interfaces)}]"
+    for z in program.zones
+  )
+  redirect_lines = "\n".join(
+    f"//   @xdp({zp.zone_name}) redirects to: "
+    f"{', '.join(_collect_redirect_zones(zp)) or '(none)'}"
+    for zp in program.programs
+  )
+  return f"""\
+// Generated by fwl. Do not edit.
+// FWL multi-zone bundle manifest (v0.4 § 6.2).
+//
+// Each <zone>.bpf.c compiles to its own XDP program. Shared state is
+// held in bpffs-pinned maps (LIBBPF_PIN_BY_NAME) so every zone program
+// resolves to the SAME kernel map — load all objects with a common
+// pin root. The `conntrack` map is the cross-zone state: a flow
+// established on one zone is ESTABLISHED for every other zone.
+//
+// Zones:
+{zone_lines or '//   (none — degenerate single-zone unit)'}
+//
+// Redirect topology (devmaps, daemon-populated with egress ifindexes):
+{redirect_lines}
+"""
 
 
 def _program_uses_log(program: ast.Program) -> bool:
@@ -1693,6 +1892,7 @@ def _emit_tier2_body(
   counter_slots: dict[str, int],
   program: ast.Program,
   ct_create: str = "",
+  zone_name: str | None = None,
 ) -> tuple[str, str]:
   """Emit the body of a Tier 2 function. Returns (body, final_return)."""
   locals_: dict[str, ast.LocalType] = {}
@@ -1709,7 +1909,8 @@ def _emit_tier2_body(
   if decl_block:
     decl_block += "\n"
   ctx = _Tier2EmitCtx(
-    locals=locals_, counter_slots=counter_slots, ct_create=ct_create
+    locals=locals_, counter_slots=counter_slots, ct_create=ct_create,
+    zone_name=zone_name,
   )
   body_text = _emit_tier2_stmts(func.body, ctx, indent="  ")
   return decl_block + body_text, "XDP_PASS"
@@ -1717,10 +1918,12 @@ def _emit_tier2_body(
 
 class _Tier2EmitCtx:
   """Mutable context threaded through Tier 2 emission."""
-  def __init__(self, *, locals, counter_slots, ct_create=""):
+  def __init__(self, *, locals, counter_slots, ct_create="", zone_name=None):
     self.locals = locals
     self.counter_slots = counter_slots
     self.ct_create = ct_create
+    # The @xdp block's zone, for folding pkt.zone (v0.4 § 6.4).
+    self.zone_name = zone_name
 
 
 def _emit_tier2_stmts(stmts, ctx: _Tier2EmitCtx, indent: str) -> str:
@@ -1736,6 +1939,8 @@ def _emit_tier2_stmt(stmt, ctx: _Tier2EmitCtx, indent: str) -> str:
       return f"{indent}{ctx.ct_create}return XDP_PASS;\n"
     if stmt.action == ast.Action.DROP:
       return f"{indent}return XDP_DROP;\n"
+    if stmt.action == ast.Action.REDIRECT:
+      return f"{indent}return {_redirect_return(stmt.redirect_zone)};\n"
     if stmt.action == ast.Action.LOG:
       return (
         f"{indent}{{\n{indent}  "
@@ -1809,6 +2014,8 @@ def _emit_scalar(expr, ctx: _Tier2EmitCtx) -> str:
     return _emit_tier2_comparison(expr, ctx)
   if isinstance(expr, ast.ConntrackStateCompare):
     return _emit_ct_state_compare(expr)
+  if isinstance(expr, ast.ZoneCompare):
+    return _emit_zone_compare(expr, ctx.zone_name)
   if isinstance(expr, ast.AndOp):
     parts = [f"({_emit_scalar(c, ctx)})" for c in expr.operands]
     return "(" + " && ".join(parts) + ")"

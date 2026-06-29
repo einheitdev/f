@@ -66,6 +66,14 @@ class FwlIndenter(Indenter):
       if token.type == self.NL_type:
         if in_def:
           yield from self.handle_NL(token)
+          # Once the def body has fully dedented back to column 0 we are
+          # at top level again — between @xdp blocks, after the final
+          # statement, or before the next zone decl — where the file is
+          # line-oriented and `_NL` must be dropped. Re-arm on the next
+          # DEF. (v0.4 § 6.2: multiple @xdp blocks per file means a hook
+          # can follow a Tier 2 def, so the gate cannot stay latched.)
+          if len(self.indent_level) == 1:
+            in_def = False
         # else: drop the newline silently — Tier 1 doesn't need it.
       else:
         yield token
@@ -275,6 +283,10 @@ class _ToAst(Transformer):
   def VLAN_FIELD(self, tok): return tok
   def CT_STATE_FIELD(self, tok): return tok
   def CT_STATE_KEYWORD(self, tok): return tok
+  def ZONE_FIELD(self, tok): return tok
+  def ZONE(self, tok): return tok
+  def REDIRECT(self, tok): return tok
+  def TO(self, tok): return tok
   def PROTO_KEYWORD(self, tok): return tok
   def IPV4(self, tok): return tok
   def IPV6(self, tok): return tok
@@ -288,24 +300,35 @@ class _ToAst(Transformer):
     (iface_tok,) = children
     return ast.Hook(interface=str(iface_tok), span=_span(iface_tok))
 
+  # Action tuples are 5-tuples:
+  #   (Action, span, counter_name, log_sample, redirect_zone)
+  # Only one of counter_name / log_sample / redirect_zone is ever
+  # non-None, keyed to the action verb.
   def terminal_action(self, children):
     (tok,) = children
     if tok.type == "ALLOW":
-      return ast.Action.ALLOW, _span(tok), None, None
-    return ast.Action.DROP, _span(tok), None, None
+      return ast.Action.ALLOW, _span(tok), None, None, None
+    return ast.Action.DROP, _span(tok), None, None, None
+
+  def redirect_action(self, children):
+    """`redirect to <zone>` — terminal action carrying the dest zone."""
+    redirect_tok, _to_tok, zone_tok = children
+    return (
+      ast.Action.REDIRECT, _span(redirect_tok), None, None, str(zone_tok)
+    )
 
   def log_action(self, children):
     log_tok = children[0]
     sample = None
     if len(children) > 1:
       sample = _parse_int(str(children[1]))
-    return ast.Action.LOG, _span(log_tok), None, sample
+    return ast.Action.LOG, _span(log_tok), None, sample, None
 
   def nonterminal_action(self, children):
     if isinstance(children[0], tuple):
       return children[0]
     count_tok, name_tok = children
-    return ast.Action.COUNT, _span(count_tok), str(name_tok), None
+    return ast.Action.COUNT, _span(count_tok), str(name_tok), None, None
 
   def action(self, children):
     (action_tuple,) = children
@@ -313,11 +336,13 @@ class _ToAst(Transformer):
 
   def default_rule(self, children) -> ast.DefaultRule:
     (action_tuple,) = children
-    action, span, _, _ = action_tuple
+    action, span, _, _, _ = action_tuple
     return ast.DefaultRule(action=action, span=span)
 
   def rule(self, children) -> ast.Rule:
-    action, action_span, counter_name, log_sample = children[0]
+    action, action_span, counter_name, log_sample, redirect_zone = (
+      children[0]
+    )
     condition: ast.Condition | None = None
     modifier: ast.RateLimit | None = None
     for child in children[1:]:
@@ -332,6 +357,7 @@ class _ToAst(Transformer):
       span=action_span,
       counter_name=counter_name,
       log_sample=log_sample,
+      redirect_zone=redirect_zone,
     )
 
   def modifier(self, children) -> ast.RateLimit:
@@ -349,7 +375,19 @@ class _ToAst(Transformer):
     (item,) = children
     return item
 
-  def program(self, children) -> ast.Program:
+  def zone_decl(self, children) -> ast.ZoneDecl:
+    """`zone <name> = [<iface>, ...]` declaration (v0.4 § 6.1)."""
+    zone_tok = children[0]
+    name_tok = children[1]
+    iface_toks = children[2:]
+    return ast.ZoneDecl(
+      name=str(name_tok),
+      interfaces=tuple(str(t) for t in iface_toks),
+      span=_span(zone_tok),
+    )
+
+  def xdp_block(self, children) -> ast.ZoneProgram:
+    """One @xdp(<zone>) block — a single zone's policy (v0.4 § 6.2)."""
     hook = children[0]
     default: ast.DefaultRule | None = None
     function: ast.FunctionDef | None = None
@@ -373,9 +411,19 @@ class _ToAst(Transformer):
             span=child.span,
           ))
         rules.append(child)
-    return ast.Program(
+    return ast.ZoneProgram(
       hook=hook, rules=rules, default=default, function=function
     )
+
+  def program(self, children) -> ast.Program:
+    zones: list[ast.ZoneDecl] = []
+    programs: list[ast.ZoneProgram] = []
+    for child in children:
+      if isinstance(child, ast.ZoneDecl):
+        zones.append(child)
+      elif isinstance(child, ast.ZoneProgram):
+        programs.append(child)
+    return ast.Program(programs=programs, zones=zones)
 
   # --- conditions ---
 
@@ -496,6 +544,22 @@ class _ToAst(Transformer):
     return ast.ConntrackStateCompare(
       op="in", states=states, span=_span(ct_tok)
     )
+
+  def zone_name_list(self, children) -> tuple[str, ...]:
+    """`[ <zone>, ... ]` on the right of `pkt.zone in`."""
+    return tuple(str(tok) for tok in children)
+
+  def zone_compare(self, children) -> ast.ZoneCompare:
+    """`pkt.zone <op> <zone>` for op in ==/!=/<...> (analyzer narrows)."""
+    zone_field_tok, op, name_tok = children
+    return ast.ZoneCompare(
+      op=op, zones=(str(name_tok),), span=_span(zone_field_tok)
+    )
+
+  def zone_in(self, children) -> ast.ZoneCompare:
+    """`pkt.zone in [ <zone>, ... ]`."""
+    zone_field_tok, names = children
+    return ast.ZoneCompare(op="in", zones=names, span=_span(zone_field_tok))
 
   def count_call(self, children) -> ast.CountCall:
     count_tok, name_tok = children
@@ -628,6 +692,15 @@ class _ToAst(Transformer):
       action=ast.Action.COUNT,
       counter_name=str(name_tok),
       span=_span(count_tok),
+    )
+
+  def action_redirect(self, children) -> ast.ActionStmt:
+    """`redirect to <zone>` as a Tier 2 action statement (v0.4 § 6.3)."""
+    redirect_tok, _to_tok, zone_tok = children
+    return ast.ActionStmt(
+      action=ast.Action.REDIRECT,
+      redirect_zone=str(zone_tok),
+      span=_span(redirect_tok),
     )
 
   def action_stmt(self, children) -> ast.ActionStmt:

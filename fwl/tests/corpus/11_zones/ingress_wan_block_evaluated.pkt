@@ -1,0 +1,20 @@
+name: the wan @xdp block governs wan-ingress packets
+source_fw: 'zone wan = [wan0]
+
+  zone lan = [lan0, lan1, lan2, lan3]
+
+  @xdp(wan)
+
+  drop
+
+  @xdp(lan)
+
+  redirect to wan
+
+  '
+ingress_zone: wan
+test_packet:
+  builder: tcp(src_ip="8.8.8.8", dst_ip="10.0.0.5", dst_port=40000)
+expected:
+  compiles: true
+  bpf_action: drop

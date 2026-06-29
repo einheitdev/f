@@ -1,0 +1,12 @@
+name: empty zone is a compile error
+source_fw: 'zone wan = []
+
+  @xdp(wan)
+
+  allow
+
+  '
+test_packet:
+  builder: tcp()
+expected:
+  compiles: false

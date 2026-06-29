@@ -41,21 +41,30 @@ def parse(source: Path) -> None:
 
 def _format_program(p: ast.Program) -> str:
   """One-rule-per-line summary of an AST. Easier to scan than dataclass repr."""
-  lines = [f"@xdp({p.hook.interface})"]
-  for i, rule in enumerate(p.rules):
-    parts = [rule.action.value]
-    if rule.action == ast.Action.COUNT and rule.counter_name:
-      parts.append(rule.counter_name)
-    if rule.condition is not None:
-      parts.append(f"if {_format_condition(rule.condition)}")
-    if rule.modifier is not None:
-      parts.append(
-        f"limited by rate_limit({rule.modifier.threshold}, "
-        f"per={rule.modifier.per_field})"
-      )
-    lines.append(f"  [{i}] {' '.join(parts)}")
-  if p.default is not None:
-    lines.append(f"  default {p.default.action.value}")
+  lines: list[str] = []
+  for z in p.zones:
+    lines.append(f"zone {z.name} = [{', '.join(z.interfaces)}]")
+  for zp in p.programs:
+    lines.append(f"@xdp({zp.hook.interface})")
+    for i, rule in enumerate(zp.rules):
+      parts = [rule.action.value]
+      if rule.action == ast.Action.COUNT and rule.counter_name:
+        parts.append(rule.counter_name)
+      if rule.action == ast.Action.REDIRECT and rule.redirect_zone:
+        parts.append(f"to {rule.redirect_zone}")
+      if rule.condition is not None:
+        parts.append(f"if {_format_condition(rule.condition)}")
+      if rule.modifier is not None:
+        parts.append(
+          f"limited by rate_limit({rule.modifier.threshold}, "
+          f"per={rule.modifier.per_field})"
+        )
+      lines.append(f"  [{i}] {' '.join(parts)}")
+    if zp.default is not None:
+      lines.append(f"  default {zp.default.action.value}")
+    if zp.function is not None:
+      lines.append(f"  def {zp.function.name}(pkt): "
+                   f"({len(zp.function.body)} stmts)")
   return "\n".join(lines)
 
 
@@ -121,19 +130,101 @@ def check(source: Path) -> None:
   "-o", "--output", type=click.Path(path_type=Path), default=None,
   help="Write generated C to this path instead of stdout.",
 )
-def compile(source: Path, output: Path | None) -> None:
-  """Compile SOURCE to BPF C."""
+@click.option(
+  "--bundle", "bundle_dir", type=click.Path(path_type=Path), default=None,
+  help=(
+    "Emit a multi-zone bundle (one <zone>.bpf.c + .bpf.o per @xdp "
+    "block, a shared header, and manifest.json) into this directory."
+  ),
+)
+def compile(source: Path, output: Path | None, bundle_dir: Path | None) -> None:
+  """Compile SOURCE to BPF C (single object) or a multi-zone bundle."""
   text = source.read_text(encoding="utf-8")
   try:
     program = analyzer.analyze(parser.parse(text))
   except FwlException as exc:
     click.echo(exc.error.format(), err=True)
     sys.exit(1)
+
+  if bundle_dir is not None:
+    _emit_bundle_dir(program, bundle_dir)
+    return
+
+  # A multi-zone unit has more than one program; a single C file cannot
+  # represent it. Point the user at --bundle.
+  if len(program.programs) > 1:
+    click.echo(
+      "error: this file declares multiple @xdp zones; use --bundle "
+      "<dir> to emit one object per zone",
+      err=True,
+    )
+    sys.exit(1)
+
   c_source = emitter.emit(program)
   if output is None:
     click.echo(c_source, nl=False)
   else:
     output.write_text(c_source, encoding="utf-8")
+
+
+def _emit_bundle_dir(program: ast.Program, bundle_dir: Path) -> None:
+  """Write a multi-zone bundle to `bundle_dir`.
+
+  Emits each zone's `<zone>.bpf.c` and the shared header, compiles each
+  C file to `<zone>.bpf.o` when clang is available, and writes a
+  `manifest.json` describing the zones, per-zone objects, redirect
+  topology, and the bpffs-pinned shared maps the daemon must wire up.
+  """
+  import json
+  import subprocess
+
+  from . import bpf_runner
+
+  bundle_dir.mkdir(parents=True, exist_ok=True)
+  files = emitter.emit_bundle(program)
+  for name, c_source in files.items():
+    (bundle_dir / name).write_text(c_source, encoding="utf-8")
+
+  programs_meta = []
+  for zp in program.programs:
+    c_name = f"{zp.zone_name}.bpf.c"
+    o_name = f"{zp.zone_name}.bpf.o"
+    try:
+      result = bpf_runner.compile_c(
+        files[c_name], work_dir=bundle_dir
+      )
+      # compile_c writes fwl_prog.bpf.o; move it to the zone name.
+      result.obj_path.replace(bundle_dir / o_name)
+      compiled = True
+    except (bpf_runner.BpfUnavailable, subprocess.CalledProcessError):
+      compiled = False
+    programs_meta.append({
+      "zone": zp.zone_name,
+      "source": c_name,
+      "object": o_name if compiled else None,
+      "redirects_to": emitter._collect_redirect_zones(zp),
+    })
+
+  manifest = {
+    "version": "0.4",
+    "zones": [
+      {"name": z.name, "interfaces": list(z.interfaces)}
+      for z in program.zones
+    ],
+    "programs": programs_meta,
+    "shared_pinned_maps": ["conntrack"],
+  }
+  (bundle_dir / "manifest.json").write_text(
+    json.dumps(manifest, indent=2), encoding="utf-8"
+  )
+  # Drop the scratch source compile_c leaves behind in the bundle dir.
+  stray = bundle_dir / "fwl_prog.bpf.c"
+  if stray.exists():
+    stray.unlink()
+  click.echo(
+    f"wrote bundle: {len(program.programs)} zone program(s) to "
+    f"{bundle_dir}"
+  )
 
 
 @main.command()

@@ -21,6 +21,9 @@ class XdpAction(Enum):
   """The XDP return values an FWL program can produce."""
   PASS = "XDP_PASS"
   DROP = "XDP_DROP"
+  # v0.4 § 6.3: `redirect to <zone>` returns XDP_REDIRECT. The
+  # destination zone is reported separately on EvalResult.redirect_zone.
+  REDIRECT = "XDP_REDIRECT"
 
 
 @dataclass
@@ -42,11 +45,15 @@ class EvalResult:
   action: XdpAction
   counter_changes: dict[str, int] = field(default_factory=dict)
   log_events: list[LogEvent] = field(default_factory=list)
+  # Set when the resulting action is REDIRECT: the destination zone
+  # name (v0.4 § 6.3). None for every other action.
+  redirect_zone: str | None = None
 
 
 _TERMINAL_ACTION_TO_XDP = {
   ast.Action.ALLOW: XdpAction.PASS,
   ast.Action.DROP: XdpAction.DROP,
+  ast.Action.REDIRECT: XdpAction.REDIRECT,
 }
 
 
@@ -228,7 +235,13 @@ def evaluate_full(
   uses_ct = _program_uses_conntrack(program)
   ct = conntrack if conntrack is not None else ConntrackTable()
   ct_state = ct.state_for(packet)
-  ctx = _Ctx(geoip_data=geoip_data, ct_state=ct_state)
+  # pkt.zone's constant value is the @xdp block's zone (the hook
+  # argument); works for a Program (delegates to programs[0]) or a
+  # ZoneProgram passed directly by the cross-zone runner (v0.4 § 6.4).
+  zone_name = program.hook.interface
+  ctx = _Ctx(
+    geoip_data=geoip_data, ct_state=ct_state, zone_name=zone_name
+  )
   counters: dict[str, int] = {}
   log_events: list[LogEvent] = []
   if program.function is not None:
@@ -238,7 +251,7 @@ def evaluate_full(
     # fall-through None) of a NEW packet creates conntrack state.
     if uses_ct and result is XdpAction.PASS and ct_state == ast.CtState.NEW:
       ct.create(packet)
-    return EvalResult(action=action)
+    return EvalResult(action=action, redirect_zone=ctx.redirect_zone)
   for idx, rule in enumerate(program.rules):
     if rule.condition is not None and not _eval(
       rule.condition, packet, ctx, counters
@@ -255,6 +268,10 @@ def evaluate_full(
         action=_TERMINAL_ACTION_TO_XDP[rule.action],
         counter_changes=counters,
         log_events=log_events,
+        redirect_zone=(
+          rule.redirect_zone
+          if rule.action == ast.Action.REDIRECT else None
+        ),
       )
     if rule.action == ast.Action.COUNT and rule.counter_name:
       counters[rule.counter_name] = (
@@ -312,6 +329,9 @@ def _exec_stmts(
         return XdpAction.PASS
       if stmt.action == ast.Action.DROP:
         return XdpAction.DROP
+      if stmt.action == ast.Action.REDIRECT:
+        ctx.redirect_zone = stmt.redirect_zone
+        return XdpAction.REDIRECT
       # LOG and COUNT are non-terminal: side effect omitted in test.
       continue
     if isinstance(stmt, ast.AssignStmt):
@@ -367,6 +387,8 @@ def _eval_scalar(
     return _eval_tier2_comparison(expr, packet, ctx, locals_)
   if isinstance(expr, ast.ConntrackStateCompare):
     return _eval_ct_state_compare(expr, ctx.ct_state)
+  if isinstance(expr, ast.ZoneCompare):
+    return _eval_zone_compare(expr, ctx.zone_name)
   if isinstance(expr, ast.NotOp):
     return not _eval_scalar(expr.inner, packet, ctx, locals_)
   if isinstance(expr, ast.AndOp):
@@ -701,12 +723,19 @@ class _Ctx:
     *,
     geoip_data: dict[str, list[str]],
     ct_state: ast.CtState = ast.CtState.NEW,
+    zone_name: str | None = None,
   ):
     self.geoip_data = geoip_data
     # The conntrack state of the packet under evaluation, computed once
     # from the conntrack table (v0.4). Every conntrack(pkt).state read
     # in this packet's evaluation sees the same value.
     self.ct_state = ct_state
+    # The zone this @xdp block is attached to — pkt.zone's constant
+    # value for the evaluation (v0.4 § 6.4).
+    self.zone_name = zone_name
+    # Set by a fired `redirect to <zone>` so evaluate_full can report
+    # the destination on EvalResult.redirect_zone (v0.4 § 6.3).
+    self.redirect_zone: str | None = None
     # Per-call resolved prefix lists keyed by the GeoIp call_index.
     # Memoising keeps repeated lookups cheap when a rule fires per
     # packet across a corpus run.
@@ -739,6 +768,8 @@ def _eval(
     return op_fn(cur, val) if op_fn else False
   if isinstance(node, ast.ConntrackStateCompare):
     return _eval_ct_state_compare(node, ctx.ct_state)
+  if isinstance(node, ast.ZoneCompare):
+    return _eval_zone_compare(node, ctx.zone_name)
   if isinstance(node, ast.BoolField):
     return bool(packet.get(_field_key(node.field.name), False))
   if isinstance(node, ast.NotOp):
@@ -769,6 +800,21 @@ def _eval_ct_state_compare(
   if node.op == "in":
     return ct_state in node.states
   raise AssertionError(f"unexpected ct_state op {node.op}")
+
+
+def _eval_zone_compare(node: ast.ZoneCompare, zone_name: str | None) -> bool:
+  """Evaluate `pkt.zone <op> ...` — a compile-time constant (v0.4 § 6.4).
+
+  pkt.zone equals the @xdp block's zone, so the comparison is decided
+  by the static zone name alone.
+  """
+  if node.op == "==":
+    return zone_name == node.zones[0]
+  if node.op == "!=":
+    return zone_name != node.zones[0]
+  if node.op == "in":
+    return zone_name in node.zones
+  raise AssertionError(f"unexpected zone op {node.op}")
 
 
 def _field_key(name: str) -> str:

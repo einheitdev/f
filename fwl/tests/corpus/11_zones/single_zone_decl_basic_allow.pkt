@@ -1,0 +1,16 @@
+name: one zone decl + one @xdp behaves like a v0.3 program
+source_fw: 'zone edge = [eth0]
+
+  @xdp(edge)
+
+  allow if pkt.proto == tcp
+
+  default drop
+
+  '
+ingress_zone: edge
+test_packet:
+  builder: tcp(src_ip="1.1.1.1", dst_ip="2.2.2.2", dst_port=80)
+expected:
+  compiles: true
+  bpf_action: allow

@@ -77,6 +77,10 @@ class PktCase:
   # table (interpreter) / one loaded BPF object (bpf).
   conntrack_seed: tuple = ()
   sequence: tuple = None  # type: ignore[assignment]
+  # v0.4 § 6: the zone the packet arrives on, naming which @xdp block
+  # evaluates it in a multi-zone unit. None selects the first/only
+  # block (the degenerate single-zone case).
+  ingress_zone: str = None  # type: ignore[assignment]
 
 
 @dataclass(frozen=True)
@@ -583,6 +587,9 @@ _TOP_LEVEL_KEYS = frozenset({
   # v0.4: a multi-packet conntrack test. Mutually exclusive with the
   # single test_packet/expected pair.
   "sequence",
+  # v0.4 § 6: names the ingress zone (which @xdp block) for a multi-zone
+  # unit. Omitted for single-zone files.
+  "ingress_zone",
 })
 _TEST_PACKET_KEYS = frozenset({"builder", "truncate_to"})
 _EXPECTED_KEYS = frozenset({
@@ -591,6 +598,9 @@ _EXPECTED_KEYS = frozenset({
   # Hunt-emitted assertion text. The runner does not consume it
   # today — wiring it through the analyzer is a v0.3 backlog item.
   "compile_error_pattern",
+  # v0.4 § 6.3: for a `redirect` bpf_action, the expected destination
+  # zone (checked by the interpreter oracle).
+  "redirect_zone",
 })
 # v0.4 adds `conntrack` (a list of pre-seeded entries) alongside the
 # v0.1 `rate_limit` bucket state.
@@ -790,6 +800,7 @@ def _load_sequence(doc: dict, path: Path) -> PktCase:
       (doc.get("state") or {}).get("conntrack")
     ),
     sequence=tuple(steps),
+    ingress_zone=doc.get("ingress_zone"),
   )
 
 
@@ -837,6 +848,7 @@ def load(path: Path) -> PktCase:
     path=path,
     geoip_data=geoip_data,
     conntrack_seed=conntrack_seed,
+    ingress_zone=doc.get("ingress_zone"),
   )
 
 

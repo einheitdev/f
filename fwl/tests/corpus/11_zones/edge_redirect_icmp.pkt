@@ -1,0 +1,19 @@
+name: redirect an ICMP echo request to wan
+source_fw: 'zone wan = [wan0]
+
+  zone lan = [lan0, lan1, lan2, lan3]
+
+  @xdp(lan)
+
+  redirect to wan if pkt.proto == icmp
+
+  drop
+
+  '
+ingress_zone: lan
+test_packet:
+  builder: icmp(src_ip="10.0.0.5", dst_ip="1.1.1.1", type=8, code=0)
+expected:
+  compiles: true
+  bpf_action: redirect
+  redirect_zone: wan

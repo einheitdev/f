@@ -1,0 +1,18 @@
+name: two @xdp blocks for one zone is a compile error
+source_fw: 'zone wan = [wan0]
+
+  zone lan = [lan0, lan1, lan2, lan3]
+
+  @xdp(lan)
+
+  allow
+
+  @xdp(lan)
+
+  drop
+
+  '
+test_packet:
+  builder: tcp()
+expected:
+  compiles: false

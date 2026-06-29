@@ -1,0 +1,20 @@
+name: pkt.zone in [wan, dmz] is false in the lan block
+source_fw: 'zone wan = [wan0]
+
+  zone lan = [lan0]
+
+  zone dmz = [dmz0]
+
+  @xdp(lan)
+
+  allow if pkt.zone in [wan, dmz]
+
+  drop
+
+  '
+ingress_zone: lan
+test_packet:
+  builder: tcp(src_ip="10.0.0.5", dst_ip="1.1.1.1", dst_port=80)
+expected:
+  compiles: true
+  bpf_action: drop

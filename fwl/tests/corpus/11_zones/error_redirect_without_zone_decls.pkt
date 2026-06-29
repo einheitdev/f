@@ -1,0 +1,10 @@
+name: redirect in a file with no zone declarations is an error
+source_fw: '@xdp(eth0)
+
+  redirect to wan
+
+  '
+test_packet:
+  builder: tcp()
+expected:
+  compiles: false
