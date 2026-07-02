@@ -1,0 +1,16 @@
+name: "three stage match last"
+source_fw: |
+  @xdp(eth0)
+  allow if pkt.src_ip == 1.1.1.1
+  chain b
+  drop if pkt.src_ip == 2.2.2.2
+  chain c
+  allow if pkt.proto == tcp and pkt.dst_port == 443
+  default drop
+
+test_packet:
+  builder: tcp(src_ip="8.8.8.8", dst_ip="9.9.9.9", dst_port=443)
+
+expected:
+  compiles: true
+  bpf_action: allow

@@ -13,6 +13,7 @@ to 0 (or the rule's condition naturally evaluates to false).
 from __future__ import annotations
 
 from . import ast
+from . import splitter
 
 
 _PROTO_TO_IPPROTO = {
@@ -58,6 +59,13 @@ struct fwl_vlanhdr {
   __u16 tci;
   __u16 inner_proto;
 };
+
+// v0.4 § 6.5 multi-def: helper `def`s compile to `static __noinline`
+// BPF-to-BPF functions returning an XDP action, or this sentinel when
+// the helper reached no terminal action (the caller then continues).
+// -1 never collides with a real XDP_* code (XDP_ABORTED..XDP_REDIRECT
+// are 0..4).
+#define FWL_CONTINUE (-1)
 """
 
 
@@ -733,8 +741,15 @@ def _stmts_activate_v6(stmts) -> bool:
   return False
 
 
-def _emit_parse_prelude(program: ast.Program) -> str:
+def _emit_parse_prelude(
+  program: ast.Program, early_out: str = "XDP_PASS"
+) -> str:
   """Emit the packet-parsing prelude.
+
+  `early_out` is the value returned when the frame is non-IP (and not a
+  tagged frame the program matches on): XDP_PASS in the top-level
+  program, or FWL_CONTINUE inside a `static __noinline` helper so the
+  caller keeps evaluating (v0.4 § 6.5 multi-def).
 
   Initializes all referenced fields to 0 and overwrites them only
   when each parse step succeeds. Truncated or non-IPv4 packets fall
@@ -1019,7 +1034,7 @@ def _emit_parse_prelude(program: ast.Program) -> str:
       }}
     }}{v6_branch}
   }}
-  if (!v4_ok && !v6_ok{vlan_gate}) return XDP_PASS;
+  if (!v4_ok && !v6_ok{vlan_gate}) return {early_out};
 
 """
 
@@ -1950,19 +1965,134 @@ struct {{
   return "\n".join(blocks)
 
 
-def emit(program: ast.Program) -> str:
+def _walk_calls_in_stmts(stmts):
+  """Yield every CallStmt name in a statement block (all branches)."""
+  for s in stmts:
+    if isinstance(s, ast.CallStmt):
+      yield s.name
+    elif isinstance(s, ast.IfStmt):
+      yield from _walk_calls_in_stmts(s.body)
+      for _cond, body in s.elif_branches:
+        yield from _walk_calls_in_stmts(body)
+      if s.else_body is not None:
+        yield from _walk_calls_in_stmts(s.else_body)
+
+
+def _reachable_helpers(
+  zp: ast.ZoneProgram, helpers: list[ast.FunctionDef]
+) -> list[ast.FunctionDef]:
+  """Transitive closure of helper defs called from a zone's body (v0.4
+  § 6.5).
+
+  Returns the reachable helpers in dependency order (callee before
+  caller), so a C prototype block is unnecessary for straight-line call
+  chains — though the emitter emits prototypes anyway for safety. Only
+  a Tier 2 body can host a CallStmt; a Tier 1 rule zone reaches none.
+  """
+  by_name = {h.name: h for h in helpers}
+  order: list[ast.FunctionDef] = []
+  seen: set[str] = set()
+
+  def visit(name: str) -> None:
+    if name in seen or name not in by_name:
+      return
+    seen.add(name)
+    h = by_name[name]
+    for callee in _walk_calls_in_stmts(h.body):
+      visit(callee)
+    order.append(h)
+
+  if zp.function is not None:
+    for callee in _walk_calls_in_stmts(zp.function.body):
+      visit(callee)
+  return order
+
+
+def _synth_unit(zp: ast.ZoneProgram, func: ast.FunctionDef) -> ast.ZoneProgram:
+  """Wrap a helper def as a ZoneProgram so per-unit collectors reuse."""
+  return ast.ZoneProgram(hook=zp.hook, function=func)
+
+
+def _allocate_counter_slots_units(
+  units: list[ast.ZoneProgram],
+) -> dict[str, int]:
+  """Allocate counter slots across a zone body + its reachable helpers.
+
+  Counters of the same name in the body and a helper share one slot
+  (one per-CPU map per zone object). The reserved rate-limit overflow
+  slot stays last, after every user counter from every unit.
+  """
+  slots: dict[str, int] = {}
+  uses_rl = False
+  for u in units:
+    for rule in u.rules:
+      if rule.action == ast.Action.COUNT and rule.counter_name:
+        if rule.counter_name not in slots:
+          slots[rule.counter_name] = len(slots)
+      for n in _walk(rule.condition):
+        if isinstance(n, ast.CountCompare):
+          name = n.call.counter_name
+          if name not in slots:
+            slots[name] = len(slots)
+    if u.function is not None:
+      _collect_tier2_counter_slots(u.function.body, slots)
+    if _program_uses_rate_limit(u):
+      uses_rl = True
+  if uses_rl:
+    slots[RATE_LIMIT_OVERFLOW_COUNTER] = len(slots)
+  return slots
+
+
+def _emit_helper_function(
+  func: ast.FunctionDef,
+  counter_slots: dict[str, int],
+  zp: ast.ZoneProgram,
+  ct_create: str,
+  zone_name: str | None,
+) -> str:
+  """Emit one helper `def` as a `static __noinline` BPF function (v0.4
+  § 6.5).
+
+  The helper parses the frame independently (its own prelude, whose
+  non-IP early-out returns FWL_CONTINUE so the caller keeps going),
+  runs its Tier 2 body, and falls through to `return FWL_CONTINUE`. A
+  terminal action inside the body emits `return XDP_...`, which the
+  call site propagates.
+  """
+  synth = _synth_unit(zp, func)
+  prelude = _emit_parse_prelude(synth, early_out="FWL_CONTINUE")
+  body, _ = _emit_tier2_body(func, counter_slots, synth, ct_create, zone_name)
+  return (
+    f"static __noinline int fwl_helper_{func.name}"
+    f"(struct xdp_md *ctx) {{\n"
+    f"{prelude}{body}  return FWL_CONTINUE;\n"
+    f"}}\n"
+  )
+
+
+def emit(program: ast.Program, *, split: bool | None = None) -> str:
   """Emit BPF C source for the first @xdp block of `program`.
 
   This is the single-object entry point used by `fwl compile -o` and
   by the test runner's BPF oracle (one zone program per object,
   maps defined inline, no bpffs pinning). For a multi-zone bundle with
   bpffs-pinned shared maps, see `emit_bundle`.
+
+  `split` (v0.4 § 6.6): None lets the estimator decide; True/False force
+  a tail-call pipeline / single program. The pipeline_equivalence
+  harness emits the same program both ways and checks identical
+  behavior.
   """
-  return _emit_zone_source(program.programs[0], pinned_shared=False)
+  return _emit_zone_source(
+    program.programs[0], pinned_shared=False, helpers=program.helpers,
+    split=split,
+  )
 
 
 def _emit_zone_source(
   zp: ast.ZoneProgram, *, pinned_shared: bool, force_nat: bool = False,
+  helpers: list[ast.FunctionDef] | None = None,
+  split: bool | None = None,
 ) -> str:
   """Emit one zone's complete BPF C source.
 
@@ -1971,29 +2101,60 @@ def _emit_zone_source(
   carry LIBBPF_PIN_BY_NAME so they resolve to one bpffs-pinned kernel
   map across every zone program in a bundle (v0.4 § 6.2).
 
+  `helpers` are the unit's top-level helper defs (v0.4 § 6.5); the ones
+  this zone reaches via CallStmt are emitted into this object as
+  `static __noinline` functions, and the shared-map / counter analysis
+  spans the zone body plus those reachable helpers.
+
+  `split` (v0.4 § 6.6): None lets the estimator decide; True forces a
+  tail-call pipeline (used by the pipeline_equivalence harness); False
+  forces a single program. When the plan splits, the object holds N
+  `fwl_stage_i` programs chained through a prog_array + per-CPU scratch
+  map instead of one `fwl_prog`.
+
   Tier 1: prelude + per-rule blocks + final return.
   Tier 2: prelude + locals declaration + statement-by-statement body.
   """
   zone_name = zp.zone_name
+  if split is False:
+    plan = splitter.SplitPlan(
+      split=False, stages=(), estimate=splitter.estimate(zp),
+      reason="forced single",
+    )
+  else:
+    plan = splitter.plan(zp, force_split=(split is True))
+  reachable = _reachable_helpers(zp, helpers or [])
+  # The zone body plus every helper it reaches, each wrapped as a unit
+  # so the per-unit collectors (conntrack/NAT/log/rate-limit/counters)
+  # account for helper usage — the maps are declared once, shared by the
+  # body and its `static __noinline` helper functions.
+  units = [zp] + [_synth_unit(zp, h) for h in reachable]
   prelude = _emit_parse_prelude(zp)
   rl_maps = _emit_rl_maps(zp)
   geoip_block = _emit_geoip_maps_and_helpers(zp)
-  uses_ct = _program_uses_conntrack(zp)
+  uses_ct = any(_program_uses_conntrack(u) for u in units)
   conntrack_decl = _maybe_pin(_CONNTRACK_DECL, pinned_shared) if uses_ct else ""
   ct_create = _emit_ct_create() if uses_ct else ""
-  devmaps = _emit_devmaps(_collect_redirect_zones(zp), pinned_shared)
+  # Redirect targets from the zone body and any reachable helper (a
+  # helper may `redirect to <zone>`), de-duplicated in first-seen order.
+  redirect_zones: list[str] = []
+  for u in units:
+    for z in _collect_redirect_zones(u):
+      if z not in redirect_zones:
+        redirect_zones.append(z)
+  devmaps = _emit_devmaps(redirect_zones, pinned_shared)
 
   # Phase 5 NAT. Emit the maps + helpers when this program uses NAT, or
   # when forced (a bundle where some other zone does — so return traffic
   # de-NATs on whichever zone it arrives). The de-NAT pass runs before
   # any rule.
-  nat_active = _program_uses_nat(zp) or force_nat
+  nat_active = any(_program_uses_nat(u) for u in units) or force_nat
   nat_decl = _maybe_pin(_NAT_DECL, pinned_shared) if nat_active else ""
   nat_helpers = _NAT_HELPERS if nat_active else ""
   nat_denat = "  fwl_nat_denat(ctx);\n" if nat_active else ""
 
-  counter_slots = _allocate_counter_slots(zp)
-  has_log = _program_uses_log(zp)
+  counter_slots = _allocate_counter_slots_units(units)
+  has_log = any(_program_uses_log(u) for u in units)
 
   log_decl = _maybe_pin(_LOG_EVENT_DECL, pinned_shared) if has_log else ""
   sampled = sum(
@@ -2022,6 +2183,46 @@ def _emit_zone_source(
     counter_decl = ""
     counter_table = ""
 
+  # v0.4 § 6.5: forward-declare every reachable helper (so any call
+  # order compiles), then emit their definitions before the program(s).
+  # The helpers come after nat_helpers because a NAT helper
+  # (fwl_masquerade etc.) may be referenced from a helper body.
+  helper_protos = "".join(
+    f"static __noinline int fwl_helper_{h.name}(struct xdp_md *ctx);\n"
+    for h in reachable
+  )
+  helper_defs = "".join(
+    _emit_helper_function(h, counter_slots, zp, ct_create, zone_name)
+    + "\n"
+    for h in reachable
+  )
+
+  maps_block = (
+    f"{log_decl}{log_sample_decl}{counter_decl}{rl_maps}{geoip_block}"
+    f"{conntrack_decl}{nat_decl}{devmaps}"
+  )
+
+  if plan.split:
+    # v0.4 § 6.6: N-program tail-call pipeline in one object.
+    programs = _emit_split_programs(
+      zp, plan, counter_slots, ct_create, zone_name, prelude, nat_denat,
+    )
+    scratch_struct = _emit_scratch_struct(zp)
+    # The scratch + prog_array are object-private transients (per-packet
+    # per-CPU metadata; this zone's own stage table). They must NOT pin
+    # by name — pinning would collide two split zones onto one kernel
+    # map in a bundle, cross-wiring their pipelines. Each zone object
+    # keeps its own unpinned copy.
+    scratch_map = _SCRATCH_MAP_DECL
+    prog_array = _PROG_ARRAY_DECL_TEMPLATE.format(n=plan.n_stages)
+    return f"""{_HEADER}
+{scratch_struct}
+{maps_block}{scratch_map}{prog_array}
+{nat_helpers}
+{helper_protos}{helper_defs}{programs}
+char _license[] SEC("license") = "GPL";
+{counter_table}"""
+
   if zp.function is not None:
     body, _ = _emit_tier2_body(
       zp.function, counter_slots, zp, ct_create, zone_name
@@ -2034,27 +2235,221 @@ def _emit_zone_source(
       _emit_rule(r, i, counter_slots, ct_create, zone_name)
       for i, r in enumerate(zp.rules)
     )
-    if zp.default is not None:
-      ret = _TERMINAL_ACTION_TO_RETURN[zp.default.action]
-      # An explicit `default allow` creates state like any allow; an
-      # explicit `default drop` (or the implicit fall-through below)
-      # does not.
-      create = ct_create if zp.default.action == ast.Action.ALLOW else ""
-      final_stmt = f"{create}return {ret};"
-    else:
-      final_stmt = "return XDP_PASS;"
+    final_stmt = _emit_final_stmt(zp, ct_create)
 
   return f"""{_HEADER}
-{log_decl}{log_sample_decl}{counter_decl}{rl_maps}{geoip_block}\
-{conntrack_decl}{nat_decl}{devmaps}
+{maps_block}
 {nat_helpers}
-SEC("xdp")
+{helper_protos}{helper_defs}SEC("xdp")
 int fwl_prog(struct xdp_md *ctx) {{
 {prelude}{nat_denat}{body}  {final_stmt}
 }}
 
 char _license[] SEC("license") = "GPL";
 {counter_table}"""
+
+
+def _emit_final_stmt(zp: ast.ZoneProgram, ct_create: str) -> str:
+  """The default-action / fall-through return for a Tier 1 rule zone."""
+  if zp.default is not None:
+    ret = _TERMINAL_ACTION_TO_RETURN[zp.default.action]
+    # An explicit `default allow` creates state like any allow; an
+    # explicit `default drop` (or the implicit fall-through) does not.
+    create = ct_create if zp.default.action == ast.Action.ALLOW else ""
+    return f"{create}return {ret};"
+  return "return XDP_PASS;"
+
+
+# v0.4 § 6.6 pipeline maps. The scratch map is a single-entry per-CPU
+# array holding the parsed-packet metadata the parse stage writes and
+# every later stage reads — one entry per CPU keeps the tail-call chain
+# (which stays on one CPU) race-free. The prog_array wires the stages;
+# the daemon/runner populates it with each stage program's fd at load.
+_SCRATCH_MAP_DECL = """\
+struct {
+  __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+  __type(key, __u32);
+  __type(value, struct fwl_meta);
+  __uint(max_entries, 1);
+} fwl_scratch SEC(".maps");
+"""
+
+_PROG_ARRAY_DECL_TEMPLATE = """\
+struct {{
+  __uint(type, BPF_MAP_TYPE_PROG_ARRAY);
+  __uint(key_size, sizeof(__u32));
+  __uint(value_size, sizeof(__u32));
+  __uint(max_entries, {n});
+}} fwl_stages SEC(".maps");
+"""
+
+
+def _scratch_members(zp: ast.ZoneProgram) -> list[tuple[str, str]]:
+  """The (C type, name) members of `struct fwl_meta` for a split zone.
+
+  Mirrors exactly the local declarations `_emit_parse_prelude` makes
+  for the same zone, so the parse stage packs each parsed local into
+  the scratch struct and every policy stage unpacks it back into an
+  identically-named local — the rule/statement emitters then run
+  unchanged against those bare locals (v0.4 § 6.6).
+  """
+  fields = _referenced_fields(zp)
+  # Keep the scratch struct in lockstep with the parse prelude: when the
+  # zone body references no packet fields directly (e.g. a Tier 2 body
+  # that only calls helpers, which re-parse from ctx themselves),
+  # _emit_parse_prelude emits nothing, so there are no parsed locals to
+  # pack — the scratch is empty too.
+  if not fields:
+    return []
+  needs_l4 = _needs_l4(fields)
+  needs_icmp = _needs_icmp(fields)
+  needs_icmp6 = _needs_icmp6(fields)
+  uses_ct = _program_uses_conntrack(zp)
+  needs_vlan_id = ast.FIELD_VLAN_ID in fields
+  needs_vlan_priority = ast.FIELD_VLAN_PRIORITY in fields
+  needs_vlan = needs_vlan_id or needs_vlan_priority
+  m: list[tuple[str, str]] = [("__u8", "proto"), ("__u8", "v4_ok")]
+  if needs_l4:
+    m.append(("__u8", "l4_ok"))
+  if ast.FIELD_SRC_IP in fields:
+    m.append(("__u32", "src_ip"))
+  if ast.FIELD_DST_IP in fields:
+    m.append(("__u32", "dst_ip"))
+  m.append(("__u8", "v6_ok"))
+  if ast.FIELD_SRC_IP6 in fields:
+    m += [("__u64", "src_ip6_hi"), ("__u64", "src_ip6_lo")]
+  if ast.FIELD_DST_IP6 in fields:
+    m += [("__u64", "dst_ip6_hi"), ("__u64", "dst_ip6_lo")]
+  if ast.FIELD_SRC_PORT in fields:
+    m.append(("__u16", "src_port"))
+  if ast.FIELD_DST_PORT in fields:
+    m.append(("__u16", "dst_port"))
+  for field_const, c_var, _bit in _TCP_FLAG_VARS:
+    if field_const in fields:
+      m.append(("__u8", c_var))
+  if needs_icmp:
+    m.append(("__u8", "icmp_ok"))
+    if ast.FIELD_ICMP_TYPE in fields:
+      m.append(("__u8", "icmp_type"))
+    if ast.FIELD_ICMP_CODE in fields:
+      m.append(("__u8", "icmp_code"))
+  if needs_icmp6:
+    m.append(("__u8", "icmp6_ok"))
+    if ast.FIELD_ICMP6_TYPE in fields:
+      m.append(("__u8", "icmp6_type"))
+    if ast.FIELD_ICMP6_CODE in fields:
+      m.append(("__u8", "icmp6_code"))
+  if needs_vlan:
+    m.append(("__u8", "vlan_ok"))
+    if needs_vlan_id:
+      m.append(("__u16", "vlan_id"))
+    if needs_vlan_priority:
+      m.append(("__u8", "vlan_priority"))
+  if uses_ct:
+    m += [
+      ("__u8", "ct_state"), ("__u8", "ct_v4"),
+      ("__u32", "ct_k_src"), ("__u32", "ct_k_dst"),
+      ("__u16", "ct_k_sport"), ("__u16", "ct_k_dport"),
+      ("__u8", "ct_k_proto"),
+    ]
+  return m
+
+
+def _emit_scratch_struct(zp: ast.ZoneProgram) -> str:
+  """Emit `struct fwl_meta { ... }` for a split zone's scratch map."""
+  members = _scratch_members(zp)
+  # A zone whose body references no fields directly (helpers re-parse)
+  # has an empty working set — but a zero-size map value is invalid, so
+  # emit a one-byte placeholder to keep the per-CPU array well-formed.
+  if not members:
+    members = [("__u8", "_unused")]
+  lines = "".join(f"  {ctype} {name};\n" for ctype, name in members)
+  return (
+    "// v0.4 § 6.6 per-CPU scratch: parsed once by the parse stage,\n"
+    "// read by every downstream stage (no re-parsing).\n"
+    f"struct fwl_meta {{\n{lines}}};\n"
+  )
+
+
+def _emit_scratch_lookup() -> str:
+  """Emit the scratch-map lookup prologue shared by every stage."""
+  return (
+    "  __u32 _zero = 0;\n"
+    "  struct fwl_meta *_m = bpf_map_lookup_elem(&fwl_scratch, &_zero);\n"
+    "  if (!_m) return XDP_PASS;\n"
+  )
+
+
+def _emit_scratch_pack(zp: ast.ZoneProgram) -> str:
+  """Copy the parse stage's parsed locals into the scratch struct."""
+  return "".join(
+    f"  _m->{name} = {name};\n" for _ctype, name in _scratch_members(zp)
+  )
+
+
+def _emit_scratch_unpack(zp: ast.ZoneProgram) -> str:
+  """Restore a downstream stage's bare locals from the scratch struct."""
+  return "".join(
+    f"  {ctype} {name} = _m->{name};\n"
+    for ctype, name in _scratch_members(zp)
+  )
+
+
+def _emit_split_programs(
+  zp: ast.ZoneProgram,
+  plan: "splitter.SplitPlan",
+  counter_slots: dict[str, int],
+  ct_create: str,
+  zone_name: str | None,
+  prelude: str,
+  nat_denat: str,
+) -> str:
+  """Emit the N `fwl_stage_i` programs of a split pipeline (v0.4 § 6.6).
+
+  Stage 0 parses into the scratch struct and tail-calls stage 1. Each
+  policy stage restores the scratch locals, runs its slice of the
+  policy, and either tail-calls the next stage or (the last stage)
+  applies the default. A tail-call that finds no successor program
+  falls through to `XDP_PASS` — fail-open, matching the implicit
+  fall-through of a single program; the loader always populates every
+  slot so this is unreachable in practice.
+  """
+  out: list[str] = []
+  # Stage 0: parse + de-NAT + pack scratch, then jump to stage 1.
+  out.append(
+    f'SEC("xdp")\nint fwl_stage_0(struct xdp_md *ctx) {{\n'
+    f"{prelude}{nat_denat}"
+    f"{_emit_scratch_lookup()}{_emit_scratch_pack(zp)}"
+    f"  bpf_tail_call(ctx, &fwl_stages, 1);\n"
+    f"  return XDP_PASS;\n}}\n"
+  )
+  unpack = _emit_scratch_unpack(zp)
+  for stage in plan.stages:
+    if stage.kind == "parse":
+      continue
+    if stage.kind == "policy":
+      body, _ = _emit_tier2_body(
+        zp.function, counter_slots, zp, ct_create, zone_name
+      )
+      tail = "  return XDP_PASS;\n"
+    else:
+      lo, hi = stage.rule_range
+      body = "".join(
+        _emit_rule(zp.rules[i], i, counter_slots, ct_create, zone_name)
+        for i in range(lo, hi)
+      )
+      if stage.is_last:
+        tail = f"  {_emit_final_stmt(zp, ct_create)}\n"
+      else:
+        tail = (
+          f"  bpf_tail_call(ctx, &fwl_stages, {stage.index + 1});\n"
+          f"  return XDP_PASS;\n"
+        )
+    out.append(
+      f'SEC("xdp")\nint fwl_stage_{stage.index}(struct xdp_md *ctx) {{\n'
+      f"{_emit_scratch_lookup()}{unpack}{body}{tail}}}\n"
+    )
+  return "\n".join(out) + "\n"
 
 
 def _maybe_pin(map_decl: str, pinned: bool) -> str:
@@ -2105,7 +2500,7 @@ def emit_bundle(program: ast.Program) -> dict[str, str]:
   files: dict[str, str] = {}
   for zp in program.programs:
     files[f"{zp.zone_name}.bpf.c"] = _emit_zone_source(
-      zp, pinned_shared=True, force_nat=bundle_nat
+      zp, pinned_shared=True, force_nat=bundle_nat, helpers=program.helpers
     )
   files["fwl_shared.h"] = _emit_shared_header(program)
   return files
@@ -2324,6 +2719,16 @@ def _emit_tier2_stmt(stmt, ctx: _Tier2EmitCtx, indent: str) -> str:
       )
   if isinstance(stmt, ast.AssignStmt):
     return _emit_tier2_assign(stmt, ctx, indent)
+  if isinstance(stmt, ast.CallStmt):
+    # v0.4 § 6.5: BPF-to-BPF call. The helper returns FWL_CONTINUE when
+    # it reached no terminal action; any other value is an XDP verdict
+    # the caller propagates immediately.
+    return (
+      f"{indent}{{\n"
+      f"{indent}  int _r = fwl_helper_{stmt.name}(ctx);\n"
+      f"{indent}  if (_r != FWL_CONTINUE) return _r;\n"
+      f"{indent}}}\n"
+    )
   if isinstance(stmt, ast.IfStmt):
     return _emit_tier2_if(stmt, ctx, indent)
   raise AssertionError(f"unexpected stmt {type(stmt).__name__}")

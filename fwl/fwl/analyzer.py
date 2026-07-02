@@ -92,10 +92,156 @@ def analyze(program: ast.Program) -> ast.Program:
   """
   declared = _collect_declared_zones(program)
   _check_xdp_zone_bindings(program, declared)
+  # v0.4 § 6.5 multi-def: validate + type-check the shared helper defs
+  # once, returning the set of callable names for the per-zone passes.
+  helper_names = _analyze_helpers(program, declared)
   for zp in program.programs:
     _check_zone_references(zp, declared)
-    _analyze_program(zp)
+    _analyze_program(zp, helper_names)
   return program
+
+
+def _analyze_helpers(
+  program: ast.Program, declared: dict[str, ast.ZoneDecl]
+) -> frozenset[str]:
+  """Validate the unit's top-level helper defs (v0.4 § 6.5 multi-def).
+
+  Each helper is a self-contained Tier 2 function: it type-checks and
+  guard-checks independently (the verifier analyzes each BPF function
+  once), so a helper that reads pkt.dst_port must guard on the protocol
+  inside its own body. Rejects duplicate helper names, calls to
+  undefined helpers, recursion (helpers may not form a call cycle — BPF
+  forbids recursion), and helper-only unsupported constructs
+  (geoip/rate_limit/pkt.zone, whose per-zone lowering does not compose
+  with a shared, per-zone-duplicated function body in v0.4).
+  """
+  names: set[str] = set()
+  for h in program.helpers:
+    if h.name in names:
+      raise FwlException(FwlError(
+        category="semantic",
+        message=f"duplicate helper def '{h.name}'",
+        span=h.span,
+      ))
+    names.add(h.name)
+  helper_names = frozenset(names)
+  _check_helper_cycles(program.helpers, helper_names)
+  for h in program.helpers:
+    _reject_helper_unsupported(h)
+    _check_zone_refs_stmts(h.body, declared)
+    ctx = _Tier2Ctx(helper_names=helper_names)
+    _check_stmts(h.body, ctx, established_guards=frozenset())
+    _check_stack_budget(h, ctx)
+  return helper_names
+
+
+def _calls_in_stmts(stmts):
+  """Yield every CallStmt reachable in a statement block (all branches)."""
+  for s in stmts:
+    if isinstance(s, ast.CallStmt):
+      yield s
+    elif isinstance(s, ast.IfStmt):
+      yield from _calls_in_stmts(s.body)
+      for _cond, body in s.elif_branches:
+        yield from _calls_in_stmts(body)
+      if s.else_body is not None:
+        yield from _calls_in_stmts(s.else_body)
+
+
+def _check_helper_cycles(
+  helpers: list[ast.FunctionDef], helper_names: frozenset[str]
+) -> None:
+  """Reject recursion / mutual recursion among helper defs.
+
+  BPF-to-BPF calls may not recurse; a call cycle would also make the
+  emitter's per-function lowering non-terminating. Any call to a name
+  that is not a declared helper is left for the per-body pass to report
+  as "call to undefined helper".
+  """
+  graph: dict[str, list[str]] = {}
+  by_name = {h.name: h for h in helpers}
+  for h in helpers:
+    graph[h.name] = [
+      c.name for c in _calls_in_stmts(h.body) if c.name in by_name
+    ]
+  # Iterative DFS with a recursion stack for cycle detection.
+  WHITE, GREY, BLACK = 0, 1, 2
+  color = {n: WHITE for n in graph}
+
+  def visit(node: str, path: list[str]) -> None:
+    color[node] = GREY
+    path.append(node)
+    for nxt in graph[node]:
+      if color[nxt] == GREY:
+        cycle = " -> ".join(path[path.index(nxt):] + [nxt])
+        raise FwlException(FwlError(
+          category="semantic",
+          message=f"recursive helper call cycle: {cycle}",
+          span=by_name[node].span,
+        ))
+      if color[nxt] == WHITE:
+        visit(nxt, path)
+    path.pop()
+    color[node] = BLACK
+
+  for n in graph:
+    if color[n] == WHITE:
+      visit(n, [])
+
+
+def _reject_helper_unsupported(func: ast.FunctionDef) -> None:
+  """Reject constructs a shared helper may not use in v0.4 § 6.5."""
+  for op in _walk_geoip_in_stmts(func.body):
+    raise FwlException(FwlError(
+      category="semantic",
+      message=(
+        f"geoip() is not supported inside a helper def '{func.name}' "
+        f"(v0.4 § 6.5); use it in the @xdp body"
+      ),
+      span=op.span,
+    ))
+  for call in _walk_rate_limit_in_stmts(func.body):
+    raise FwlException(FwlError(
+      category="semantic",
+      message=(
+        f"rate_limit() is not supported inside a helper def "
+        f"'{func.name}' (v0.4 § 6.5)"
+      ),
+      span=call.span,
+    ))
+  _reject_zone_field_stmts(func.name, func.body)
+
+
+def _reject_zone_field_stmts(fname: str, stmts) -> None:
+  """Reject pkt.zone anywhere in a helper body (its value is per-caller)."""
+  for s in stmts:
+    if isinstance(s, ast.AssignStmt):
+      _reject_zone_field_expr(fname, s.rhs)
+    elif isinstance(s, ast.IfStmt):
+      _reject_zone_field_expr(fname, s.cond)
+      _reject_zone_field_stmts(fname, s.body)
+      for cond, body in s.elif_branches:
+        _reject_zone_field_expr(fname, cond)
+        _reject_zone_field_stmts(fname, body)
+      if s.else_body is not None:
+        _reject_zone_field_stmts(fname, s.else_body)
+
+
+def _reject_zone_field_expr(fname: str, expr) -> None:
+  if isinstance(expr, ast.ZoneCompare):
+    raise FwlException(FwlError(
+      category="semantic",
+      message=(
+        f"pkt.zone is not supported inside a helper def '{fname}' "
+        f"(v0.4 § 6.5): a shared helper has no single ingress zone"
+      ),
+      span=expr.span,
+    ))
+  if isinstance(expr, ast.NotOp):
+    _reject_zone_field_expr(fname, expr.inner)
+  elif isinstance(expr, (ast.AndOp, ast.OrOp)):
+    for c in expr.operands:
+      _reject_zone_field_expr(fname, c)
 
 
 def _collect_declared_zones(
@@ -266,7 +412,9 @@ def _check_zone_refs_stmts(
         _check_zone_refs_stmts(s.else_body, declared)
 
 
-def _analyze_program(program) -> object:
+def _analyze_program(
+  program, helper_names: frozenset[str] = frozenset()
+) -> object:
   """Per-@xdp-block analysis (Tier 1/Tier 2 dispatch).
 
   `program` is a ZoneProgram (or, in the single-block degenerate case,
@@ -278,6 +426,14 @@ def _analyze_program(program) -> object:
   # Mutual exclusion: per FWL_V02_SPEC.md § Tier 2 / Edge cases.
   has_tier1 = bool(program.rules) or program.default is not None
   has_tier2 = program.function is not None
+  # v0.4 § 6.6: `chain` separates Tier 1 rules; a Tier 2 body is split
+  # (if at all) at the parse/policy seam, not by a manual marker.
+  if has_tier2 and getattr(program, "chain_boundaries", ()):
+    raise FwlException(FwlError(
+      category="semantic",
+      message="'chain' is a Tier 1 stage boundary; not valid in a def body",
+      span=program.function.span if program.function else None,
+    ))
   if has_tier1 and has_tier2:
     raise FwlException(FwlError(
       category="semantic",
@@ -288,8 +444,11 @@ def _analyze_program(program) -> object:
       span=program.function.span if program.function else None,
     ))
 
+  # A Tier 1 rule sequence cannot host a CallStmt (calls are Tier 2
+  # statements), so a file with helpers but a rule-based @xdp body still
+  # works — the helpers just go uncalled from that zone.
   if has_tier2:
-    return _analyze_tier2(program)
+    return _analyze_tier2(program, helper_names)
   return _analyze_tier1(program)
 
 
@@ -341,7 +500,9 @@ def _analyze_tier1(program) -> object:
   return program
 
 
-def _analyze_tier2(program: ast.Program) -> ast.Program:
+def _analyze_tier2(
+  program: ast.Program, helper_names: frozenset[str] = frozenset()
+) -> ast.Program:
   """Tier 2 analyzer pass — type infer locals + dominator + reachability.
 
   Implementation detail per FWL_V02_SPEC.md § Tier 2:
@@ -357,7 +518,7 @@ def _analyze_tier2(program: ast.Program) -> ast.Program:
   assert func is not None
   _assign_geoip_call_indices_tier2(program)
   _assign_rate_limit_call_indices_tier2(program)
-  ctx = _Tier2Ctx()
+  ctx = _Tier2Ctx(helper_names=helper_names)
   _check_stmts(func.body, ctx, established_guards=frozenset())
   _check_stack_budget(func, ctx)
   if len(ctx.counter_names) > _MAX_COUNTERS:
@@ -374,10 +535,12 @@ def _analyze_tier2(program: ast.Program) -> ast.Program:
 
 class _Tier2Ctx:
   """Mutable state threaded through the Tier 2 walk."""
-  def __init__(self):
+  def __init__(self, helper_names: frozenset[str] = frozenset()):
     self.locals: dict[str, ast.LocalType] = {}
     self.counter_names: set[str] = set()
     self.next_rate_limit_index = 0
+    # v0.4 § 6.5: names of top-level helper defs a CallStmt may target.
+    self.helper_names = helper_names
 
 
 def _check_stmts(
@@ -412,6 +575,17 @@ def _check_stmts(
         terminated = True
     elif isinstance(stmt, ast.AssignStmt):
       _check_assign(stmt, ctx, guards)
+    elif isinstance(stmt, ast.CallStmt):
+      # v0.4 § 6.5: the target must be a declared helper. A call is
+      # non-terminal for reachability (the helper *may* terminate, but
+      # we cannot prove it does on every path) and establishes no
+      # guards in the caller.
+      if stmt.name not in ctx.helper_names:
+        raise FwlException(FwlError(
+          category="semantic",
+          message=f"call to undefined helper '{stmt.name}'",
+          span=stmt.span,
+        ))
     elif isinstance(stmt, ast.IfStmt):
       branch_terms = []
       branch_cond_guards = _established_by(stmt.cond)

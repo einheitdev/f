@@ -301,6 +301,49 @@ namespace {
 // like the single-program g_obj. Closing them would detach the maps.
 std::vector<struct bpf_object*> g_zone_objs;
 
+// v0.4 § 6.6: resolve the program to attach for one loaded zone object,
+// wiring a split pipeline if present.
+//
+// A single-program zone exposes `fwl_prog`. A split zone instead holds
+// N `fwl_stage_i` XDP programs chained through the `fwl_stages`
+// prog_array; the daemon must populate that array (index i -> stage i's
+// program fd) before attaching, then attach stage 0 as the pipeline
+// entry. Returns the entry program, or nullptr if neither shape is
+// found.
+auto ResolveZoneEntryProgram(struct bpf_object* obj,
+                             const std::string& zone)
+    -> struct bpf_program* {
+  struct bpf_program* prog =
+      bpf_object__find_program_by_name(obj, "fwl_prog");
+  if (prog) return prog;
+
+  int arr_fd = FindMap(obj, "fwl_stages");
+  if (arr_fd < 0) return nullptr;  // not a split object either
+
+  struct bpf_program* entry = nullptr;
+  int n_stages = 0;
+  for (uint32_t i = 0;; ++i) {
+    std::string name = "fwl_stage_" + std::to_string(i);
+    struct bpf_program* stage =
+        bpf_object__find_program_by_name(obj, name.c_str());
+    if (!stage) break;
+    int fd = bpf_program__fd(stage);
+    if (i == 0) entry = stage;
+    uint32_t key = i;
+    uint32_t val = static_cast<uint32_t>(fd);
+    if (bpf_map_update_elem(arr_fd, &key, &val, BPF_ANY) != 0) {
+      spdlog::error("zone '{}' prog_array update stage {} failed", zone, i);
+      return nullptr;
+    }
+    ++n_stages;
+  }
+  if (entry) {
+    spdlog::info("zone '{}' split pipeline: {} stages wired", zone,
+                 n_stages);
+  }
+  return entry;
+}
+
 // Resolve a zone's interface names to ifindexes. Absent interfaces
 // (if_nametoindex == 0) are skipped with a warning rather than failing
 // the load — a zone's NIC may appear after boot.
@@ -388,11 +431,12 @@ auto LoadZoneBundle(std::string_view bundle_dir,
     }
     g_zone_objs.push_back(obj);
 
-    struct bpf_program* prog =
-        bpf_object__find_program_by_name(obj, "fwl_prog");
+    // v0.4 § 6.6: `fwl_prog` for a single-program zone, or the wired
+    // `fwl_stage_0` entry of a split tail-call pipeline.
+    struct bpf_program* prog = ResolveZoneEntryProgram(obj, zone);
     if (!prog) {
       return MakeError(BpfError::kLoadFailed,
-          std::format("fwl_prog not found in {}", obj_path));
+          std::format("no fwl_prog / fwl_stage_0 entry in {}", obj_path));
     }
 
     ZoneProgramHandle zh;

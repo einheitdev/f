@@ -1,0 +1,17 @@
+name: "fail duplicate helper"
+source_fw: |
+  def a(pkt):
+    drop
+  
+  def a(pkt):
+    allow
+  
+  @xdp(eth0)
+  def m(pkt):
+    a(pkt)
+
+test_packet:
+  builder: tcp()
+
+expected:
+  compiles: false

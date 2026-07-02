@@ -1,0 +1,14 @@
+name: "chain icmp type"
+source_fw: |
+  @xdp(eth0)
+  allow if pkt.proto == icmp and pkt.icmp.type == 8
+  chain b
+  drop if pkt.proto == icmp and pkt.icmp.type == 3
+  default drop
+
+test_packet:
+  builder: icmp(src_ip="1.1.1.1", dst_ip="2.2.2.2", type=3, code=1)
+
+expected:
+  compiles: true
+  bpf_action: drop

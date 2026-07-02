@@ -1,0 +1,17 @@
+name: "helper count"
+source_fw: |
+  def logit(pkt):
+    if pkt.proto == tcp and pkt.dst_port == 80:
+      count web
+  
+  @xdp(eth0)
+  def m(pkt):
+    logit(pkt)
+    allow
+
+test_packet:
+  builder: tcp(src_ip="1.1.1.1", dst_ip="9.9.9.9", dst_port=80)
+
+expected:
+  compiles: true
+  bpf_action: allow

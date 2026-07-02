@@ -1,0 +1,14 @@
+name: "chain ipv6"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.src_ip6 == 2001:db8::1
+  chain b
+  allow if pkt.dst_ip6 == 2001:db8::2
+  default drop
+
+test_packet:
+  builder: tcp6(src_ip="2001:db8::9", dst_ip="2001:db8::2", dst_port=80)
+
+expected:
+  compiles: true
+  bpf_action: allow

@@ -1,0 +1,17 @@
+name: "helper vlan"
+source_fw: |
+  def vcheck(pkt):
+    if pkt.vlan_id == 100:
+      allow
+  
+  @xdp(eth0)
+  def m(pkt):
+    vcheck(pkt)
+    drop
+
+test_packet:
+  builder: tcp(src_ip="1.1.1.1", dst_ip="9.9.9.9", dst_port=80, vlan_id=100)
+
+expected:
+  compiles: true
+  bpf_action: allow

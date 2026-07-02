@@ -1,0 +1,15 @@
+name: "fail geoip in helper"
+source_fw: |
+  def a(pkt):
+    if pkt.src_ip in geoip(RU):
+      drop
+  
+  @xdp(eth0)
+  def m(pkt):
+    a(pkt)
+
+test_packet:
+  builder: tcp()
+
+expected:
+  compiles: false

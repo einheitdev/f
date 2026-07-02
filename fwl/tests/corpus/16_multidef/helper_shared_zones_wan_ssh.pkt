@@ -1,0 +1,26 @@
+name: "shared helper across zones (wan ingress)"
+source_fw: |
+  zone wan = [wan0]
+  zone lan = [lan0]
+  
+  def gate(pkt):
+    if pkt.proto == tcp and pkt.dst_port == 22:
+      drop
+  
+  @xdp(wan)
+  def fw(pkt):
+    gate(pkt)
+    drop
+  
+  @xdp(lan)
+  def fl(pkt):
+    gate(pkt)
+    allow
+
+ingress_zone: wan
+test_packet:
+  builder: tcp(src_ip="1.2.3.4", dst_ip="9.9.9.9", dst_port=22)
+
+expected:
+  compiles: true
+  bpf_action: drop

@@ -1,0 +1,12 @@
+name: "fail chain in tier2"
+source_fw: |
+  @xdp(eth0)
+  chain x
+  def m(pkt):
+    drop
+
+test_packet:
+  builder: tcp()
+
+expected:
+  compiles: false

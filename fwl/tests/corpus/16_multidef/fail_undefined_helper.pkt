@@ -1,0 +1,12 @@
+name: "fail undefined helper"
+source_fw: |
+  @xdp(eth0)
+  def m(pkt):
+    nope(pkt)
+    drop
+
+test_packet:
+  builder: tcp()
+
+expected:
+  compiles: false

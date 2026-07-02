@@ -30,7 +30,12 @@
 // shape is the degenerate case: no zone decls, one xdp_block. The
 // FwlIndenter drops top-level _NL so zone decls and block boundaries
 // are self-delimiting (each starts with a distinct keyword/`@xdp`).
-program       : zone_decl* xdp_block+
+// v0.4 § 6.5 multi-def: zero or more top-level helper `def`s may precede
+// the @xdp blocks. Helpers compile to `static __noinline` BPF functions
+// callable from any zone's body via a `call_stmt`. A `def` before the
+// first @xdp is a shared helper; a `def` inside an xdp_block (body_item)
+// is that zone's Tier 2 policy function.
+program       : zone_decl* function_def* xdp_block+
 
 xdp_block     : hook_decl body_item*
 
@@ -39,7 +44,14 @@ xdp_block     : hook_decl body_item*
 // rather than a bare syntax error.
 zone_decl     : ZONE IDENTIFIER "=" "[" (IDENTIFIER ("," IDENTIFIER)*)? "]"
 
-body_item     : rule | default_rule | function_def
+body_item     : rule | default_rule | function_def | chain_decl
+
+// v0.4 § 6.6 manual override: `chain <name>` forces a pipeline stage
+// boundary between the preceding and following rules. An escape hatch —
+// the compiler normally decides the split from its budget estimate.
+// A Tier 1 construct only (it separates rules); the analyzer rejects it
+// in a Tier 2 body.
+chain_decl    : CHAIN IDENTIFIER
 
 hook_decl     : "@xdp" "(" IDENTIFIER ")"
 
@@ -60,6 +72,13 @@ block         : _NL* statement (_NL* statement)* _NL*
 statement     : if_stmt
               | assign_stmt
               | action_stmt
+              | call_stmt
+
+// v0.4 § 6.5: a bare `helper(pkt)` call statement. The target name is
+// resolved against the unit's top-level helper defs by the analyzer.
+// LALR-distinguishable from assign_stmt by the token after IDENTIFIER
+// (`(` here vs `=` there).
+call_stmt     : IDENTIFIER "(" "pkt" ")" _NL+
 
 action_stmt   : ALLOW                  _NL+  -> action_allow
               | DROP                   _NL+  -> action_drop
@@ -261,6 +280,8 @@ DEF.10           : /def(?![a-z0-9_])/
 ZONE.10          : /zone(?![a-z0-9_])/
 REDIRECT.10      : /redirect(?![a-z0-9_])/
 TO.10            : /to(?![a-z0-9_])/
+// v0.4 § 6.6 pipeline-split boundary keyword.
+CHAIN.10         : /chain(?![a-z0-9_])/
 
 // Phase 5 NAT action keywords. Reserved words (negative-lookahead so
 // `masqueraded`, `snatted` still lex as IDENTIFIER).
