@@ -1,0 +1,14 @@
+name: "chain cidr set"
+source_fw: |
+  @xdp(eth0)
+  allow if pkt.src_ip in [10.0.0.0/8]
+  chain b
+  drop if pkt.proto == tcp and pkt.dst_port in [22, 23]
+  default drop
+
+test_packet:
+  builder: tcp(src_ip="1.2.3.4", dst_ip="9.9.9.9", dst_port=22)
+
+expected:
+  compiles: true
+  bpf_action: drop

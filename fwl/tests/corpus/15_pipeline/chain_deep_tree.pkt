@@ -1,0 +1,16 @@
+name: "chain deep tree"
+source_fw: |
+  @xdp(eth0)
+  allow if pkt.src_ip == 1.1.1.1
+  drop if pkt.src_ip == 2.2.2.2
+  chain mid
+  allow if pkt.proto == tcp and pkt.dst_port == 22
+  drop if pkt.dst_ip in [8.8.8.8]
+  default drop
+
+test_packet:
+  builder: tcp(src_ip="7.7.7.7", dst_ip="9.9.9.9", dst_port=22)
+
+expected:
+  compiles: true
+  bpf_action: allow

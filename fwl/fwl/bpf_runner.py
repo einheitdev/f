@@ -324,14 +324,12 @@ def _load_and_run_seq(
     for map_name, entries in map_init.items():
       _populate_map(libbpf, obj, map_name, entries)
 
-    prog = libbpf.bpf_object__find_program_by_name(
-      obj, b"fwl_prog"
-    )
-    if not prog:
-      raise RuntimeError(
-        "BPF program 'fwl_prog' not found in object"
-      )
-    prog_fd = libbpf.bpf_program__fd(prog)
+    # v0.4 § 6.6: a split object has no `fwl_prog` — it holds N
+    # `fwl_stage_i` programs chained through the `fwl_stages` prog_array.
+    # Populate that array with the stage fds and enter at stage 0, so
+    # BPF_PROG_TEST_RUN drives the whole tail-call pipeline exactly as
+    # the daemon would after wiring the prog_array at load.
+    prog_fd = _resolve_entry_prog(libbpf, obj)
 
     results: list[RunResult] = []
     for packet in packets:
@@ -359,6 +357,48 @@ def _load_and_run_seq(
     if rb:
       libbpf.ring_buffer__free(rb)
     libbpf.bpf_object__close(obj)
+
+
+def _resolve_entry_prog(libbpf, obj) -> int:
+  """Return the fd of the program to run, wiring a split pipeline.
+
+  For a single-program object, that is `fwl_prog`. For a v0.4 § 6.6
+  split object, it is `fwl_stage_0` after every `fwl_stage_i` fd has
+  been written into the `fwl_stages` prog_array (index i -> stage i's
+  fd), which is what makes the `bpf_tail_call(ctx, &fwl_stages, i)`
+  hops resolve.
+  """
+  stages_map = libbpf.bpf_object__find_map_by_name(obj, b"fwl_stages")
+  if not stages_map:
+    prog = libbpf.bpf_object__find_program_by_name(obj, b"fwl_prog")
+    if not prog:
+      raise RuntimeError("BPF program 'fwl_prog' not found in object")
+    return libbpf.bpf_program__fd(prog)
+
+  arr_fd = libbpf.bpf_map__fd(stages_map)
+  entry_fd = None
+  i = 0
+  while True:
+    prog = libbpf.bpf_object__find_program_by_name(
+      obj, f"fwl_stage_{i}".encode("utf-8")
+    )
+    if not prog:
+      break
+    fd = libbpf.bpf_program__fd(prog)
+    if i == 0:
+      entry_fd = fd
+    key = struct.pack("<I", i)
+    val = struct.pack("<i", fd)
+    key_buf = (ctypes.c_ubyte * 4).from_buffer_copy(key)
+    val_buf = (ctypes.c_ubyte * 4).from_buffer_copy(val)
+    rc = libbpf.bpf_map_update_elem(arr_fd, key_buf, val_buf, 0)
+    if rc != 0:
+      err = ctypes.get_errno()
+      raise OSError(err, f"prog_array update failed at stage {i}")
+    i += 1
+  if entry_fd is None:
+    raise RuntimeError("split object has no 'fwl_stage_0' program")
+  return entry_fd
 
 
 def _populate_map(

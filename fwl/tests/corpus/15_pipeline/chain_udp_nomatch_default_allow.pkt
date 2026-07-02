@@ -1,0 +1,14 @@
+name: "chain udp nomatch default allow"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.proto == tcp
+  chain b
+  drop if pkt.proto == icmp
+  default allow
+
+test_packet:
+  builder: udp(src_ip="1.1.1.1", dst_ip="9.9.9.9", dst_port=53)
+
+expected:
+  compiles: true
+  bpf_action: allow

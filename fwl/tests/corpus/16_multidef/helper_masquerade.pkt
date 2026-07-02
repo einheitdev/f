@@ -1,0 +1,16 @@
+name: "helper masquerade"
+source_fw: |
+  def snatit(pkt):
+    masquerade
+  
+  @xdp(eth0)
+  def m(pkt):
+    snatit(pkt)
+    allow
+
+test_packet:
+  builder: tcp(src_ip="10.0.0.5", dst_ip="9.9.9.9", dst_port=443)
+
+expected:
+  compiles: true
+  bpf_action: allow

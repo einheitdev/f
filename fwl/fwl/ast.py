@@ -428,6 +428,21 @@ class CountCompare:
 
 
 @dataclass(frozen=True)
+class ChainMarker:
+  """A `chain <name>` manual pipeline-split boundary (v0.4 § 6.6).
+
+  Placed between Tier 1 rules, it forces the emitter to start a new
+  tail-call stage at the following rule. `name` is a human label for
+  the stage (surfaced in the emitted stage filename / manifest). The
+  parser records the marker's position as a rule-index boundary on
+  ZoneProgram.chain_boundaries; the node itself is not retained in the
+  rule list.
+  """
+  name: str
+  span: Span
+
+
+@dataclass(frozen=True)
 class Hook:
   """The `@xdp(<interface>)` declaration."""
   interface: str
@@ -527,6 +542,21 @@ class ActionStmt:
 
 
 @dataclass(frozen=True)
+class CallStmt:
+  """A Tier 2 `helper(pkt)` call statement (v0.4 § 6.5 multi-def).
+
+  Invokes a top-level helper `def` (resolved by `name` against
+  Program.helpers). The helper compiles to a `static __noinline` BPF
+  function; the call site checks its return value and propagates a
+  terminal verdict (allow/drop/redirect) while falling through on the
+  helper's non-terminal fall-out. Non-terminal side effects (count,
+  log, NAT rewrite, conntrack create) happen inside the helper.
+  """
+  name: str
+  span: Span
+
+
+@dataclass(frozen=True)
 class IfStmt:
   """A Tier 2 `if` / `elif` / `else` chain (FWL_V02_SPEC.md grammar).
 
@@ -541,8 +571,8 @@ class IfStmt:
   span: Span
 
 
-# A Tier 2 statement is one of these four shapes.
-Stmt = Union[IfStmt, AssignStmt, ActionStmt]
+# A Tier 2 statement is one of these shapes.
+Stmt = Union[IfStmt, AssignStmt, ActionStmt, CallStmt]
 
 
 # A `scalar_expr` is the RHS of an `AssignStmt`, narrowed at analysis
@@ -600,6 +630,10 @@ class ZoneProgram:
   rules: list[Rule] = field(default_factory=list)
   default: DefaultRule | None = None
   function: FunctionDef | None = None
+  # v0.4 § 6.6: rule indices at which a manual `chain` forces a new
+  # pipeline stage. Each value b means rules[b:] start a fresh stage.
+  # Empty when the source has no `chain` markers.
+  chain_boundaries: tuple[int, ...] = ()
 
   @property
   def zone_name(self) -> str:
@@ -621,6 +655,10 @@ class Program:
   """
   programs: list[ZoneProgram] = field(default_factory=list)
   zones: list[ZoneDecl] = field(default_factory=list)
+  # v0.4 § 6.5 multi-def: top-level helper `def`s shared across zones.
+  # Each compiles to a `static __noinline` BPF function; zone bodies
+  # invoke them via CallStmt. Empty in the v0.1-v0.3 shape.
+  helpers: list[FunctionDef] = field(default_factory=list)
 
   @property
   def hook(self) -> Hook:

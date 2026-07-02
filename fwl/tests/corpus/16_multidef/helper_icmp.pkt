@@ -1,0 +1,17 @@
+name: "helper icmp"
+source_fw: |
+  def pingok(pkt):
+    if pkt.proto == icmp and pkt.icmp.type == 8:
+      allow
+  
+  @xdp(eth0)
+  def m(pkt):
+    pingok(pkt)
+    drop
+
+test_packet:
+  builder: icmp(src_ip="1.1.1.1", dst_ip="2.2.2.2", type=8, code=0)
+
+expected:
+  compiles: true
+  bpf_action: allow

@@ -281,6 +281,7 @@ def evaluate_full(
   ctx = _Ctx(
     geoip_data=geoip_data, ct_state=ct_state, zone_name=zone_name,
     nat=nat,
+    helpers={h.name: h for h in getattr(program, "helpers", [])},
   )
   # Seed the NAT working packet with the input header fields, then apply
   # ingress de-NAT (return traffic) before any rule evaluates — the BPF
@@ -399,6 +400,17 @@ def _exec_stmts(
       continue
     if isinstance(stmt, ast.AssignStmt):
       locals_[stmt.name] = _eval_scalar(stmt.rhs, packet, ctx, locals_)
+      continue
+    if isinstance(stmt, ast.CallStmt):
+      # v0.4 § 6.5: execute the helper inline with a FRESH local scope
+      # (function-call semantics). A terminal action in the helper is
+      # the packet's verdict and propagates; non-terminal side effects
+      # (NAT rewrite, redirect_zone) already applied to `ctx`. The
+      # analyzer guarantees the target resolves and is non-recursive.
+      helper = ctx.helpers[stmt.name]
+      result = _exec_stmts(helper.body, packet, ctx, state, {})
+      if result is not None:
+        return result
       continue
     if isinstance(stmt, ast.IfStmt):
       cond_value = _eval_scalar(stmt.cond, packet, ctx, locals_)
@@ -788,8 +800,13 @@ class _Ctx:
     ct_state: ast.CtState = ast.CtState.NEW,
     zone_name: str | None = None,
     nat: "NatState | None" = None,
+    helpers: dict[str, ast.FunctionDef] | None = None,
   ):
     self.geoip_data = geoip_data
+    # v0.4 § 6.5 multi-def: name -> helper FunctionDef, so a CallStmt in
+    # a Tier 2 body executes the helper inline (the interpreter models
+    # the split-invisible single unit).
+    self.helpers = helpers or {}
     # Phase 5 NAT model + accumulator. `nat` supplies the masquerade IP
     # and pre-seeded reply mappings. `work` is the packet's header
     # fields as a NAT rewrite leaves them; `nat_fired` records whether
