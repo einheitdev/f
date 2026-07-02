@@ -130,6 +130,309 @@ struct {
 """
 
 
+# Phase 5 NAT mapping table + masquerade config. The key byte-matches
+# the conntrack 5-tuple (network-order addresses, host-order ports). The
+# value records what a *return* packet must rewrite: FWL_NAT_DNAT
+# rewrites the destination back (reply of an egress SNAT/masquerade),
+# FWL_NAT_SNAT rewrites the source back (reply of an inbound DNAT).
+# Emitted (and bpffs-pinned in a bundle) only when the program uses NAT
+# — or, for a bundle, when any zone does, so return traffic de-NATs on
+# whichever zone it lands.
+_NAT_DECL = """\
+#define FWL_NAT_SNAT 1
+#define FWL_NAT_DNAT 2
+
+struct fwl_nat_key {
+  __u32 src_addr;
+  __u32 dst_addr;
+  __u16 src_port;
+  __u16 dst_port;
+  __u8  proto;
+  __u8  pad[3];
+};
+
+struct fwl_nat_value {
+  __u32 new_addr;
+  __u16 new_port;
+  __u8  nat_type;
+  __u8  pad;
+};
+
+struct {
+  __uint(type, BPF_MAP_TYPE_HASH);
+  __uint(max_entries, 65536);
+  __type(key, struct fwl_nat_key);
+  __type(value, struct fwl_nat_value);
+} fwl_nat SEC(".maps");
+
+struct fwl_nat_cfg {
+  __u32 masq_addr;
+};
+
+struct {
+  __uint(type, BPF_MAP_TYPE_ARRAY);
+  __uint(max_entries, 1);
+  __type(key, __u32);
+  __type(value, struct fwl_nat_cfg);
+} fwl_nat_cfg SEC(".maps");
+"""
+
+
+# NAT rewrite + checksum helpers. XDP has no bpf_l3/l4_csum_replace (skb
+# only), so checksums are updated with bpf_csum_diff: the IP header is
+# recomputed over its fixed 20 bytes; L4 checksums are updated
+# incrementally (RFC 1624) for the changed pseudo-header fields. Only
+# the no-IP-options common case (ihl == 5) is rewritten.
+_NAT_HELPERS = """\
+static __always_inline __u16 fwl_csum_fold(__u64 sum) {
+  sum = (sum & 0xffffffff) + (sum >> 32);
+  sum = (sum & 0xffff) + (sum >> 16);
+  sum = (sum & 0xffff) + (sum >> 16);
+  return (__u16)sum;
+}
+
+static __always_inline struct iphdr *fwl_find_ipv4(
+    struct xdp_md *ctx, __u32 *ip_off) {
+  void *data = (void *)(long)ctx->data;
+  void *data_end = (void *)(long)ctx->data_end;
+  struct ethhdr *eth = data;
+  if ((void *)(eth + 1) > data_end) return 0;
+  __u16 h_proto = eth->h_proto;
+  __u32 off = sizeof(*eth);
+  if (h_proto == bpf_htons(ETH_P_8021Q)) {
+    struct fwl_vlanhdr *vh = (void *)(eth + 1);
+    if ((void *)(vh + 1) > data_end) return 0;
+    h_proto = vh->inner_proto;
+    off += sizeof(*vh);
+  }
+  if (h_proto != bpf_htons(ETH_P_IP)) return 0;
+  struct iphdr *ip = (void *)((__u8 *)data + off);
+  if ((void *)(ip + 1) > data_end) return 0;
+  if (ip->ihl != 5) return 0;
+  *ip_off = off;
+  return ip;
+}
+
+static __always_inline void fwl_fix_ip_csum(struct iphdr *ip) {
+  ip->check = 0;
+  __u64 sum = bpf_csum_diff(0, 0, (__be32 *)ip, sizeof(struct iphdr), 0);
+  ip->check = ~fwl_csum_fold(sum);
+}
+
+// Update a TCP/UDP checksum after an address and/or port rewrite,
+// incrementally (RFC 1624). All operands are read in native byte order
+// exactly as the checksum field is read/written, so the ones-complement
+// update stays self-consistent regardless of host endianness. Unchanged
+// fields pass old == new (zero delta).
+static __always_inline __u16 fwl_l4_fix(
+    __u16 check, __be32 old_a, __be32 new_a,
+    __be16 old_p, __be16 new_p) {
+  __u16 *ow = (__u16 *)&old_a;
+  __u16 *nw = (__u16 *)&new_a;
+  __u32 sum = (__u16)~check;
+  sum += (__u16)~ow[0];
+  sum += (__u16)~ow[1];
+  sum += nw[0];
+  sum += nw[1];
+  if (old_p != new_p) {
+    sum += (__u16)~old_p;
+    sum += new_p;
+  }
+  sum = (sum & 0xffff) + (sum >> 16);
+  sum = (sum & 0xffff) + (sum >> 16);
+  return ~sum;
+}
+
+// SNAT/masquerade egress: rewrite source -> new_saddr (port-preserving),
+// fix L3 + L4 checksums, install the reply mapping so return traffic
+// de-NATs the destination back to the original source.
+static __always_inline void fwl_snat_egress(
+    struct xdp_md *ctx, __be32 new_saddr) {
+  __u32 ip_off;
+  struct iphdr *ip = fwl_find_ipv4(ctx, &ip_off);
+  if (!ip) return;
+  __be32 old_saddr = ip->saddr;
+  if (old_saddr == new_saddr) return;
+  __be32 daddr = ip->daddr;
+  __u8 proto = ip->protocol;
+  void *data = (void *)(long)ctx->data;
+  void *data_end = (void *)(long)ctx->data_end;
+  __u32 l4_off = ip_off + sizeof(struct iphdr);
+  __be16 sport = 0, dport = 0;
+  if (proto == IPPROTO_TCP) {
+    struct tcphdr *t = (void *)((__u8 *)data + l4_off);
+    if ((void *)(t + 1) > data_end) return;
+    sport = t->source; dport = t->dest;
+  } else if (proto == IPPROTO_UDP) {
+    struct udphdr *u = (void *)((__u8 *)data + l4_off);
+    if ((void *)(u + 1) > data_end) return;
+    sport = u->source; dport = u->dest;
+  }
+  struct fwl_nat_key rk = {
+    .src_addr = daddr, .dst_addr = new_saddr,
+    .src_port = bpf_ntohs(dport), .dst_port = bpf_ntohs(sport),
+    .proto = proto,
+  };
+  struct fwl_nat_value rv = {
+    .new_addr = old_saddr, .new_port = bpf_ntohs(sport),
+    .nat_type = FWL_NAT_DNAT,
+  };
+  bpf_map_update_elem(&fwl_nat, &rk, &rv, BPF_ANY);
+  ip->saddr = new_saddr;
+  fwl_fix_ip_csum(ip);
+  if (proto == IPPROTO_TCP) {
+    struct tcphdr *t = (void *)((__u8 *)data + l4_off);
+    if ((void *)(t + 1) <= data_end)
+      t->check = fwl_l4_fix(t->check, old_saddr, new_saddr, sport, sport);
+  } else if (proto == IPPROTO_UDP) {
+    struct udphdr *u = (void *)((__u8 *)data + l4_off);
+    if ((void *)(u + 1) <= data_end && u->check != 0) {
+      __u16 c = fwl_l4_fix(u->check, old_saddr, new_saddr, sport, sport);
+      u->check = c ? c : 0xffff;
+    }
+  }
+}
+
+static __always_inline void fwl_masquerade(struct xdp_md *ctx) {
+  __u32 k = 0;
+  struct fwl_nat_cfg *cfg = bpf_map_lookup_elem(&fwl_nat_cfg, &k);
+  if (cfg && cfg->masq_addr) fwl_snat_egress(ctx, cfg->masq_addr);
+}
+
+// DNAT ingress: rewrite destination -> new_daddr:new_dport, fix L3 + L4
+// checksums, install the reply mapping so return traffic de-NATs the
+// source back to the original (public) destination.
+static __always_inline void fwl_dnat_ingress(
+    struct xdp_md *ctx, __be32 new_daddr, __be16 new_dport) {
+  __u32 ip_off;
+  struct iphdr *ip = fwl_find_ipv4(ctx, &ip_off);
+  if (!ip) return;
+  __be32 old_daddr = ip->daddr;
+  __be32 saddr = ip->saddr;
+  __u8 proto = ip->protocol;
+  void *data = (void *)(long)ctx->data;
+  void *data_end = (void *)(long)ctx->data_end;
+  __u32 l4_off = ip_off + sizeof(struct iphdr);
+  __be16 sport = 0, old_dport = 0;
+  if (proto == IPPROTO_TCP) {
+    struct tcphdr *t = (void *)((__u8 *)data + l4_off);
+    if ((void *)(t + 1) > data_end) return;
+    sport = t->source; old_dport = t->dest;
+  } else if (proto == IPPROTO_UDP) {
+    struct udphdr *u = (void *)((__u8 *)data + l4_off);
+    if ((void *)(u + 1) > data_end) return;
+    sport = u->source; old_dport = u->dest;
+  } else {
+    return;
+  }
+  struct fwl_nat_key rk = {
+    .src_addr = new_daddr, .dst_addr = saddr,
+    .src_port = bpf_ntohs(new_dport), .dst_port = bpf_ntohs(sport),
+    .proto = proto,
+  };
+  struct fwl_nat_value rv = {
+    .new_addr = old_daddr, .new_port = bpf_ntohs(old_dport),
+    .nat_type = FWL_NAT_SNAT,
+  };
+  bpf_map_update_elem(&fwl_nat, &rk, &rv, BPF_ANY);
+  ip->daddr = new_daddr;
+  fwl_fix_ip_csum(ip);
+  if (proto == IPPROTO_TCP) {
+    struct tcphdr *t = (void *)((__u8 *)data + l4_off);
+    if ((void *)(t + 1) <= data_end) {
+      t->check = fwl_l4_fix(t->check, old_daddr, new_daddr,
+                            old_dport, new_dport);
+      t->dest = new_dport;
+    }
+  } else if (proto == IPPROTO_UDP) {
+    struct udphdr *u = (void *)((__u8 *)data + l4_off);
+    if ((void *)(u + 1) <= data_end) {
+      if (u->check != 0) {
+        __u16 c = fwl_l4_fix(u->check, old_daddr, new_daddr,
+                             old_dport, new_dport);
+        u->check = c ? c : 0xffff;
+      }
+      u->dest = new_dport;
+    }
+  }
+}
+
+// Return-traffic de-NAT, run before any rule: if this packet matches an
+// installed reply mapping, rewrite the recorded side back to the
+// original endpoint.
+static __always_inline void fwl_nat_denat(struct xdp_md *ctx) {
+  __u32 ip_off;
+  struct iphdr *ip = fwl_find_ipv4(ctx, &ip_off);
+  if (!ip) return;
+  __u8 proto = ip->protocol;
+  void *data = (void *)(long)ctx->data;
+  void *data_end = (void *)(long)ctx->data_end;
+  __u32 l4_off = ip_off + sizeof(struct iphdr);
+  __be16 sport = 0, dport = 0;
+  if (proto == IPPROTO_TCP) {
+    struct tcphdr *t = (void *)((__u8 *)data + l4_off);
+    if ((void *)(t + 1) > data_end) return;
+    sport = t->source; dport = t->dest;
+  } else if (proto == IPPROTO_UDP) {
+    struct udphdr *u = (void *)((__u8 *)data + l4_off);
+    if ((void *)(u + 1) > data_end) return;
+    sport = u->source; dport = u->dest;
+  } else {
+    return;
+  }
+  struct fwl_nat_key k = {
+    .src_addr = ip->saddr, .dst_addr = ip->daddr,
+    .src_port = bpf_ntohs(sport), .dst_port = bpf_ntohs(dport),
+    .proto = proto,
+  };
+  struct fwl_nat_value *v = bpf_map_lookup_elem(&fwl_nat, &k);
+  if (!v) return;
+  __be16 new_p = bpf_htons(v->new_port);
+  if (v->nat_type == FWL_NAT_DNAT) {
+    __be32 old_d = ip->daddr;
+    ip->daddr = v->new_addr;
+    fwl_fix_ip_csum(ip);
+    if (proto == IPPROTO_TCP) {
+      struct tcphdr *t = (void *)((__u8 *)data + l4_off);
+      if ((void *)(t + 1) <= data_end) {
+        t->check = fwl_l4_fix(t->check, old_d, v->new_addr, dport, new_p);
+        t->dest = new_p;
+      }
+    } else {
+      struct udphdr *u = (void *)((__u8 *)data + l4_off);
+      if ((void *)(u + 1) <= data_end) {
+        if (u->check != 0) {
+          __u16 c = fwl_l4_fix(u->check, old_d, v->new_addr, dport, new_p);
+          u->check = c ? c : 0xffff;
+        }
+        u->dest = new_p;
+      }
+    }
+  } else if (v->nat_type == FWL_NAT_SNAT) {
+    __be32 old_s = ip->saddr;
+    ip->saddr = v->new_addr;
+    fwl_fix_ip_csum(ip);
+    if (proto == IPPROTO_TCP) {
+      struct tcphdr *t = (void *)((__u8 *)data + l4_off);
+      if ((void *)(t + 1) <= data_end) {
+        t->check = fwl_l4_fix(t->check, old_s, v->new_addr, sport, new_p);
+        t->source = new_p;
+      }
+    } else {
+      struct udphdr *u = (void *)((__u8 *)data + l4_off);
+      if ((void *)(u + 1) <= data_end) {
+        if (u->check != 0) {
+          __u16 c = fwl_l4_fix(u->check, old_s, v->new_addr, sport, new_p);
+          u->check = c ? c : 0xffff;
+        }
+        u->source = new_p;
+      }
+    }
+  }
+}
+"""
+
+
 _LOG_EVENT_DECL = """\
 struct fwl_log_event {
   __u64 timestamp_ns;
@@ -1287,6 +1590,10 @@ def _emit_rule(
     elif rule.action == ast.Action.COUNT:
       slot = counter_slots[rule.counter_name]  # type: ignore[index]
       side_effect = _emit_count(slot)
+    elif rule.action in ast.NAT_ACTIONS:
+      side_effect = _emit_nat_call(
+        rule.action, rule.nat_addr, rule.nat_port
+      )
     else:
       raise NotImplementedError(
         f"emitter: unsupported action {rule.action}"
@@ -1578,6 +1885,46 @@ def _collect_redirect_zones_stmts(stmts, add) -> None:
         _collect_redirect_zones_stmts(s.else_body, add)
 
 
+def _program_uses_nat(zp: ast.ZoneProgram) -> bool:
+  """True iff `zp` contains any NAT rewrite action (Phase 5)."""
+  for rule in zp.rules:
+    if rule.action in ast.NAT_ACTIONS:
+      return True
+  if zp.function is not None:
+    return _stmts_use_nat(zp.function.body)
+  return False
+
+
+def _stmts_use_nat(stmts) -> bool:
+  for s in stmts:
+    if isinstance(s, ast.ActionStmt) and s.action in ast.NAT_ACTIONS:
+      return True
+    if isinstance(s, ast.IfStmt):
+      if _stmts_use_nat(s.body):
+        return True
+      for _, body in s.elif_branches:
+        if _stmts_use_nat(body):
+          return True
+      if s.else_body is not None and _stmts_use_nat(s.else_body):
+        return True
+  return False
+
+
+def _emit_nat_call(action: ast.Action, nat_addr, nat_port) -> str:
+  """C side-effect statement for one NAT rewrite action.
+
+  `nat_addr` is the dotted-quad-as-int (big-endian) the parser produced;
+  `bpf_htonl` converts it to the __be32 the packet carries. masquerade
+  takes the source from the runtime `fwl_nat_cfg` map instead."""
+  if action == ast.Action.MASQUERADE:
+    return "fwl_masquerade(ctx);"
+  if action == ast.Action.SNAT:
+    return f"fwl_snat_egress(ctx, bpf_htonl({nat_addr & 0xffffffff}U));"
+  # DNAT
+  return (f"fwl_dnat_ingress(ctx, bpf_htonl({nat_addr & 0xffffffff}U), "
+          f"bpf_htons({nat_port}));")
+
+
 def _emit_devmaps(zones: list[str], pinned: bool) -> str:
   """Emit one BPF_MAP_TYPE_DEVMAP per redirect-destination zone.
 
@@ -1615,7 +1962,7 @@ def emit(program: ast.Program) -> str:
 
 
 def _emit_zone_source(
-  zp: ast.ZoneProgram, *, pinned_shared: bool,
+  zp: ast.ZoneProgram, *, pinned_shared: bool, force_nat: bool = False,
 ) -> str:
   """Emit one zone's complete BPF C source.
 
@@ -1635,6 +1982,15 @@ def _emit_zone_source(
   conntrack_decl = _maybe_pin(_CONNTRACK_DECL, pinned_shared) if uses_ct else ""
   ct_create = _emit_ct_create() if uses_ct else ""
   devmaps = _emit_devmaps(_collect_redirect_zones(zp), pinned_shared)
+
+  # Phase 5 NAT. Emit the maps + helpers when this program uses NAT, or
+  # when forced (a bundle where some other zone does — so return traffic
+  # de-NATs on whichever zone it arrives). The de-NAT pass runs before
+  # any rule.
+  nat_active = _program_uses_nat(zp) or force_nat
+  nat_decl = _maybe_pin(_NAT_DECL, pinned_shared) if nat_active else ""
+  nat_helpers = _NAT_HELPERS if nat_active else ""
+  nat_denat = "  fwl_nat_denat(ctx);\n" if nat_active else ""
 
   counter_slots = _allocate_counter_slots(zp)
   has_log = _program_uses_log(zp)
@@ -1690,10 +2046,11 @@ def _emit_zone_source(
 
   return f"""{_HEADER}
 {log_decl}{log_sample_decl}{counter_decl}{rl_maps}{geoip_block}\
-{conntrack_decl}{devmaps}
+{conntrack_decl}{nat_decl}{devmaps}
+{nat_helpers}
 SEC("xdp")
 int fwl_prog(struct xdp_md *ctx) {{
-{prelude}{body}  {final_stmt}
+{prelude}{nat_denat}{body}  {final_stmt}
 }}
 
 char _license[] SEC("license") = "GPL";
@@ -1740,10 +2097,15 @@ def emit_bundle(program: ast.Program) -> dict[str, str]:
   tracked on one zone are visible to every other zone. The single-zone
   degenerate case still goes through `emit()` (no pinning).
   """
+  # When any zone uses NAT, every zone program emits the shared NAT map
+  # + de-NAT pass so return traffic is un-translated on whichever zone
+  # it lands (the egress zone installs the reply mapping; the ingress
+  # zone consumes it).
+  bundle_nat = any(_program_uses_nat(zp) for zp in program.programs)
   files: dict[str, str] = {}
   for zp in program.programs:
     files[f"{zp.zone_name}.bpf.c"] = _emit_zone_source(
-      zp, pinned_shared=True
+      zp, pinned_shared=True, force_nat=bundle_nat
     )
   files["fwl_shared.h"] = _emit_shared_header(program)
   return files
@@ -1953,6 +2315,12 @@ def _emit_tier2_stmt(stmt, ctx: _Tier2EmitCtx, indent: str) -> str:
         f"{indent}{{\n{indent}  "
         + _emit_count(slot).replace("\n", f"\n{indent}  ")
         + f"\n{indent}}}\n"
+      )
+    if stmt.action in ast.NAT_ACTIONS:
+      return (
+        f"{indent}"
+        + _emit_nat_call(stmt.action, stmt.nat_addr, stmt.nat_port)
+        + "\n"
       )
   if isinstance(stmt, ast.AssignStmt):
     return _emit_tier2_assign(stmt, ctx, indent)

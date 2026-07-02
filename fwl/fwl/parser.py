@@ -287,6 +287,9 @@ class _ToAst(Transformer):
   def ZONE(self, tok): return tok
   def REDIRECT(self, tok): return tok
   def TO(self, tok): return tok
+  def MASQUERADE(self, tok): return tok
+  def SNAT(self, tok): return tok
+  def DNAT(self, tok): return tok
   def PROTO_KEYWORD(self, tok): return tok
   def IPV4(self, tok): return tok
   def IPV6(self, tok): return tok
@@ -300,35 +303,58 @@ class _ToAst(Transformer):
     (iface_tok,) = children
     return ast.Hook(interface=str(iface_tok), span=_span(iface_tok))
 
-  # Action tuples are 5-tuples:
-  #   (Action, span, counter_name, log_sample, redirect_zone)
-  # Only one of counter_name / log_sample / redirect_zone is ever
-  # non-None, keyed to the action verb.
+  # Action tuples are 7-tuples:
+  #   (Action, span, counter_name, log_sample, redirect_zone,
+  #    nat_addr, nat_port)
+  # Only the fields keyed to the action verb are non-None.
   def terminal_action(self, children):
     (tok,) = children
     if tok.type == "ALLOW":
-      return ast.Action.ALLOW, _span(tok), None, None, None
-    return ast.Action.DROP, _span(tok), None, None, None
+      return ast.Action.ALLOW, _span(tok), None, None, None, None, None
+    return ast.Action.DROP, _span(tok), None, None, None, None, None
 
   def redirect_action(self, children):
     """`redirect to <zone>` — terminal action carrying the dest zone."""
     redirect_tok, _to_tok, zone_tok = children
     return (
-      ast.Action.REDIRECT, _span(redirect_tok), None, None, str(zone_tok)
+      ast.Action.REDIRECT, _span(redirect_tok), None, None,
+      str(zone_tok), None, None
     )
+
+  def nat_action(self, children):
+    """`masquerade` / `snat to <ip>` / `dnat to <ip>:<port>`.
+
+    Non-terminal rewrite actions. masquerade carries no operand; snat
+    carries the new source IP; dnat carries the new dst IP and port.
+    """
+    head = children[0]
+    if head.type == "MASQUERADE":
+      return (ast.Action.MASQUERADE, _span(head), None, None, None,
+              None, None)
+    if head.type == "SNAT":
+      # SNAT TO IPV4
+      ip_tok = children[2]
+      return (ast.Action.SNAT, _span(head), None, None, None,
+              _parse_ipv4(str(ip_tok)), None)
+    # DNAT TO IPV4 ":" INTEGER
+    ip_tok = children[2]
+    port_tok = children[3]
+    return (ast.Action.DNAT, _span(head), None, None, None,
+            _parse_ipv4(str(ip_tok)), _parse_int(str(port_tok)))
 
   def log_action(self, children):
     log_tok = children[0]
     sample = None
     if len(children) > 1:
       sample = _parse_int(str(children[1]))
-    return ast.Action.LOG, _span(log_tok), None, sample, None
+    return ast.Action.LOG, _span(log_tok), None, sample, None, None, None
 
   def nonterminal_action(self, children):
     if isinstance(children[0], tuple):
       return children[0]
     count_tok, name_tok = children
-    return ast.Action.COUNT, _span(count_tok), str(name_tok), None, None
+    return (ast.Action.COUNT, _span(count_tok), str(name_tok), None,
+            None, None, None)
 
   def action(self, children):
     (action_tuple,) = children
@@ -336,13 +362,12 @@ class _ToAst(Transformer):
 
   def default_rule(self, children) -> ast.DefaultRule:
     (action_tuple,) = children
-    action, span, _, _, _ = action_tuple
+    action, span = action_tuple[0], action_tuple[1]
     return ast.DefaultRule(action=action, span=span)
 
   def rule(self, children) -> ast.Rule:
-    action, action_span, counter_name, log_sample, redirect_zone = (
-      children[0]
-    )
+    (action, action_span, counter_name, log_sample, redirect_zone,
+     nat_addr, nat_port) = children[0]
     condition: ast.Condition | None = None
     modifier: ast.RateLimit | None = None
     for child in children[1:]:
@@ -358,6 +383,8 @@ class _ToAst(Transformer):
       counter_name=counter_name,
       log_sample=log_sample,
       redirect_zone=redirect_zone,
+      nat_addr=nat_addr,
+      nat_port=nat_port,
     )
 
   def modifier(self, children) -> ast.RateLimit:
@@ -701,6 +728,32 @@ class _ToAst(Transformer):
       action=ast.Action.REDIRECT,
       redirect_zone=str(zone_tok),
       span=_span(redirect_tok),
+    )
+
+  def action_masquerade(self, children) -> ast.ActionStmt:
+    """`masquerade` as a Tier 2 action statement (Phase 5 NAT)."""
+    (tok,) = children
+    return ast.ActionStmt(
+      action=ast.Action.MASQUERADE, span=_span(tok)
+    )
+
+  def action_snat(self, children) -> ast.ActionStmt:
+    """`snat to <ip>` as a Tier 2 action statement (Phase 5 NAT)."""
+    snat_tok, _to_tok, ip_tok = children
+    return ast.ActionStmt(
+      action=ast.Action.SNAT,
+      nat_addr=_parse_ipv4(str(ip_tok)),
+      span=_span(snat_tok),
+    )
+
+  def action_dnat(self, children) -> ast.ActionStmt:
+    """`dnat to <ip>:<port>` as a Tier 2 action statement (Phase 5)."""
+    dnat_tok, _to_tok, ip_tok, port_tok = children
+    return ast.ActionStmt(
+      action=ast.Action.DNAT,
+      nat_addr=_parse_ipv4(str(ip_tok)),
+      nat_port=_parse_int(str(port_tok)),
+      span=_span(dnat_tok),
     )
 
   def action_stmt(self, children) -> ast.ActionStmt:

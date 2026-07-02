@@ -48,6 +48,12 @@ class EvalResult:
   # Set when the resulting action is REDIRECT: the destination zone
   # name (v0.4 § 6.3). None for every other action.
   redirect_zone: str | None = None
+  # Phase 5 NAT: the packet's header fields after every NAT rewrite that
+  # fired (src_ip/dst_ip as dotted-quad strings, src_port/dst_port as
+  # ints), or None when no NAT action rewrote the packet. The .pkt
+  # runner compares this against `expected.output_packet` and the BPF
+  # oracle's captured frame.
+  output_packet: dict[str, Any] | None = None
 
 
 _TERMINAL_ACTION_TO_XDP = {
@@ -125,6 +131,37 @@ class ConntrackTable:
       self._fwd.add(key)
 
 
+class NatState:
+  """Interpreter NAT model (Phase 5).
+
+  Carries the masquerade source IP (the runtime WAN address the BPF
+  program reads from its `fwl_nat_cfg` map; the .pkt supplies it via
+  `state.nat.masq_ip`) and a set of pre-seeded reply-direction mappings
+  used to de-NAT return traffic before rule evaluation. Each mapping is
+  keyed by the inbound packet's forward 5-tuple
+  `(proto, src, dst, sport, dport)` and records what to rewrite:
+  `('dnat', new_addr, new_port)` rewrites the destination back to the
+  original internal host (the reply of an egress SNAT/masquerade), and
+  `('snat', new_addr, new_port)` rewrites the source (the reply of an
+  inbound DNAT). Addresses are stored as 32-bit ints (the
+  `_ipv4_to_int` convention); ports as ints.
+  """
+  def __init__(self, masq_ip=None, mappings=None):
+    self.masq_ip = masq_ip
+    self._reply: dict[tuple, tuple] = dict(mappings or {})
+
+  def denat(self, packet: dict[str, Any]) -> tuple | None:
+    """Return the rewrite to apply to a return packet, or None.
+
+    The tuple is `(kind, new_addr_int, new_port_or_None)` where kind is
+    'dnat' (rewrite dst) or 'snat' (rewrite src).
+    """
+    key = _ct_key(packet)
+    if not isinstance(key, tuple):
+      return None  # untracked frame: no reply mapping can apply
+    return self._reply.get(key)
+
+
 def _program_uses_conntrack(program: ast.Program) -> bool:
   """True iff any rule or Tier 2 statement reads conntrack(pkt).state.
 
@@ -178,6 +215,7 @@ def evaluate(
   state: dict[int, dict[Any, int]] | None = None,
   geoip_data: dict[str, list[str]] | None = None,
   conntrack: ConntrackTable | None = None,
+  nat: "NatState | None" = None,
 ) -> XdpAction:
   """Run `program` against `packet` and return the resulting XDP action.
 
@@ -205,7 +243,7 @@ def evaluate(
   no v6 parse path, so v6 frames hit the default action.
   """
   return evaluate_full(
-    program, packet, state, geoip_data, conntrack
+    program, packet, state, geoip_data, conntrack, nat
   ).action
 
 
@@ -215,6 +253,7 @@ def evaluate_full(
   state: dict[int, dict[Any, int]] | None = None,
   geoip_data: dict[str, list[str]] | None = None,
   conntrack: ConntrackTable | None = None,
+  nat: "NatState | None" = None,
 ) -> EvalResult:
   """Run `program` against `packet` and return full results.
 
@@ -240,8 +279,15 @@ def evaluate_full(
   # ZoneProgram passed directly by the cross-zone runner (v0.4 § 6.4).
   zone_name = program.hook.interface
   ctx = _Ctx(
-    geoip_data=geoip_data, ct_state=ct_state, zone_name=zone_name
+    geoip_data=geoip_data, ct_state=ct_state, zone_name=zone_name,
+    nat=nat,
   )
+  # Seed the NAT working packet with the input header fields, then apply
+  # ingress de-NAT (return traffic) before any rule evaluates — the BPF
+  # program rewrites the destination of a reply before the rule body
+  # runs, so the oracle does too.
+  ctx.work = _nat_work_init(packet)
+  _apply_ingress_denat(packet, ctx)
   counters: dict[str, int] = {}
   log_events: list[LogEvent] = []
   if program.function is not None:
@@ -251,7 +297,10 @@ def evaluate_full(
     # fall-through None) of a NEW packet creates conntrack state.
     if uses_ct and result is XdpAction.PASS and ct_state == ast.CtState.NEW:
       ct.create(packet)
-    return EvalResult(action=action, redirect_zone=ctx.redirect_zone)
+    return EvalResult(
+      action=action, redirect_zone=ctx.redirect_zone,
+      output_packet=ctx.work if ctx.nat_fired else None,
+    )
   for idx, rule in enumerate(program.rules):
     if rule.condition is not None and not _eval(
       rule.condition, packet, ctx, counters
@@ -272,7 +321,14 @@ def evaluate_full(
           rule.redirect_zone
           if rule.action == ast.Action.REDIRECT else None
         ),
+        output_packet=ctx.work if ctx.nat_fired else None,
       )
+    if rule.action in ast.NAT_ACTIONS:
+      # Non-terminal rewrite: translate the working packet and fall
+      # through to the next rule (the terminal emits the rewrite).
+      _apply_nat(rule.action, rule.nat_addr, rule.nat_port,
+                 ctx.work, ctx.nat)
+      ctx.nat_fired = True
     if rule.action == ast.Action.COUNT and rule.counter_name:
       counters[rule.counter_name] = (
         counters.get(rule.counter_name, 0) + 1
@@ -297,6 +353,7 @@ def evaluate_full(
     action=action,
     counter_changes=counters,
     log_events=log_events,
+    output_packet=ctx.work if ctx.nat_fired else None,
   )
 
 
@@ -332,6 +389,12 @@ def _exec_stmts(
       if stmt.action == ast.Action.REDIRECT:
         ctx.redirect_zone = stmt.redirect_zone
         return XdpAction.REDIRECT
+      if stmt.action in ast.NAT_ACTIONS:
+        # Non-terminal rewrite: translate and fall through.
+        _apply_nat(stmt.action, stmt.nat_addr, stmt.nat_port,
+                   ctx.work, ctx.nat)
+        ctx.nat_fired = True
+        continue
       # LOG and COUNT are non-terminal: side effect omitted in test.
       continue
     if isinstance(stmt, ast.AssignStmt):
@@ -724,8 +787,16 @@ class _Ctx:
     geoip_data: dict[str, list[str]],
     ct_state: ast.CtState = ast.CtState.NEW,
     zone_name: str | None = None,
+    nat: "NatState | None" = None,
   ):
     self.geoip_data = geoip_data
+    # Phase 5 NAT model + accumulator. `nat` supplies the masquerade IP
+    # and pre-seeded reply mappings. `work` is the packet's header
+    # fields as a NAT rewrite leaves them; `nat_fired` records whether
+    # any rewrite (ingress de-NAT or an action) touched it.
+    self.nat = nat
+    self.work: dict[str, Any] = {}
+    self.nat_fired = False
     # The conntrack state of the packet under evaluation, computed once
     # from the conntrack table (v0.4). Every conntrack(pkt).state read
     # in this packet's evaluation sees the same value.
@@ -861,6 +932,72 @@ def _ipv4_to_int(addr: str | int) -> int:
   for part in parts:
     value = (value << 8) | int(part)
   return value
+
+
+def _int_to_ipv4(value: int) -> str:
+  """Render a 32-bit integer (the `_ipv4_to_int` convention) as a
+  dotted-quad string, the form the packet dict / output_packet uses."""
+  return (f"{(value >> 24) & 0xff}.{(value >> 16) & 0xff}."
+          f"{(value >> 8) & 0xff}.{value & 0xff}")
+
+
+def _nat_work_init(packet: dict[str, Any]) -> dict[str, Any]:
+  """The header fields a NAT rewrite may touch, copied from `packet`.
+
+  Carries the dotted-quad src/dst IPs and src/dst ports (when present)
+  so output_packet reports the post-rewrite 5-tuple regardless of which
+  fields a given action changes."""
+  work: dict[str, Any] = {}
+  for k in ("src_ip", "dst_ip", "src_port", "dst_port", "proto"):
+    if packet.get(k) is not None:
+      work[k] = packet[k]
+  return work
+
+
+def _apply_ingress_denat(packet: dict[str, Any], ctx: "_Ctx") -> None:
+  """Rewrite return traffic before rule evaluation (Phase 5).
+
+  A reply to an egress SNAT/masquerade arrives addressed to the
+  translated tuple; the seeded reply mapping restores the original
+  internal destination. Mirrors the BPF program's pre-rule de-NAT."""
+  if ctx.nat is None:
+    return
+  hit = ctx.nat.denat(packet)
+  if hit is None:
+    return
+  kind, new_addr, new_port = hit
+  if kind == "dnat":
+    ctx.work["dst_ip"] = _int_to_ipv4(new_addr)
+    if new_port is not None:
+      ctx.work["dst_port"] = new_port
+  elif kind == "snat":
+    ctx.work["src_ip"] = _int_to_ipv4(new_addr)
+    if new_port is not None:
+      ctx.work["src_port"] = new_port
+  ctx.nat_fired = True
+
+
+def _apply_nat(action: ast.Action, nat_addr: int | None,
+               nat_port: int | None, work: dict[str, Any],
+               nat: "NatState | None") -> None:
+  """Apply one NAT rewrite action to the working packet dict `work`.
+
+  Port-preserving (the translated source port equals the original) so
+  both oracles agree deterministically; only the address (and, for
+  DNAT, the destination port) changes. masquerade rewrites the source
+  to the masquerade IP (`state.nat.masq_ip`); snat to the literal
+  target; dnat rewrites the destination address and port.
+  """
+  if action == ast.Action.SNAT and nat_addr is not None:
+    work["src_ip"] = _int_to_ipv4(nat_addr)
+  elif action == ast.Action.MASQUERADE:
+    masq = nat.masq_ip if nat is not None else None
+    if masq is not None:
+      work["src_ip"] = _int_to_ipv4(masq)
+  elif action == ast.Action.DNAT and nat_addr is not None:
+    work["dst_ip"] = _int_to_ipv4(nat_addr)
+    if nat_port is not None:
+      work["dst_port"] = nat_port
 
 
 def _ipv6_to_int(addr: str | int) -> int:

@@ -25,6 +25,7 @@
 
 #include <bpf/bpf.h>
 #include <bpf/libbpf.h>
+#include <linux/if_link.h>
 #include <net/if.h>
 
 namespace f {
@@ -32,6 +33,11 @@ namespace f {
 namespace {
 
 struct bpf_object* g_obj = nullptr;
+
+// Objects opened by LoadProgramFromPath, keyed by their program fd.
+// BpfHandles carries fds only (not the bpf_object*), so UnloadProgram
+// uses this to find and close the right object on a hot-swap.
+std::map<int, struct bpf_object*> g_path_objs;
 
 auto FindMap(struct bpf_object* obj, const char* name)
     -> int {
@@ -141,6 +147,57 @@ auto LoadProgram(std::string_view bundle_dir)
   return h;
 }
 
+auto LoadProgramFromPath(std::string_view obj_path)
+    -> std::expected<BpfHandles, Error<BpfError>> {
+  // Open a fresh, independent object (not the cold-boot g_obj) so the
+  // currently-running program stays loaded until the swap succeeds.
+  std::string path(obj_path);
+  struct bpf_object* obj = bpf_object__open(path.c_str());
+  if (!obj) {
+    return MakeError(BpfError::kLoadFailed,
+        std::format("open {} failed", path));
+  }
+  int err = bpf_object__load(obj);
+  if (err) {
+    bpf_object__close(obj);
+    return MakeError(BpfError::kLoadFailed,
+        std::format("load {} failed: {}", path,
+                    std::strerror(-err)));
+  }
+  // v0.2+ emitter names the entry `fwl_prog`; legacy is `fw_prog`.
+  struct bpf_program* prog =
+      bpf_object__find_program_by_name(obj, "fwl_prog");
+  if (!prog) {
+    prog = bpf_object__find_program_by_name(obj, "fw_prog");
+  }
+  if (!prog) {
+    bpf_object__close(obj);
+    return MakeError(BpfError::kLoadFailed,
+        std::format("neither fwl_prog nor fw_prog in {}", path));
+  }
+
+  BpfHandles h;
+  h.prog_fd = bpf_program__fd(prog);
+  h.rules_a_fd = FindMap(obj, "rules_a");
+  h.rules_b_fd = FindMap(obj, "rules_b");
+  h.cidr_a_fd = FindMap(obj, "cidr_a");
+  h.cidr_b_fd = FindMap(obj, "cidr_b");
+  h.conntrack_fd = FindMap(obj, "conntrack");
+  h.counters_fd = FindMap(obj, "counters");
+  h.config_fd = FindMap(obj, "config");
+  h.events_fd = FindMap(obj, "events");
+  g_path_objs[h.prog_fd] = obj;
+  return h;
+}
+
+auto UnloadProgram(const BpfHandles& h) -> void {
+  auto it = g_path_objs.find(h.prog_fd);
+  if (it != g_path_objs.end()) {
+    bpf_object__close(it->second);
+    g_path_objs.erase(it);
+  }
+}
+
 auto AttachXdp(const BpfHandles& h, int ifindex)
     -> std::expected<void, Error<BpfError>> {
   int err = bpf_xdp_attach(
@@ -159,6 +216,28 @@ auto DetachXdp(int ifindex)
   if (err) {
     return MakeError(BpfError::kDetachFailed,
         std::format("bpf_xdp_detach ifindex={} failed: {}",
+                    ifindex, std::strerror(-err)));
+  }
+  return {};
+}
+
+auto ReplaceXdp(int ifindex, int new_prog_fd, int old_prog_fd)
+    -> std::expected<void, Error<BpfError>> {
+  // Atomic swap: the kernel replaces old_prog_fd with new_prog_fd on
+  // ifindex in one operation, failing (EEXIST) if the currently
+  // attached program is not old_prog_fd. This is the zero-drop hot
+  // reload primitive. old_prog_fd < 0 means "attach if nothing is
+  // there yet" (no REPLACE constraint).
+  LIBBPF_OPTS(bpf_xdp_attach_opts, opts);
+  __u32 flags = 0;
+  if (old_prog_fd >= 0) {
+    opts.old_prog_fd = old_prog_fd;
+    flags = XDP_FLAGS_REPLACE;
+  }
+  int err = bpf_xdp_attach(ifindex, new_prog_fd, flags, &opts);
+  if (err) {
+    return MakeError(BpfError::kAttachFailed,
+        std::format("replace xdp on ifindex={} failed: {}",
                     ifindex, std::strerror(-err)));
   }
   return {};
@@ -359,6 +438,41 @@ auto LoadZoneBundle(std::string_view bundle_dir,
   }
 
   return handles;
+}
+
+auto IsMultiZoneBundle(std::string_view bundle_dir) -> bool {
+  using nlohmann::json;
+  std::filesystem::path dir(bundle_dir);
+  std::ifstream mf(dir / "manifest.json");
+  if (!mf) {
+    return false;
+  }
+  std::stringstream ss;
+  ss << mf.rdbuf();
+  json manifest;
+  try {
+    manifest = json::parse(ss.str());
+  } catch (const std::exception&) {
+    return false;
+  }
+  // A multi-zone bundle carries a non-empty "zones" array and a
+  // matching "programs" array; the legacy single-program manifest has
+  // neither. This is the routing signal for the cold-boot and
+  // hot-reload paths.
+  return !manifest.value("zones", json::array()).empty() &&
+         !manifest.value("programs", json::array()).empty();
+}
+
+auto DetachZoneBundle(const ZoneBundleHandles& handles) -> void {
+  for (const auto& prog : handles.programs) {
+    for (int ifindex : prog.ifindexes) {
+      int err = bpf_xdp_detach(ifindex, 0, nullptr);
+      if (err) {
+        spdlog::warn("detach zone '{}' from ifindex {} failed: {}",
+                     prog.zone, ifindex, std::strerror(-err));
+      }
+    }
+  }
 }
 
 }  // namespace f

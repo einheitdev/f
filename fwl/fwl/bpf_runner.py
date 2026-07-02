@@ -49,6 +49,10 @@ class RunResult:
   action: XdpAction
   counter_deltas: dict[int, int]
   log_events: list[LogEvent]
+  # The packet as the program left it (rewritten headers for a NAT
+  # program). Phase 5 output-packet verification compares this against
+  # the .pkt's expected.output_packet.
+  output_packet: bytes = b""
 
 
 @dataclass(frozen=True)
@@ -333,7 +337,7 @@ def _load_and_run_seq(
     for packet in packets:
       log_events: list[LogEvent] = []
       rb = _setup_ring_buffer(libbpf, obj, log_events) if has_log else None
-      action = _bpf_prog_test_run(prog_fd, packet)
+      action, out_packet = _bpf_prog_test_run_out(prog_fd, packet)
       if rb:
         libbpf.ring_buffer__consume(rb)
         libbpf.ring_buffer__free(rb)
@@ -348,6 +352,7 @@ def _load_and_run_seq(
         action=action,
         counter_deltas=counter_deltas,
         log_events=log_events,
+        output_packet=out_packet,
       ))
     return results
   finally:
@@ -505,7 +510,18 @@ _NR_BPF = 321  # x86_64 syscall number
 
 
 def _bpf_prog_test_run(prog_fd: int, packet: bytes) -> XdpAction:
-  """Invoke BPF_PROG_TEST_RUN via the bpf() syscall."""
+  """Invoke BPF_PROG_TEST_RUN, returning only the XDP action."""
+  return _bpf_prog_test_run_out(prog_fd, packet)[0]
+
+
+def _bpf_prog_test_run_out(
+  prog_fd: int, packet: bytes
+) -> tuple[XdpAction, bytes]:
+  """Invoke BPF_PROG_TEST_RUN, returning the action and output packet.
+
+  The output packet is the frame as the program left it — for a NAT
+  program, the rewritten headers — so the caller can verify the
+  translated fields and recompute checksums (Phase 5)."""
   libc = ctypes.CDLL("libc.so.6", use_errno=True)
   libc.syscall.restype = ctypes.c_long
 
@@ -543,12 +559,13 @@ def _bpf_prog_test_run(prog_fd: int, packet: bytes) -> XdpAction:
     raise OSError(err, f"BPF_PROG_TEST_RUN failed: errno={err}")
 
   retval = attr.retval
+  out = bytes(data_out[:attr.data_size_out])
   # XDP_DROP=1, XDP_PASS=2, XDP_TX=3, XDP_REDIRECT=4. v0.4 `redirect to`
   # produces XDP_REDIRECT (§ 6.3); v0.1-v0.3 only ever PASS or DROP.
   if retval == 1:
-    return XdpAction.DROP
+    return XdpAction.DROP, out
   if retval == 2:
-    return XdpAction.PASS
+    return XdpAction.PASS, out
   if retval == 4:
-    return XdpAction.REDIRECT
+    return XdpAction.REDIRECT, out
   raise RuntimeError(f"unexpected XDP retval {retval}")

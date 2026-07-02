@@ -319,6 +319,7 @@ def _analyze_tier1(program) -> object:
         ),
         span=rule.span,
       ))
+    _check_nat_port(rule.action, rule.nat_port, rule.span)
 
   if len(counter_names) > _MAX_COUNTERS:
     # Find the rule that pushed us over so we can point at a span.
@@ -406,6 +407,7 @@ def _check_stmts(
     if isinstance(stmt, ast.ActionStmt):
       if stmt.action == ast.Action.COUNT and stmt.counter_name is not None:
         ctx.counter_names.add(stmt.counter_name)
+      _check_nat_port(stmt.action, stmt.nat_port, stmt.span)
       if stmt.action in ast.TERMINAL_ACTIONS:
         terminated = True
     elif isinstance(stmt, ast.AssignStmt):
@@ -435,6 +437,24 @@ def _check_stmts(
     else:
       raise AssertionError(f"unexpected stmt {type(stmt).__name__}")
   return terminated, guards
+
+
+def _check_nat_port(action: ast.Action, nat_port: int | None,
+                    span) -> None:
+  """Reject a `dnat to <ip>:<port>` whose port is out of range.
+
+  The dotted-quad IP is range-checked at parse time; the port is the
+  one NAT operand that can still be out of bounds here (Phase 5 NAT).
+  """
+  if action == ast.Action.DNAT and nat_port is not None:
+    if not (1 <= nat_port <= 65535):
+      raise FwlException(FwlError(
+        category="semantic",
+        message=(
+          f"dnat target port out of range 1-65535 (got {nat_port})"
+        ),
+        span=span,
+      ))
 
 
 def _last_terminal_name(prev_stmts: list[ast.Stmt]) -> str:

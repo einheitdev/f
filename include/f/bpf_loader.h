@@ -50,6 +50,19 @@ struct BpfHandles {
 auto LoadProgram(std::string_view bundle_dir = "")
     -> std::expected<BpfHandles, Error<BpfError>>;
 
+/// Load a single XDP program from a specific object path. Used by the
+/// hot-reload path to stage a new program before atomically swapping
+/// it in. Unlike LoadProgram this ignores the cold-boot search list and
+/// keeps its own bpf_object alive (close it via UnloadProgram), so the
+/// running program is untouched until the swap succeeds.
+auto LoadProgramFromPath(std::string_view obj_path)
+    -> std::expected<BpfHandles, Error<BpfError>>;
+
+/// Close the bpf_object a prior LoadProgramFromPath opened for `h`
+/// (looked up by prog_fd). No-op when `h` was not produced by
+/// LoadProgramFromPath.
+auto UnloadProgram(const BpfHandles& h) -> void;
+
 /// Resolve which BPF object the loader will pick, without
 /// actually opening it. Returns the empty string when nothing on
 /// the search list exists. Exposed for unit tests; the live
@@ -62,6 +75,14 @@ auto AttachXdp(const BpfHandles& h, int ifindex)
 
 /// Detach the XDP program from an interface.
 auto DetachXdp(int ifindex)
+    -> std::expected<void, Error<BpfError>>;
+
+/// Atomically replace the XDP program on `ifindex`: swap `old_prog_fd`
+/// for `new_prog_fd` in a single kernel op (XDP_FLAGS_REPLACE), failing
+/// if the attached program is not `old_prog_fd`. Pass `old_prog_fd < 0`
+/// to attach without the replace constraint. The zero-drop hot-reload
+/// primitive used by ApplyBundle's single-program swap.
+auto ReplaceXdp(int ifindex, int new_prog_fd, int old_prog_fd)
     -> std::expected<void, Error<BpfError>>;
 
 /// Pin all maps to bpffs for persistence across restarts.
@@ -108,6 +129,18 @@ struct ZoneBundleHandles {
 auto LoadZoneBundle(std::string_view bundle_dir,
                     std::string_view pin_root)
     -> std::expected<ZoneBundleHandles, Error<BpfError>>;
+
+/// True when `<bundle_dir>/manifest.json` describes a multi-zone bundle
+/// (a non-empty "zones" array and a non-empty "programs" array). The
+/// cold-boot (EngineInit) and hot-reload (ApplyBundle) paths use this
+/// to route to LoadZoneBundle instead of the single-program loader.
+/// Returns false when the manifest is missing or unparseable.
+auto IsMultiZoneBundle(std::string_view bundle_dir) -> bool;
+
+/// Detach every program in a previously loaded zone bundle from its
+/// interfaces. Best-effort: logs and continues on per-interface error.
+/// Used before a hot-reload re-attaches a new bundle.
+auto DetachZoneBundle(const ZoneBundleHandles& handles) -> void;
 
 }  // namespace f
 

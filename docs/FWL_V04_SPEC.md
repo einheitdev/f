@@ -764,6 +764,146 @@ def from_dmz(pkt):
   drop
 ```
 
+## NAT — `masquerade`, `snat to <ip>`, `dnat to <ip>:<port>` (Phase 5)
+
+NAT rewrites packets in flight: the source for outbound traffic
+(`snat`/`masquerade`), the destination for inbound port forwarding
+(`dnat`), and the matching reverse rewrite on the return path. NAT
+builds on zones — `masquerade` + `redirect to wan` is the core gateway
+pattern.
+
+### Construct
+
+```
+masquerade                  # rewrite source -> the WAN interface address
+snat to <ip>                # rewrite source -> a fixed IPv4 literal
+dnat to <ip>:<port>         # rewrite destination -> a fixed IPv4:port
+```
+
+All three are **non-terminal rewrite actions**: they translate the
+packet in place and fall through, so the *following* terminal action
+(`redirect to <zone>` or `allow`) emits the rewritten frame. They are
+valid as Tier 1 rule actions (`snat to 203.0.113.1 if pkt.proto == tcp`)
+and as Tier 2 action statements. They are **not** valid `default`
+actions — `default masquerade` is a syntax error.
+
+### Type rules
+
+`masquerade` takes no operand. `snat to` takes an IPv4 literal. `dnat
+to` takes an IPv4 literal and a port (`1`–`65535`). A `dnat` port
+outside that range is a compile error.
+
+### Semantics
+
+- **Source NAT (`snat`/`masquerade`).** When the action fires, the
+  emitter rewrites the source address (to the literal, or — for
+  `masquerade` — to the address the daemon wrote into the per-zone
+  `fwl_nat_cfg` map), fixes the IPv4 header checksum and the TCP/UDP
+  checksum, and installs a **reply mapping** in the shared `fwl_nat`
+  map so the return packet is de-NAT'd. v0.4 is **port-preserving**:
+  the translated source port equals the original, so two oracles agree
+  deterministically and the only L4-checksum delta is the address
+  change. (Ephemeral-port reallocation on collision is Phase 5.3.)
+- **Destination NAT (`dnat`).** Rewrites the destination address **and**
+  port, fixes both checksums, and installs the reply mapping that
+  restores the original (public) destination on return traffic.
+- **Return traffic (automatic de-NAT).** Before any rule evaluates,
+  each NAT-carrying program probes `fwl_nat` with the packet's forward
+  5-tuple; on a hit it rewrites the recorded side (destination for an
+  SNAT/masquerade reply, source for a DNAT reply) back to the original
+  endpoint, fixing checksums. In a bundle, **every** zone program emits
+  this de-NAT pass and the shared `fwl_nat` map, so the egress zone
+  installs the mapping and the ingress zone consumes it.
+- **Checksums.** XDP has no `bpf_l3/l4_csum_replace` (skb-only), so the
+  IPv4 header checksum is recomputed with `bpf_csum_diff` and the L4
+  checksum is updated incrementally (RFC 1624) in native byte order.
+  A wrong checksum compiles and passes the interpreter but is silently
+  dropped on the wire — the BPF oracle therefore recomputes both
+  checksums of every asserted `expected.output_packet`.
+- **Conditions read the original packet.** A NAT rewrite affects the
+  emitted frame and the reply mapping only; rule conditions evaluated
+  after a `snat`/`dnat` still read the pre-NAT parsed fields (the
+  emitter captures them into locals up front, and the interpreter
+  mirrors this).
+- **IPv4 only.** v0.4 NAT translates IPv4 only (the `fwl_nat` key is
+  32-bit, like conntrack). An IPv6 frame is never rewritten and creates
+  no mapping. Only the no-IP-options common case (`ihl == 5`) is
+  rewritten.
+
+### Edge cases
+
+- *Guard miss.* `snat to <ip> if pkt.proto == tcp` leaves a UDP frame
+  unrewritten (the action never fires).
+- *IPv6 frame.* No rewrite, no mapping (NAT is IPv4-only).
+- *UDP with checksum 0.* Left as 0 ("no checksum"); a computed checksum
+  that folds to 0 is stored as `0xffff`.
+- *ICMP.* v0.4 NAT does not rewrite ICMP (ICMP-error NAT is Phase 5.3).
+
+### Compile errors
+
+| Condition | Error |
+|---|---|
+| `default masquerade` | `default` admits only `allow`/`drop` (syntax error) |
+| `dnat to 10.0.0.5:70000` | dnat target port out of range 1-65535 |
+| `snat to 999.0.0.1` | invalid IPv4 octet |
+
+### Examples
+
+```
+# Outbound gateway: the LAN masquerades behind the WAN address and
+# redirects out; return traffic is de-NAT'd automatically before the
+# WAN program redirects it back.
+zone wan = [wan0]
+zone lan = [lan0, lan1]
+
+@xdp(lan)
+masquerade
+redirect to wan
+
+@xdp(wan)
+redirect to lan if conntrack(pkt).state == established
+drop
+```
+
+```
+# Port forward TCP/80 on the WAN address to an internal web server.
+@xdp(wan)
+dnat to 10.0.0.5:8080 if pkt.proto == tcp and pkt.dst_port == 80
+redirect to lan
+```
+
+### PKT format additions
+
+The `.pkt` test format gains two Phase 5 extensions:
+
+- **`expected.output_packet`** — the packet header fields after the
+  program's NAT rewrite (`src_ip`, `dst_ip`, `src_port`, `dst_port`;
+  only the listed keys are checked). Verified by both oracles; when set,
+  the BPF oracle also recomputes the IPv4 + TCP/UDP checksums of the
+  rewritten frame and fails on any invalid checksum.
+  ```yaml
+  expected:
+    bpf_action: allow
+    output_packet:
+      src_ip: "198.51.100.9"
+      dst_ip: "93.184.216.34"
+      src_port: 12345
+  ```
+- **`state.nat`** — the masquerade source IP and pre-seeded reply
+  mappings for return-traffic de-NAT (analogous to `state.conntrack`).
+  Each mapping carries the forward 5-tuple the return packet presents,
+  the address+port to restore, and `nat_type` (`snat` rewrites source,
+  `dnat` rewrites destination).
+  ```yaml
+  state:
+    nat:
+      masq_ip: "203.0.113.7"
+      mappings:
+        - { proto: tcp, src_ip: "93.184.216.34", dst_ip: "198.51.100.9",
+            src_port: 80, dst_port: 12345, new_ip: "10.0.0.5",
+            new_port: 12345, nat_type: dnat }
+  ```
+
 ## Compilation
 
 The two constructs activate parse paths the same way v0.2 fields do:

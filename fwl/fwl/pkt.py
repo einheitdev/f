@@ -81,6 +81,13 @@ class PktCase:
   # evaluates it in a multi-zone unit. None selects the first/only
   # block (the degenerate single-zone case).
   ingress_zone: str = None  # type: ignore[assignment]
+  # Phase 5 NAT. `nat_masq_ip` is the masquerade source (the WAN IP the
+  # `state.nat.masq_ip` block supplies, a 32-bit int) and `nat_mappings`
+  # the pre-seeded reply mappings for return-traffic de-NAT: each a tuple
+  # `(proto_str, src_u32, dst_u32, src_port, dst_port, new_u32,
+  # new_port, kind)` where kind is 'snat' or 'dnat'.
+  nat_masq_ip: int = None  # type: ignore[assignment]
+  nat_mappings: tuple = ()
 
 
 @dataclass(frozen=True)
@@ -333,6 +340,25 @@ def _ipv4_checksum(header: bytes) -> int:
   return (~total) & 0xFFFF
 
 
+def _l4_checksum(src4: bytes, dst4: bytes, proto_num: int,
+                 l4: bytes) -> int:
+  """TCP/UDP checksum over the IPv4 pseudo-header + L4 segment.
+
+  Built frames carry a *valid* L4 checksum so a NAT rewrite (which
+  updates it incrementally) can be checked on the wire — the BPF
+  oracle recomputes it after every translation."""
+  data = (src4 + dst4 + bytes([0, proto_num])
+          + len(l4).to_bytes(2, "big") + l4)
+  if len(data) % 2:
+    data += b"\x00"
+  total = 0
+  for i in range(0, len(data), 2):
+    total += (data[i] << 8) | data[i + 1]
+  while total >> 16:
+    total = (total & 0xFFFF) + (total >> 16)
+  return (~total) & 0xFFFF
+
+
 def _ipv6_to_bytes(addr: Any, field: str = "ip") -> bytes:
   """Pack an RFC 5952 canonical IPv6 string as 16 big-endian bytes (v0.2).
 
@@ -570,6 +596,18 @@ def build_packet(fields: dict[str, Any]) -> Packet:
   checksum = _ipv4_checksum(ip_header)
   ip_header = ip_header[:10] + struct.pack(">H", checksum) + ip_header[12:]
 
+  # Fill a valid TCP/UDP checksum (ICMP keeps its zero placeholder —
+  # v0.4 NAT never rewrites ICMP, so no oracle checks it). The L4
+  # checksum field sits at offset 16 (TCP) / 6 (UDP).
+  src4 = _ipv4_to_bytes(src_ip, "src_ip")
+  dst4 = _ipv4_to_bytes(dst_ip, "dst_ip")
+  if proto == "tcp":
+    c = _l4_checksum(src4, dst4, proto_num, l4)
+    l4 = l4[:16] + struct.pack(">H", c) + l4[18:]
+  elif proto == "udp":
+    c = _l4_checksum(src4, dst4, proto_num, l4) or 0xFFFF
+    l4 = l4[:6] + struct.pack(">H", c) + l4[8:]
+
   eth, vlan_decoded, is_qinq = _eth_header(
     _ETH_P_IP, fields.get("vlan_id"), fields.get("vlan_priority"),
     fields.get("inner_vlan_id"), fields.get("inner_vlan_priority"),
@@ -601,10 +639,22 @@ _EXPECTED_KEYS = frozenset({
   # v0.4 § 6.3: for a `redirect` bpf_action, the expected destination
   # zone (checked by the interpreter oracle).
   "redirect_zone",
+  # Phase 5 NAT: the expected packet header fields after the program's
+  # NAT rewrite. A mapping of {src_ip, dst_ip, src_port, dst_port} —
+  # only the keys present are checked. Verified by both oracles.
+  "output_packet",
 })
-# v0.4 adds `conntrack` (a list of pre-seeded entries) alongside the
-# v0.1 `rate_limit` bucket state.
-_STATE_KEYS = frozenset({"rate_limit", "conntrack"})
+# v0.4 adds `conntrack`; Phase 5 adds `nat` (masquerade IP + pre-seeded
+# reply mappings) alongside the v0.1 `rate_limit` bucket state.
+_STATE_KEYS = frozenset({"rate_limit", "conntrack", "nat"})
+_OUTPUT_PACKET_KEYS = frozenset({
+  "src_ip", "dst_ip", "src_port", "dst_port",
+})
+_NAT_STATE_KEYS = frozenset({"masq_ip", "mappings"})
+_NAT_MAPPING_KEYS = frozenset({
+  "proto", "src_ip", "dst_ip", "src_port", "dst_port",
+  "new_ip", "new_port", "nat_type",
+})
 _SEQUENCE_STEP_KEYS = frozenset({"name", "builder", "truncate_to", "expected"})
 _CONNTRACK_ENTRY_KEYS = frozenset({
   "src_ip", "dst_ip", "src_port", "dst_port", "proto",
@@ -632,6 +682,54 @@ def _ipv4_str_to_int(addr: str, where: str) -> int:
       raise ValueError(f"{where}: IPv4 octet out of range 0..255: {n}")
     value = (value << 8) | n
   return value
+
+
+def _parse_nat_state(raw: Any) -> tuple:
+  """Parse `state.nat` into `(masq_ip_int_or_None, mappings_tuple)`.
+
+  `masq_ip` is the masquerade source IPv4. `mappings` is a list of
+  reply-direction entries used to de-NAT return traffic; each carries
+  the forward 5-tuple the return packet presents (proto/src_ip/dst_ip/
+  src_port/dst_port), the address+port to restore (new_ip/new_port), and
+  the direction `nat_type` ('snat' rewrites source, 'dnat' rewrites
+  destination). Returned mappings are
+  `(proto, src_u32, dst_u32, sport, dport, new_u32, new_port, kind)`.
+  """
+  if raw is None:
+    return (None, ())
+  if not isinstance(raw, dict):
+    raise ValueError("state.nat must be a mapping")
+  _reject_unknown_keys(raw, _NAT_STATE_KEYS, "state.nat")
+  masq = raw.get("masq_ip")
+  masq_ip = (_ipv4_str_to_int(masq, "state.nat.masq_ip")
+             if masq is not None else None)
+  out: list[tuple] = []
+  for i, m in enumerate(raw.get("mappings") or []):
+    if not isinstance(m, dict):
+      raise ValueError(f"state.nat.mappings[{i}] must be a mapping")
+    _reject_unknown_keys(m, _NAT_MAPPING_KEYS, f"state.nat.mappings[{i}]")
+    proto = m.get("proto")
+    if proto not in _CONNTRACK_PROTO_NUM:
+      raise ValueError(
+        f"state.nat.mappings[{i}].proto must be tcp/udp/icmp"
+      )
+    kind = m.get("nat_type")
+    if kind not in ("snat", "dnat"):
+      raise ValueError(
+        f"state.nat.mappings[{i}].nat_type must be snat or dnat"
+      )
+    w = f"state.nat.mappings[{i}]"
+    out.append((
+      proto,
+      _ipv4_str_to_int(m["src_ip"], f"{w}.src_ip"),
+      _ipv4_str_to_int(m["dst_ip"], f"{w}.dst_ip"),
+      int(m.get("src_port", 0)),
+      int(m.get("dst_port", 0)),
+      _ipv4_str_to_int(m["new_ip"], f"{w}.new_ip"),
+      int(m.get("new_port", 0)),
+      kind,
+    ))
+  return (masq_ip, tuple(out))
 
 
 def _parse_conntrack_seed(raw: Any) -> tuple:
@@ -838,6 +936,14 @@ def load(path: Path) -> PktCase:
   conntrack_seed = _parse_conntrack_seed(
     (doc.get("state") or {}).get("conntrack")
   )
+  nat_masq_ip, nat_mappings = _parse_nat_state(
+    (doc.get("state") or {}).get("nat")
+  )
+  if "output_packet" in doc["expected"]:
+    _reject_unknown_keys(
+      doc["expected"]["output_packet"], _OUTPUT_PACKET_KEYS,
+      "expected.output_packet",
+    )
 
   return PktCase(
     name=doc["name"],
@@ -849,6 +955,8 @@ def load(path: Path) -> PktCase:
     geoip_data=geoip_data,
     conntrack_seed=conntrack_seed,
     ingress_zone=doc.get("ingress_zone"),
+    nat_masq_ip=nat_masq_ip,
+    nat_mappings=nat_mappings,
   )
 
 
