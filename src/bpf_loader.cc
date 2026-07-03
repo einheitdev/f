@@ -23,10 +23,14 @@
 
 #include "f/types.h"
 
+#include <arpa/inet.h>
 #include <bpf/bpf.h>
 #include <bpf/libbpf.h>
+#include <ifaddrs.h>
 #include <linux/if_link.h>
 #include <net/if.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
 
 namespace f {
 
@@ -44,6 +48,47 @@ auto FindMap(struct bpf_object* obj, const char* name)
   struct bpf_map* map = bpf_object__find_map_by_name(
       obj, name);
   return map ? bpf_map__fd(map) : -1;
+}
+
+// First IPv4 address configured on the interface `ifindex`, in network
+// byte order, or 0 when the interface has none. Used to derive the
+// masquerade source address the XDP `masquerade` action rewrites to.
+auto GetIfaceIpv4(int ifindex) -> uint32_t {
+  struct ifaddrs* list = nullptr;
+  if (getifaddrs(&list) != 0) return 0;
+  char want[IF_NAMESIZE] = {};
+  if_indextoname(static_cast<unsigned int>(ifindex), want);
+  uint32_t addr = 0;
+  for (auto* ifa = list; ifa; ifa = ifa->ifa_next) {
+    if (!ifa->ifa_addr || !ifa->ifa_name) continue;
+    if (ifa->ifa_addr->sa_family != AF_INET) continue;
+    if (std::strcmp(ifa->ifa_name, want) != 0) continue;
+    addr = reinterpret_cast<struct sockaddr_in*>(ifa->ifa_addr)
+               ->sin_addr.s_addr;
+    break;
+  }
+  freeifaddrs(list);
+  return addr;
+}
+
+// Attach an XDP program to `ifindex`, preferring native (driver) mode
+// but falling back to generic (SKB) mode. Native is line-rate, but some
+// NICs have no native XDP — notably the RTL8125 (`r8169`), which rejects
+// a native attach outright — and there the program must run in generic
+// mode to work at all. Returns 0 on success (sets *generic to whether
+// the fallback was used), else the errno from the generic attempt.
+auto AttachXdpFallback(int ifindex, int prog_fd, bool* generic) -> int {
+  int err = bpf_xdp_attach(ifindex, prog_fd, XDP_FLAGS_DRV_MODE, nullptr);
+  if (!err) {
+    if (generic) *generic = false;
+    return 0;
+  }
+  int gerr = bpf_xdp_attach(ifindex, prog_fd, XDP_FLAGS_SKB_MODE, nullptr);
+  if (!gerr) {
+    if (generic) *generic = true;
+    return 0;
+  }
+  return gerr;
 }
 
 }  // namespace
@@ -200,12 +245,16 @@ auto UnloadProgram(const BpfHandles& h) -> void {
 
 auto AttachXdp(const BpfHandles& h, int ifindex)
     -> std::expected<void, Error<BpfError>> {
-  int err = bpf_xdp_attach(
-      ifindex, h.prog_fd, 0, nullptr);
+  bool generic = false;
+  int err = AttachXdpFallback(ifindex, h.prog_fd, &generic);
   if (err) {
     return MakeError(BpfError::kAttachFailed,
         std::format("bpf_xdp_attach ifindex={} failed: {}",
                     ifindex, std::strerror(-err)));
+  }
+  if (generic) {
+    spdlog::warn("ifindex {}: native XDP unavailable, attached in "
+                 "generic (SKB) mode", ifindex);
   }
   return {};
 }
@@ -398,6 +447,20 @@ auto LoadZoneBundle(std::string_view bundle_dir,
     ZoneProgramHandle zh;
     zh.zone = zone;
     zh.prog_fd = bpf_program__fd(prog);
+    zh.masquerades = p.value("masquerades", false);
+    for (const auto& d : p.value("redirects_to", json::array())) {
+      zh.redirects_to.push_back(d.get<std::string>());
+    }
+    // Resolve the zone's declared interface names (for `show zones`);
+    // some may not be present on the host yet.
+    for (const auto& z : manifest.value("zones", json::array())) {
+      if (z.value("name", std::string{}) == zone) {
+        for (const auto& i : z.value("interfaces", json::array())) {
+          zh.interfaces.push_back(i.get<std::string>());
+        }
+        break;
+      }
+    }
 
     // Capture the shared conntrack fd from whichever zone defines it.
     if (handles.conntrack_fd < 0) {
@@ -422,13 +485,69 @@ auto LoadZoneBundle(std::string_view bundle_dir,
                    dest_zone, targets.size());
     }
 
-    // Attach the program to every interface in its own zone.
+    // Capture the shared NAT reply-mapping fd (for `show nat`).
+    if (handles.nat_fd < 0) {
+      int nf = FindMap(obj, "fwl_nat");
+      if (nf >= 0) handles.nat_fd = nf;
+    }
+
+    // Every NAT zone object embeds fwl_nat_cfg (the de-NAT pass needs
+    // it), so its mere presence does not mean this zone masquerades —
+    // the manifest's per-program `masquerades` flag says so. Only a
+    // masquerading zone seeds the shared cfg; otherwise a non-masq zone
+    // would clobber it with its own (wrong, LAN-side) address. The XDP
+    // masquerade action rewrites the source to cfg->masq_addr and
+    // no-ops when the slot is unset, so seeding it is mandatory. The
+    // source is the egress (redirect destination) zone's address — the
+    // WAN side of the gateway.
+    int nat_cfg_fd = FindMap(obj, "fwl_nat_cfg");
+    if (nat_cfg_fd >= 0 && handles.nat_cfg_fd < 0) {
+      handles.nat_cfg_fd = nat_cfg_fd;
+    }
+    if (nat_cfg_fd >= 0 && p.value("masquerades", false)) {
+      uint32_t masq = 0;
+      for (const auto& dest : p.value("redirects_to", json::array())) {
+        for (int idx : zone_ifindexes[dest.get<std::string>()]) {
+          masq = GetIfaceIpv4(idx);
+          if (masq) break;
+        }
+        if (masq) break;
+      }
+      if (masq) {
+        uint32_t key = 0;
+        // Matches `struct fwl_nat_cfg { __u32 masq_addr; }` in the
+        // emitted BPF C; masq_addr is network byte order.
+        struct {
+          uint32_t masq_addr;
+        } cfg{masq};
+        if (bpf_map_update_elem(nat_cfg_fd, &key, &cfg, BPF_ANY) == 0) {
+          char buf[INET_ADDRSTRLEN] = {};
+          inet_ntop(AF_INET, &masq, buf, sizeof(buf));
+          spdlog::info("zone '{}' masquerade source -> {}", zone, buf);
+        } else {
+          spdlog::warn("zone '{}' failed to set masquerade source",
+                       zone);
+        }
+      } else {
+        spdlog::warn("zone '{}' masquerades but no WAN address found; "
+                     "source NAT will not rewrite", zone);
+      }
+    }
+
+    // Attach the program to every interface in its own zone, native
+    // mode preferred with a generic (SKB) fallback for NICs without
+    // native XDP (e.g. the RTL8125 on the RK3588 test rig).
     for (int ifindex : zone_ifindexes[zone]) {
-      int aerr = bpf_xdp_attach(ifindex, zh.prog_fd, 0, nullptr);
+      bool generic = false;
+      int aerr = AttachXdpFallback(ifindex, zh.prog_fd, &generic);
       if (aerr) {
         return MakeError(BpfError::kAttachFailed,
             std::format("attach zone '{}' to ifindex {} failed: {}",
                         zone, ifindex, std::strerror(-aerr)));
+      }
+      if (generic) {
+        spdlog::warn("zone '{}' ifindex {}: native XDP unavailable, "
+                     "attached in generic (SKB) mode", zone, ifindex);
       }
       zh.ifindexes.push_back(ifindex);
     }

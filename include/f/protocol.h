@@ -27,6 +27,10 @@ enum class Cmd : uint8_t {
   kGetFirewall = 6,
   kGetRules = 7,
   kClearCounters = 8,
+  // v0.4 multi-zone bundle introspection.
+  kGetZones = 9,
+  kGetNat = 10,
+  kGetConntrack = 11,
 };
 
 // ============================================================================

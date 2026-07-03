@@ -101,6 +101,9 @@ struct ZoneProgramHandle {
   std::string zone;            ///< zone name (the @xdp argument)
   int prog_fd = -1;            ///< the XDP program fd (fwl_prog)
   std::vector<int> ifindexes;  ///< interfaces it was attached to
+  std::vector<std::string> interfaces;  ///< zone interface names
+  std::vector<std::string> redirects_to;  ///< redirect destinations
+  bool masquerades = false;    ///< true if this zone masquerades
 };
 
 /// Result of loading a multi-zone bundle: one entry per @xdp block.
@@ -109,6 +112,15 @@ struct ZoneBundleHandles {
   /// The shared, bpffs-pinned conntrack map fd (cross-zone state), or
   /// -1 when no zone program uses conntrack.
   int conntrack_fd = -1;
+  /// The shared, bpffs-pinned NAT reply-mapping map fd (`fwl_nat`), or
+  /// -1 when no zone program uses NAT. Read to report active
+  /// translations (`show nat`).
+  int nat_fd = -1;
+  /// The shared masquerade config map fd (`fwl_nat_cfg`), or -1 when no
+  /// zone program masquerades. The loader seeds slot 0 with the
+  /// masquerade source address so the XDP `masquerade` action rewrites
+  /// to a real WAN address instead of no-opping.
+  int nat_cfg_fd = -1;
 };
 
 /// Load every zone program in a `fwl compile --bundle` directory.

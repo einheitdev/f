@@ -2,6 +2,7 @@
 /// @brief BPF engine: load, attach, pin, ZMQ control loop.
 
 #include "f/engine.h"
+#include "f/reload.h"
 
 #include <arpa/inet.h>
 #include <net/if.h>
@@ -67,6 +68,51 @@ auto FlushMap(int map_fd) -> void {
     std::memcpy(key, next_key, sizeof(key));
     bpf_map_delete_elem(map_fd, key);
   }
+}
+
+// Reply-mapping entry in the shared fwl_nat map. Byte-compatible with
+// `struct fwl_nat_key`/`fwl_nat_value` in the emitted BPF C. Ports are
+// host byte order (the emitter stores bpf_ntohs'd values); addresses
+// are network byte order.
+struct NatMapKey {
+  uint32_t src_addr;
+  uint32_t dst_addr;
+  uint16_t src_port;
+  uint16_t dst_port;
+  uint8_t proto;
+  uint8_t pad[3];
+};
+struct NatMapValue {
+  uint32_t new_addr;
+  uint16_t new_port;
+  uint8_t nat_type;
+  uint8_t pad;
+};
+
+auto ProtoName(uint8_t proto) -> std::string {
+  switch (proto) {
+    case 1: return "icmp";
+    case 6: return "tcp";
+    case 17: return "udp";
+    case 0: return "any";
+    default: return std::to_string(proto);
+  }
+}
+
+auto CtStateName(uint8_t state) -> std::string {
+  switch (state) {
+    case 0: return "new";
+    case 1: return "established";
+    case 2: return "related";
+    case 3: return "invalid";
+    default: return std::to_string(state);
+  }
+}
+
+auto Ipv4Str(uint32_t netorder) -> std::string {
+  char buf[INET_ADDRSTRLEN] = {};
+  inet_ntop(AF_INET, &netorder, buf, sizeof(buf));
+  return buf;
 }
 
 auto HandleRequest(Engine& e, const std::string& req_str)
@@ -241,6 +287,110 @@ auto HandleRequest(Engine& e, const std::string& req_str)
         cleared++;
       }
       return json({{"cleared", cleared}}).dump();
+    }
+    case Cmd::kReloadProg: {
+      // Recompile the configured source and hot-swap it. On any
+      // failure (compile error, invalid bundle) ReloadFromSource
+      // leaves the running program untouched — the reload path never
+      // installs a broken program.
+      auto r = ReloadFromSource(e);
+      if (!r) {
+        return json({{"error", r.error().message}}).dump();
+      }
+      return json({
+          {"status", "reloaded"},
+          {"version", r->version},
+          {"rules_installed", r->rules_installed},
+          {"program_updated", r->program_updated},
+      }).dump();
+    }
+    case Cmd::kGetZones: {
+      // v0.4 multi-zone bundle topology. Empty on the single-program
+      // path (no zones declared).
+      json arr = json::array();
+      for (const auto& p : e.zone_bundle.programs) {
+        json attached = json::array();
+        for (int idx : p.ifindexes) {
+          char nm[IF_NAMESIZE] = {};
+          if (if_indextoname(static_cast<unsigned int>(idx), nm)) {
+            attached.push_back(std::string(nm));
+          }
+        }
+        arr.push_back({
+            {"zone", p.zone},
+            {"interfaces", p.interfaces},
+            {"redirects_to", p.redirects_to},
+            {"masquerades", p.masquerades},
+            {"attached", attached},
+            {"attached_count", p.ifindexes.size()},
+        });
+      }
+      return arr.dump();
+    }
+    case Cmd::kGetNat: {
+      json j;
+      json arr = json::array();
+      int fd = e.zone_bundle.nat_fd;
+      if (fd >= 0) {
+        NatMapKey key{}, next{};
+        NatMapValue val{};
+        bool has =
+            bpf_map_get_next_key(fd, nullptr, &next) == 0;
+        while (has) {
+          if (bpf_map_lookup_elem(fd, &next, &val) == 0) {
+            arr.push_back({
+                {"proto", ProtoName(next.proto)},
+                {"orig_src", Ipv4Str(next.src_addr)},
+                {"orig_dst", Ipv4Str(next.dst_addr)},
+                {"orig_src_port", next.src_port},
+                {"orig_dst_port", next.dst_port},
+                {"new_addr", Ipv4Str(val.new_addr)},
+                {"new_port", val.new_port},
+                {"type", val.nat_type == 1 ? "snat" : "dnat"},
+            });
+          }
+          key = next;
+          has = bpf_map_get_next_key(fd, &key, &next) == 0;
+        }
+      }
+      j["translations"] = arr;
+      // Report the masquerade source address the daemon programmed.
+      if (e.zone_bundle.nat_cfg_fd >= 0) {
+        uint32_t k = 0, masq = 0;
+        if (bpf_map_lookup_elem(
+                e.zone_bundle.nat_cfg_fd, &k, &masq) == 0 &&
+            masq != 0) {
+          j["masq_source"] = Ipv4Str(masq);
+        }
+      }
+      return j.dump();
+    }
+    case Cmd::kGetConntrack: {
+      json arr = json::array();
+      int fd = e.conntrack.map_fd;
+      if (fd >= 0) {
+        ConnKey key{}, next{};
+        ConnValue val{};
+        bool has =
+            bpf_map_get_next_key(fd, nullptr, &next) == 0;
+        while (has) {
+          if (bpf_map_lookup_elem(fd, &next, &val) == 0) {
+            arr.push_back({
+                {"proto", ProtoName(next.proto)},
+                {"src", Ipv4Str(next.src_addr)},
+                {"dst", Ipv4Str(next.dst_addr)},
+                {"src_port", next.src_port},
+                {"dst_port", next.dst_port},
+                {"state", CtStateName(val.state)},
+                {"packets", val.packets},
+                {"last_seen_ns", val.last_seen_ns},
+            });
+          }
+          key = next;
+          has = bpf_map_get_next_key(fd, &key, &next) == 0;
+        }
+      }
+      return arr.dump();
     }
     default:
       return R"({"error":"unknown command"})";

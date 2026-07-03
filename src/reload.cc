@@ -206,6 +206,22 @@ auto ApplyBundle(Engine& e, std::string_view bundle_dir)
       DetachZoneBundle(e.zone_bundle);
       e.zone_bundle = ZoneBundleHandles{};
     }
+    // The per-zone devmaps hold no state worth preserving (the daemon
+    // repopulates them with egress ifindexes at load). libbpf refuses
+    // to reuse a pinned DEVMAP on reload ("parameter mismatch"), so
+    // unpin them here and let the new bundle create fresh ones. The
+    // shared state maps (conntrack, fwl_nat) stay pinned and are reused
+    // so a flow established before the reload survives it.
+    {
+      std::error_code uec;
+      for (const auto& entry :
+           std::filesystem::directory_iterator(e.pin_path, uec)) {
+        auto name = entry.path().filename().string();
+        if (name.rfind("fwl_devmap_", 0) == 0) {
+          std::filesystem::remove(entry.path(), uec);
+        }
+      }
+    }
     auto loaded = LoadZoneBundle(dir.string(), e.pin_path);
     if (!loaded) {
       return MakeError(ReloadError::kApplyFailed,
@@ -353,25 +369,29 @@ auto ReloadFromSource(Engine& e)
     return std::unexpected(envelope.error());
   }
 
-  // Validate the envelope.
-  json env;
+  // A zero-exit compile succeeded (RunCompiler already turns a non-zero
+  // exit into kCompileFailed). Some compile modes emit a JSON status
+  // envelope on stdout; the `--bundle` mode instead prints a human
+  // summary. So only treat stdout as a failure signal when it actually
+  // parses as a JSON envelope reporting a non-ok status — otherwise the
+  // exit code is authoritative and the bundle's manifest.json (checked
+  // by ApplyBundle below) is the source of truth.
   try {
-    env = json::parse(*envelope);
-  } catch (const std::exception& ex) {
-    return MakeError(ReloadError::kCompileFailed,
-                     std::format("parse envelope: {}",
-                                 ex.what()));
-  }
-  if (env.value("status", std::string()) != "ok") {
-    std::string errs;
-    if (env.contains("errors")) {
-      for (const auto& e : env["errors"]) {
-        if (!errs.empty()) errs += "; ";
-        errs += e.get<std::string>();
+    json env = json::parse(*envelope);
+    if (env.is_object() && env.contains("status") &&
+        env.value("status", std::string()) != "ok") {
+      std::string errs;
+      if (env.contains("errors")) {
+        for (const auto& e : env["errors"]) {
+          if (!errs.empty()) errs += "; ";
+          errs += e.get<std::string>();
+        }
       }
+      return MakeError(ReloadError::kCompileFailed,
+                       errs.empty() ? "compile failed" : errs);
     }
-    return MakeError(ReloadError::kCompileFailed,
-                     errs.empty() ? "compile failed" : errs);
+  } catch (const std::exception&) {
+    // Non-JSON stdout (e.g. the --bundle human summary) is fine.
   }
 
   auto applied = ApplyBundle(e, bundle_dir.string());
