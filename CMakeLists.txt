@@ -116,10 +116,12 @@ add_bpf_object(fw bpf/fw.bpf.c)
 # ============================================================================
 add_library(libf-engine STATIC
   src/bpf_loader.cc
+  src/config.cc
   src/engine.cc
   src/reload.cc
   src/slow_path.cc
   src/components.cc
+  src/watcher.cc
 )
 
 target_include_directories(libf-engine PUBLIC
@@ -133,6 +135,7 @@ target_link_libraries(libf-engine PUBLIC
   nlohmann_json::nlohmann_json
   cppzmq
   spdlog::spdlog
+  yaml-cpp::yaml-cpp
   pthread
 )
 
