@@ -1,0 +1,26 @@
+{% if length(translations) > 0 %}
+<table class="data-table">
+  <thead>
+    <tr>
+      <th>proto</th>
+      <th>type</th>
+      <th>orig src</th>
+      <th>orig dst</th>
+      <th>translated</th>
+    </tr>
+  </thead>
+  <tbody>
+{% for t in translations %}
+    <tr>
+      <td>{{ t.proto }}</td>
+      <td><span class="badge badge-warn">{{ t.type }}</span></td>
+      <td class="mono">{{ t.orig_src }}:{{ t.orig_src_port }}</td>
+      <td class="mono">{{ t.orig_dst }}:{{ t.orig_dst_port }}</td>
+      <td class="mono">{{ t.new_addr }}:{{ t.new_port }}</td>
+    </tr>
+{% endfor %}
+  </tbody>
+</table>
+{% else %}
+<div class="empty">no active translations</div>
+{% endif %}

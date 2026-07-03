@@ -217,6 +217,74 @@ auto ReadDaemonStatus(const std::string& fd_socket)
   return j;
 }
 
+// Send a single-byte control command to fd and return the parsed JSON
+// reply, or null on any failure. The v0.4 zone/NAT/conntrack views read
+// their data from the daemon's control surface (same commands the CLI
+// uses) rather than the pinned maps.
+auto QueryDaemon(const std::string& fd_socket, f::Cmd cmd) -> json {
+  try {
+    zmq::context_t ctx(1);
+    zmq::socket_t sock(ctx, zmq::socket_type::req);
+    sock.set(zmq::sockopt::linger, 0);
+    sock.set(zmq::sockopt::rcvtimeo, 1000);
+    sock.set(zmq::sockopt::sndtimeo, 1000);
+    sock.connect(fd_socket);
+    char b = static_cast<char>(static_cast<uint8_t>(cmd));
+    zmq::message_t req(1);
+    std::memcpy(req.data(), &b, 1);
+    if (!sock.send(req, zmq::send_flags::none)) return json();
+    zmq::message_t reply;
+    if (!sock.recv(reply, zmq::recv_flags::none)) return json();
+    return json::parse(std::string(
+        static_cast<char*>(reply.data()), reply.size()));
+  } catch (...) {
+    return json();
+  }
+}
+
+auto JoinArr(const json& arr) -> std::string {
+  std::string out;
+  if (!arr.is_array()) return out;
+  for (const auto& s : arr) {
+    if (!out.empty()) out += ", ";
+    out += s.get<std::string>();
+  }
+  return out;
+}
+
+// Add the display fields the zones_table template renders (joined
+// interface/redirect lists, yes/no + semantic badges).
+auto DecorateZones(json zones) -> json {
+  if (!zones.is_array()) return json::array();
+  for (auto& z : zones) {
+    z["ifaces_str"] = JoinArr(z.value("interfaces", json::array()));
+    z["attached_str"] = JoinArr(z.value("attached", json::array()));
+    if (z["attached_str"].get<std::string>().empty()) {
+      z["attached_str"] = "(none)";
+    }
+    auto redir = JoinArr(z.value("redirects_to", json::array()));
+    z["redirects_str"] = redir.empty() ? "-" : redir;
+    bool masq = z.value("masquerades", false);
+    z["masq_str"] = masq ? "yes" : "no";
+    z["masq_semantic"] = masq ? "good" : "dim";
+    z["attach_semantic"] =
+        z.value("attached_count", 0) > 0 ? "good" : "warn";
+  }
+  return zones;
+}
+
+// Tag each conntrack entry with a badge semantic for its state.
+auto DecorateConntrack(json entries) -> json {
+  if (!entries.is_array()) return json::array();
+  for (auto& c : entries) {
+    auto st = c.value("state", "");
+    c["state_semantic"] = st == "established" ? "good"
+                          : st == "invalid"   ? "bad"
+                                              : "warn";
+  }
+  return entries;
+}
+
 class FwUiAdapter final : public ui::ProductUiAdapter {
  public:
   explicit FwUiAdapter(FwUiConfig cfg)
@@ -241,7 +309,10 @@ class FwUiAdapter final : public ui::ProductUiAdapter {
         {"/", "Dashboard", "dashboard", "monitor"},
         {"/interfaces", "Interfaces", "interfaces",
          "network"},
+        {"/zones", "Zones", "zones", "layers"},
         {"/firewall", "Firewall", "firewall", "shield"},
+        {"/nat", "NAT", "nat", "shuffle"},
+        {"/conntrack", "Conntrack", "conntrack", "activity"},
         {"/counters", "Counters", "counters",
          "bar-chart-2"},
     };
@@ -273,18 +344,55 @@ class FwUiAdapter final : public ui::ProductUiAdapter {
         .swap_target = "counters-table",
         .swap_strategy = "outerHTML",
     });
+    // v0.4 live views: NAT translations, conntrack, zones.
+    events->Bind(ui::TopicBinding{
+        .topic = "fw.nat",
+        .fragment = "fw/nat_table",
+        .swap_target = "nat-table",
+        .swap_strategy = "outerHTML",
+    });
+    events->Bind(ui::TopicBinding{
+        .topic = "fw.conntrack",
+        .fragment = "fw/conntrack_table",
+        .swap_target = "conntrack-table",
+        .swap_strategy = "outerHTML",
+    });
+    events->Bind(ui::TopicBinding{
+        .topic = "fw.zones",
+        .fragment = "fw/zones_table",
+        .swap_target = "zones-table",
+        .swap_strategy = "outerHTML",
+    });
 
     // -- Dashboard --
     CROW_ROUTE(app, "/")
     ([eng, nav, this](const crow::request& req) {
       auto status = ReadDaemonStatus(cfg_.fd_socket);
       auto ifaces = GatherInterfaces();
+      // v0.4 zone/NAT/conntrack summary, read from the daemon.
+      auto zones = QueryDaemon(cfg_.fd_socket, f::Cmd::kGetZones);
+      auto nat = QueryDaemon(cfg_.fd_socket, f::Cmd::kGetNat);
+      auto ct = QueryDaemon(cfg_.fd_socket, f::Cmd::kGetConntrack);
       json data = {
           {"daemon", status},
           {"maps_available", maps_open_},
           {"iface_count", ifaces.size()},
           {"has_firewall", false},
+          {"zone_count", zones.is_array() ? zones.size() : 0},
+          {"conntrack_count", ct.is_array() ? ct.size() : 0},
+          {"nat_count", 0},
+          {"has_masq", false},
+          {"masq_source", ""},
       };
+      if (nat.is_object()) {
+        auto tr = nat.value("translations", json::array());
+        data["nat_count"] = tr.size();
+        if (nat.contains("masq_source")) {
+          data["has_masq"] = true;
+          data["masq_source"] =
+              nat["masq_source"].get<std::string>();
+        }
+      }
       if (maps_open_) {
         uint32_t cfg_key = 0;
         f::FwConfig fw_cfg{};
@@ -389,6 +497,84 @@ class FwUiAdapter final : public ui::ProductUiAdapter {
       return std::move(*r);
     });
 
+    // -- Zones (v0.4) --
+    CROW_ROUTE(app, "/zones")
+    ([eng, nav, this](const crow::request& req) {
+      auto zones = QueryDaemon(cfg_.fd_socket, f::Cmd::kGetZones);
+      json data = {{"zones", DecorateZones(zones)}};
+      ui::RenderArgs args;
+      args.fragment = "fw/zones";
+      args.layout = "layout";
+      args.data = data;
+      args.meta = {
+          {"title", "Zones"},
+          {"brand", "f firewall"},
+          {"active", "zones"},
+          {"nav", ui::NavToJson(nav)},
+      };
+      auto r = ui::Render(*eng, req, args);
+      if (!r) {
+        return ui::RenderError(
+            *eng, req, 500, "render", r.error().message);
+      }
+      return std::move(*r);
+    });
+
+    // -- NAT translations (v0.4) --
+    CROW_ROUTE(app, "/nat")
+    ([eng, nav, this](const crow::request& req) {
+      auto nat = QueryDaemon(cfg_.fd_socket, f::Cmd::kGetNat);
+      json data;
+      data["translations"] =
+          nat.is_object() ? nat.value("translations", json::array())
+                          : json::array();
+      data["has_masq"] =
+          nat.is_object() && nat.contains("masq_source");
+      data["masq_source"] =
+          data["has_masq"].get<bool>()
+              ? nat["masq_source"].get<std::string>()
+              : std::string();
+      ui::RenderArgs args;
+      args.fragment = "fw/nat";
+      args.layout = "layout";
+      args.data = data;
+      args.meta = {
+          {"title", "NAT"},
+          {"brand", "f firewall"},
+          {"active", "nat"},
+          {"nav", ui::NavToJson(nav)},
+      };
+      auto r = ui::Render(*eng, req, args);
+      if (!r) {
+        return ui::RenderError(
+            *eng, req, 500, "render", r.error().message);
+      }
+      return std::move(*r);
+    });
+
+    // -- Conntrack (v0.4) --
+    CROW_ROUTE(app, "/conntrack")
+    ([eng, nav, this](const crow::request& req) {
+      auto ct = QueryDaemon(cfg_.fd_socket, f::Cmd::kGetConntrack);
+      json data = {{"conntrack", DecorateConntrack(ct)}};
+      ui::RenderArgs args;
+      args.fragment = "fw/conntrack";
+      args.layout = "layout";
+      args.data = data;
+      args.meta = {
+          {"title", "Conntrack"},
+          {"brand", "f firewall"},
+          {"active", "conntrack"},
+          {"nav", ui::NavToJson(nav)},
+      };
+      auto r = ui::Render(*eng, req, args);
+      if (!r) {
+        return ui::RenderError(
+            *eng, req, 500, "render", r.error().message);
+      }
+      return std::move(*r);
+    });
+
     // -- Counters --
     CROW_ROUTE(app, "/counters")
     ([eng, nav, this](const crow::request& req) {
@@ -450,6 +636,27 @@ class FwUiAdapter final : public ui::ProductUiAdapter {
             std::chrono::milliseconds(
                 cfg_.sample_interval_ms));
         if (sampler_stop_.load()) break;
+        // v0.4 zone/NAT/conntrack come from the daemon, independent of
+        // whether the pinned rule maps are open.
+        auto zones =
+            QueryDaemon(cfg_.fd_socket, f::Cmd::kGetZones);
+        if (zones.is_array()) {
+          events->Publish("fw.zones",
+                          {{"zones", DecorateZones(zones)}});
+        }
+        auto nat = QueryDaemon(cfg_.fd_socket, f::Cmd::kGetNat);
+        if (nat.is_object()) {
+          events->Publish(
+              "fw.nat",
+              {{"translations",
+                nat.value("translations", json::array())}});
+        }
+        auto ct =
+            QueryDaemon(cfg_.fd_socket, f::Cmd::kGetConntrack);
+        if (ct.is_array()) {
+          events->Publish("fw.conntrack",
+                          {{"conntrack", DecorateConntrack(ct)}});
+        }
         if (!maps_open_) continue;
         auto rules = ReadRules(maps_);
         events->Publish("fw.rules", {{"rules", rules}});

@@ -1,0 +1,11 @@
+<section class="card">
+  <h2 class="card-title">NAT translations</h2>
+  <div class="card-body">
+{% if has_masq %}
+    <p class="dim">masquerade source: <span class="mono">{{ masq_source }}</span></p>
+{% endif %}
+    <div id="nat-table">
+      {% include "fw/nat_table" %}
+    </div>
+  </div>
+</section>

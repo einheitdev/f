@@ -1,0 +1,6 @@
+<section class="card">
+  <h2 class="card-title">zones</h2>
+  <div class="card-body" id="zones-table">
+    {% include "fw/zones_table" %}
+  </div>
+</section>
