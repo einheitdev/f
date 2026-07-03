@@ -109,6 +109,31 @@ struct ConnValue {
   uint8_t pad[7];
 };
 
+// NAT reply-mapping entry in the shared `fwl_nat` map. Byte-compatible
+// with `struct fwl_nat_key`/`fwl_nat_value` the FWL emitter generates.
+// Ports are host byte order (the emitter stores bpf_ntohs'd values);
+// addresses are network byte order.
+struct FwlNatKey {
+  uint32_t src_addr;
+  uint32_t dst_addr;
+  uint16_t src_port;
+  uint16_t dst_port;
+  uint8_t proto;
+  uint8_t pad[3];
+};
+struct FwlNatValue {
+  uint32_t new_addr;
+  uint16_t new_port;
+  uint8_t nat_type;
+  uint8_t pad;
+};
+
+// Per-zone masquerade config (`fwl_nat_cfg`, slot 0). `masq_addr` is the
+// network-byte-order source the XDP masquerade action rewrites to.
+struct FwlNatCfg {
+  uint32_t masq_addr;
+};
+
 /// Global firewall config (array map, 1 entry).
 struct FwConfig {
   uint8_t default_action;

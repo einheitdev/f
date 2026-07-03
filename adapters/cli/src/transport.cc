@@ -927,45 +927,71 @@ class FLocalTransport final
         "/etc/systemd/network/10-f-{}.network", iface);
   }
 
-  // Minimal read-modify-write of the managed .network file: the set of
-  // Address= lines and an optional MTUBytes=, so multiple addresses and
-  // MTU persist together. Returns false if the file could not be
-  // written (e.g. missing privileges) so the caller can report it.
-  auto WriteNetworkd(const std::string& iface,
-                     const std::vector<std::string>& addrs,
-                     const std::string& mtu) -> bool {
+  // Parsed view of the managed .network file. `extra` preserves any
+  // [Network] keys the adapter does not itself manage (Gateway=, DNS=,
+  // ...) so a hand-edited file is not clobbered on rewrite.
+  struct IfaceNet {
+    std::vector<std::string> addrs;
+    std::string mtu;
+    std::vector<std::string> extra;
+  };
+
+  // Read-modify basis: parse the managed .network file so add/remove
+  // merges with what is already persisted, preserving unmanaged keys.
+  auto ReadNetworkd(const std::string& iface) -> IfaceNet {
+    IfaceNet n;
+    std::ifstream f(NetworkdPath(iface));
+    std::string line, section;
+    while (std::getline(f, line)) {
+      if (!line.empty() && line.front() == '[') {
+        section = line;
+        continue;
+      }
+      if (line.rfind("Address=", 0) == 0) {
+        n.addrs.push_back(line.substr(8));
+      } else if (line.rfind("MTUBytes=", 0) == 0) {
+        n.mtu = line.substr(9);
+      } else if (line.rfind("Name=", 0) == 0) {
+        // regenerated from `iface`
+      } else if (section == "[Network]" && !line.empty()) {
+        n.extra.push_back(line);
+      }
+    }
+    return n;
+  }
+
+  // Rewrite the managed .network file atomically (temp + rename) so a
+  // crash mid-write cannot corrupt the unit. Returns false if the file
+  // could not be written (e.g. missing privileges).
+  auto WriteNetworkd(const std::string& iface, const IfaceNet& n)
+      -> bool {
     std::string out;
     out += "[Match]\n";
     out += std::format("Name={}\n\n", iface);
     out += "[Network]\n";
-    for (const auto& a : addrs) {
+    for (const auto& a : n.addrs) {
       out += std::format("Address={}\n", a);
     }
-    if (!mtu.empty()) {
-      out += std::format("\n[Link]\nMTUBytes={}\n", mtu);
+    for (const auto& e : n.extra) {
+      out += e + "\n";
     }
-    std::ofstream f(NetworkdPath(iface));
-    if (!f) return false;
-    f << out;
-    return f.good();
-  }
-
-  // Parse the managed .network file back into (addresses, mtu) so an
-  // add/remove merges with what is already persisted.
-  auto ReadNetworkd(const std::string& iface)
-      -> std::pair<std::vector<std::string>, std::string> {
-    std::vector<std::string> addrs;
-    std::string mtu;
-    std::ifstream f(NetworkdPath(iface));
-    std::string line;
-    while (std::getline(f, line)) {
-      if (line.rfind("Address=", 0) == 0) {
-        addrs.push_back(line.substr(8));
-      } else if (line.rfind("MTUBytes=", 0) == 0) {
-        mtu = line.substr(9);
-      }
+    if (!n.mtu.empty()) {
+      out += std::format("\n[Link]\nMTUBytes={}\n", n.mtu);
     }
-    return {addrs, mtu};
+    auto tmp = NetworkdPath(iface) + ".tmp";
+    {
+      std::ofstream f(tmp);
+      if (!f) return false;
+      f << out;
+      if (!f.good()) return false;
+    }
+    std::error_code ec;
+    std::filesystem::rename(tmp, NetworkdPath(iface), ec);
+    if (ec) {
+      std::filesystem::remove(tmp, ec);
+      return false;
+    }
+    return true;
   }
 
   auto HandleIfaceSetAddress(const proto::Request& req)
@@ -986,12 +1012,12 @@ class FLocalTransport final
     bool applied = rc == 0 ||
                    out.find("File exists") != std::string::npos;
     // Persist: merge into the managed networkd file.
-    auto [addrs, mtu] = ReadNetworkd(iface);
-    if (std::find(addrs.begin(), addrs.end(), addr) ==
-        addrs.end()) {
-      addrs.push_back(addr);
+    auto net = ReadNetworkd(iface);
+    if (std::find(net.addrs.begin(), net.addrs.end(), addr) ==
+        net.addrs.end()) {
+      net.addrs.push_back(addr);
     }
-    bool persisted = WriteNetworkd(iface, addrs, mtu);
+    bool persisted = WriteNetworkd(iface, net);
     json j = {
         {"interface", iface}, {"action", "set address"},
         {"value", addr}, {"applied", applied},
@@ -1018,10 +1044,11 @@ class FLocalTransport final
         {"ip", "addr", "del", addr, "dev", iface});
     bool applied = rc == 0 ||
                    out.find("Cannot assign") != std::string::npos;
-    auto [addrs, mtu] = ReadNetworkd(iface);
-    addrs.erase(std::remove(addrs.begin(), addrs.end(), addr),
-                addrs.end());
-    bool persisted = WriteNetworkd(iface, addrs, mtu);
+    auto net = ReadNetworkd(iface);
+    net.addrs.erase(
+        std::remove(net.addrs.begin(), net.addrs.end(), addr),
+        net.addrs.end());
+    bool persisted = WriteNetworkd(iface, net);
     json j = {
         {"interface", iface}, {"action", "remove address"},
         {"value", addr}, {"applied", applied},
@@ -1046,8 +1073,9 @@ class FLocalTransport final
     }
     auto [rc, out] = RunSubprocess(
         {"ip", "link", "set", "dev", iface, "mtu", mtu});
-    auto [addrs, _] = ReadNetworkd(iface);
-    bool persisted = WriteNetworkd(iface, addrs, mtu);
+    auto net = ReadNetworkd(iface);
+    net.mtu = mtu;
+    bool persisted = WriteNetworkd(iface, net);
     json j = {
         {"interface", iface}, {"action", "set mtu"},
         {"value", mtu}, {"applied", rc == 0},

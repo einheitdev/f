@@ -70,25 +70,6 @@ auto FlushMap(int map_fd) -> void {
   }
 }
 
-// Reply-mapping entry in the shared fwl_nat map. Byte-compatible with
-// `struct fwl_nat_key`/`fwl_nat_value` in the emitted BPF C. Ports are
-// host byte order (the emitter stores bpf_ntohs'd values); addresses
-// are network byte order.
-struct NatMapKey {
-  uint32_t src_addr;
-  uint32_t dst_addr;
-  uint16_t src_port;
-  uint16_t dst_port;
-  uint8_t proto;
-  uint8_t pad[3];
-};
-struct NatMapValue {
-  uint32_t new_addr;
-  uint16_t new_port;
-  uint8_t nat_type;
-  uint8_t pad;
-};
-
 auto ProtoName(uint8_t proto) -> std::string {
   switch (proto) {
     case 1: return "icmp";
@@ -332,12 +313,19 @@ auto HandleRequest(Engine& e, const std::string& req_str)
       json arr = json::array();
       int fd = e.zone_bundle.nat_fd;
       if (fd >= 0) {
-        NatMapKey key{}, next{};
-        NatMapValue val{};
+        FwlNatKey key{}, next{};
+        FwlNatValue val{};
         bool has =
             bpf_map_get_next_key(fd, nullptr, &next) == 0;
         while (has) {
           if (bpf_map_lookup_elem(fd, &next, &val) == 0) {
+            // fwl_nat holds reply mappings, so nat_type is what the
+            // RETURN packet rewrites — the inverse of the original
+            // action. Report the original direction operators expect:
+            // a reply that restores the destination (DNAT) came from an
+            // outbound snat/masquerade; one that restores the source
+            // (SNAT) came from an inbound dnat/port-forward.
+            const char* dir = val.nat_type == 2 ? "snat" : "dnat";
             arr.push_back({
                 {"proto", ProtoName(next.proto)},
                 {"orig_src", Ipv4Str(next.src_addr)},
@@ -346,7 +334,7 @@ auto HandleRequest(Engine& e, const std::string& req_str)
                 {"orig_dst_port", next.dst_port},
                 {"new_addr", Ipv4Str(val.new_addr)},
                 {"new_port", val.new_port},
-                {"type", val.nat_type == 1 ? "snat" : "dnat"},
+                {"type", dir},
             });
           }
           key = next;

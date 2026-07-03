@@ -515,11 +515,7 @@ auto LoadZoneBundle(std::string_view bundle_dir,
       }
       if (masq) {
         uint32_t key = 0;
-        // Matches `struct fwl_nat_cfg { __u32 masq_addr; }` in the
-        // emitted BPF C; masq_addr is network byte order.
-        struct {
-          uint32_t masq_addr;
-        } cfg{masq};
+        FwlNatCfg cfg{masq};
         if (bpf_map_update_elem(nat_cfg_fd, &key, &cfg, BPF_ANY) == 0) {
           char buf[INET_ADDRSTRLEN] = {};
           inet_ntop(AF_INET, &masq, buf, sizeof(buf));
