@@ -203,7 +203,19 @@ def _emit_bundle_dir(program: ast.Program, bundle_dir: Path) -> None:
       "source": c_name,
       "object": o_name if compiled else None,
       "redirects_to": emitter._collect_redirect_zones(zp),
+      # The daemon seeds fwl_nat_cfg (the masquerade source address)
+      # only for zones that actually masquerade; a zone that merely
+      # carries the shared de-NAT pass must not be treated as one.
+      "masquerades": emitter._program_masquerades(zp),
     })
+
+  # The bpffs-pinned maps every zone object shares. conntrack is always
+  # shared; the NAT maps are shared whenever any zone uses NAT so a
+  # reply mapping installed by the egress zone is read by the ingress
+  # zone (and the daemon can find fwl_nat for `show nat`).
+  shared_maps = ["conntrack"]
+  if any(emitter._program_uses_nat(zp) for zp in program.programs):
+    shared_maps += ["fwl_nat", "fwl_nat_cfg"]
 
   manifest = {
     "version": "0.4",
@@ -212,7 +224,7 @@ def _emit_bundle_dir(program: ast.Program, bundle_dir: Path) -> None:
       for z in program.zones
     ],
     "programs": programs_meta,
-    "shared_pinned_maps": ["conntrack"],
+    "shared_pinned_maps": shared_maps,
   }
   (bundle_dir / "manifest.json").write_text(
     json.dumps(manifest, indent=2), encoding="utf-8"

@@ -1910,6 +1910,38 @@ def _stmts_use_nat(stmts) -> bool:
   return False
 
 
+def _program_masquerades(zp: ast.ZoneProgram) -> bool:
+  """True iff `zp` uses the `masquerade` action.
+
+  Only `masquerade` derives its source from the runtime `fwl_nat_cfg`
+  map (the WAN address the daemon programs); `snat`/`dnat` bake fixed
+  addresses into the emitted C. The daemon reads this manifest flag to
+  decide which zone's fwl_nat_cfg to seed, so a non-masquerading zone
+  that merely carries the shared de-NAT machinery is not mistaken for a
+  masquerade source."""
+  for rule in zp.rules:
+    if rule.action == ast.Action.MASQUERADE:
+      return True
+  if zp.function is not None:
+    return _stmts_masquerade(zp.function.body)
+  return False
+
+
+def _stmts_masquerade(stmts) -> bool:
+  for s in stmts:
+    if isinstance(s, ast.ActionStmt) and s.action == ast.Action.MASQUERADE:
+      return True
+    if isinstance(s, ast.IfStmt):
+      if _stmts_masquerade(s.body):
+        return True
+      for _, body in s.elif_branches:
+        if _stmts_masquerade(body):
+          return True
+      if s.else_body is not None and _stmts_masquerade(s.else_body):
+        return True
+  return False
+
+
 def _emit_nat_call(action: ast.Action, nat_addr, nat_port) -> str:
   """C side-effect statement for one NAT rewrite action.
 
