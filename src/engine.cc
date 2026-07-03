@@ -17,6 +17,7 @@
 
 #include <bpf/bpf.h>
 #include <bpf/libbpf.h>
+#include <linux/if_link.h>
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
 
@@ -94,6 +95,30 @@ auto Ipv4Str(uint32_t netorder) -> std::string {
   char buf[INET_ADDRSTRLEN] = {};
   inet_ntop(AF_INET, &netorder, buf, sizeof(buf));
   return buf;
+}
+
+// Cap on entries serialized per map dump — an unbounded map (up to 64k
+// conntrack/NAT entries) would block the single-threaded control loop
+// while it builds the JSON. Beyond this the reply is marked truncated.
+constexpr size_t kMaxDumpEntries = 4096;
+
+// Which XDP mode a program is attached in on `ifindex`: native (driver)
+// is line-rate, generic (SKB) is the software fallback for NICs without
+// native XDP. Operators need this to know if they are on the slow path.
+auto XdpMode(int ifindex) -> std::string {
+  LIBBPF_OPTS(bpf_xdp_query_opts, opts);
+  if (bpf_xdp_query(ifindex, 0, &opts) != 0) return "unknown";
+  switch (opts.attach_mode) {
+    case XDP_ATTACHED_DRV:
+    case XDP_ATTACHED_HW:
+      return "native";
+    case XDP_ATTACHED_SKB:
+      return "generic";
+    case XDP_ATTACHED_NONE:
+      return "none";
+    default:
+      return "multi";
+  }
 }
 
 auto HandleRequest(Engine& e, const std::string& req_str)
@@ -291,10 +316,19 @@ auto HandleRequest(Engine& e, const std::string& req_str)
       json arr = json::array();
       for (const auto& p : e.zone_bundle.programs) {
         json attached = json::array();
+        // Aggregate the XDP attach mode across the zone's interfaces:
+        // a single value if they agree, "mixed" otherwise.
+        std::string mode;
         for (int idx : p.ifindexes) {
           char nm[IF_NAMESIZE] = {};
           if (if_indextoname(static_cast<unsigned int>(idx), nm)) {
             attached.push_back(std::string(nm));
+          }
+          auto m = XdpMode(idx);
+          if (mode.empty()) {
+            mode = m;
+          } else if (mode != m) {
+            mode = "mixed";
           }
         }
         arr.push_back({
@@ -304,6 +338,7 @@ auto HandleRequest(Engine& e, const std::string& req_str)
             {"masquerades", p.masquerades},
             {"attached", attached},
             {"attached_count", p.ifindexes.size()},
+            {"xdp_mode", mode.empty() ? "none" : mode},
         });
       }
       return arr.dump();
@@ -339,6 +374,10 @@ auto HandleRequest(Engine& e, const std::string& req_str)
           }
           key = next;
           has = bpf_map_get_next_key(fd, &key, &next) == 0;
+          if (arr.size() >= kMaxDumpEntries) {
+            j["truncated"] = true;
+            break;
+          }
         }
       }
       j["translations"] = arr;
@@ -376,6 +415,15 @@ auto HandleRequest(Engine& e, const std::string& req_str)
           }
           key = next;
           has = bpf_map_get_next_key(fd, &key, &next) == 0;
+          // The response is a bare array (the CLI/UI consume it as one),
+          // so cap it and log rather than reshape to add a flag — the
+          // point is to not block the control loop serializing 64k
+          // entries.
+          if (arr.size() >= kMaxDumpEntries) {
+            spdlog::warn("conntrack dump truncated at {} entries",
+                         kMaxDumpEntries);
+            break;
+          }
         }
       }
       return arr.dump();

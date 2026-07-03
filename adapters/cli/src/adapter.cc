@@ -397,6 +397,7 @@ auto RenderShowZones(const Response& resp,
   AddColumn(t, "ZONE", Align::Left, Priority::High);
   AddColumn(t, "INTERFACES", Align::Left, Priority::High);
   AddColumn(t, "ATTACHED", Align::Left, Priority::Medium);
+  AddColumn(t, "MODE", Align::Left, Priority::Medium);
   AddColumn(t, "REDIRECTS TO", Align::Left, Priority::Medium);
   AddColumn(t, "MASQ", Align::Left, Priority::Medium);
   for (const auto& z : j) {
@@ -410,10 +411,17 @@ auto RenderShowZones(const Response& resp,
     // A declared interface with no attach is down / absent.
     auto att_count = z.value("attached_count", 0);
     auto sem = att_count > 0 ? Semantic::Good : Semantic::Warn;
+    // Generic (SKB) XDP is the software slow path — flag it so the
+    // operator knows they are not at line rate.
+    auto mode = z.value("xdp_mode", "");
+    auto mode_sem = mode == "native" ? Semantic::Good
+                    : mode == "generic" ? Semantic::Warn
+                    : Semantic::Dim;
     AddRow(t, {
         Cell{z.value("zone", ""), Semantic::Emphasis},
         Cell{ifaces.empty() ? "-" : ifaces},
         Cell{attached.empty() ? "(none)" : attached, sem},
+        Cell{mode.empty() ? "-" : mode, mode_sem},
         Cell{redir.empty() ? "-" : redir, Semantic::Info},
         Cell{masq ? "yes" : "no",
              masq ? Semantic::Good : Semantic::Dim},

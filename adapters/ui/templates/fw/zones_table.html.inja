@@ -5,6 +5,7 @@
       <th>zone</th>
       <th>interfaces</th>
       <th>attached</th>
+      <th>mode</th>
       <th>redirects to</th>
       <th>masq</th>
     </tr>
@@ -15,6 +16,7 @@
       <td class="mono">{{ z.zone }}</td>
       <td>{{ z.ifaces_str }}</td>
       <td><span class="badge badge-{{ z.attach_semantic }}">{{ z.attached_str }}</span></td>
+      <td><span class="badge badge-{{ z.mode_semantic }}">{{ z.xdp_mode }}</span></td>
       <td>{{ z.redirects_str }}</td>
       <td><span class="badge badge-{{ z.masq_semantic }}">{{ z.masq_str }}</span></td>
     </tr>

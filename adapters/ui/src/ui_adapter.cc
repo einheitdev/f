@@ -269,6 +269,12 @@ auto DecorateZones(json zones) -> json {
     z["masq_semantic"] = masq ? "good" : "dim";
     z["attach_semantic"] =
         z.value("attached_count", 0) > 0 ? "good" : "warn";
+    auto mode = z.value("xdp_mode", std::string("-"));
+    if (mode.empty()) mode = "-";
+    z["xdp_mode"] = mode;
+    z["mode_semantic"] = mode == "native"    ? "good"
+                         : mode == "generic" ? "warn"
+                                             : "dim";
   }
   return zones;
 }
