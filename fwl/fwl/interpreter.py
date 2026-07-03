@@ -282,6 +282,7 @@ def evaluate_full(
     geoip_data=geoip_data, ct_state=ct_state, zone_name=zone_name,
     nat=nat,
   )
+  ctx.ct = ct
   # Seed the NAT working packet with the input header fields, then apply
   # ingress de-NAT (return traffic) before any rule evaluates — the BPF
   # program rewrites the destination of a reply before the rule body
@@ -326,9 +327,11 @@ def evaluate_full(
     if rule.action in ast.NAT_ACTIONS:
       # Non-terminal rewrite: translate the working packet and fall
       # through to the next rule (the terminal emits the rewrite).
+      _before_src = ctx.work.get("src_ip")
       _apply_nat(rule.action, rule.nat_addr, rule.nat_port,
                  ctx.work, ctx.nat)
       ctx.nat_fired = True
+      _track_source_nat(rule.action, ctx, _before_src)
     if rule.action == ast.Action.COUNT and rule.counter_name:
       counters[rule.counter_name] = (
         counters.get(rule.counter_name, 0) + 1
@@ -391,9 +394,11 @@ def _exec_stmts(
         return XdpAction.REDIRECT
       if stmt.action in ast.NAT_ACTIONS:
         # Non-terminal rewrite: translate and fall through.
+        _before_src = ctx.work.get("src_ip")
         _apply_nat(stmt.action, stmt.nat_addr, stmt.nat_port,
                    ctx.work, ctx.nat)
         ctx.nat_fired = True
+        _track_source_nat(stmt.action, ctx, _before_src)
         continue
       # LOG and COUNT are non-terminal: side effect omitted in test.
       continue
@@ -797,6 +802,9 @@ class _Ctx:
     self.nat = nat
     self.work: dict[str, Any] = {}
     self.nat_fired = False
+    # Conntrack table, so a source-NAT action can track the flow (insert
+    # the post-NAT 5-tuple) from either the Tier 1 or Tier 2 walk.
+    self.ct: "ConntrackTable | None" = None
     # The conntrack state of the packet under evaluation, computed once
     # from the conntrack table (v0.4). Every conntrack(pkt).state read
     # in this packet's evaluation sees the same value.
@@ -975,6 +983,22 @@ def _apply_ingress_denat(packet: dict[str, Any], ctx: "_Ctx") -> None:
     if new_port is not None:
       ctx.work["src_port"] = new_port
   ctx.nat_fired = True
+
+
+def _track_source_nat(action: ast.Action, ctx: "_Ctx",
+                      before_src: Any) -> None:
+  """Track a source-NAT flow in conntrack (mirrors fwl_snat_egress).
+
+  A `masquerade`/`snat` that actually rewrote the source inserts the
+  post-NAT forward 5-tuple, so the reply (its reverse 5-tuple) reads
+  `established`. Only when the source changed — the BPF returns early
+  when old == new — and only for IPv4 (ct.create is a no-op otherwise).
+  """
+  if action not in (ast.Action.MASQUERADE, ast.Action.SNAT):
+    return
+  if ctx.ct is None or ctx.work.get("src_ip") == before_src:
+    return
+  ctx.ct.create(ctx.work)
 
 
 def _apply_nat(action: ast.Action, nat_addr: int | None,

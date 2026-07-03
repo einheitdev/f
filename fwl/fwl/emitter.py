@@ -278,6 +278,18 @@ static __always_inline void fwl_snat_egress(
     .nat_type = FWL_NAT_DNAT,
   };
   bpf_map_update_elem(&fwl_nat, &rk, &rv, BPF_ANY);
+  // Track the flow: insert the post-NAT forward 5-tuple so the reply
+  // (its reverse 5-tuple) reads `established`, letting a stateful WAN
+  // program redirect return traffic back in. BPF_NOEXIST is idempotent.
+  struct fwl_conn_key _ct_nk = {
+    .src_addr = new_saddr, .dst_addr = daddr,
+    .src_port = bpf_ntohs(sport), .dst_port = bpf_ntohs(dport),
+    .proto = proto,
+  };
+  struct fwl_conn_value _ct_nv = {
+    .last_seen_ns = bpf_ktime_get_ns(), .packets = 1, .state = 1,
+  };
+  bpf_map_update_elem(&conntrack, &_ct_nk, &_ct_nv, BPF_NOEXIST);
   ip->saddr = new_saddr;
   fwl_fix_ip_csum(ip);
   if (proto == IPPROTO_TCP) {
@@ -2010,16 +2022,24 @@ def _emit_zone_source(
   prelude = _emit_parse_prelude(zp)
   rl_maps = _emit_rl_maps(zp)
   geoip_block = _emit_geoip_maps_and_helpers(zp)
-  uses_ct = _program_uses_conntrack(zp)
-  conntrack_decl = _maybe_pin(_CONNTRACK_DECL, pinned_shared) if uses_ct else ""
-  ct_create = _emit_ct_create() if uses_ct else ""
-  devmaps = _emit_devmaps(_collect_redirect_zones(zp), pinned_shared)
-
   # Phase 5 NAT. Emit the maps + helpers when this program uses NAT, or
   # when forced (a bundle where some other zone does — so return traffic
   # de-NATs on whichever zone it arrives). The de-NAT pass runs before
   # any rule.
   nat_active = _program_uses_nat(zp) or force_nat
+
+  uses_ct = _program_uses_conntrack(zp)
+  # A source-NAT action tracks the flow (fwl_snat_egress inserts the
+  # post-NAT 5-tuple into conntrack so the reply reads `established`), so
+  # the conntrack map + structs must be present whenever NAT helpers are
+  # emitted — even in a program that never reads conntrack(pkt).state.
+  conntrack_decl = (
+    _maybe_pin(_CONNTRACK_DECL, pinned_shared)
+    if (uses_ct or nat_active) else ""
+  )
+  ct_create = _emit_ct_create() if uses_ct else ""
+  devmaps = _emit_devmaps(_collect_redirect_zones(zp), pinned_shared)
+
   nat_decl = _maybe_pin(_NAT_DECL, pinned_shared) if nat_active else ""
   nat_helpers = _NAT_HELPERS if nat_active else ""
   nat_denat = "  fwl_nat_denat(ctx);\n" if nat_active else ""

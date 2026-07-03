@@ -482,14 +482,24 @@ The four states:
   TCP segment with no SYN flag → `invalid` (data/ACK/RST for a flow whose
   handshake was never seen). Everything else → `new`. `established` takes
   precedence over `invalid`.
-- **Entry creation (side effect).** When a packet reads `new` **and** an
-  explicit `allow` rule (or an explicit `default allow`) permits it, the
-  forward 5-tuple is inserted into the conntrack table (via
-  `BPF_NOEXIST`). A `drop` on a `new` packet creates **nothing**, and the
-  implicit fall-through `XDP_PASS` (a program with no matching rule and no
-  `default`) does **not** create an entry — only an explicit allow does.
-  This is the first FWL construct whose evaluation of one packet changes
-  the state a later packet sees.
+- **Entry creation (side effect).** Two constructs insert a forward
+  5-tuple into the conntrack table (via `BPF_NOEXIST`):
+  1. An explicit `allow` rule (or an explicit `default allow`) that
+     permits a packet reading `new` — the packet's own 5-tuple.
+  2. A **source-NAT** action (`masquerade`/`snat`) that actually rewrites
+     the source — the **post-NAT** 5-tuple (the rewritten source, the
+     unchanged destination, and the preserved ports). A NAT'd flow is a
+     tracked connection: inserting the post-NAT tuple is what lets the
+     reply — which arrives with that tuple reversed — read `established`,
+     so a stateful gateway can redirect return traffic back in. Without
+     it the canonical `masquerade` + `redirect to wan` / `redirect to lan
+     if established` gateway would be outbound-only.
+
+  A `drop` on a `new` packet creates **nothing**, the implicit
+  fall-through `XDP_PASS` (no matching rule and no `default`) does
+  **not** create an entry, and `redirect` alone creates none. This is the
+  first family of constructs whose evaluation of one packet changes the
+  state a later packet sees.
 - **IPv4 only.** v0.4 conntrack tracks IPv4 flows (the daemon's `ConnKey`
   is keyed on 32-bit addresses). On an IPv6 frame `conntrack(pkt).state`
   is always `new`, and an allowed IPv6 packet creates no entry. A program

@@ -43,6 +43,9 @@ except Exception:
     p = []
 if not p:
     print("RETURN_DROPPED: nothing reached the LAN host")
-else:
-    print("RETURN_OK: LAN host saw dst=%s (de-NAT'd)" % p[0][IP].dst)
+    sys.exit(1)
+if p[0][IP].dst != "10.0.0.2":
+    print("RETURN_WRONG: de-NAT restored dst=%s, want 10.0.0.2" % p[0][IP].dst)
+    sys.exit(1)
+print("RETURN_OK: LAN host saw dst=%s (de-NAT'd)" % p[0][IP].dst)
 PY
