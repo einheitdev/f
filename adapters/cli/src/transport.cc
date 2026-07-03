@@ -36,6 +36,9 @@ enum : uint8_t {
   kGetFirewall = 6,
   kGetRules = 7,
   kClearCounters = 8,
+  kGetZones = 9,
+  kGetNat = 10,
+  kGetConntrack = 11,
 };
 }  // namespace fd_cmd
 
@@ -398,6 +401,15 @@ class FLocalTransport final
     if (req.command == "show_counters") {
       return HandleShowCounters(req);
     }
+    if (req.command == "show_zones") {
+      return FdQuery(req.id, fd_cmd::kGetZones);
+    }
+    if (req.command == "show_nat") {
+      return FdQuery(req.id, fd_cmd::kGetNat);
+    }
+    if (req.command == "show_conntrack") {
+      return FdQuery(req.id, fd_cmd::kGetConntrack);
+    }
     if (req.command == "reload_firewall") {
       return HandleReloadFirewall(req);
     }
@@ -445,6 +457,18 @@ class FLocalTransport final
     }
     if (req.command == "set_editor") {
       return HandleSetEditor(req);
+    }
+    if (req.command == "iface_set_address") {
+      return HandleIfaceSetAddress(req);
+    }
+    if (req.command == "iface_del_address") {
+      return HandleIfaceDelAddress(req);
+    }
+    if (req.command == "iface_set_mtu") {
+      return HandleIfaceSetMtu(req);
+    }
+    if (req.command == "iface_set_state") {
+      return HandleIfaceSetState(req);
     }
     if (req.command == "show_log") {
       return HandleShowLog(req);
@@ -890,6 +914,177 @@ class FLocalTransport final
     return MakeOk(req.id, {
         {"commits", json::array()},
     });
+  }
+
+  auto IfaceExists(const std::string& name) -> bool {
+    return std::filesystem::exists(
+        std::format("/sys/class/net/{}", name));
+  }
+
+  // Path to the networkd unit this adapter manages for `iface`.
+  auto NetworkdPath(const std::string& iface) -> std::string {
+    return std::format(
+        "/etc/systemd/network/10-f-{}.network", iface);
+  }
+
+  // Minimal read-modify-write of the managed .network file: the set of
+  // Address= lines and an optional MTUBytes=, so multiple addresses and
+  // MTU persist together. Returns false if the file could not be
+  // written (e.g. missing privileges) so the caller can report it.
+  auto WriteNetworkd(const std::string& iface,
+                     const std::vector<std::string>& addrs,
+                     const std::string& mtu) -> bool {
+    std::string out;
+    out += "[Match]\n";
+    out += std::format("Name={}\n\n", iface);
+    out += "[Network]\n";
+    for (const auto& a : addrs) {
+      out += std::format("Address={}\n", a);
+    }
+    if (!mtu.empty()) {
+      out += std::format("\n[Link]\nMTUBytes={}\n", mtu);
+    }
+    std::ofstream f(NetworkdPath(iface));
+    if (!f) return false;
+    f << out;
+    return f.good();
+  }
+
+  // Parse the managed .network file back into (addresses, mtu) so an
+  // add/remove merges with what is already persisted.
+  auto ReadNetworkd(const std::string& iface)
+      -> std::pair<std::vector<std::string>, std::string> {
+    std::vector<std::string> addrs;
+    std::string mtu;
+    std::ifstream f(NetworkdPath(iface));
+    std::string line;
+    while (std::getline(f, line)) {
+      if (line.rfind("Address=", 0) == 0) {
+        addrs.push_back(line.substr(8));
+      } else if (line.rfind("MTUBytes=", 0) == 0) {
+        mtu = line.substr(9);
+      }
+    }
+    return {addrs, mtu};
+  }
+
+  auto HandleIfaceSetAddress(const proto::Request& req)
+      -> proto::Response {
+    if (req.args.size() < 2) {
+      return MakeErr(req.id, "missing_args",
+          "Usage: set address <interface> <addr/prefix>");
+    }
+    const auto& iface = req.args[0];
+    const auto& addr = req.args[1];
+    if (!IfaceExists(iface)) {
+      return MakeErr(req.id, "no_such_interface",
+          std::format("interface {} not found", iface));
+    }
+    // Apply immediately; treat "exists" as success (idempotent).
+    auto [rc, out] = RunSubprocess(
+        {"ip", "addr", "add", addr, "dev", iface});
+    bool applied = rc == 0 ||
+                   out.find("File exists") != std::string::npos;
+    // Persist: merge into the managed networkd file.
+    auto [addrs, mtu] = ReadNetworkd(iface);
+    if (std::find(addrs.begin(), addrs.end(), addr) ==
+        addrs.end()) {
+      addrs.push_back(addr);
+    }
+    bool persisted = WriteNetworkd(iface, addrs, mtu);
+    json j = {
+        {"interface", iface}, {"action", "set address"},
+        {"value", addr}, {"applied", applied},
+        {"persisted", persisted},
+        {"config", NetworkdPath(iface)},
+    };
+    if (!applied && !out.empty()) j["warning"] = out;
+    if (!persisted) {
+      j["warning"] = "could not write networkd config "
+                     "(need root?)";
+    }
+    return MakeOk(req.id, j);
+  }
+
+  auto HandleIfaceDelAddress(const proto::Request& req)
+      -> proto::Response {
+    if (req.args.size() < 2) {
+      return MakeErr(req.id, "missing_args",
+          "Usage: no address <interface> <addr/prefix>");
+    }
+    const auto& iface = req.args[0];
+    const auto& addr = req.args[1];
+    auto [rc, out] = RunSubprocess(
+        {"ip", "addr", "del", addr, "dev", iface});
+    bool applied = rc == 0 ||
+                   out.find("Cannot assign") != std::string::npos;
+    auto [addrs, mtu] = ReadNetworkd(iface);
+    addrs.erase(std::remove(addrs.begin(), addrs.end(), addr),
+                addrs.end());
+    bool persisted = WriteNetworkd(iface, addrs, mtu);
+    json j = {
+        {"interface", iface}, {"action", "remove address"},
+        {"value", addr}, {"applied", applied},
+        {"persisted", persisted},
+        {"config", NetworkdPath(iface)},
+    };
+    if (!applied && !out.empty()) j["warning"] = out;
+    return MakeOk(req.id, j);
+  }
+
+  auto HandleIfaceSetMtu(const proto::Request& req)
+      -> proto::Response {
+    if (req.args.size() < 2) {
+      return MakeErr(req.id, "missing_args",
+          "Usage: set mtu <interface> <bytes>");
+    }
+    const auto& iface = req.args[0];
+    const auto& mtu = req.args[1];
+    if (!IfaceExists(iface)) {
+      return MakeErr(req.id, "no_such_interface",
+          std::format("interface {} not found", iface));
+    }
+    auto [rc, out] = RunSubprocess(
+        {"ip", "link", "set", "dev", iface, "mtu", mtu});
+    auto [addrs, _] = ReadNetworkd(iface);
+    bool persisted = WriteNetworkd(iface, addrs, mtu);
+    json j = {
+        {"interface", iface}, {"action", "set mtu"},
+        {"value", mtu}, {"applied", rc == 0},
+        {"persisted", persisted},
+        {"config", NetworkdPath(iface)},
+    };
+    if (rc != 0 && !out.empty()) j["warning"] = out;
+    return MakeOk(req.id, j);
+  }
+
+  auto HandleIfaceSetState(const proto::Request& req)
+      -> proto::Response {
+    if (req.args.size() < 2) {
+      return MakeErr(req.id, "missing_args",
+          "Usage: set link <interface> <up|down>");
+    }
+    const auto& iface = req.args[0];
+    const auto& state = req.args[1];
+    if (state != "up" && state != "down") {
+      return MakeErr(req.id, "invalid_state",
+          "state must be 'up' or 'down'");
+    }
+    if (!IfaceExists(iface)) {
+      return MakeErr(req.id, "no_such_interface",
+          std::format("interface {} not found", iface));
+    }
+    auto [rc, out] = RunSubprocess(
+        {"ip", "link", "set", "dev", iface, state});
+    json j = {
+        {"interface", iface}, {"action", "set link"},
+        {"value", state}, {"applied", rc == 0},
+        {"persisted", false},
+        {"warning", "admin state is applied but not "
+                    "persisted across reboot"},
+    };
+    if (rc != 0 && !out.empty()) j["warning"] = out;
+    return MakeOk(req.id, j);
   }
 
   auto HandleSetEditor(const proto::Request& req)

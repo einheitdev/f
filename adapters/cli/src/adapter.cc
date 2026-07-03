@@ -136,23 +136,6 @@ auto FormatBytes(uint64_t bytes) -> std::string {
   return std::to_string(bytes);
 }
 
-auto ListFwFileNames(const std::string& partial)
-    -> std::vector<std::string> {
-  std::vector<std::string> out;
-  std::string dir = "/etc/f";
-  if (!std::filesystem::is_directory(dir)) return out;
-  for (const auto& e :
-       std::filesystem::directory_iterator(dir)) {
-    if (e.path().extension() != ".fw") continue;
-    auto name = e.path().filename().string();
-    if (name.rfind(partial, 0) == 0) {
-      out.push_back(name);
-    }
-  }
-  std::sort(out.begin(), out.end());
-  return out;
-}
-
 auto SemanticForState(const std::string& state)
     -> Semantic {
   if (state == "up") return Semantic::Good;
@@ -388,6 +371,138 @@ auto RenderShowCounters(const Response& resp,
   RenderFormatted(t, renderer);
 }
 
+auto JoinStrings(const json& arr) -> std::string {
+  std::string out;
+  if (!arr.is_array()) return out;
+  for (const auto& s : arr) {
+    if (!out.empty()) out += ", ";
+    out += s.get<std::string>();
+  }
+  return out;
+}
+
+auto RenderShowZones(const Response& resp,
+                     Renderer& renderer) -> void {
+  auto j = ParseData(resp);
+  if (!j.is_array() || j.empty()) {
+    Table t;
+    AddColumn(t, "ZONES");
+    AddRow(t, {Cell{"no zones (single-program mode "
+                    "or fd not running)",
+                    Semantic::Dim}});
+    RenderFormatted(t, renderer);
+    return;
+  }
+  Table t;
+  AddColumn(t, "ZONE", Align::Left, Priority::High);
+  AddColumn(t, "INTERFACES", Align::Left, Priority::High);
+  AddColumn(t, "ATTACHED", Align::Left, Priority::Medium);
+  AddColumn(t, "REDIRECTS TO", Align::Left, Priority::Medium);
+  AddColumn(t, "MASQ", Align::Left, Priority::Medium);
+  for (const auto& z : j) {
+    auto ifaces = JoinStrings(z.value("interfaces",
+                                      json::array()));
+    auto attached = JoinStrings(z.value("attached",
+                                        json::array()));
+    auto redir = JoinStrings(z.value("redirects_to",
+                                     json::array()));
+    bool masq = z.value("masquerades", false);
+    // A declared interface with no attach is down / absent.
+    auto att_count = z.value("attached_count", 0);
+    auto sem = att_count > 0 ? Semantic::Good : Semantic::Warn;
+    AddRow(t, {
+        Cell{z.value("zone", ""), Semantic::Emphasis},
+        Cell{ifaces.empty() ? "-" : ifaces},
+        Cell{attached.empty() ? "(none)" : attached, sem},
+        Cell{redir.empty() ? "-" : redir, Semantic::Info},
+        Cell{masq ? "yes" : "no",
+             masq ? Semantic::Good : Semantic::Dim},
+    });
+  }
+  RenderFormatted(t, renderer);
+}
+
+auto RenderShowNat(const Response& resp,
+                   Renderer& renderer) -> void {
+  auto j = ParseData(resp);
+  auto translations = j.value("translations", json::array());
+  if (j.contains("masq_source")) {
+    auto& out = renderer.Out();
+    out << "masquerade source: "
+        << j["masq_source"].get<std::string>() << "\n";
+  }
+  if (translations.empty()) {
+    Table t;
+    AddColumn(t, "NAT");
+    AddRow(t, {Cell{"no active translations",
+                    Semantic::Dim}});
+    RenderFormatted(t, renderer);
+    return;
+  }
+  Table t;
+  AddColumn(t, "PROTO", Align::Left, Priority::Medium);
+  AddColumn(t, "TYPE", Align::Left, Priority::High);
+  AddColumn(t, "ORIG SRC", Align::Left, Priority::High);
+  AddColumn(t, "ORIG DST", Align::Left, Priority::High);
+  AddColumn(t, "TRANSLATED", Align::Left, Priority::High);
+  for (const auto& tr : translations) {
+    auto sport = tr.value("orig_src_port", 0);
+    auto dport = tr.value("orig_dst_port", 0);
+    auto nport = tr.value("new_port", 0);
+    auto osrc = std::format("{}:{}",
+        tr.value("orig_src", "0.0.0.0"), sport);
+    auto odst = std::format("{}:{}",
+        tr.value("orig_dst", "0.0.0.0"), dport);
+    auto trans = std::format("{}:{}",
+        tr.value("new_addr", "0.0.0.0"), nport);
+    AddRow(t, {
+        Cell{tr.value("proto", "any"), Semantic::Info},
+        Cell{tr.value("type", ""), Semantic::Warn},
+        Cell{osrc},
+        Cell{odst},
+        Cell{trans, Semantic::Good},
+    });
+  }
+  RenderFormatted(t, renderer);
+}
+
+auto RenderShowConntrack(const Response& resp,
+                         Renderer& renderer) -> void {
+  auto j = ParseData(resp);
+  if (!j.is_array() || j.empty()) {
+    Table t;
+    AddColumn(t, "CONNTRACK");
+    AddRow(t, {Cell{"no tracked connections",
+                    Semantic::Dim}});
+    RenderFormatted(t, renderer);
+    return;
+  }
+  Table t;
+  AddColumn(t, "PROTO", Align::Left, Priority::Medium);
+  AddColumn(t, "SOURCE", Align::Left, Priority::High);
+  AddColumn(t, "DESTINATION", Align::Left, Priority::High);
+  AddColumn(t, "STATE", Align::Left, Priority::High);
+  AddColumn(t, "PACKETS", Align::Right, Priority::Medium);
+  for (const auto& c : j) {
+    auto state = c.value("state", "");
+    auto sem = state == "established" ? Semantic::Good
+               : state == "invalid" ? Semantic::Bad
+               : Semantic::Warn;
+    auto src = std::format("{}:{}",
+        c.value("src", "0.0.0.0"), c.value("src_port", 0));
+    auto dst = std::format("{}:{}",
+        c.value("dst", "0.0.0.0"), c.value("dst_port", 0));
+    AddRow(t, {
+        Cell{c.value("proto", "any"), Semantic::Info},
+        Cell{src},
+        Cell{dst},
+        Cell{state, sem},
+        Cell{std::to_string(c.value("packets", 0))},
+    });
+  }
+  RenderFormatted(t, renderer);
+}
+
 auto RenderSimpleOk(const Response& resp,
                     Renderer& renderer) -> void {
   auto j = ParseData(resp);
@@ -479,6 +594,40 @@ auto RenderEdit(const Response& resp,
   RenderFormatted(t, renderer);
 }
 
+auto RenderIfaceConfig(const Response& resp,
+                       Renderer& renderer) -> void {
+  auto j = ParseData(resp);
+  Table t;
+  AddColumn(t, "FIELD", Align::Left, Priority::High);
+  AddColumn(t, "VALUE", Align::Left, Priority::High);
+  auto row = [&](const std::string& f, const std::string& v,
+                 Semantic sem = Semantic::Default) {
+    AddRow(t, {Cell{f, Semantic::Info}, Cell{v, sem}});
+  };
+  if (j.contains("interface")) {
+    row("interface", j["interface"].get<std::string>(),
+        Semantic::Emphasis);
+  }
+  if (j.contains("action")) {
+    row("action", j["action"].get<std::string>());
+  }
+  if (j.contains("value")) {
+    row("value", j["value"].get<std::string>());
+  }
+  bool applied = j.value("applied", false);
+  row("applied", applied ? "yes" : "no",
+      applied ? Semantic::Good : Semantic::Warn);
+  bool persisted = j.value("persisted", false);
+  row("persisted", persisted ? j.value("config", "yes")
+                             : "no",
+      persisted ? Semantic::Good : Semantic::Dim);
+  if (j.contains("warning")) {
+    row("warning", j["warning"].get<std::string>(),
+        Semantic::Warn);
+  }
+  RenderFormatted(t, renderer);
+}
+
 auto RenderSetEditor(const Response& resp,
                      Renderer& renderer) -> void {
   auto j = ParseData(resp);
@@ -562,6 +711,12 @@ class FwAdapter final : public cli::ProductAdapter {
              "Per-rule detail with hit counts"),
         Show("counters", "show_counters",
              "Named counters from the BPF program"),
+        Show("zones", "show_zones",
+             "Zones, interfaces, redirect topology (v0.4)"),
+        Show("nat", "show_nat",
+             "Active NAT translations and masquerade source"),
+        Show("conntrack", "show_conntrack",
+             "Connection-tracking table entries"),
         MakeShowLog(),
         MakeShowFiles(),
         MakeEdit(),
@@ -569,6 +724,10 @@ class FwAdapter final : public cli::ProductAdapter {
         MakeRenameFile(),
         MakeDeleteFile(),
         MakeSetEditor(),
+        MakeSetAddress(),
+        MakeSetMtu(),
+        MakeSetLink(),
+        MakeNoAddress(),
         MakeReload(),
         MakeClearCounters(),
     };
@@ -594,6 +753,12 @@ class FwAdapter final : public cli::ProductAdapter {
       RenderShowFirewallRules(response, renderer);
     } else if (wc == "show_counters") {
       RenderShowCounters(response, renderer);
+    } else if (wc == "show_zones") {
+      RenderShowZones(response, renderer);
+    } else if (wc == "show_nat") {
+      RenderShowNat(response, renderer);
+    } else if (wc == "show_conntrack") {
+      RenderShowConntrack(response, renderer);
     } else if (wc == "show_log") {
       RenderShowLog(response, renderer);
     } else if (wc == "show_files") {
@@ -603,6 +768,11 @@ class FwAdapter final : public cli::ProductAdapter {
       RenderEdit(response, renderer);
     } else if (wc == "set_editor") {
       RenderSetEditor(response, renderer);
+    } else if (wc == "iface_set_address" ||
+               wc == "iface_set_mtu" ||
+               wc == "iface_set_state" ||
+               wc == "iface_del_address") {
+      RenderIfaceConfig(response, renderer);
     } else if (wc == "configure" || wc == "commit" ||
                wc == "rollback" || wc == "set" ||
                wc == "delete" || wc == "show_config" ||
@@ -615,17 +785,6 @@ class FwAdapter final : public cli::ProductAdapter {
 
   auto EventTopicsFor(const CommandSpec& /*cmd*/) const
       -> std::vector<std::string> override {
-    return {};
-  }
-
-  auto CompleteArg(const CommandSpec& cmd,
-                   const cli::ArgSpec& arg,
-                   const std::string& partial) const
-      -> std::vector<std::string> override {
-    if (arg.name == "file" || arg.name == "name" ||
-        arg.name == "from") {
-      return ListFwFileNames(partial);
-    }
     return {};
   }
 
@@ -734,6 +893,70 @@ class FwAdapter final : public cli::ProductAdapter {
         .help = "Editor command name",
         .required = false,
     }};
+    return c;
+  }
+
+  static auto MakeSetAddress() -> CommandSpec {
+    CommandSpec c;
+    c.path = "set address";
+    c.wire_command = "iface_set_address";
+    c.help = "Assign an IPv4/IPv6 address to an interface "
+             "(persists to networkd, applies immediately)";
+    c.role = RoleGate::OperatorOrAdmin;
+    c.args = {
+        {.name = "interface",
+         .help = "Interface name (e.g. eth0)",
+         .required = true},
+        {.name = "address",
+         .help = "Address with prefix (e.g. 10.0.0.1/24)",
+         .required = true},
+    };
+    return c;
+  }
+
+  static auto MakeSetMtu() -> CommandSpec {
+    CommandSpec c;
+    c.path = "set mtu";
+    c.wire_command = "iface_set_mtu";
+    c.help = "Set an interface MTU";
+    c.role = RoleGate::OperatorOrAdmin;
+    c.args = {
+        {.name = "interface", .help = "Interface name",
+         .required = true},
+        {.name = "mtu", .help = "MTU in bytes (e.g. 1500)",
+         .required = true},
+    };
+    return c;
+  }
+
+  static auto MakeSetLink() -> CommandSpec {
+    CommandSpec c;
+    c.path = "set link";
+    c.wire_command = "iface_set_state";
+    c.help = "Set an interface admin state up or down";
+    c.role = RoleGate::OperatorOrAdmin;
+    c.args = {
+        {.name = "interface", .help = "Interface name",
+         .required = true},
+        {.name = "state", .help = "up or down",
+         .required = true},
+    };
+    return c;
+  }
+
+  static auto MakeNoAddress() -> CommandSpec {
+    CommandSpec c;
+    c.path = "no address";
+    c.wire_command = "iface_del_address";
+    c.help = "Remove an address from an interface";
+    c.role = RoleGate::OperatorOrAdmin;
+    c.args = {
+        {.name = "interface", .help = "Interface name",
+         .required = true},
+        {.name = "address",
+         .help = "Address with prefix to remove",
+         .required = true},
+    };
     return c;
   }
 

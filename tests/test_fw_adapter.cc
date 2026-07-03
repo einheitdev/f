@@ -397,4 +397,110 @@ TEST_F(FwAdapterTest, EventTopicsEmpty) {
   }
 }
 
+// --- v0.4 renderers: zones / nat / conntrack -----------------------
+
+TEST_F(FwAdapterTest, V04CommandsRegistered) {
+  auto have = [&](const std::string& wc) {
+    for (const auto& c : adapter_->Commands()) {
+      if (c.wire_command == wc) return true;
+    }
+    return false;
+  };
+  EXPECT_TRUE(have("show_zones"));
+  EXPECT_TRUE(have("show_nat"));
+  EXPECT_TRUE(have("show_conntrack"));
+}
+
+TEST_F(FwAdapterTest, RenderShowZonesEmpty) {
+  const auto* cmd = FindCommand("show zones");
+  ASSERT_NE(cmd, nullptr);
+  auto output = RenderToString(*cmd, MakeResponse(json::array()));
+  EXPECT_NE(output.find("no zones"), std::string::npos);
+}
+
+TEST_F(FwAdapterTest, RenderShowZonesWithData) {
+  const auto* cmd = FindCommand("show zones");
+  ASSERT_NE(cmd, nullptr);
+  json data = json::array({
+      {{"zone", "lan"},
+       {"interfaces", json::array({"lan0"})},
+       {"attached", json::array({"lan0"})},
+       {"attached_count", 1},
+       {"redirects_to", json::array({"wan"})},
+       {"masquerades", true}},
+      {{"zone", "wan"},
+       {"interfaces", json::array({"wan0"})},
+       {"attached", json::array()},
+       {"attached_count", 0},
+       {"redirects_to", json::array({"lan"})},
+       {"masquerades", false}},
+  });
+  auto output = RenderToString(*cmd, MakeResponse(data));
+  EXPECT_NE(output.find("lan"), std::string::npos);
+  EXPECT_NE(output.find("wan"), std::string::npos);
+  // masquerades true renders "yes"; the WAN zone with no attach shows
+  // its interface list, not the attached list.
+  EXPECT_NE(output.find("yes"), std::string::npos);
+  EXPECT_NE(output.find("wan0"), std::string::npos);
+}
+
+TEST_F(FwAdapterTest, RenderShowNatEmpty) {
+  const auto* cmd = FindCommand("show nat");
+  ASSERT_NE(cmd, nullptr);
+  auto output =
+      RenderToString(*cmd, MakeResponse({{"translations",
+                                          json::array()}}));
+  EXPECT_NE(output.find("no active translations"),
+            std::string::npos);
+}
+
+TEST_F(FwAdapterTest, RenderShowNatWithData) {
+  const auto* cmd = FindCommand("show nat");
+  ASSERT_NE(cmd, nullptr);
+  json data = {
+      {"masq_source", "203.0.113.1"},
+      {"translations",
+       json::array({
+           {{"proto", "tcp"},
+            {"type", "dnat"},
+            {"orig_src", "203.0.113.9"},
+            {"orig_src_port", 80},
+            {"orig_dst", "203.0.113.1"},
+            {"orig_dst_port", 40000},
+            {"new_addr", "10.0.0.2"},
+            {"new_port", 40000}},
+       })},
+  };
+  auto output = RenderToString(*cmd, MakeResponse(data));
+  EXPECT_NE(output.find("203.0.113.1"), std::string::npos);
+  EXPECT_NE(output.find("10.0.0.2:40000"), std::string::npos);
+  EXPECT_NE(output.find("masquerade source"), std::string::npos);
+}
+
+TEST_F(FwAdapterTest, RenderShowConntrackEmpty) {
+  const auto* cmd = FindCommand("show conntrack");
+  ASSERT_NE(cmd, nullptr);
+  auto output = RenderToString(*cmd, MakeResponse(json::array()));
+  EXPECT_NE(output.find("no tracked connections"),
+            std::string::npos);
+}
+
+TEST_F(FwAdapterTest, RenderShowConntrackWithData) {
+  const auto* cmd = FindCommand("show conntrack");
+  ASSERT_NE(cmd, nullptr);
+  json data = json::array({
+      {{"proto", "tcp"},
+       {"src", "10.0.0.2"},
+       {"src_port", 51000},
+       {"dst", "10.0.0.1"},
+       {"dst_port", 22},
+       {"state", "established"},
+       {"packets", 7}},
+  });
+  auto output = RenderToString(*cmd, MakeResponse(data));
+  EXPECT_NE(output.find("10.0.0.2:51000"), std::string::npos);
+  EXPECT_NE(output.find("established"), std::string::npos);
+  EXPECT_NE(output.find("7"), std::string::npos);
+}
+
 }  // namespace
