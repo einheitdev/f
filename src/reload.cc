@@ -13,6 +13,8 @@
 #include <format>
 #include <fstream>
 #include <sstream>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include <nlohmann/json.hpp>
@@ -200,18 +202,16 @@ auto ApplyBundle(Engine& e, std::string_view bundle_dir)
   // apply. Route it to the zone loader instead of the single-program
   // rule-application path below.
   if (IsMultiZoneBundle(dir.string())) {
-    // Detach a previously loaded bundle so the per-zone re-attach below
-    // does not collide with the old programs (hot-reload).
-    if (!e.zone_bundle.programs.empty()) {
-      DetachZoneBundle(e.zone_bundle);
-      e.zone_bundle = ZoneBundleHandles{};
-    }
-    // The per-zone devmaps hold no state worth preserving (the daemon
-    // repopulates them with egress ifindexes at load). libbpf refuses
-    // to reuse a pinned DEVMAP on reload ("parameter mismatch"), so
-    // unpin them here and let the new bundle create fresh ones. The
-    // shared state maps (conntrack, fwl_nat) stay pinned and are reused
-    // so a flow established before the reload survives it.
+    // Hitless hot-reload: keep the old programs attached while the new
+    // bundle loads, then atomically ReplaceXdp per interface, so no
+    // interface is ever left without an XDP program mid-reload.
+    ZoneBundleHandles old_bundle = e.zone_bundle;
+
+    // Per-zone devmaps can't be reused across a reload (libbpf refuses a
+    // pinned DEVMAP: "parameter mismatch"), so unpin them and let the
+    // new bundle create fresh ones. The still-attached old programs keep
+    // running via their held fds. Shared state maps (conntrack, fwl_nat)
+    // stay pinned and are reused, so flows survive the reload.
     {
       std::error_code uec;
       for (const auto& entry :
@@ -222,12 +222,52 @@ auto ApplyBundle(Engine& e, std::string_view bundle_dir)
         }
       }
     }
-    auto loaded = LoadZoneBundle(dir.string(), e.pin_path);
+
+    // Load the new bundle but do not attach yet.
+    auto loaded =
+        LoadZoneBundle(dir.string(), e.pin_path, /*attach=*/false);
     if (!loaded) {
       return MakeError(ReloadError::kApplyFailed,
                        std::format("LoadZoneBundle: {}",
                                    loaded.error().message));
     }
+
+    // ifindex -> currently-attached (old) program fd, for the swap.
+    std::unordered_map<int, int> old_fd;
+    for (const auto& p : old_bundle.programs) {
+      for (int idx : p.ifindexes) old_fd[idx] = p.prog_fd;
+    }
+    std::unordered_set<int> new_ifs;
+    for (const auto& p : loaded->programs) {
+      for (int idx : p.ifindexes) {
+        new_ifs.insert(idx);
+        auto it = old_fd.find(idx);
+        int prev = it != old_fd.end() ? it->second : -1;
+        auto sw = ReplaceXdp(idx, p.prog_fd, prev);
+        if (!sw) {
+          // An atomic native replace is not possible on a generic-XDP
+          // NIC (e.g. RTL8125); fall back to detach + attach for this
+          // interface (a brief gap on it only). AttachXdp carries the
+          // native->generic fallback.
+          (void)DetachXdp(idx);
+          BpfHandles h{};
+          h.prog_fd = p.prog_fd;
+          auto at = AttachXdp(h, idx);
+          if (!at) {
+            return MakeError(ReloadError::kApplyFailed,
+                std::format("swap zone '{}' ifindex {}: {}",
+                            p.zone, idx, at.error().message));
+          }
+        }
+      }
+    }
+    // Detach any interface the old bundle used that the new one drops.
+    for (const auto& p : old_bundle.programs) {
+      for (int idx : p.ifindexes) {
+        if (!new_ifs.count(idx)) (void)DetachXdp(idx);
+      }
+    }
+
     e.zone_bundle = *loaded;
     if (e.zone_bundle.conntrack_fd >= 0) {
       e.conntrack.map_fd = e.zone_bundle.conntrack_fd;
@@ -236,7 +276,8 @@ auto ApplyBundle(Engine& e, std::string_view bundle_dir)
     out.version = manifest["version"].get<std::string>();
     out.rules_installed = 0;
     out.program_updated = true;
-    spdlog::info("reload: multi-zone bundle, {} zone program(s)",
+    spdlog::info("reload: multi-zone bundle hot-swapped, "
+                 "{} zone program(s)",
                  e.zone_bundle.programs.size());
     return out;
   }

@@ -138,8 +138,16 @@ struct ZoneBundleHandles {
 /// This is the multi-program analogue of LoadProgram + AttachXdp; the
 /// per-program load/attach/devmap mechanism is exercised end-to-end by
 /// tests/system/zone_redirect_netns.sh.
+///
+/// `attach` controls whether the programs are attached to their zone
+/// interfaces. Cold boot passes true (attach immediately). A hot reload
+/// passes false so the caller can atomically ReplaceXdp the new program
+/// over the old one per interface — no window where an interface has no
+/// XDP program. Either way `ifindexes` on each ZoneProgramHandle is
+/// populated with the resolved interfaces.
 auto LoadZoneBundle(std::string_view bundle_dir,
-                    std::string_view pin_root)
+                    std::string_view pin_root,
+                    bool attach = true)
     -> std::expected<ZoneBundleHandles, Error<BpfError>>;
 
 /// True when `<bundle_dir>/manifest.json` describes a multi-zone bundle

@@ -370,7 +370,8 @@ auto ResolveZoneIfindexes(const std::vector<std::string>& ifaces)
 }  // namespace
 
 auto LoadZoneBundle(std::string_view bundle_dir,
-                    std::string_view pin_root)
+                    std::string_view pin_root,
+                    bool attach)
     -> std::expected<ZoneBundleHandles, Error<BpfError>> {
   using nlohmann::json;
   std::filesystem::path dir(bundle_dir);
@@ -530,20 +531,24 @@ auto LoadZoneBundle(std::string_view bundle_dir,
       }
     }
 
-    // Attach the program to every interface in its own zone, native
-    // mode preferred with a generic (SKB) fallback for NICs without
-    // native XDP (e.g. the RTL8125 on the RK3588 test rig).
+    // Record the zone's interfaces, and (on cold boot) attach the
+    // program to each — native mode preferred with a generic (SKB)
+    // fallback for NICs without native XDP (e.g. the RTL8125 on the
+    // RK3588). A hot reload passes attach=false and swaps atomically
+    // via ReplaceXdp afterwards.
     for (int ifindex : zone_ifindexes[zone]) {
-      bool generic = false;
-      int aerr = AttachXdpFallback(ifindex, zh.prog_fd, &generic);
-      if (aerr) {
-        return MakeError(BpfError::kAttachFailed,
-            std::format("attach zone '{}' to ifindex {} failed: {}",
-                        zone, ifindex, std::strerror(-aerr)));
-      }
-      if (generic) {
-        spdlog::warn("zone '{}' ifindex {}: native XDP unavailable, "
-                     "attached in generic (SKB) mode", zone, ifindex);
+      if (attach) {
+        bool generic = false;
+        int aerr = AttachXdpFallback(ifindex, zh.prog_fd, &generic);
+        if (aerr) {
+          return MakeError(BpfError::kAttachFailed,
+              std::format("attach zone '{}' to ifindex {} failed: {}",
+                          zone, ifindex, std::strerror(-aerr)));
+        }
+        if (generic) {
+          spdlog::warn("zone '{}' ifindex {}: native XDP unavailable, "
+                       "attached in generic (SKB) mode", zone, ifindex);
+        }
       }
       zh.ifindexes.push_back(ifindex);
     }
