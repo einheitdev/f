@@ -618,17 +618,6 @@ class FwAdapter final : public cli::ProductAdapter {
     return {};
   }
 
-  auto CompleteArg(const CommandSpec& cmd,
-                   const cli::ArgSpec& arg,
-                   const std::string& partial) const
-      -> std::vector<std::string> override {
-    if (arg.name == "file" || arg.name == "name" ||
-        arg.name == "from") {
-      return ListFwFileNames(partial);
-    }
-    return {};
-  }
-
   auto RenderEvent(const std::string& /*topic*/,
                    const Event& /*event*/,
                    Renderer& /*renderer*/) const
