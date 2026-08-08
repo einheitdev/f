@@ -43,10 +43,20 @@ auto ParseInterfaces(const std::string& s)
   return out;
 }
 
+/// File-watcher settings from the `watch:` config block.
+struct WatchConfig {
+  bool enabled = false;
+  std::string source;
+  std::string compiled_dir;
+  std::string fwl = "fwl";
+  int interval_s = 5;
+};
+
 auto RunEngine(const std::string& sock_addr,
                const std::vector<std::string>& ifaces,
                const std::string& pin_path,
-               const std::string& bundle_dir) -> int {
+               const std::string& bundle_dir,
+               const WatchConfig& watch) -> int {
   f::Engine engine;
   auto res = f::EngineInit(
       engine, sock_addr, ifaces, pin_path, bundle_dir);
@@ -54,6 +64,22 @@ auto RunEngine(const std::string& sock_addr,
     spdlog::error("Init failed: {}",
                   res.error().message);
     return 1;
+  }
+
+  if (watch.enabled) {
+    auto wres = f::WatcherInit(
+        engine.watcher, watch.source, watch.compiled_dir,
+        std::chrono::seconds(watch.interval_s));
+    if (!wres) {
+      spdlog::warn("Watcher disabled: {}",
+                   wres.error().message);
+    } else {
+      engine.watcher.fwl_path = watch.fwl;
+      f::WatcherStart(engine.watcher);
+      spdlog::info(
+          "Watching {} every {}s (compile via {}).",
+          watch.source, watch.interval_s, watch.fwl);
+    }
   }
 
   struct sigaction sa{};
@@ -84,7 +110,8 @@ auto LoadConfig(const std::string& path,
                 std::string& interfaces,
                 std::string& socket_addr,
                 std::string& pin_path,
-                std::string& log_level) -> bool {
+                std::string& log_level,
+                WatchConfig& watch) -> bool {
   try {
     auto cfg = YAML::LoadFile(path);
     if (cfg["interfaces"]) {
@@ -103,6 +130,27 @@ auto LoadConfig(const std::string& path,
     }
     if (cfg["log_level"]) {
       log_level = cfg["log_level"].as<std::string>();
+    }
+    if (cfg["watch"]) {
+      auto w = cfg["watch"];
+      watch.enabled = w["enabled"] && w["enabled"].as<bool>();
+      if (w["source"]) {
+        watch.source = w["source"].as<std::string>();
+      }
+      if (w["compiled_dir"]) {
+        watch.compiled_dir = w["compiled_dir"].as<std::string>();
+      }
+      if (w["fwl"]) {
+        watch.fwl = w["fwl"].as<std::string>();
+      }
+      if (w["interval"]) {
+        // "5s" or a bare integer of seconds.
+        auto text = w["interval"].as<std::string>();
+        if (!text.empty() && text.back() == 's') {
+          text.pop_back();
+        }
+        watch.interval_s = std::max(1, std::stoi(text));
+      }
     }
     return true;
   } catch (const std::exception& e) {
@@ -150,12 +198,13 @@ int main(int argc, char** argv) {
   CLI11_PARSE(app, argc, argv);
 
   // Load config file (CLI flags override).
+  WatchConfig watch;
   if (!config_file.empty()) {
     LoadConfig(config_file, interfaces, socket_addr,
-               pin_path, log_level);
+               pin_path, log_level, watch);
   } else if (std::ifstream("/etc/f/fd.yaml").good()) {
     LoadConfig("/etc/f/fd.yaml", interfaces, socket_addr,
-               pin_path, log_level);
+               pin_path, log_level, watch);
   }
 
   if (log_level == "trace")
@@ -184,14 +233,16 @@ int main(int argc, char** argv) {
     }
     f::WritePidFile(f::kEnginePidPath);
     chmod(f::kEnginePidPath, 0644);
-    int rc = RunEngine(socket_addr, ifaces, pin_path, bundle_dir);
+    int rc = RunEngine(socket_addr, ifaces, pin_path, bundle_dir,
+                       watch);
     f::RemovePidFile(f::kEnginePidPath);
     return rc;
   }
 
   // "run" — foreground.
   f::WritePidFile(f::kEnginePidPath);
-  int rc = RunEngine(socket_addr, ifaces, pin_path, bundle_dir);
+  int rc = RunEngine(socket_addr, ifaces, pin_path, bundle_dir,
+                     watch);
   f::RemovePidFile(f::kEnginePidPath);
   return rc;
 }

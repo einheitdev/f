@@ -12,6 +12,7 @@
 #include <filesystem>
 #include <format>
 #include <fstream>
+#include <set>
 #include <sstream>
 #include <vector>
 
@@ -78,17 +79,26 @@ auto RunCompiler(std::string_view fwl_path,
                  std::string_view output_dir)
     -> std::expected<std::string, Error<ReloadError>> {
   // Build argv: fwl compile <source> --bundle <output_dir>
+  // [--geoip /etc/f/geoip.json]. The geoip data file is passed
+  // whenever the conventional path exists — the compiler ignores it
+  // for programs without geoip(), and a geoip() program without it
+  // is a hard compile error (silently empty tries never match).
   std::string fwl(fwl_path);
   std::string src(source_path);
   std::string out(output_dir);
+  static const std::string kGeoipData = "/etc/f/geoip.json";
   std::vector<char*> argv{
       fwl.data(),
       const_cast<char*>("compile"),
       src.data(),
       const_cast<char*>("--bundle"),
       out.data(),
-      nullptr,
   };
+  if (std::filesystem::exists(kGeoipData)) {
+    argv.push_back(const_cast<char*>("--geoip"));
+    argv.push_back(const_cast<char*>(kGeoipData.c_str()));
+  }
+  argv.push_back(nullptr);
 
   // Pipe for capturing stdout (error context on failure).
   int stdout_pipe[2] = {-1, -1};
@@ -200,18 +210,38 @@ auto ApplyBundle(Engine& e, std::string_view bundle_dir)
   // apply. Route it to the zone loader instead of the single-program
   // rule-application path below.
   if (IsMultiZoneBundle(dir.string())) {
-    // Detach a previously loaded bundle so the per-zone re-attach below
-    // does not collide with the old programs (hot-reload).
-    if (!e.zone_bundle.programs.empty()) {
-      DetachZoneBundle(e.zone_bundle);
-      e.zone_bundle = ZoneBundleHandles{};
-    }
-    auto loaded = LoadZoneBundle(dir.string(), e.pin_path);
+    // Hot reload: swap each already-attached interface to the new
+    // bundle's program atomically (XDP_FLAGS_REPLACE). Detaching
+    // first would reset the NIC (igb drops the link for seconds) and
+    // leave a policy-off window — measured on the i350 rig.
+    //
+    // The new objects need fresh per-zone private maps (their shape
+    // follows the new policy); the shared state pins (conntrack,
+    // fwl_nat, ...) stay so established flows survive the reload.
+    UnpinZonePrivateMaps(e.pin_path);
+    const ZoneBundleHandles* old =
+        e.zone_bundle.programs.empty() ? nullptr : &e.zone_bundle;
+    auto loaded = LoadZoneBundle(dir.string(), e.pin_path, old);
     if (!loaded) {
+      // The old bundle is still attached and intact.
       return MakeError(ReloadError::kApplyFailed,
                        std::format("LoadZoneBundle: {}",
                                    loaded.error().message));
     }
+    // Interfaces the old bundle covered but the new one does not:
+    // nothing replaced them, detach explicitly.
+    std::set<int> covered;
+    for (const auto& np : loaded->programs) {
+      covered.insert(np.ifindexes.begin(), np.ifindexes.end());
+    }
+    for (const auto& op : e.zone_bundle.programs) {
+      for (int idx : op.ifindexes) {
+        if (!covered.contains(idx)) {
+          DetachXdp(idx);
+        }
+      }
+    }
+    CloseZoneBundle(e.zone_bundle);
     e.zone_bundle = *loaded;
     if (e.zone_bundle.conntrack_fd >= 0) {
       e.conntrack.map_fd = e.zone_bundle.conntrack_fd;
@@ -220,7 +250,8 @@ auto ApplyBundle(Engine& e, std::string_view bundle_dir)
     out.version = manifest["version"].get<std::string>();
     out.rules_installed = 0;
     out.program_updated = true;
-    spdlog::info("reload: multi-zone bundle, {} zone program(s)",
+    spdlog::info("reload: multi-zone bundle, {} zone program(s), "
+                 "atomic swap",
                  e.zone_bundle.programs.size());
     return out;
   }

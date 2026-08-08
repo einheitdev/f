@@ -13,6 +13,9 @@
 
 #include "f/error.h"
 
+// libbpf handle; opaque here so the header stays libbpf-free.
+struct bpf_object;
+
 namespace f {
 
 enum class BpfError : uint8_t {
@@ -110,6 +113,9 @@ struct ZoneBundleHandles {
   /// The shared, bpffs-pinned conntrack map fd (cross-zone state), or
   /// -1 when no zone program uses conntrack.
   int conntrack_fd = -1;
+  /// The loaded bpf_object per zone; owned by this bundle and closed
+  /// by CloseZoneBundle once the bundle is replaced or shut down.
+  std::vector<::bpf_object*> objs;
 };
 
 /// Load every zone program in a `fwl compile --bundle` directory.
@@ -127,9 +133,29 @@ struct ZoneBundleHandles {
 /// This is the multi-program analogue of LoadProgram + AttachXdp; the
 /// per-program load/attach/devmap mechanism is exercised end-to-end by
 /// tests/system/zone_redirect_netns.sh.
+/// `replace`: a previously loaded bundle whose programs are still
+/// attached. When given, each interface present in both bundles is
+/// swapped atomically (XDP_FLAGS_REPLACE) instead of detach+attach —
+/// the hot-reload zero-loss primitive; a detach/attach cycle resets
+/// real NICs (igb takes the link down for seconds). Interfaces only
+/// in the old bundle are left attached — the caller detaches them
+/// after adopting the new handles.
 auto LoadZoneBundle(std::string_view bundle_dir,
-                    std::string_view pin_root)
+                    std::string_view pin_root,
+                    const ZoneBundleHandles* replace = nullptr)
     -> std::expected<ZoneBundleHandles, Error<BpfError>>;
+
+/// Close every bpf_object a LoadZoneBundle call opened for `handles`.
+/// Detaches nothing — swap or detach first.
+auto CloseZoneBundle(ZoneBundleHandles& handles) -> void;
+
+/// Remove the bpffs pins of zone-PRIVATE maps (fwl_counters_*,
+/// fwl_rl_*, fwl_geoip_*) under `pin_root`, keeping the shared
+/// cross-reload state (conntrack, fwl_nat, fwl_nat_cfg,
+/// fwl_log_events). A reload's new objects must create fresh private
+/// maps — their shape follows the policy — while attached programs
+/// keep their own references until swapped out.
+auto UnpinZonePrivateMaps(std::string_view pin_root) -> void;
 
 /// One LPM-trie entry parsed from a bundle's geoip.json.
 struct GeoipTrieEntry {
@@ -142,6 +168,12 @@ struct GeoipTrieEntry {
 /// Parsed geoip.json: trie map name -> its prefix entries.
 using GeoipTries =
     std::map<std::string, std::vector<GeoipTrieEntry>>;
+
+/// First IPv4 address (network byte order) configured on any of the
+/// named interfaces, or 0 when none carries one. The masquerade
+/// source: the daemon writes this into the bundle's `fwl_nat_cfg`
+/// map so `masquerade` rules translate to the egress zone's address.
+auto FirstZoneIpv4(const std::vector<std::string>& ifaces) -> uint32_t;
 
 /// Parse `<bundle_dir>/geoip.json` (written by `fwl compile --bundle
 /// --geoip`). Returns an empty map when the file is absent — a bundle

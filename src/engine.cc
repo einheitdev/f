@@ -19,6 +19,8 @@
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
 
+#include "f/reload.h"
+
 namespace f {
 
 auto WritePidFile(const char* path) -> bool {
@@ -440,6 +442,18 @@ auto EngineRun(Engine& e, std::stop_token stop)
       }
     }
 
+    // Hot reload: the watcher thread flags a source change; the
+    // compile + apply runs here on the main thread so it can touch
+    // engine state without locking.
+    if (WatcherConsumeReload(e.watcher)) {
+      auto reloaded = ReloadFromSource(e);
+      if (!reloaded) {
+        spdlog::error("reload failed ({}); previous policy stays "
+                      "active",
+                      reloaded.error().message);
+      }
+    }
+
     auto now_ns = static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now()
@@ -458,6 +472,7 @@ auto EngineRun(Engine& e, std::stop_token stop)
 }
 
 auto EngineStop(Engine& e) -> void {
+  WatcherStop(e.watcher);
   // Stop slow path.
   if (e.slow_path_thread.joinable()) {
     e.slow_path_thread.request_stop();

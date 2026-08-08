@@ -12,7 +12,7 @@ zone t = [$RECV_IF]
 @xdp(t)
 
 count echo_req if pkt.proto == icmp and pkt.icmp.type == 8
-count redirect if pkt.proto == icmp and pkt.icmp.type == 5
+count redir if pkt.proto == icmp and pkt.icmp.type == 5
 drop if pkt.proto == icmp and pkt.icmp.type == 5
 default allow
 EOF
@@ -25,6 +25,6 @@ sleep 1
 hw::sniff_wait
 
 assert_eq "counter echo_req" "$(hw::counter echo_req)" 100
-assert_eq "counter redirect" "$(hw::counter redirect)" 100
+assert_eq "counter redirect" "$(hw::counter redir)" 100
 assert_eq "wire echo passed"     "$(hw::sniff_get icmp:10.99.4.1:8)" 100
 assert_eq "wire redirect dropped" "$(hw::sniff_get icmp:10.99.4.1:5)" 0

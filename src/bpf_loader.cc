@@ -8,6 +8,8 @@
 #include "f/bpf_loader.h"
 
 #include <arpa/inet.h>
+#include <ifaddrs.h>
+#include <netinet/in.h>
 
 #include <cerrno>
 #include <cstring>
@@ -308,7 +310,6 @@ namespace {
 
 // Loaded zone objects are kept alive for the daemon's lifetime, exactly
 // like the single-program g_obj. Closing them would detach the maps.
-std::vector<struct bpf_object*> g_zone_objs;
 
 // v0.4 § 6.6: resolve the program to attach for one loaded zone object,
 // wiring a split pipeline if present.
@@ -371,6 +372,32 @@ auto ResolveZoneIfindexes(const std::vector<std::string>& ifaces)
 }
 
 }  // namespace
+
+auto FirstZoneIpv4(const std::vector<std::string>& ifaces)
+    -> uint32_t {
+  struct ifaddrs* addrs = nullptr;
+  if (getifaddrs(&addrs) != 0) {
+    return 0;
+  }
+  uint32_t found = 0;
+  for (const auto& want : ifaces) {
+    for (struct ifaddrs* a = addrs; a != nullptr; a = a->ifa_next) {
+      if (a->ifa_addr == nullptr ||
+          a->ifa_addr->sa_family != AF_INET ||
+          want != a->ifa_name) {
+        continue;
+      }
+      found = reinterpret_cast<struct sockaddr_in*>(a->ifa_addr)
+                  ->sin_addr.s_addr;
+      break;
+    }
+    if (found != 0) {
+      break;
+    }
+  }
+  freeifaddrs(addrs);
+  return found;
+}
 
 auto ParseGeoipFile(std::string_view bundle_dir)
     -> std::expected<GeoipTries, Error<BpfError>> {
@@ -460,8 +487,40 @@ auto PopulateGeoipTrie(struct bpf_object* obj,
 
 }  // namespace
 
+auto UnpinZonePrivateMaps(std::string_view pin_root) -> void {
+  static constexpr std::string_view kPrivatePrefixes[] = {
+      "fwl_counters_", "fwl_rl_", "fwl_geoip_"};
+  std::error_code ec;
+  std::filesystem::directory_iterator it(
+      std::string(pin_root), ec);
+  if (ec) {
+    return;
+  }
+  for (const auto& entry : it) {
+    auto name = entry.path().filename().string();
+    for (auto prefix : kPrivatePrefixes) {
+      if (name.starts_with(prefix)) {
+        std::filesystem::remove(entry.path(), ec);
+        break;
+      }
+    }
+  }
+}
+
+auto CloseZoneBundle(ZoneBundleHandles& handles) -> void {
+  for (auto* obj : handles.objs) {
+    if (obj != nullptr) {
+      bpf_object__close(obj);
+    }
+  }
+  handles.objs.clear();
+  handles.programs.clear();
+  handles.conntrack_fd = -1;
+}
+
 auto LoadZoneBundle(std::string_view bundle_dir,
-                    std::string_view pin_root)
+                    std::string_view pin_root,
+                    const ZoneBundleHandles* replace)
     -> std::expected<ZoneBundleHandles, Error<BpfError>> {
   using nlohmann::json;
   std::filesystem::path dir(bundle_dir);
@@ -488,15 +547,18 @@ auto LoadZoneBundle(std::string_view bundle_dir,
   }
 
   // zone name -> resolved ifindexes (egress targets for redirect, and
-  // ingress interfaces to attach each program to).
+  // ingress interfaces to attach each program to). Interface names are
+  // kept too: the masquerade config needs the egress zone's address.
   std::map<std::string, std::vector<int>> zone_ifindexes;
+  std::map<std::string, std::vector<std::string>> zone_ifnames;
   for (const auto& z : manifest.value("zones", json::array())) {
     std::vector<std::string> ifaces;
     for (const auto& i : z.value("interfaces", json::array())) {
       ifaces.push_back(i.get<std::string>());
     }
-    zone_ifindexes[z.at("name").get<std::string>()] =
-        ResolveZoneIfindexes(ifaces);
+    std::string zname = z.at("name").get<std::string>();
+    zone_ifindexes[zname] = ResolveZoneIfindexes(ifaces);
+    zone_ifnames[zname] = std::move(ifaces);
   }
 
   // Common pin root so LIBBPF_PIN_BY_NAME maps (conntrack, devmaps)
@@ -512,7 +574,35 @@ auto LoadZoneBundle(std::string_view bundle_dir,
                     pin_root_str, ec.message()));
   }
 
+  // Hot-reload swap targets: ifindex -> the currently attached
+  // program from the bundle being replaced.
+  std::map<int, int> old_prog_by_ifindex;
+  if (replace != nullptr) {
+    for (const auto& prev : replace->programs) {
+      for (int idx : prev.ifindexes) {
+        old_prog_by_ifindex[idx] = prev.prog_fd;
+      }
+    }
+  }
+  // Interfaces already flipped/attached to NEW programs, for rollback
+  // when a later step fails: replaced ones swap back to the old
+  // program, freshly attached ones detach.
+  std::vector<std::pair<int, int>> flipped;
+  std::vector<int> fresh_attached;
+
   ZoneBundleHandles handles;
+  auto bail = [&](BpfError code, std::string message)
+      -> std::unexpected<Error<BpfError>> {
+    for (const auto& [idx, old_fd] : flipped) {
+      ReplaceXdp(idx, old_fd, -1);
+    }
+    for (int idx : fresh_attached) {
+      bpf_xdp_detach(idx, 0, nullptr);
+    }
+    CloseZoneBundle(handles);
+    return MakeError(code, std::move(message));
+  };
+
   for (const auto& p : manifest.value("programs", json::array())) {
     if (p.value("object", json()).is_null()) {
       // The bundle was emitted without a compiled object (clang
@@ -530,24 +620,25 @@ auto LoadZoneBundle(std::string_view bundle_dir,
     struct bpf_object* obj =
         bpf_object__open_file(obj_path.c_str(), &open_opts);
     if (!obj) {
-      return MakeError(BpfError::kLoadFailed,
+      return bail(BpfError::kLoadFailed,
           std::format("open {} failed", obj_path));
     }
     int err = bpf_object__load(obj);
     if (err) {
       bpf_object__close(obj);
-      return MakeError(BpfError::kLoadFailed,
+      return bail(BpfError::kLoadFailed,
           std::format("load {} failed: {}", obj_path,
                       std::strerror(-err)));
     }
-    g_zone_objs.push_back(obj);
+    handles.objs.push_back(obj);
 
     // v0.4 § 6.6: `fwl_prog` for a single-program zone, or the wired
     // `fwl_stage_0` entry of a split tail-call pipeline.
     struct bpf_program* prog = ResolveZoneEntryProgram(obj, zone);
     if (!prog) {
-      return MakeError(BpfError::kLoadFailed,
-          std::format("no fwl_prog / fwl_stage_0 entry in {}", obj_path));
+      return bail(BpfError::kLoadFailed,
+          std::format("no fwl_prog / fwl_stage_0 entry in {}",
+                      obj_path));
     }
 
     ZoneProgramHandle zh;
@@ -564,6 +655,40 @@ auto LoadZoneBundle(std::string_view bundle_dir,
     // geoip.json (no-op for bundles without geoip() calls).
     for (const auto& [map_name, entries] : *geoip) {
       PopulateGeoipTrie(obj, map_name, entries, geoip_done);
+    }
+
+    // masquerade (v0.4 § NAT): the program translates sources to "the
+    // WAN interface address" — the first IPv4 on the redirect
+    // destination zone. fwl_nat_cfg exists only in objects whose
+    // policy uses masquerade; it is pinned by name, so one write
+    // configures every zone program.
+    int nat_cfg_fd = FindMap(obj, "fwl_nat_cfg");
+    if (nat_cfg_fd >= 0) {
+      uint32_t masq_addr = 0;
+      std::string masq_zone;
+      for (const auto& dest : p.value("redirects_to", json::array())) {
+        std::string dest_zone = dest.get<std::string>();
+        masq_addr = FirstZoneIpv4(zone_ifnames[dest_zone]);
+        if (masq_addr != 0) {
+          masq_zone = dest_zone;
+          break;
+        }
+      }
+      if (masq_addr != 0) {
+        uint32_t key = 0;
+        struct { uint32_t masq_addr; } cfg = {masq_addr};
+        bpf_map_update_elem(nat_cfg_fd, &key, &cfg, BPF_ANY);
+        char buf[INET_ADDRSTRLEN] = {};
+        inet_ntop(AF_INET, &masq_addr, buf, sizeof(buf));
+        spdlog::info("zone '{}' masquerade address {} (zone '{}')",
+                     zone, buf, masq_zone);
+      } else {
+        spdlog::warn(
+            "zone '{}' uses masquerade but no redirect-destination "
+            "zone interface carries an IPv4 address; masquerade "
+            "rules will not translate",
+            zone);
+      }
     }
 
     // Populate each redirect destination's devmap with that zone's
@@ -583,13 +708,29 @@ auto LoadZoneBundle(std::string_view bundle_dir,
                    dest_zone, targets.size());
     }
 
-    // Attach the program to every interface in its own zone.
+    // Attach the program to every interface in its own zone. On a
+    // hot reload the interface already runs the previous bundle's
+    // program: swap atomically (no detach, no NIC reset, no
+    // policy-off window).
     for (int ifindex : zone_ifindexes[zone]) {
-      int aerr = bpf_xdp_attach(ifindex, zh.prog_fd, 0, nullptr);
-      if (aerr) {
-        return MakeError(BpfError::kAttachFailed,
-            std::format("attach zone '{}' to ifindex {} failed: {}",
-                        zone, ifindex, std::strerror(-aerr)));
+      auto old_it = old_prog_by_ifindex.find(ifindex);
+      if (old_it != old_prog_by_ifindex.end()) {
+        auto r = ReplaceXdp(ifindex, zh.prog_fd, old_it->second);
+        if (!r) {
+          return bail(BpfError::kAttachFailed,
+              std::format("swap zone '{}' on ifindex {} failed: {}",
+                          zone, ifindex, r.error().message));
+        }
+        flipped.emplace_back(ifindex, old_it->second);
+      } else {
+        int aerr = bpf_xdp_attach(ifindex, zh.prog_fd, 0, nullptr);
+        if (aerr) {
+          return bail(BpfError::kAttachFailed,
+              std::format("attach zone '{}' to ifindex {} "
+                          "failed: {}",
+                          zone, ifindex, std::strerror(-aerr)));
+        }
+        fresh_attached.push_back(ifindex);
       }
       zh.ifindexes.push_back(ifindex);
     }

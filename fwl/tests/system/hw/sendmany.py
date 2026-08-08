@@ -88,10 +88,32 @@ def probe(send_iface: str, recv_iface: str, timeout: float) -> bool:
   rx.close()
   return ok
 
-def send(iface: str, count: int, builder: str) -> None:
+def send(iface: str, count: int, builder: str,
+         pps: float | None = None) -> None:
   import time
   frame = pkt.build_packet(pkt.parse_builder(builder)).raw
   s = _raw_socket(iface)
+  if pps:
+    # Steady paced stream (reload/soak tests): absolute schedule so
+    # send() latency doesn't accumulate drift.
+    start = time.monotonic()
+    sent = 0
+    for i in range(count):
+      target = start + i / pps
+      delay = target - time.monotonic()
+      if delay > 0:
+        time.sleep(delay)
+      try:
+        s.send(frame)
+        sent += 1
+      except OSError:
+        # Link mid-reset (e.g. an XDP attach bounced it) — the lost
+        # send IS the measurement; keep pacing.
+        pass
+    s.close()
+    print(f"sent {sent}/{count} x {len(frame)}B out {iface} "
+          f"at {pps}pps: {builder}")
+    return
   for i in range(count):
     s.send(frame)
     # Light pacing so receiver-side witnesses keep up; ~10k fps still
@@ -112,6 +134,11 @@ def main() -> int:
       return 0
     print("wire dead: probe frames never crossed", file=sys.stderr)
     return 1
+  if sys.argv[1] == "--pps":
+    # --pps <rate> <iface> <count> <builder>
+    send(sys.argv[3], int(sys.argv[4]), sys.argv[5],
+         pps=float(sys.argv[2]))
+    return 0
   send(sys.argv[1], int(sys.argv[2]), sys.argv[3])
   return 0
 
