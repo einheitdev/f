@@ -12,6 +12,7 @@ gracefully rather than failing the whole test suite.
 from __future__ import annotations
 import ctypes
 import os
+import platform
 import shutil
 import struct
 import subprocess
@@ -546,7 +547,16 @@ class _BpfAttrTestRun(ctypes.Structure):
 
 
 _BPF_PROG_TEST_RUN = 10
-_NR_BPF = 321  # x86_64 syscall number
+# The bpf(2) syscall number is per-architecture. Hardcoding the
+# x86_64 value made every BPF_PROG_TEST_RUN fail with ENOSYS on the
+# aarch64 rig — the loader (libbpf) worked, so the failure only
+# surfaced when the oracle actually executed a program.
+_NR_BPF_BY_MACHINE = {
+  "x86_64": 321,
+  "aarch64": 280,
+  "riscv64": 280,
+}
+_NR_BPF = _NR_BPF_BY_MACHINE.get(platform.machine(), 321)
 
 
 def _bpf_prog_test_run(prog_fd: int, packet: bytes) -> XdpAction:

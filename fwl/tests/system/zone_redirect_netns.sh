@@ -58,7 +58,7 @@ drop
 EOF
 
 cd "$WS"
-PYTHONPATH="$WS" python3 -c "
+PYTHONPATH="$WS${PYTHONPATH:+:$PYTHONPATH}" python3 -c "
 from fwl import analyzer, parser, emitter
 prog = analyzer.analyze(parser.parse(open('$WORK/gw.fw').read()))
 files = emitter.emit_bundle(prog)
@@ -131,12 +131,12 @@ ip netns exec wandst timeout 6 tcpdump -i wan0p -c 1 -nn \
 CAPPID=$!
 sleep 1
 
-ip netns exec lansrc env PYTHONPATH="$WS" python3 "$HERE/send_frame.py" \
+ip netns exec lansrc env PYTHONPATH="$WS${PYTHONPATH:+:$PYTHONPATH}" python3 "$HERE/send_frame.py" \
   lan0p 'tcp(src_ip="10.0.0.5", dst_ip="93.184.216.34", dst_port=80, syn=true)' \
   || fail "send frame"
 
 # Send a second, non-matching frame (udp) to show it does NOT cross.
-ip netns exec lansrc env PYTHONPATH="$WS" python3 "$HERE/send_frame.py" \
+ip netns exec lansrc env PYTHONPATH="$WS${PYTHONPATH:+:$PYTHONPATH}" python3 "$HERE/send_frame.py" \
   lan0p 'udp(src_ip="10.0.0.5", dst_ip="93.184.216.34", dst_port=53)' \
   2>/dev/null
 

@@ -176,35 +176,55 @@ int main(int argc, char** argv) {
   std::string bundle_dir = "/usr/share/f/compiled";
   std::string log_level = "info";
 
-  app.add_option("-c,--config", config_file,
-                 "YAML config file");
-  app.add_option("-i,--interfaces", interfaces,
-                 "Comma-separated NIC list");
-  app.add_option("-s,--socket", socket_addr,
-                 "ZMQ IPC control address");
-  app.add_option("--pin-path", pin_path,
-                 "BPF map pin directory");
+  auto* opt_config = app.add_option("-c,--config", config_file,
+                                    "YAML config file");
+  auto* opt_ifaces = app.add_option("-i,--interfaces", interfaces,
+                                    "Comma-separated NIC list");
+  auto* opt_socket = app.add_option("-s,--socket", socket_addr,
+                                    "ZMQ IPC control address");
+  auto* opt_pin = app.add_option("--pin-path", pin_path,
+                                 "BPF map pin directory");
   app.add_option("--bundle-dir", bundle_dir,
                  "Compiled-bundle root; <dir>/current/main.bpf.o "
                  "is loaded at startup when present");
-  app.add_option("-l,--log-level", log_level,
-                 "Log level")
-      ->check(CLI::IsMember(
-          {"trace", "debug", "info", "warn", "error"}));
+  auto* opt_log = app.add_option("-l,--log-level", log_level,
+                                 "Log level")
+                      ->check(CLI::IsMember({"trace", "debug",
+                                             "info", "warn",
+                                             "error"}));
+  (void)opt_config;
 
   app.add_subcommand("run", "Run in foreground");
   app.add_subcommand("start", "Daemonize and run");
 
   CLI11_PARSE(app, argc, argv);
 
-  // Load config file (CLI flags override).
+  // Load config file. CLI flags override config values: the config
+  // is read into separate variables and applied only where the
+  // corresponding flag was not given. (It used to overwrite CLI
+  // values unconditionally — a standalone `fd -s ipc://... run`
+  // silently bound the config file's socket instead; found by the
+  // netns system tests running against a rig with /etc/f/fd.yaml.)
   WatchConfig watch;
-  if (!config_file.empty()) {
-    LoadConfig(config_file, interfaces, socket_addr,
-               pin_path, log_level, watch);
-  } else if (std::ifstream("/etc/f/fd.yaml").good()) {
-    LoadConfig("/etc/f/fd.yaml", interfaces, socket_addr,
-               pin_path, log_level, watch);
+  {
+    std::string cfg_ifaces = interfaces;
+    std::string cfg_socket = socket_addr;
+    std::string cfg_pin = pin_path;
+    std::string cfg_log = log_level;
+    bool loaded = false;
+    if (!config_file.empty()) {
+      loaded = LoadConfig(config_file, cfg_ifaces, cfg_socket,
+                          cfg_pin, cfg_log, watch);
+    } else if (std::ifstream("/etc/f/fd.yaml").good()) {
+      loaded = LoadConfig("/etc/f/fd.yaml", cfg_ifaces, cfg_socket,
+                          cfg_pin, cfg_log, watch);
+    }
+    if (loaded) {
+      if (opt_ifaces->count() == 0) interfaces = cfg_ifaces;
+      if (opt_socket->count() == 0) socket_addr = cfg_socket;
+      if (opt_pin->count() == 0) pin_path = cfg_pin;
+      if (opt_log->count() == 0) log_level = cfg_log;
+    }
   }
 
   if (log_level == "trace")
