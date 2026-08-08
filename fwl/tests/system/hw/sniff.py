@@ -110,6 +110,11 @@ def main() -> int:
   # Bursts land while we're parsing; a small default rcvbuf drops
   # frames the counters prove arrived. 8 MB absorbs any test burst.
   s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 8 * 1024 * 1024)
+  # The kernel software-untags 802.1Q before packet taps; the tag is
+  # only recoverable via PACKET_AUXDATA ancillary data.
+  sol_packet = getattr(socket, "SOL_PACKET", 263)
+  PACKET_AUXDATA = 8
+  s.setsockopt(sol_packet, PACKET_AUXDATA, 1)
   s.setblocking(False)
   tallies: dict[str, int] = {}
   deadline = time.monotonic() + seconds
@@ -122,12 +127,25 @@ def main() -> int:
       continue
     while True:
       try:
-        frame, meta = s.recvfrom(65535)
+        frame, ancdata, _flags, meta = s.recvmsg(65535, 4096)
       except BlockingIOError:
         break
       # Only ingress frames; outgoing copies would double-count.
       if meta[2] == socket.PACKET_OUTGOING:
         continue
+      # Re-insert a kernel-stripped VLAN tag from the auxdata so
+      # tagged flows keep their vlan<id>: key prefix.
+      for lvl, typ, data in ancdata:
+        if lvl == sol_packet and typ == PACKET_AUXDATA and \
+            len(data) >= 20:
+          status, _l, _sl, _mac, _net, tci, _tpid = \
+            struct.unpack_from("IIIHHHH", data)
+          TP_STATUS_VLAN_VALID = 1 << 4
+          if status & TP_STATUS_VLAN_VALID:
+            frame = (frame[:12]
+                     + struct.pack(">HH", ETH_P_8021Q, tci)
+                     + frame[12:])
+          break
       key = flow_key(frame, detail)
       if key is not None:
         tallies[key] = tallies.get(key, 0) + 1

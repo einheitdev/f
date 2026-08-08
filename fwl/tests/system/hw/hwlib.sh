@@ -86,6 +86,9 @@ hw::deploy() {
     || { journalctl -u fd -n 12 --no-pager >&2
          hw::abort "fd did not attach XDP"; }
   ip link set dev "$RECV_IF" promisc on
+  # The i350 strips 802.1Q tags in hardware before XDP sees them;
+  # FWL vlan_id matching needs the tag on the wire frame.
+  ethtool -K "$RECV_IF" rxvlan off 2>/dev/null || true
   # XDP attach resets the igb links; wait until frames actually cross
   # the switch again before any test traffic.
   $PY "$HERE/sendmany.py" --probe "$SEND_IF" "$RECV_IF" 45 \
@@ -175,6 +178,21 @@ hw::restore_smoke() {
   systemctl start fd
   # Drop the per-test bundle dirs; `current` points at v-smoke now.
   rm -rf "$BUNDLE_ROOT"/v-hw-* 2>/dev/null || true
+}
+
+# EX2300 port-mirror witness: the (pre-configured, deactivated)
+# analyzer `fmon` mirrors both directions of the DUT port ge-0/0/25
+# into VLAN f-mirror, whose only member is f0 — switch-made copies
+# the DUT cannot influence. Toggle per test; always off afterwards
+# (an active mirror double-counts flows on the f0 sniffer).
+hw::mirror_on() {
+  printf 'configure\nactivate forwarding-options analyzer fmon\ncommit and-quit\n' \
+    | ssh -o BatchMode=yes ex01 >/dev/null 2>&1
+}
+
+hw::mirror_off() {
+  printf 'configure\ndeactivate forwarding-options analyzer fmon\ncommit and-quit\n' \
+    | ssh -o BatchMode=yes ex01 >/dev/null 2>&1
 }
 
 hw::finish() {

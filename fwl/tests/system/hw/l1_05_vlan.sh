@@ -35,14 +35,18 @@ hw::sniff_wait
 V100=$(hw::counter arrived_v100)
 V200=$(hw::counter arrived_v200)
 if [ "$V100" -eq 0 ] && [ "$V200" -eq 0 ]; then
-  fail "BLOCKED: tagged frames never reached $RECV_IF — EX2300 test \
-ports need tagged-VLAN membership (operator: switch config)"
+  fail "BLOCKED: tagged frames never reached $RECV_IF — check EX2300 \
+tagged membership AND 'ethtool -K $RECV_IF rxvlan off' (the i350 \
+strips tags in hardware before XDP otherwise)"
 else
-  assert_eq "counter arrived_v100" "$V100" 100
-  assert_eq "counter arrived_v200" "$V200" 100
+  # XDP counters prove the in-program tag match; the sniffer
+  # recovers kernel-stripped tags via PACKET_AUXDATA, so passed
+  # tagged frames keep their vlan<id>: key.
+  assert_eq "counter arrived_v100 (tag matched in XDP)" "$V100" 100
+  assert_eq "counter arrived_v200 (tag matched in XDP)" "$V200" 100
   assert_eq "wire v100 dropped" \
     "$(hw::sniff_get vlan100:udp:10.99.5.1:5100)" 0
-  assert_eq "wire v200 passed" \
+  assert_eq "wire v200 passed (tag restored from auxdata)" \
     "$(hw::sniff_get vlan200:udp:10.99.5.2:5200)" 100
 fi
 assert_eq "counter arrived_untagged" "$(hw::counter arrived_untagged)" 100
