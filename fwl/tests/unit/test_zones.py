@@ -206,6 +206,20 @@ class TestEmitter:
     # The pinned map is the shared conntrack state.
     assert "} conntrack SEC" in files["wan.bpf.c"]
 
+  def test_bundle_zone_private_maps_are_zone_qualified(self):
+    # Two zones with DIFFERENT counter sets: a bundle-global pinned
+    # `fwl_counters` would fail to load (parameter mismatch reusing
+    # the pin) or cross-wire slots. Private maps carry the zone name.
+    prog = _analyze(
+      WL + "@xdp(wan)\ncount wan_a\ncount wan_b\ndrop\n"
+      "@xdp(lan)\ncount lan_only\nredirect to wan\n"
+    )
+    files = emitter.emit_bundle(prog)
+    assert "fwl_counters_wan" in files["wan.bpf.c"]
+    assert "fwl_counters_lan" in files["lan.bpf.c"]
+    assert "fwl_counters SEC" not in files["wan.bpf.c"]
+    assert "fwl_counters SEC" not in files["lan.bpf.c"]
+
   def test_bundle_zone_files_compile(self):
     prog = _analyze(
       WL + "@xdp(wan)\nallow if conntrack(pkt).state == established\ndrop\n"

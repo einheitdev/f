@@ -16,11 +16,17 @@ def emit(text):
 
 
 class TestPrelude:
-  def test_no_pkt_reference_no_prelude(self):
+  def test_no_pkt_reference_gets_gate_but_no_parse(self):
     src = emit("@xdp(eth0)\nallow\n")
-    # No proto/data/eth declarations when no pkt.* is touched.
+    # No full parse when no pkt.* is touched...
     assert "proto = 0" not in src
-    assert "ethhdr" not in src
+    assert "iphdr" not in src
+    # ...but the non-IP early-out is always present: without it an
+    # unconditional drop/redirect acts on L2 control frames (ARP,
+    # STP BPDUs) — reflected BPDUs trip switch loop protection on
+    # real fabric (found on the EX2300 by the hardware tests).
+    assert "ethhdr" in src
+    assert "ETH_P_IPV6" in src
 
   def test_proto_only_minimal_prelude(self):
     src = emit("@xdp(eth0)\ndrop if pkt.proto == tcp\n")

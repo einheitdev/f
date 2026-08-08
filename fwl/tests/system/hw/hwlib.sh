@@ -48,19 +48,26 @@ hw::require_root() {
   fi
 }
 
+# Abort the test as FAILED (deploy/setup error). Never exit 0 from a
+# setup failure — a test that could not run has not passed.
+hw::abort() {
+  fail "ABORT: $*"
+  exit 1
+}
+
 # hw::deploy <bundle-tag> <policy-file>
 # Compile the policy into a fresh versioned bundle, restart fd on it,
 # wait for the XDP attach, set up promisc + switch FDB.
 hw::deploy() {
   local tag="$1" fw="$2"
   local ver="$BUNDLE_ROOT/v-hw-$tag-$$"
-  fwl check "$fw" >/dev/null || { echo "policy rejected"; exit 2; }
+  fwl check "$fw" >/dev/null || hw::abort "policy rejected"
   rm -rf "$ver"
-  fwl compile --bundle "$ver" "$fw" >/dev/null
+  fwl compile --bundle "$ver" "$fw" >/dev/null \
+    || hw::abort "bundle compile failed"
   # Every zone object must have compiled (clang present on the rig).
   if grep -q '"object": null' "$ver/manifest.json"; then
-    echo "bundle has uncompiled zone objects" >&2
-    exit 2
+    hw::abort "bundle has uncompiled zone objects"
   fi
   systemctl stop fd
   # Pinned maps persist across fd restarts; stale shapes from the
@@ -76,13 +83,13 @@ hw::deploy() {
     sleep 0.5
   done
   fctl status 2>/dev/null | grep -q '"xdp_attached":true' \
-    || { echo "fd did not attach XDP" >&2; journalctl -u fd -n 10 \
-         --no-pager >&2; exit 2; }
+    || { journalctl -u fd -n 12 --no-pager >&2
+         hw::abort "fd did not attach XDP"; }
   ip link set dev "$RECV_IF" promisc on
   # XDP attach resets the igb links; wait until frames actually cross
   # the switch again before any test traffic.
   $PY "$HERE/sendmany.py" --probe "$SEND_IF" "$RECV_IF" 45 \
-    || { echo "wire never came back after attach" >&2; exit 2; }
+    || hw::abort "wire never came back after attach"
   hw::teach_fdb
   log "deployed $ver"
 }
@@ -94,21 +101,28 @@ hw::teach_fdb() {
 }
 
 # hw::counter <name> — summed per-CPU value of a named FWL counter.
-# Name->slot comes from the fwl_counter_table comment in the bundle's
-# generated C.
+# Name->slot comes from the fwl_counter_table comment in the zone's
+# generated C; counters are zone-private, so the pinned map is
+# fwl_counters_<zone> (zone = the .bpf.c basename).
 hw::counter() {
   local name="$1"
-  local src slot
-  src=$(ls "$BUNDLE_ROOT"/current/*.bpf.c | head -1)
-  slot=$(awk -v n="$name" \
-    '/fwl_counter_table:/{t=1; next} t && $3==n {print $2; exit}' \
-    "$src")
-  if [ -z "$slot" ]; then
+  local src slot zone=""
+  for src in "$BUNDLE_ROOT"/current/*.bpf.c; do
+    slot=$(awk -v n="$name" \
+      '/fwl_counter_table:/{t=1; next} t && $3==n {print $2; exit}' \
+      "$src")
+    if [ -n "$slot" ]; then
+      zone=$(basename "$src" .bpf.c)
+      break
+    fi
+  done
+  if [ -z "$zone" ]; then
     echo "unknown counter $name" >&2
     echo 0
     return 1
   fi
-  bpftool map dump pinned "$PIN/fwl_counters" 2>/dev/null | $PY -c "
+  bpftool map dump pinned "$PIN/fwl_counters_$zone" 2>/dev/null \
+    | $PY -c "
 import json, sys
 entries = json.load(sys.stdin)
 for e in entries:
@@ -131,7 +145,7 @@ SNIFF_OUT=""
 SNIFF_PID=""
 hw::sniff_start() {
   SNIFF_OUT=$(mktemp)
-  $PY "$HERE/sniff.py" "$RECV_IF" "$1" > "$SNIFF_OUT" &
+  $PY "$HERE/sniff.py" "$RECV_IF" "$@" > "$SNIFF_OUT" &
   SNIFF_PID=$!
   # Give the socket a beat to bind before traffic starts.
   sleep 0.5

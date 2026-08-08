@@ -48,10 +48,13 @@ def test_bundle_writes_geoip_json(tmp_path):
   assert result.exit_code == 0, result.output
   payload = json.loads((bundle / "geoip.json").read_text())
   assert payload["tries"] == [{
-    "map": "fwl_geoip_0",
+    "map": "fwl_geoip_eth0_0",
     "family": "ipv4",
     "prefixes": ["10.99.77.0/24"],
   }]
+  # The emitted zone source uses the same zone-qualified trie name.
+  src = (bundle / "eth0.bpf.c").read_text()
+  assert "fwl_geoip_eth0_0" in src
 
 
 def test_bundle_unions_multi_country(tmp_path):

@@ -12,6 +12,8 @@ to 0 (or the rule's condition naturally evaluates to false).
 """
 from __future__ import annotations
 
+import re
+
 from . import ast
 from . import splitter
 
@@ -766,7 +768,30 @@ def _emit_parse_prelude(
   """
   fields = _referenced_fields(program)
   if not fields:
-    return ""
+    # No referenced fields still gets the non-IP early-out. FWL has
+    # no L2 fields, so no construct can meaningfully act on ARP, STP,
+    # LLDP, or other L2 control frames — and a program built from
+    # unconditional actions otherwise WOULD act on them: an
+    # unconditional `redirect` re-emits the switch's own BPDUs out
+    # another port, which real switch fabric answers by blocking the
+    # port (loop protection). Found on the EX2300 by the hardware
+    # storm_shield test; veth-based tests cannot see it.
+    return f"""\
+  {{
+    void *data = (void *)(long)ctx->data;
+    void *data_end = (void *)(long)ctx->data_end;
+    struct ethhdr *eth = data;
+    if ((void *)(eth + 1) > data_end) return {early_out};
+    __u16 fwl_l3p = eth->h_proto;
+    if (fwl_l3p == bpf_htons(ETH_P_8021Q)) {{
+      struct fwl_vlanhdr *vh = (void *)(eth + 1);
+      if ((void *)(vh + 1) > data_end) return {early_out};
+      fwl_l3p = vh->inner_proto;
+    }}
+    if (fwl_l3p != bpf_htons(ETH_P_IP) &&
+        fwl_l3p != bpf_htons(ETH_P_IPV6)) return {early_out};
+  }}
+"""
 
   needs_l4 = _needs_l4(fields)
   needs_tcp = _needs_tcp(fields)
@@ -2499,11 +2524,31 @@ def emit_bundle(program: ast.Program) -> dict[str, str]:
   bundle_nat = any(_program_uses_nat(zp) for zp in program.programs)
   files: dict[str, str] = {}
   for zp in program.programs:
-    files[f"{zp.zone_name}.bpf.c"] = _emit_zone_source(
+    src = _emit_zone_source(
       zp, pinned_shared=True, force_nat=bundle_nat, helpers=program.helpers
+    )
+    files[f"{zp.zone_name}.bpf.c"] = _suffix_private_maps(
+      src, zp.zone_name
     )
   files["fwl_shared.h"] = _emit_shared_header(program)
   return files
+
+
+def _suffix_private_maps(src: str, zone: str) -> str:
+  """Give zone-PRIVATE maps a per-zone pinned name.
+
+  Counters, rate-limit state, and geoip tries are per-zone: their
+  layout (max_entries, slot meaning, call indices) comes from that
+  zone's own analysis. Pinning them by a bundle-global name would
+  either fail to load (different max_entries -> libbpf "parameter
+  mismatch" reusing the pin) or silently cross-wire two zones' state.
+  Genuinely shared cross-zone maps (conntrack, fwl_nat, fwl_nat_cfg,
+  fwl_log_events) keep their global names.
+  """
+  src = re.sub(r"\bfwl_counters\b", f"fwl_counters_{zone}", src)
+  src = re.sub(r"\bfwl_rl_map_(\d+)\b", rf"fwl_rl_{zone}_\1", src)
+  src = re.sub(r"\bfwl_geoip_(\d+)", rf"fwl_geoip_{zone}_\1", src)
+  return src
 
 
 def _emit_shared_header(program: ast.Program) -> str:

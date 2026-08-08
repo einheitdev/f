@@ -183,17 +183,22 @@ def compile(source: Path, output: Path | None, bundle_dir: Path | None,
     output.write_text(c_source, encoding="utf-8")
 
 
-def _collect_bundle_geoip(program: ast.Program) -> list[ast.GeoIp]:
-  """Every geoip() call site across every @xdp block, in zone order."""
-  calls: list[ast.GeoIp] = []
+def _collect_bundle_geoip(
+  program: ast.Program,
+) -> list[tuple[str, ast.GeoIp]]:
+  """(zone, call) for every geoip() site across every @xdp block."""
+  calls: list[tuple[str, ast.GeoIp]] = []
   for zp in program.programs:
     for rule in zp.rules:
       for n in emitter._walk(rule.condition):
         if (isinstance(n, ast.Comparison)
             and isinstance(n.operand, ast.GeoIp)):
-          calls.append(n.operand)
+          calls.append((zp.zone_name, n.operand))
     if zp.function is not None:
-      calls.extend(emitter._collect_geoip_in_stmts(zp.function.body))
+      calls.extend(
+        (zp.zone_name, c)
+        for c in emitter._collect_geoip_in_stmts(zp.function.body)
+      )
   return calls
 
 
@@ -204,9 +209,10 @@ def _build_geoip_bundle_file(
 
   Returns the geoip.json payload ({"tries": [...]}), or None when the
   program has no geoip() calls. Errors out (exit 1) when calls exist
-  but no data was provided, when a referenced country has no prefixes
-  of the call's family, or when two zones' same-named tries disagree
-  (the by-name bpffs pinning would silently merge them).
+  but no data was provided, or when a referenced country has no
+  prefixes of the call's family (a silently empty trie would make the
+  rule a no-op). Trie names are zone-qualified to match the emitter's
+  per-zone private-map naming.
   """
   calls = _collect_bundle_geoip(program)
   if not calls:
@@ -220,8 +226,10 @@ def _build_geoip_bundle_file(
     sys.exit(1)
   import ipaddress
   tries: dict[str, dict] = {}
-  for call in calls:
-    name = f"fwl_geoip_{call.call_index}"
+  for zone, call in calls:
+    # Matches the emitter's per-zone private-map naming
+    # (_suffix_private_maps): tries are zone-local state.
+    name = f"fwl_geoip_{zone}_{call.call_index}"
     prefixes: list[str] = []
     for code in call.codes:
       family_hits = 0
@@ -238,19 +246,10 @@ def _build_geoip_bundle_file(
           err=True,
         )
         sys.exit(1)
-    entry = {
+    tries[name] = {
       "map": name, "family": call.family,
       "prefixes": sorted(prefixes),
     }
-    if name in tries and tries[name] != entry:
-      click.echo(
-        f"error: two @xdp zones both emit trie '{name}' with "
-        "different contents; by-name pinning would merge them — "
-        "restructure the geoip() calls",
-        err=True,
-      )
-      sys.exit(1)
-    tries[name] = entry
   return {"tries": [tries[k] for k in sorted(tries)]}
 
 

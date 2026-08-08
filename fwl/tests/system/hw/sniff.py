@@ -11,7 +11,11 @@ Key format (JSON object printed on exit):
   icmp:<src_ip>:<type>       ICMP frames
   vlan<id>:<proto>:<src_ip>  802.1Q-tagged frames
 
-Usage: sniff.py <iface> <seconds>
+With --detail (NAT evidence), TCP/UDP keys instead carry both
+addresses and a checksum verdict:
+  tcp:<src_ip>>{dst_ip}:<dst_port>:<ok|badcsum>
+
+Usage: sniff.py <iface> <seconds> [--detail]
 """
 import json
 import select
@@ -24,7 +28,37 @@ ETH_P_ALL = 0x0003
 ETH_P_IP = 0x0800
 ETH_P_8021Q = 0x8100
 
-def flow_key(frame: bytes) -> str | None:
+def _fold(total: int) -> int:
+  while total >> 16:
+    total = (total & 0xFFFF) + (total >> 16)
+  return total
+
+def _sum16(data: bytes) -> int:
+  if len(data) % 2:
+    data += b"\x00"
+  return sum(struct.unpack(f">{len(data) // 2}H", data))
+
+def checksums_ok(frame: bytes, l3_off: int) -> bool:
+  """Validate the IPv4 header checksum and the TCP/UDP checksum."""
+  ihl = (frame[l3_off] & 0x0F) * 4
+  ip_hdr = frame[l3_off:l3_off + ihl]
+  if _fold(_sum16(ip_hdr)) != 0xFFFF:
+    return False
+  proto = frame[l3_off + 9]
+  if proto not in (6, 17):
+    return True
+  total_len = struct.unpack_from(">H", frame, l3_off + 2)[0]
+  l4 = frame[l3_off + ihl:l3_off + total_len]
+  if proto == 17 and len(l4) >= 8:
+    if struct.unpack_from(">H", l4, 6)[0] == 0:
+      # UDP checksum 0 = "no checksum".
+      return True
+  pseudo = (frame[l3_off + 12:l3_off + 20]
+            + bytes([0, proto])
+            + struct.pack(">H", len(l4)))
+  return _fold(_sum16(pseudo) + _sum16(l4)) == 0xFFFF
+
+def flow_key(frame: bytes, detail: bool = False) -> str | None:
   if len(frame) < 34:
     return None
   ethertype = struct.unpack_from(">H", frame, 12)[0]
@@ -41,7 +75,9 @@ def flow_key(frame: bytes) -> str | None:
   ihl = (frame[l3_off] & 0x0F) * 4
   proto = frame[l3_off + 9]
   src_ip = socket.inet_ntoa(frame[l3_off + 12:l3_off + 16])
-  if not src_ip.startswith("10.99."):
+  dst_ip = socket.inet_ntoa(frame[l3_off + 16:l3_off + 20])
+  if not (src_ip.startswith("10.99.")
+          or dst_ip.startswith("10.99.")):
     return None
   l4_off = l3_off + ihl
   if proto == 6 or proto == 17:
@@ -49,7 +85,11 @@ def flow_key(frame: bytes) -> str | None:
       return None
     dst_port = struct.unpack_from(">H", frame, l4_off + 2)[0]
     name = "tcp" if proto == 6 else "udp"
-    base = f"{name}:{src_ip}:{dst_port}"
+    if detail:
+      verdict = "ok" if checksums_ok(frame, l3_off) else "badcsum"
+      base = f"{name}:{src_ip}>{dst_ip}:{dst_port}:{verdict}"
+    else:
+      base = f"{name}:{src_ip}:{dst_port}"
   elif proto == 1:
     if len(frame) < l4_off + 2:
       return None
@@ -62,6 +102,7 @@ def flow_key(frame: bytes) -> str | None:
 
 def main() -> int:
   iface, seconds = sys.argv[1], float(sys.argv[2])
+  detail = "--detail" in sys.argv[3:]
   s = socket.socket(
     socket.AF_PACKET, socket.SOCK_RAW, socket.htons(ETH_P_ALL)
   )
@@ -87,7 +128,7 @@ def main() -> int:
       # Only ingress frames; outgoing copies would double-count.
       if meta[2] == socket.PACKET_OUTGOING:
         continue
-      key = flow_key(frame)
+      key = flow_key(frame, detail)
       if key is not None:
         tallies[key] = tallies.get(key, 0) + 1
   # PACKET_STATISTICS: (packets, drops) since socket creation. A
