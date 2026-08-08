@@ -137,7 +137,18 @@ def check(source: Path) -> None:
     "block, a shared header, and manifest.json) into this directory."
   ),
 )
-def compile(source: Path, output: Path | None, bundle_dir: Path | None) -> None:
+@click.option(
+  "--geoip", "geoip_file", type=click.Path(exists=True, path_type=Path),
+  default=None,
+  help=(
+    "Country -> CIDR-prefix data (JSON object, e.g. "
+    '{"DE": ["1.2.0.0/16"]}). Required when the program uses '
+    "geoip(); the bundle gains a geoip.json the daemon loads into "
+    "the LPM tries at attach time."
+  ),
+)
+def compile(source: Path, output: Path | None, bundle_dir: Path | None,
+            geoip_file: Path | None) -> None:
   """Compile SOURCE to BPF C (single object) or a multi-zone bundle."""
   text = source.read_text(encoding="utf-8")
   try:
@@ -146,8 +157,13 @@ def compile(source: Path, output: Path | None, bundle_dir: Path | None) -> None:
     click.echo(exc.error.format(), err=True)
     sys.exit(1)
 
+  geoip_data = None
+  if geoip_file is not None:
+    import json
+    geoip_data = json.loads(geoip_file.read_text(encoding="utf-8"))
+
   if bundle_dir is not None:
-    _emit_bundle_dir(program, bundle_dir)
+    _emit_bundle_dir(program, bundle_dir, geoip_data)
     return
 
   # A multi-zone unit has more than one program; a single C file cannot
@@ -167,18 +183,94 @@ def compile(source: Path, output: Path | None, bundle_dir: Path | None) -> None:
     output.write_text(c_source, encoding="utf-8")
 
 
-def _emit_bundle_dir(program: ast.Program, bundle_dir: Path) -> None:
+def _collect_bundle_geoip(program: ast.Program) -> list[ast.GeoIp]:
+  """Every geoip() call site across every @xdp block, in zone order."""
+  calls: list[ast.GeoIp] = []
+  for zp in program.programs:
+    for rule in zp.rules:
+      for n in emitter._walk(rule.condition):
+        if (isinstance(n, ast.Comparison)
+            and isinstance(n.operand, ast.GeoIp)):
+          calls.append(n.operand)
+    if zp.function is not None:
+      calls.extend(emitter._collect_geoip_in_stmts(zp.function.body))
+  return calls
+
+
+def _build_geoip_bundle_file(
+  program: ast.Program, geoip_data: dict | None
+) -> dict | None:
+  """Resolve geoip() call sites against the data file.
+
+  Returns the geoip.json payload ({"tries": [...]}), or None when the
+  program has no geoip() calls. Errors out (exit 1) when calls exist
+  but no data was provided, when a referenced country has no prefixes
+  of the call's family, or when two zones' same-named tries disagree
+  (the by-name bpffs pinning would silently merge them).
+  """
+  calls = _collect_bundle_geoip(program)
+  if not calls:
+    return None
+  if geoip_data is None:
+    click.echo(
+      "error: this program uses geoip() but no --geoip data file "
+      "was provided; the tries would load empty and never match",
+      err=True,
+    )
+    sys.exit(1)
+  import ipaddress
+  tries: dict[str, dict] = {}
+  for call in calls:
+    name = f"fwl_geoip_{call.call_index}"
+    prefixes: list[str] = []
+    for code in call.codes:
+      family_hits = 0
+      for cidr in geoip_data.get(code, ()):
+        net = ipaddress.ip_network(cidr, strict=False)
+        is_v4 = isinstance(net, ipaddress.IPv4Network)
+        if (call.family == "ipv4") == is_v4:
+          prefixes.append(str(net))
+          family_hits += 1
+      if family_hits == 0:
+        click.echo(
+          f"error: geoip data has no {call.family} prefixes for "
+          f"country '{code}'",
+          err=True,
+        )
+        sys.exit(1)
+    entry = {
+      "map": name, "family": call.family,
+      "prefixes": sorted(prefixes),
+    }
+    if name in tries and tries[name] != entry:
+      click.echo(
+        f"error: two @xdp zones both emit trie '{name}' with "
+        "different contents; by-name pinning would merge them — "
+        "restructure the geoip() calls",
+        err=True,
+      )
+      sys.exit(1)
+    tries[name] = entry
+  return {"tries": [tries[k] for k in sorted(tries)]}
+
+
+def _emit_bundle_dir(program: ast.Program, bundle_dir: Path,
+                     geoip_data: dict | None = None) -> None:
   """Write a multi-zone bundle to `bundle_dir`.
 
   Emits each zone's `<zone>.bpf.c` and the shared header, compiles each
   C file to `<zone>.bpf.o` when clang is available, and writes a
   `manifest.json` describing the zones, per-zone objects, redirect
   topology, and the bpffs-pinned shared maps the daemon must wire up.
+  With geoip() in the program, also writes `geoip.json` (resolved
+  prefix lists per trie) for the daemon to load.
   """
   import json
   import subprocess
 
   from . import bpf_runner
+
+  geoip_payload = _build_geoip_bundle_file(program, geoip_data)
 
   bundle_dir.mkdir(parents=True, exist_ok=True)
   files = emitter.emit_bundle(program)
@@ -217,6 +309,10 @@ def _emit_bundle_dir(program: ast.Program, bundle_dir: Path) -> None:
   (bundle_dir / "manifest.json").write_text(
     json.dumps(manifest, indent=2), encoding="utf-8"
   )
+  if geoip_payload is not None:
+    (bundle_dir / "geoip.json").write_text(
+      json.dumps(geoip_payload, indent=2), encoding="utf-8"
+    )
   # Drop the scratch source compile_c leaves behind in the bundle dir.
   stray = bundle_dir / "fwl_prog.bpf.c"
   if stray.exists():

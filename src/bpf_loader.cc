@@ -7,12 +7,15 @@
 
 #include "f/bpf_loader.h"
 
+#include <arpa/inet.h>
+
 #include <cerrno>
 #include <cstring>
 #include <filesystem>
 #include <format>
 #include <fstream>
 #include <map>
+#include <set>
 #include <sstream>
 #include <string>
 #include <system_error>
@@ -369,11 +372,105 @@ auto ResolveZoneIfindexes(const std::vector<std::string>& ifaces)
 
 }  // namespace
 
+auto ParseGeoipFile(std::string_view bundle_dir)
+    -> std::expected<GeoipTries, Error<BpfError>> {
+  using nlohmann::json;
+  std::filesystem::path path =
+      std::filesystem::path(bundle_dir) / "geoip.json";
+  GeoipTries tries;
+  std::ifstream gf(path);
+  if (!gf) {
+    // Absent file: the bundle has no geoip() calls.
+    return tries;
+  }
+  std::stringstream ss;
+  ss << gf.rdbuf();
+  json doc;
+  try {
+    doc = json::parse(ss.str());
+  } catch (const std::exception& e) {
+    return MakeError(BpfError::kLoadFailed,
+        std::format("parse geoip.json: {}", e.what()));
+  }
+  for (const auto& t : doc.value("tries", json::array())) {
+    std::string map_name = t.at("map").get<std::string>();
+    bool v6 = t.value("family", "ipv4") == "ipv6";
+    std::vector<GeoipTrieEntry>& entries = tries[map_name];
+    for (const auto& p : t.value("prefixes", json::array())) {
+      std::string cidr = p.get<std::string>();
+      auto slash = cidr.find('/');
+      if (slash == std::string::npos) {
+        return MakeError(BpfError::kLoadFailed,
+            std::format("geoip.json prefix '{}' has no /len", cidr));
+      }
+      GeoipTrieEntry entry;
+      entry.v6 = v6;
+      entry.prefixlen = static_cast<uint32_t>(
+          std::stoul(cidr.substr(slash + 1)));
+      std::string addr = cidr.substr(0, slash);
+      int rc = v6
+          ? inet_pton(AF_INET6, addr.c_str(), entry.addr)
+          : inet_pton(AF_INET, addr.c_str(), entry.addr);
+      if (rc != 1) {
+        return MakeError(BpfError::kLoadFailed,
+            std::format("geoip.json address '{}' unparseable", addr));
+      }
+      uint32_t max_len = v6 ? 128 : 32;
+      if (entry.prefixlen > max_len) {
+        return MakeError(BpfError::kLoadFailed,
+            std::format("geoip.json prefix '{}' length out of range",
+                        cidr));
+      }
+      entries.push_back(entry);
+    }
+  }
+  return tries;
+}
+
+namespace {
+
+/// Insert one trie's entries into a loaded zone object's map. Pinned
+/// by-name maps are shared across zone objects, so `done` dedupes.
+auto PopulateGeoipTrie(struct bpf_object* obj,
+                       const std::string& map_name,
+                       const std::vector<GeoipTrieEntry>& entries,
+                       std::set<std::string>& done) -> void {
+  if (done.contains(map_name)) {
+    return;
+  }
+  int map_fd = FindMap(obj, map_name.c_str());
+  if (map_fd < 0) {
+    return;
+  }
+  done.insert(map_name);
+  uint8_t one = 1;
+  size_t written = 0;
+  for (const auto& e : entries) {
+    // Kernel LPM key: __u32 prefixlen (host order) + address bytes.
+    uint8_t key[20] = {};
+    std::memcpy(key, &e.prefixlen, sizeof(e.prefixlen));
+    std::memcpy(key + 4, e.addr, e.v6 ? 16 : 4);
+    if (bpf_map_update_elem(map_fd, key, &one, BPF_ANY) == 0) {
+      written++;
+    }
+  }
+  spdlog::info("geoip trie '{}': {} of {} prefixes loaded", map_name,
+               written, entries.size());
+}
+
+}  // namespace
+
 auto LoadZoneBundle(std::string_view bundle_dir,
                     std::string_view pin_root)
     -> std::expected<ZoneBundleHandles, Error<BpfError>> {
   using nlohmann::json;
   std::filesystem::path dir(bundle_dir);
+
+  auto geoip = ParseGeoipFile(bundle_dir);
+  if (!geoip) {
+    return std::unexpected(geoip.error());
+  }
+  std::set<std::string> geoip_done;
 
   std::ifstream mf(dir / "manifest.json");
   if (!mf) {
@@ -461,6 +558,12 @@ auto LoadZoneBundle(std::string_view bundle_dir,
     if (handles.conntrack_fd < 0) {
       int ct = FindMap(obj, "conntrack");
       if (ct >= 0) handles.conntrack_fd = ct;
+    }
+
+    // Populate this object's geoip LPM tries from the bundle's
+    // geoip.json (no-op for bundles without geoip() calls).
+    for (const auto& [map_name, entries] : *geoip) {
+      PopulateGeoipTrie(obj, map_name, entries, geoip_done);
     }
 
     // Populate each redirect destination's devmap with that zone's

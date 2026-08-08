@@ -107,5 +107,79 @@ TEST_F(BpfLoaderResolverTest, BundleSymlinkFollowed) {
   EXPECT_EQ(picked, (link / "main.bpf.o").string());
 }
 
+// --- geoip.json bundle parsing (v0.4 hardware-validation gap) -------
+
+class GeoipParseTest : public BpfLoaderResolverTest {
+ protected:
+  void WriteGeoip(const std::string& body) {
+    std::ofstream(scratch_ / "geoip.json") << body;
+  }
+};
+
+TEST_F(GeoipParseTest, AbsentFileYieldsEmptyTries) {
+  auto tries = ParseGeoipFile(scratch_.string());
+  ASSERT_TRUE(tries.has_value());
+  EXPECT_TRUE(tries->empty());
+}
+
+TEST_F(GeoipParseTest, ParsesV4AndV6Prefixes) {
+  WriteGeoip(R"({"tries": [
+    {"map": "fwl_geoip_0", "family": "ipv4",
+     "prefixes": ["10.99.77.0/24", "192.0.2.0/25"]},
+    {"map": "fwl_geoip_1", "family": "ipv6",
+     "prefixes": ["2001:db8::/32"]}
+  ]})");
+  auto tries = ParseGeoipFile(scratch_.string());
+  ASSERT_TRUE(tries.has_value());
+  ASSERT_EQ(tries->size(), 2u);
+
+  const auto& v4 = tries->at("fwl_geoip_0");
+  ASSERT_EQ(v4.size(), 2u);
+  EXPECT_EQ(v4[0].prefixlen, 24u);
+  EXPECT_FALSE(v4[0].v6);
+  // 10.99.77.0 in network order.
+  EXPECT_EQ(v4[0].addr[0], 10);
+  EXPECT_EQ(v4[0].addr[1], 99);
+  EXPECT_EQ(v4[0].addr[2], 77);
+  EXPECT_EQ(v4[0].addr[3], 0);
+  EXPECT_EQ(v4[1].prefixlen, 25u);
+
+  const auto& v6 = tries->at("fwl_geoip_1");
+  ASSERT_EQ(v6.size(), 1u);
+  EXPECT_TRUE(v6[0].v6);
+  EXPECT_EQ(v6[0].prefixlen, 32u);
+  EXPECT_EQ(v6[0].addr[0], 0x20);
+  EXPECT_EQ(v6[0].addr[1], 0x01);
+  EXPECT_EQ(v6[0].addr[2], 0x0d);
+  EXPECT_EQ(v6[0].addr[3], 0xb8);
+}
+
+TEST_F(GeoipParseTest, MalformedJsonIsAnError) {
+  WriteGeoip("{not json");
+  auto tries = ParseGeoipFile(scratch_.string());
+  EXPECT_FALSE(tries.has_value());
+}
+
+TEST_F(GeoipParseTest, PrefixWithoutLengthIsAnError) {
+  WriteGeoip(R"({"tries": [{"map": "m", "family": "ipv4",
+                "prefixes": ["10.0.0.0"]}]})");
+  auto tries = ParseGeoipFile(scratch_.string());
+  EXPECT_FALSE(tries.has_value());
+}
+
+TEST_F(GeoipParseTest, PrefixLengthOutOfRangeIsAnError) {
+  WriteGeoip(R"({"tries": [{"map": "m", "family": "ipv4",
+                "prefixes": ["10.0.0.0/33"]}]})");
+  auto tries = ParseGeoipFile(scratch_.string());
+  EXPECT_FALSE(tries.has_value());
+}
+
+TEST_F(GeoipParseTest, UnparseableAddressIsAnError) {
+  WriteGeoip(R"({"tries": [{"map": "m", "family": "ipv4",
+                "prefixes": ["not.an.ip/8"]}]})");
+  auto tries = ParseGeoipFile(scratch_.string());
+  EXPECT_FALSE(tries.has_value());
+}
+
 }  // namespace
 }  // namespace f

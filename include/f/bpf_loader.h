@@ -6,6 +6,7 @@
 
 #include <cstdint>
 #include <expected>
+#include <map>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -129,6 +130,27 @@ struct ZoneBundleHandles {
 auto LoadZoneBundle(std::string_view bundle_dir,
                     std::string_view pin_root)
     -> std::expected<ZoneBundleHandles, Error<BpfError>>;
+
+/// One LPM-trie entry parsed from a bundle's geoip.json.
+struct GeoipTrieEntry {
+  uint32_t prefixlen = 0;
+  bool v6 = false;
+  /// Network-order address bytes; the first 4 are used for v4.
+  uint8_t addr[16] = {};
+};
+
+/// Parsed geoip.json: trie map name -> its prefix entries.
+using GeoipTries =
+    std::map<std::string, std::vector<GeoipTrieEntry>>;
+
+/// Parse `<bundle_dir>/geoip.json` (written by `fwl compile --bundle
+/// --geoip`). Returns an empty map when the file is absent — a bundle
+/// without geoip() calls has no geoip.json. Malformed JSON or an
+/// unparseable prefix is an error: silently loading empty tries would
+/// make every geoip() rule a no-op, which is exactly the failure mode
+/// the bundle file exists to prevent.
+auto ParseGeoipFile(std::string_view bundle_dir)
+    -> std::expected<GeoipTries, Error<BpfError>>;
 
 /// True when `<bundle_dir>/manifest.json` describes a multi-zone bundle
 /// (a non-empty "zones" array and a non-empty "programs" array). The
