@@ -1,0 +1,52 @@
+# Storm shield — testnet gateway hiding behind a flat plant-wide L2.
+#
+# wan0 faces the corporate network: one giant broadcast domain, every
+# ARP/mDNS/SSDP/NetBIOS frame from the whole site arrives here. Policy:
+# kill the firehose at the driver, admit only replies to flows the
+# testnet initiated, count what got dropped as evidence.
+#
+# Known gap: ARP (non-IP) passes the FWL program untouched — the
+# kernel needs it for the wan gateway anyway, and FWL has no L2
+# fields yet.
+
+zone wan = [wan0]
+zone lan = [lan0]
+
+@xdp(wan)
+
+# --- evidence counters ---
+count wan_total
+count noise_multicast if pkt.dst_ip in 224.0.0.0/4
+count noise_broadcast if pkt.dst_ip == 255.255.255.255
+count noise_netbios if pkt.proto == udp
+       and (pkt.dst_port == 137 or pkt.dst_port == 138)
+
+# --- keep the wan lease alive (DHCP offers arrive as broadcast) ---
+allow if pkt.proto == udp and pkt.src_port == 67 and pkt.dst_port == 68
+
+# --- the plant-floor firehose dies here ---
+# mDNS, SSDP, LLMNR, WS-Discovery — all multicast, all dead:
+drop if pkt.dst_ip in 224.0.0.0/4
+drop if pkt.dst_ip == 255.255.255.255
+# NetBIOS name/datagram service arrives as subnet-directed broadcast,
+# which looks unicast to us — match the ports instead:
+drop if pkt.proto == udp
+       and (pkt.dst_port == 137 or pkt.dst_port == 138)
+# Site-specific: uncomment with the corporate subnet's directed
+# broadcast address once known.
+# drop if pkt.dst_ip == 10.1.255.255
+
+# --- flood guard for whatever unicast noise remains ---
+drop limited by rate_limit(2000, per=src_ip)
+
+# --- replies to testnet-initiated flows only; nothing else exists ---
+allow if conntrack(pkt).state == established
+
+default drop
+
+@xdp(lan)
+
+# Testnet egress: hide every inside address behind the wan IP.
+count lan_out
+masquerade
+redirect to wan

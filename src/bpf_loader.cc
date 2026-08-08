@@ -246,7 +246,13 @@ auto ReplaceXdp(int ifindex, int new_prog_fd, int old_prog_fd)
 auto PinMaps(const BpfHandles& h,
              std::string_view pin_path)
     -> std::expected<void, Error<BpfError>> {
-  std::filesystem::create_directories(pin_path);
+  std::error_code ec;
+  std::filesystem::create_directories(pin_path, ec);
+  if (ec) {
+    return MakeError(BpfError::kLoadFailed,
+        std::format("create pin path {}: {}",
+                    pin_path, ec.message()));
+  }
   std::string base(pin_path);
 
   struct MapPin {
@@ -397,9 +403,17 @@ auto LoadZoneBundle(std::string_view bundle_dir,
   }
 
   // Common pin root so LIBBPF_PIN_BY_NAME maps (conntrack, devmaps)
-  // resolve to one kernel map across every zone object.
+  // resolve to one kernel map across every zone object. Fails without
+  // privileges (bpffs is root-owned) — surface that as a load error
+  // rather than an exception.
   std::string pin_root_str(pin_root);
-  std::filesystem::create_directories(pin_root_str);
+  std::error_code ec;
+  std::filesystem::create_directories(pin_root_str, ec);
+  if (ec) {
+    return MakeError(BpfError::kLoadFailed,
+        std::format("create pin root {}: {}",
+                    pin_root_str, ec.message()));
+  }
 
   ZoneBundleHandles handles;
   for (const auto& p : manifest.value("programs", json::array())) {
@@ -499,12 +513,12 @@ auto IsMultiZoneBundle(std::string_view bundle_dir) -> bool {
   } catch (const std::exception&) {
     return false;
   }
-  // A multi-zone bundle carries a non-empty "zones" array and a
-  // matching "programs" array; the legacy single-program manifest has
-  // neither. This is the routing signal for the cold-boot and
+  // A v0.4 bundle carries a non-empty "programs" array (one entry
+  // per @xdp block); the legacy single-program manifest has none.
+  // "zones" stays empty when the source declares no named zones, so
+  // it must not gate the routing signal for the cold-boot and
   // hot-reload paths.
-  return !manifest.value("zones", json::array()).empty() &&
-         !manifest.value("programs", json::array()).empty();
+  return !manifest.value("programs", json::array()).empty();
 }
 
 auto DetachZoneBundle(const ZoneBundleHandles& handles) -> void {

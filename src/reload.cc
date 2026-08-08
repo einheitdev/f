@@ -90,7 +90,7 @@ auto RunCompiler(std::string_view fwl_path,
       nullptr,
   };
 
-  // Pipe for capturing the JSON envelope from stdout.
+  // Pipe for capturing stdout (error context on failure).
   int stdout_pipe[2] = {-1, -1};
   if (pipe(stdout_pipe) != 0) {
     return MakeError(ReloadError::kSpawnFailed,
@@ -345,33 +345,15 @@ auto ReloadFromSource(Engine& e)
   spdlog::info("reload: compiling {} -> {}",
                e.watcher.source_path, bundle_dir.string());
 
-  auto envelope = RunCompiler(
+  // v0.4: `fwl compile --bundle` signals success via exit status
+  // and the bundle's manifest.json (validated in ApplyBundle) —
+  // there is no JSON envelope on stdout anymore.
+  auto compiled = RunCompiler(
       e.watcher.fwl_path,
       e.watcher.source_path,
       bundle_dir.string());
-  if (!envelope) {
-    return std::unexpected(envelope.error());
-  }
-
-  // Validate the envelope.
-  json env;
-  try {
-    env = json::parse(*envelope);
-  } catch (const std::exception& ex) {
-    return MakeError(ReloadError::kCompileFailed,
-                     std::format("parse envelope: {}",
-                                 ex.what()));
-  }
-  if (env.value("status", std::string()) != "ok") {
-    std::string errs;
-    if (env.contains("errors")) {
-      for (const auto& e : env["errors"]) {
-        if (!errs.empty()) errs += "; ";
-        errs += e.get<std::string>();
-      }
-    }
-    return MakeError(ReloadError::kCompileFailed,
-                     errs.empty() ? "compile failed" : errs);
+  if (!compiled) {
+    return std::unexpected(compiled.error());
   }
 
   auto applied = ApplyBundle(e, bundle_dir.string());

@@ -114,12 +114,19 @@ add_bpf_object(fw bpf/fw.bpf.c)
 # ============================================================================
 # Engine library (BPF + ZMQ, no HTTP)
 # ============================================================================
+# yaml-cpp (system, for fd config file parsing)
+if(NOT TARGET yaml-cpp::yaml-cpp)
+  find_package(yaml-cpp REQUIRED)
+endif()
+
 add_library(libf-engine STATIC
   src/bpf_loader.cc
+  src/config.cc
   src/engine.cc
   src/reload.cc
   src/slow_path.cc
   src/components.cc
+  src/watcher.cc
 )
 
 target_include_directories(libf-engine PUBLIC
@@ -133,6 +140,7 @@ target_link_libraries(libf-engine PUBLIC
   nlohmann_json::nlohmann_json
   cppzmq
   spdlog::spdlog
+  yaml-cpp::yaml-cpp
   pthread
 )
 
@@ -182,13 +190,6 @@ add_subdirectory(
   ${CMAKE_BINARY_DIR}/_deps/einheit-ui
   EXCLUDE_FROM_ALL
 )
-
-# ============================================================================
-# yaml-cpp (system, for fd config file parsing)
-# ============================================================================
-if(NOT TARGET yaml-cpp::yaml-cpp)
-  find_package(yaml-cpp REQUIRED)
-endif()
 
 # ============================================================================
 # fd — BPF engine daemon
