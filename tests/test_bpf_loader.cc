@@ -12,6 +12,8 @@
 
 #include <gtest/gtest.h>
 
+#include <arpa/inet.h>
+
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
@@ -179,6 +181,23 @@ TEST_F(GeoipParseTest, UnparseableAddressIsAnError) {
                 "prefixes": ["not.an.ip/8"]}]})");
   auto tries = ParseGeoipFile(scratch_.string());
   EXPECT_FALSE(tries.has_value());
+}
+
+// --- masquerade address resolution ----------------------------------
+
+TEST(FirstZoneIpv4Test, LoopbackResolves) {
+  // 127.0.0.1 in network order — the one address every host has.
+  uint32_t addr = FirstZoneIpv4({"lo"});
+  EXPECT_EQ(addr, htonl(0x7F000001u));
+}
+
+TEST(FirstZoneIpv4Test, UnknownInterfaceYieldsZero) {
+  EXPECT_EQ(FirstZoneIpv4({"no-such-if0"}), 0u);
+}
+
+TEST(FirstZoneIpv4Test, FallsThroughToLaterInterface) {
+  EXPECT_EQ(FirstZoneIpv4({"no-such-if0", "lo"}),
+            htonl(0x7F000001u));
 }
 
 }  // namespace
