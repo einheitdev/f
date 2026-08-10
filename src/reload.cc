@@ -245,6 +245,9 @@ auto ApplyBundle(Engine& e, std::string_view bundle_dir)
     e.zone_bundle = *loaded;
     if (e.zone_bundle.conntrack_fd >= 0) {
       e.conntrack.map_fd = e.zone_bundle.conntrack_fd;
+      // Mirror EngineInit: a reload must not leave GC switched off
+      // (see the note there — it never ran in bundle mode at all).
+      e.conntrack.enabled = true;
     }
     ReloadResult out{};
     out.version = manifest["version"].get<std::string>();

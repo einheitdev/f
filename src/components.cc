@@ -112,13 +112,39 @@ auto RuleTable::SetState(const nlohmann::json& j)
 // IfaceMgr
 // ============================================================
 
+namespace {
+
+/// True when the kernel currently has an XDP program on `ifindex`.
+///
+/// This used to be reported as the literal `true` for every tracked
+/// interface, which made `fctl status` structurally incapable of
+/// reporting a disarmed firewall: after an external detach (another
+/// tool, `ip link set xdp off`, an interface replaced underneath us)
+/// the daemon still claimed every interface was attached while
+/// traffic passed unfiltered. Verified on hardware —
+/// tests/system/hw/l8_03_attach_truth.sh saw 50/50 previously
+/// dropped frames leak while status reported attached.
+///
+/// Asking the kernel costs one netlink round-trip per interface on a
+/// status call, which is the right trade for a field whose entire
+/// purpose is to answer "is the firewall actually on".
+auto XdpAttached(int ifindex) -> bool {
+  __u32 prog_id = 0;
+  if (bpf_xdp_query_id(ifindex, 0, &prog_id) != 0) {
+    return false;
+  }
+  return prog_id != 0;
+}
+
+}  // namespace
+
 auto IfaceMgr::GetState() const -> nlohmann::json {
   auto arr = nlohmann::json::array();
   for (uint32_t i = 0; i < count; i++) {
     arr.push_back({
         {"name", interfaces[i].name},
         {"ifindex", interfaces[i].ifindex},
-        {"xdp_attached", true},
+        {"xdp_attached", XdpAttached(interfaces[i].ifindex)},
     });
   }
   return {{"interfaces", arr}, {"count", count}};

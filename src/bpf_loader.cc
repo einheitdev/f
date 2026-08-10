@@ -739,6 +739,31 @@ auto LoadZoneBundle(std::string_view bundle_dir,
     handles.programs.push_back(std::move(zh));
   }
 
+  // A manifest that lists programs but yields none loadable is not a
+  // successful load — it is an unusable bundle, and treating it as
+  // success is catastrophic. On reload, ApplyBundle detaches every
+  // interface the previous bundle held that the new one does not
+  // cover; an empty program set covers nothing, so the entire
+  // firewall silently disappears while the journal logs "ok" and
+  // systemd still reports the unit healthy. The `current` symlink is
+  // then advanced to the broken bundle, so the next boot comes up
+  // with no policy either. Verified on hardware before this check
+  // existed (tests/system/hw/l8_01_objectless_bundle.sh: XDP
+  // attachment went 1 -> 0 with fd active).
+  //
+  // Failing here keeps the old bundle attached on the reload path
+  // (ApplyBundle propagates the error before touching anything) and
+  // makes the cold-boot path exit loudly instead of coming up naked.
+  // The common cause is compiling a bundle on a host without clang,
+  // which emits `"object": null` for every zone.
+  if (handles.programs.empty()) {
+    return bail(BpfError::kLoadFailed,
+        std::format("bundle {} has no loadable zone programs "
+                    "(every manifest entry lacks a compiled "
+                    "object) — refusing to apply it",
+                    bundle_dir));
+  }
+
   return handles;
 }
 

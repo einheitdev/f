@@ -44,13 +44,15 @@ prog_id() {
   ip -d link show "$RECV_IF" | grep -o "prog/xdp id [0-9]*" \
     | awk '{print $3}'
 }
+# NOTE: everything noisy in here must go to stderr — this function's
+# stdout IS its return value, and the senders print a summary line.
 enforcing() {
   ip link set dev "$RECV_IF" promisc on 2>/dev/null || true
-  hw::sniff_start 6
-  hw::send 30 'udp(src_ip="10.99.190.1", dst_port=6300)'
-  hw::send 30 'udp(src_ip="10.99.190.1", dst_port=6301)'
+  hw::sniff_start 6 >&2
+  hw::send 30 'udp(src_ip="10.99.190.1", dst_port=6300)' >&2
+  hw::send 30 'udp(src_ip="10.99.190.1", dst_port=6301)' >&2
   sleep 1
-  hw::sniff_wait
+  hw::sniff_wait >&2
   local blocked passed
   blocked=$(hw::sniff_get udp:10.99.190.1:6300)
   passed=$(hw::sniff_get udp:10.99.190.1:6301)

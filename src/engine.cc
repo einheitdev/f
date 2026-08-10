@@ -286,6 +286,26 @@ auto EngineInit(Engine& e,
     }
     e.zone_bundle = *zb;
     e.conntrack.map_fd = e.zone_bundle.conntrack_fd;
+    // Garbage collection is gated on `enabled`, which was only ever
+    // set by ApplyConfig — the single-program rule path. A bundle
+    // deployment (i.e. every v0.4 deployment) therefore never
+    // collected: entries accumulated until the map hit its 65536
+    // cap, after which new flows stopped being tracked and every
+    // established-state rule silently began mismatching, with
+    // nothing logged. Measured on hardware —
+    // tests/system/hw/l8_02_conntrack_gc.sh saw entries only grow
+    // with enabled=false and total_evicted stuck at 0.
+    //
+    // Enable it whenever the bundle actually carries a conntrack map
+    // (a policy that never reads conntrack(pkt).state has none, and
+    // there is nothing to collect). The struct defaults — 300 s
+    // idle timeout, 30 s sweep — are the documented ones.
+    if (e.zone_bundle.conntrack_fd >= 0) {
+      e.conntrack.enabled = true;
+      spdlog::info(
+          "Conntrack GC enabled (timeout {}s, sweep every {}s).",
+          e.conntrack.timeout_s, e.conntrack.gc_interval_s);
+    }
     // Record the attached interfaces for status reporting.
     for (const auto& prog : e.zone_bundle.programs) {
       for (int idx : prog.ifindexes) {
