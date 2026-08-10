@@ -2,13 +2,15 @@
 
 Captures frames on <iface> for <seconds> via AF_PACKET (which taps
 AFTER XDP on ingress — XDP_DROPped frames never appear here) and
-tallies test frames by flow key. Only frames whose IPv4 source is in
-10.99.0.0/16 count; switch chatter and household noise are ignored.
+tallies test frames by flow key. Only frames addressed within the
+test ranges count (10.99.0.0/16 for v4, 2001:db8:99::/48 for v6);
+switch chatter and household noise are ignored.
 
 Key format (JSON object printed on exit):
   tcp:<src_ip>:<dst_port>    TCP frames
   udp:<src_ip>:<dst_port>    UDP frames
   icmp:<src_ip>:<type>       ICMP frames
+  tcp6:<src_ip>:<dst_port>   IPv6 TCP frames (same for udp6/icmp6)
   vlan<id>:<proto>:<src_ip>  802.1Q-tagged frames
 
 With --detail (NAT evidence), TCP/UDP keys instead carry both
@@ -26,17 +28,25 @@ import time
 
 ETH_P_ALL = 0x0003
 ETH_P_IP = 0x0800
+ETH_P_IPV6 = 0x86DD
 ETH_P_8021Q = 0x8100
+# Test traffic lives in 10.99.0.0/16 (v4) and 2001:db8:99::/48 (v6);
+# everything else on the wire is ambient noise to be ignored.
+V4_TEST_PREFIX = "10.99."
+V6_TEST_PREFIX = "2001:db8:99:"
+
 
 def _fold(total: int) -> int:
   while total >> 16:
     total = (total & 0xFFFF) + (total >> 16)
   return total
 
+
 def _sum16(data: bytes) -> int:
   if len(data) % 2:
     data += b"\x00"
   return sum(struct.unpack(f">{len(data) // 2}H", data))
+
 
 def checksums_ok(frame: bytes, l3_off: int) -> bool:
   """Validate the IPv4 header checksum and the TCP/UDP checksum."""
@@ -58,6 +68,47 @@ def checksums_ok(frame: bytes, l3_off: int) -> bool:
             + struct.pack(">H", len(l4)))
   return _fold(_sum16(pseudo) + _sum16(l4)) == 0xFFFF
 
+
+def _v6_key(frame: bytes, l3_off: int, vlan_id) -> str | None:
+  """Flow key for an IPv6 frame.
+
+  v0.4 reads the fixed 40-byte header only (no extension-header
+  walk), so the key mirrors that: next_header is treated as the
+  protocol, exactly like the XDP program sees it. A frame carrying
+  extension headers therefore keys on the extension type — which is
+  the point when testing that the program does not match L4 rules on
+  such a frame.
+  """
+  if len(frame) < l3_off + 40:
+    return None
+  next_hdr = frame[l3_off + 6]
+  src = socket.inet_ntop(
+    socket.AF_INET6, frame[l3_off + 8:l3_off + 24]
+  )
+  dst = socket.inet_ntop(
+    socket.AF_INET6, frame[l3_off + 24:l3_off + 40]
+  )
+  if not (src.startswith(V6_TEST_PREFIX)
+          or dst.startswith(V6_TEST_PREFIX)):
+    return None
+  l4_off = l3_off + 40
+  if next_hdr in (6, 17):
+    if len(frame) < l4_off + 4:
+      return None
+    dst_port = struct.unpack_from(">H", frame, l4_off + 2)[0]
+    name = "tcp6" if next_hdr == 6 else "udp6"
+    base = f"{name}:{src}:{dst_port}"
+  elif next_hdr == 58:
+    if len(frame) < l4_off + 2:
+      return None
+    base = f"icmp6:{src}:{frame[l4_off]}"
+  else:
+    base = f"v6nh{next_hdr}:{src}:0"
+  if vlan_id is not None:
+    return f"vlan{vlan_id}:{base}"
+  return base
+
+
 def flow_key(frame: bytes, detail: bool = False) -> str | None:
   if len(frame) < 34:
     return None
@@ -70,14 +121,16 @@ def flow_key(frame: bytes, detail: bool = False) -> str | None:
     tci, ethertype = struct.unpack_from(">HH", frame, 14)
     vlan_id = tci & 0x0FFF
     l3_off = 18
+  if ethertype == ETH_P_IPV6:
+    return _v6_key(frame, l3_off, vlan_id)
   if ethertype != ETH_P_IP:
     return None
   ihl = (frame[l3_off] & 0x0F) * 4
   proto = frame[l3_off + 9]
   src_ip = socket.inet_ntoa(frame[l3_off + 12:l3_off + 16])
   dst_ip = socket.inet_ntoa(frame[l3_off + 16:l3_off + 20])
-  if not (src_ip.startswith("10.99.")
-          or dst_ip.startswith("10.99.")):
+  if not (src_ip.startswith(V4_TEST_PREFIX)
+          or dst_ip.startswith(V4_TEST_PREFIX)):
     return None
   l4_off = l3_off + ihl
   if proto == 6 or proto == 17:
@@ -99,6 +152,7 @@ def flow_key(frame: bytes, detail: bool = False) -> str | None:
   if vlan_id is not None:
     return f"vlan{vlan_id}:{base}"
   return base
+
 
 def main() -> int:
   iface, seconds = sys.argv[1], float(sys.argv[2])
@@ -161,6 +215,7 @@ def main() -> int:
   json.dump(tallies, sys.stdout)
   print()
   return 0
+
 
 if __name__ == "__main__":
   sys.exit(main())
