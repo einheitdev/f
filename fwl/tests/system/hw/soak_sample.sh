@@ -25,11 +25,13 @@ except Exception:
   print(-1)
 ")
 temp=$(cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null || echo 0)
+# i350 die sensor (igb hwmon "i350bb"; crit 110C).
+nic=$(cat /sys/class/hwmon/hwmon8/temp1_input 2>/dev/null || echo 0)
 errs=$(journalctl -u fd --since "-5min" -p err --no-pager -q \
   | wc -l)
 flaps=$(dmesg | grep -c "enp1s0f[012].*Link is Up" || true)
 rx=$(ethtool -S enp1s0f1 | awk '/^ *rx_packets:/{print $2}')
 
-printf '{"ts":"%s","counters":%s,"fd_rss_kb":%s,"conntrack":%s,"soc_temp_mC":%s,"fd_err_5min":%s,"linkup_total":%s,"rx_packets":%s,"fd_active":"%s"}\n' \
-  "$(date -u +%FT%TZ)" "$counters" "$fd_rss" "$ct" "$temp" \
+printf '{"ts":"%s","counters":%s,"fd_rss_kb":%s,"conntrack":%s,"soc_temp_mC":%s,"i350_die_mC":%s,"fd_err_5min":%s,"linkup_total":%s,"rx_packets":%s,"fd_active":"%s"}\n' \
+  "$(date -u +%FT%TZ)" "$counters" "$fd_rss" "$ct" "$temp" "$nic" \
   "$errs" "$flaps" "$rx" "$(systemctl is-active fd)" >> "$OUT"
