@@ -49,6 +49,20 @@ def main() -> int:
           f"running with a bundle loaded?")
     return 2
 
+  # An XDP attach resets the igb links and the switch port needs
+  # seconds to forward again — every fd restart (including the one
+  # each hw.sh scenario does on exit) lands here. Without this wait
+  # the smoke test reports a false failure on a perfectly healthy
+  # rig. Bounded: if the wire is genuinely dead, say so.
+  probe = subprocess.run(
+    [sys.executable, str(HERE / "sendmany.py"), "--probe",
+     SEND_IF, RECV_IF, "45"], capture_output=True, text=True,
+  )
+  if probe.returncode != 0:
+    print(f"wire dead: no frame crossed {SEND_IF} -> {RECV_IF} in "
+          f"45 s. Check link state and the EX2300 port config.")
+    return 1
+
   subprocess.run(
     [sys.executable, str(HERE / "sendmany.py"), "--teach",
      RECV_IF, SEND_IF], check=True, capture_output=True,
