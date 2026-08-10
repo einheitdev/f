@@ -5,6 +5,7 @@
 
 #include <spawn.h>
 #include <sys/wait.h>
+#include <net/if.h>
 #include <unistd.h>
 
 #include <chrono>
@@ -248,6 +249,23 @@ auto ApplyBundle(Engine& e, std::string_view bundle_dir)
       // Mirror EngineInit: a reload must not leave GC switched off
       // (see the note there — it never ran in bundle mode at all).
       e.conntrack.enabled = true;
+    }
+    // Re-derive the tracked interface list from the bundle that is
+    // now attached. Leaving it stale made `fctl status` describe the
+    // boot-time topology forever, and gave EngineStop the wrong set
+    // to detach.
+    e.ifaces.count = 0;
+    for (const auto& prog : e.zone_bundle.programs) {
+      for (int idx : prog.ifindexes) {
+        if (e.ifaces.count >= sizeof(e.ifaces.interfaces) /
+                                  sizeof(e.ifaces.interfaces[0])) {
+          break;
+        }
+        auto& entry = e.ifaces.interfaces[e.ifaces.count];
+        entry.ifindex = idx;
+        if_indextoname(static_cast<unsigned int>(idx), entry.name);
+        e.ifaces.count++;
+      }
     }
     ReloadResult out{};
     out.version = manifest["version"].get<std::string>();

@@ -501,8 +501,21 @@ auto EngineStop(Engine& e) -> void {
   SlowPathStop(e.slow_path);
 
   spdlog::info("Detaching XDP.");
-  for (uint32_t i = 0; i < e.ifaces.count; i++) {
-    DetachXdp(e.ifaces.interfaces[i].ifindex);
+  // Detach what is actually attached, not what was attached at
+  // startup. `e.ifaces` is populated once in EngineInit; a reload
+  // that changes zone membership replaces `e.zone_bundle` without
+  // touching it. Walking the stale list left every interface a
+  // reload had ADDED still running an XDP program after a clean
+  // `systemctl stop` — a firewall with no daemon behind it,
+  // surviving until reboot or a manual detach, and liable to
+  // collide with the next start. Measured on hardware:
+  // tests/system/hw/l8_05_stale_ifaces.sh.
+  if (!e.zone_bundle.programs.empty()) {
+    DetachZoneBundle(e.zone_bundle);
+  } else {
+    for (uint32_t i = 0; i < e.ifaces.count; i++) {
+      DetachXdp(e.ifaces.interfaces[i].ifindex);
+    }
   }
   e.ctrl_socket.reset();
   e.zmq_ctx.reset();
