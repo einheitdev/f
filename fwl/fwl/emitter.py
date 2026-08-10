@@ -807,6 +807,13 @@ def _emit_parse_prelude(
   # inside the IPv4 branch after the fixed-header bounds check
   # succeeds, mirroring the v6_ok pattern.
   decls.append("__u8 v4_ok = 0;")
+  # Records "this frame is IPv6" independently of whether the v6
+  # parse path was generated. The non-IP early-out must not swallow
+  # IPv6 frames: FWL_V02_SPEC.md:937 requires that in a v0.1-shaped
+  # program they "fall through every rule ... and reach the default
+  # action". Passing them instead makes `default drop` forward all
+  # IPv6 traffic.
+  decls.append("__u8 is_v6_frame = 0;")
   # l4_ok gates port and TCP-flag reads. Set to 1 only inside the
   # TCP/UDP guard blocks after the L4 bounds check succeeds.
   if _needs_l4(fields):
@@ -953,9 +960,23 @@ def _emit_parse_prelude(
             }}
           }}"""
 
+    # A non-first fragment (offset != 0) carries no L4 header — the
+    # bytes at ip_hlen are ordinary payload. Reading them as ports or
+    # flags lets an attacker choose what the filter sees, which is the
+    # classic tiny-fragment bypass: payload crafted to mimic an
+    # allowed port walks through a `default drop` policy. Verified on
+    # hardware before this guard existed (tests/system/hw/
+    # l6_01_fragments.sh: 50/50 such fragments passed).
+    #
+    # Gating the whole L4 parse block leaves l4_ok/icmp_ok at 0, so
+    # every port, TCP-flag, and ICMP type/code guard fails closed,
+    # while pkt.proto / src_ip / dst_ip (read outside this block)
+    # still match — exactly what FWL_V01_SPEC:204 specifies.
     l4_block = f"""
         __u32 ip_hlen = ip->ihl * 4;
-        if (ip_hlen >= sizeof(struct iphdr) &&
+        __u8 fwl_first_frag =
+            (bpf_ntohs(ip->frag_off) & 0x1FFF) == 0;
+        if (fwl_first_frag && ip_hlen >= sizeof(struct iphdr) &&
             (void *)ip + ip_hlen <= data_end) \
 {{{tcp_block}{udp_block}{icmp_block}
         }}"""
@@ -1042,7 +1063,13 @@ def _emit_parse_prelude(
   # v0.4: when the program reads vlan fields, vlan_ok joins the gate
   # so a tagged non-IP frame (or a tagged frame truncated before L3)
   # still reaches the vlan-matching rules instead of early-passing.
+  # ...but an IPv6 frame is IP, and the spec requires it to reach the
+  # default action even when the v6 parse path was not generated.
+  # Excluding it from the early-out is what makes `default drop`
+  # actually deny IPv6 (verified on wire:
+  # tests/system/hw/l1_13_ipv6_activation.sh).
   vlan_gate = " && !vlan_ok" if needs_vlan else ""
+  vlan_gate += " && !is_v6_frame"
   return f"""\
 {decl_block}
   void *data = (void *)(long)ctx->data;
@@ -1051,6 +1078,9 @@ def _emit_parse_prelude(
   if ((void *)(eth + 1) <= data_end) {{
     __u16 l3_proto = eth->h_proto;
     void *l3 = (void *)(eth + 1);{vlan_block}
+    if (l3_proto == bpf_htons(ETH_P_IPV6)) {{
+      is_v6_frame = 1;
+    }}
     if (l3_proto == bpf_htons(ETH_P_IP)) {{
       struct iphdr *ip = l3;
       if ((void *)(ip + 1) <= data_end) {{

@@ -81,6 +81,20 @@ class TestPrelude:
     assert "(icmp6_ok && (icmp6_code != 0))" in src
 
 
+def _early_out(src):
+  """Return the non-IP early-out line, or None.
+
+  Matched by shape rather than exact text: the gate accumulates
+  terms (vlan_ok, is_v6_frame) as the language grows, and these
+  tests are about which frames escape it, not its spelling.
+  """
+  for line in src.splitlines():
+    s = line.strip()
+    if s.startswith("if (!v4_ok") and "return XDP_PASS;" in s:
+      return s
+  return None
+
+
 class TestNonIpEarlyOut:
   """Pin the ARP/non-IP early-out per planning/SOAK_INCIDENTS.md
   Incident #3. The dogfood soak surfaced that programs with
@@ -90,7 +104,7 @@ class TestNonIpEarlyOut:
   the prelude, when the program references any IP-aware field."""
   def test_prelude_emits_non_ip_early_out(self):
     src = emit("@xdp(eth0)\ndrop if pkt.proto == tcp\n")
-    assert "if (!v4_ok && !v6_ok) return XDP_PASS;" in src
+    assert _early_out(src) is not None
 
   def test_no_prelude_no_early_out(self):
     src = emit("@xdp(eth0)\nallow\n")
@@ -98,13 +112,28 @@ class TestNonIpEarlyOut:
     # is explicitly choosing to apply the action to every frame).
     assert "v4_ok" not in src
 
+  def test_ipv6_is_excluded_from_the_early_out(self):
+    # FWL_V02_SPEC.md:937 — in a program with no IPv6 surface,
+    # IPv6 frames "fall through every rule ... and reach the
+    # default action". Letting them take the non-IP early-out
+    # makes `default drop` forward all IPv6 traffic.
+    src = emit(
+      "@xdp(eth0)\n"
+      "count v4 if pkt.src_ip in 10.0.0.0/8\n"
+      "default drop\n"
+    )
+    gate = _early_out(src)
+    assert gate is not None
+    assert "!is_v6_frame" in gate
+    assert "is_v6_frame = 1;" in src
+
   def test_v6_active_program_keeps_early_out(self):
     src = emit(
       "@xdp(eth0)\n"
       "allow if pkt.src_ip6 in 2001:db8::/32\n"
       "default drop\n"
     )
-    assert "if (!v4_ok && !v6_ok) return XDP_PASS;" in src
+    assert _early_out(src) is not None
 
   def test_tier2_default_drop_does_not_drop_non_ip(self):
     src = emit(
@@ -116,9 +145,10 @@ class TestNonIpEarlyOut:
     )
     # Without the early-out, ARP would land on the trailing
     # `return XDP_DROP;` and kill the link.
-    assert "if (!v4_ok && !v6_ok) return XDP_PASS;" in src
+    gate = _early_out(src)
+    assert gate is not None
     # And the early-out must precede any user rule.
-    early_pos = src.index("if (!v4_ok && !v6_ok) return XDP_PASS;")
+    early_pos = src.index(gate)
     drop_pos = src.index("return XDP_DROP")
     assert early_pos < drop_pos
 

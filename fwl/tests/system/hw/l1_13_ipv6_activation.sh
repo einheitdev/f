@@ -1,19 +1,19 @@
 #!/usr/bin/env bash
 # Two documented IPv6 semantics with real operational teeth.
 #
-# PHASE A — the v6 parse path is conditional (FWL_V02_SPEC
-# "Compilation" + the proto-enum table). A program that touches no
-# IPv6 surface is "v0.1-shaped": it parses IPv4 only, and an IPv6
-# frame is unparseable, so it takes the early-out — XDP_PASS —
-# *bypassing `default drop` entirely*.
+# PHASE A — a program touching no IPv6 surface is "v0.1-shaped":
+# it parses IPv4 only, so an IPv6 frame matches no rule. The spec is
+# explicit about where such a frame ends up:
 #
-#   "a v0.1-shaped program gets v0.1 behaviour on every packet,
-#    including v6 packets, exactly as in v0.1"  (FWL_V02_SPEC:171)
+#   "Frames with EtherType 0x86DD (IPv6) fall through every rule,
+#    exactly as in v0.1, and reach the default action."
+#                                        (FWL_V02_SPEC.md:937)
 #
-# This is a deliberate strict-superset guarantee, and a serious
-# footgun: a deny-all firewall that never mentions IPv6 forwards
-# 100% of IPv6 traffic. Asserted here so it can never regress
-# silently and so the operator guide has wire evidence to point at.
+# So `default drop` must DROP IPv6. The emitter's non-IP early-out
+# used to swallow them first, making a deny-all policy forward 100%
+# of IPv6 traffic — verified on this rig at 100/100 before the fix.
+# The early-out exists to protect ARP/BPDU (soak Incident #3), which
+# is right; it simply must not apply to IPv6, which is IP.
 #
 # PHASE B — with the v6 path activated (one `pkt.src_ip6` rule is
 # enough), the same frames become subject to the rules. Conntrack,
@@ -51,9 +51,10 @@ assert_eq "deny-all: v4 frames seen by the program" \
   "$(hw::counter seen_v4)" 100
 assert_eq "deny-all: v4 frames DROPPED as intended" \
   "$(hw::sniff_get tcp:10.99.13.1:80)" 0
-assert_eq "deny-all WITHOUT a v6 rule: every IPv6 frame BYPASSES \
-default drop (documented v0.1-shape guarantee, FWL_V02_SPEC:171)" \
-  "$(hw::sniff_get 'tcp6:2001:db8:99:aa::1:80')" 100
+assert_eq "deny-all WITHOUT a v6 rule: IPv6 reaches the default \
+action and is DROPPED (FWL_V02_SPEC:937; regression witness for the \
+early-out that used to forward all IPv6)" \
+  "$(hw::sniff_get 'tcp6:2001:db8:99:aa::1:80')" 0
 
 # ---------- PHASE B: v6 path activated ----------
 cat > "$FW" <<EOF

@@ -125,7 +125,8 @@ class TestEmitter:
 
   def test_early_out_omits_vlan_ok_when_not_referenced(self):
     src = _emit(H + "drop if pkt.src_ip in 10.0.0.0/8\ndefault allow\n")
-    assert "if (!v4_ok && !v6_ok) return XDP_PASS;" in src
+    assert "if (!v4_ok && !v6_ok && !is_v6_frame) return XDP_PASS;" \
+        in src
     assert "vlan_ok" not in src
 
   def test_l3_derives_from_vlan_aware_pointer(self):
