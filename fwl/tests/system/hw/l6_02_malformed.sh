@@ -84,8 +84,22 @@ verify L3 checksums; the stack drops it later)" \
   "$(hw::sniff_get tcp:10.99.20.15:443)" 50
 
 # --- QinQ: outer 0x88A8 is not parsed by v0.4 ---
-assert_eq "QinQ (0x88A8) is non-IP to the program, so default drop \
-does not apply — it takes the non-IP early-out and passes" \
+# The witness keys QinQ frames by their two tags. It cannot read the
+# inner IP — and neither can v0.4, which is the point. Asserting only
+# "no IP flow seen" would pass whether the frame was dropped or
+# merely unobservable, so assert the frame itself arrived.
+QINQ=$(hw::sniff_get qinq100.200)
+if [ "$QINQ" -eq 0 ]; then
+  log "BLOCKED: no 0x88A8 frame reached $RECV_IF — the EX2300 test \
+ports are 802.1Q trunks and drop 802.1ad outer tags. Testing QinQ \
+disposition needs dot1q-tunneling on the switch (or a back-to-back \
+cable). Skipped rather than asserting something unobservable."
+else
+  assert_eq "QinQ (0x88A8 outer) is non-IP to the program: it takes \
+the non-IP early-out and PASSES rather than hitting default drop" \
+    "$QINQ" 50
+fi
+assert_eq "QinQ inner IP stays invisible to IP rules" \
   "$(hw::sniff_get udp:10.99.20.16:443)" 0
 
 # --- shortip: observed, documented ---

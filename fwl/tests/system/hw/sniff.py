@@ -30,6 +30,10 @@ ETH_P_ALL = 0x0003
 ETH_P_IP = 0x0800
 ETH_P_IPV6 = 0x86DD
 ETH_P_8021Q = 0x8100
+# 802.1ad (QinQ) outer tag. v0.4 does not parse it, but the witness
+# must still see such frames: otherwise a dropped frame and
+# an unobservable one look identical.
+ETH_P_8021AD = 0x88A8
 # Test traffic lives in 10.99.0.0/16 (v4) and 2001:db8:99::/48 (v6);
 # everything else on the wire is ambient noise to be ignored.
 V4_TEST_PREFIX = "10.99."
@@ -115,6 +119,13 @@ def flow_key(frame: bytes, detail: bool = False) -> str | None:
   ethertype = struct.unpack_from(">H", frame, 12)[0]
   l3_off = 14
   vlan_id = None
+  if ethertype == ETH_P_8021AD:
+    # Outer 802.1ad tag, then an inner 802.1Q tag, then L3.
+    if len(frame) < 22:
+      return None
+    outer = struct.unpack_from(">H", frame, 14)[0] & 0x0FFF
+    inner = struct.unpack_from(">H", frame, 18)[0] & 0x0FFF
+    return f"qinq{outer}.{inner}"
   if ethertype == ETH_P_8021Q:
     if len(frame) < 38:
       return None
