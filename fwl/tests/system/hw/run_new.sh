@@ -6,8 +6,12 @@ set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
 declare -a RESULTS=()
 RC=0
-for script in "$HERE"/l5_*.sh "$HERE"/l7_*.sh "$HERE"/l8_*.sh \
-              "$HERE"/l9_*.sh; do
+# Policy-level tests first (cheap, independent). The l8 daemon
+# probes go last: several of them deliberately stop, wedge or
+# misconfigure fd, and a casualty there should not be mistaken
+# for a policy failure.
+for script in "$HERE"/l5_*.sh "$HERE"/l7_*.sh "$HERE"/l9_*.sh \
+              "$HERE"/l8_*.sh; do
   name=$(basename "$script" .sh)
   echo
   echo "================ $name ================"
