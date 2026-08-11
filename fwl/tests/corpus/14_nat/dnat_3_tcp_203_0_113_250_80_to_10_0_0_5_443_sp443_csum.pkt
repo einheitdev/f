@@ -1,0 +1,14 @@
+name: "dnat 3 tcp 203.0.113.250 80 to 10.0.0.5 443 sp443 csum"
+source_fw: |
+  @xdp(wan)
+  dnat to 10.0.0.5:443 if pkt.proto == tcp and pkt.dst_port == 80
+  allow
+test_packet:
+  builder: tcp(src_ip="93.184.216.34", dst_ip="203.0.113.250", src_port=443, dst_port=80, syn=true)
+expected:
+  compiles: true
+  bpf_action: allow
+  output_packet:
+    src_ip: "93.184.216.34"
+    dst_ip: "10.0.0.5"
+    dst_port: 443

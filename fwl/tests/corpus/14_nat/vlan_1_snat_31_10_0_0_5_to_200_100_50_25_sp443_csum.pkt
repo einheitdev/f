@@ -1,0 +1,14 @@
+name: "vlan 1 snat 31 10.0.0.5 to 200.100.50.25 sp443 csum"
+source_fw: |
+  @xdp(lan)
+  snat to 200.100.50.25 if pkt.proto == tcp
+  allow
+test_packet:
+  builder: tcp(src_ip="10.0.0.5", dst_ip="93.184.216.34", src_port=443, dst_port=65535, syn=true, vlan_id=1)
+expected:
+  compiles: true
+  bpf_action: allow
+  output_packet:
+    src_ip: "200.100.50.25"
+    dst_ip: "93.184.216.34"
+    src_port: 443

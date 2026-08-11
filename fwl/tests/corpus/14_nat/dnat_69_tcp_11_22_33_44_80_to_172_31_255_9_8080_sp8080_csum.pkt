@@ -1,0 +1,14 @@
+name: "dnat 69 tcp 11.22.33.44 80 to 172.31.255.9 8080 sp8080 csum"
+source_fw: |
+  @xdp(wan)
+  dnat to 172.31.255.9:8080 if pkt.proto == tcp and pkt.dst_port == 80
+  allow
+test_packet:
+  builder: tcp(src_ip="93.184.216.34", dst_ip="11.22.33.44", src_port=8080, dst_port=80, syn=true)
+expected:
+  compiles: true
+  bpf_action: allow
+  output_packet:
+    src_ip: "93.184.216.34"
+    dst_ip: "172.31.255.9"
+    dst_port: 8080

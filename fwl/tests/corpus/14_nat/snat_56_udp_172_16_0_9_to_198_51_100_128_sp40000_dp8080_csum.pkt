@@ -1,0 +1,14 @@
+name: "snat 56 udp 172.16.0.9 to 198.51.100.128 sp40000 dp8080 csum"
+source_fw: |
+  @xdp(lan)
+  snat to 198.51.100.128 if pkt.proto == udp
+  allow
+test_packet:
+  builder: udp(src_ip="172.16.0.9", dst_ip="208.67.222.222", src_port=40000, dst_port=8080)
+expected:
+  compiles: true
+  bpf_action: allow
+  output_packet:
+    src_ip: "198.51.100.128"
+    dst_ip: "208.67.222.222"
+    src_port: 40000
