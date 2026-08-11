@@ -11,12 +11,15 @@
 #include <ifaddrs.h>
 #include <netinet/in.h>
 
+#include <unistd.h>
+
 #include <cerrno>
 #include <cstring>
 #include <filesystem>
 #include <format>
 #include <fstream>
 #include <map>
+#include <optional>
 #include <set>
 #include <sstream>
 #include <string>
@@ -485,6 +488,103 @@ auto PopulateGeoipTrie(struct bpf_object* obj,
                written, entries.size());
 }
 
+/// The shape a zone object declares for `map`, before it is loaded.
+auto DeclaredShape(const struct bpf_map* map) -> PinnedMapShape {
+  PinnedMapShape shape;
+  shape.type = static_cast<uint32_t>(bpf_map__type(map));
+  shape.key_size = bpf_map__key_size(map);
+  shape.value_size = bpf_map__value_size(map);
+  shape.max_entries = bpf_map__max_entries(map);
+  shape.map_flags = bpf_map__map_flags(map);
+  return shape;
+}
+
+/// The shape of the map already pinned at `path`, if one is there.
+auto PinnedShape(const std::string& path)
+    -> std::optional<PinnedMapShape> {
+  int fd = bpf_obj_get(path.c_str());
+  if (fd < 0) {
+    return std::nullopt;
+  }
+  struct bpf_map_info info = {};
+  uint32_t len = sizeof(info);
+  int rc = bpf_map_get_info_by_fd(fd, &info, &len);
+  ::close(fd);
+  if (rc != 0) {
+    return std::nullopt;
+  }
+  PinnedMapShape shape;
+  shape.type = info.type;
+  shape.key_size = info.key_size;
+  shape.value_size = info.value_size;
+  shape.max_entries = info.max_entries;
+  shape.map_flags = info.map_flags;
+  return shape;
+}
+
+/// Note which zone pinned each map name, so a later conflict can name
+/// the zone the operator has to compare against rather than a path.
+auto RecordPinnedMaps(struct bpf_object* obj,
+                      const std::string& pin_root,
+                      const std::string& zone,
+                      std::map<std::string, std::string>& pinned_by)
+    -> void {
+  struct bpf_map* map = nullptr;
+  bpf_object__for_each_map(map, obj) {
+    const char* name = bpf_map__name(map);
+    if (name == nullptr) {
+      continue;
+    }
+    std::error_code ec;
+    if (!std::filesystem::exists(pin_root + "/" + name, ec) || ec) {
+      continue;
+    }
+    pinned_by.emplace(name, zone);
+  }
+}
+
+/// Turn a failed zone-object load into a sentence naming the map and
+/// the conflicting zones.
+///
+/// libbpf validates a map's definition against the pin it is reusing
+/// and returns -EINVAL when they differ. That error names nothing, so
+/// what reaches the operator is "load b.bpf.o failed: Invalid
+/// argument" for a fault that is entirely specific: one map, two
+/// zones, one number. Returns the empty string when no pinned map
+/// disagrees — the failure was something else and the caller keeps
+/// its own message.
+auto ExplainPinConflict(
+    struct bpf_object* obj, const std::string& pin_root,
+    const std::string& zone,
+    const std::map<std::string, std::string>& pinned_by) -> std::string {
+  struct bpf_map* map = nullptr;
+  bpf_object__for_each_map(map, obj) {
+    const char* name = bpf_map__name(map);
+    if (name == nullptr) {
+      continue;
+    }
+    std::string path = pin_root + "/" + name;
+    std::error_code ec;
+    if (!std::filesystem::exists(path, ec) || ec) {
+      continue;
+    }
+    auto existing = PinnedShape(path);
+    if (!existing) {
+      continue;
+    }
+    auto owner = pinned_by.find(name);
+    std::string held_by = owner == pinned_by.end()
+        ? std::format("the pin left at {} by an earlier load", path)
+        : std::format("zone '{}'", owner->second);
+    std::string message = DescribePinConflict(
+        name, zone, held_by, DeclaredShape(map), *existing);
+    if (!message.empty()) {
+      return message;
+    }
+  }
+  return {};
+}
+
 }  // namespace
 
 auto UnpinZonePrivateMaps(std::string_view pin_root) -> void {
@@ -520,6 +620,41 @@ auto UnpinZonePrivateMaps(std::string_view pin_root) -> void {
       }
     }
   }
+}
+
+auto DescribePinConflict(std::string_view map_name,
+                         std::string_view loading_zone,
+                         std::string_view owner,
+                         const PinnedMapShape& want,
+                         const PinnedMapShape& have) -> std::string {
+  std::vector<std::string> diffs;
+  auto note = [&](std::string_view field, uint32_t a, uint32_t b) {
+    if (a != b) {
+      diffs.push_back(std::format("{} {} vs {}", field, a, b));
+    }
+  };
+  note("type", want.type, have.type);
+  note("key_size", want.key_size, have.key_size);
+  note("value_size", want.value_size, have.value_size);
+  note("max_entries", want.max_entries, have.max_entries);
+  note("map_flags", want.map_flags, have.map_flags);
+  if (diffs.empty()) {
+    return {};
+  }
+  std::string joined;
+  for (size_t i = 0; i < diffs.size(); ++i) {
+    joined += (i == 0 ? "" : ", ");
+    joined += diffs[i];
+  }
+  return std::format(
+      "zone '{}' declares map '{}' differently from {}, which holds "
+      "the same pinned name: {}. A pinned name is ONE kernel map, so "
+      "libbpf refuses to reuse a pin whose definition differs "
+      "(-EINVAL, \"parameter mismatch\"). If this map holds per-zone "
+      "state its name must carry the zone; if it is bundle-wide "
+      "state, every zone must declare it identically (size it from a "
+      "constant, not from a per-zone rule or counter count).",
+      loading_zone, map_name, owner, joined);
 }
 
 auto CloseZoneBundle(ZoneBundleHandles& handles) -> void {
@@ -605,6 +740,10 @@ auto LoadZoneBundle(std::string_view bundle_dir,
   std::vector<std::pair<int, int>> flipped;
   std::vector<int> fresh_attached;
 
+  // Which zone pinned each map name, so a shape conflict on a later
+  // object can name the zone to compare against, not just a path.
+  std::map<std::string, std::string> pinned_by;
+
   ZoneBundleHandles handles;
   auto bail = [&](BpfError code, std::string message)
       -> std::unexpected<Error<BpfError>> {
@@ -640,12 +779,22 @@ auto LoadZoneBundle(std::string_view bundle_dir,
     }
     int err = bpf_object__load(obj);
     if (err) {
+      // -EINVAL here is usually a pinned map this zone declares
+      // differently from the zone that pinned it. Say which map and
+      // which zones before the object goes away.
+      std::string conflict =
+          ExplainPinConflict(obj, pin_root_str, zone, pinned_by);
       bpf_object__close(obj);
+      if (!conflict.empty()) {
+        return bail(BpfError::kLoadFailed,
+            std::format("load {} failed: {}", obj_path, conflict));
+      }
       return bail(BpfError::kLoadFailed,
           std::format("load {} failed: {}", obj_path,
                       std::strerror(-err)));
     }
     handles.objs.push_back(obj);
+    RecordPinnedMaps(obj, pin_root_str, zone, pinned_by);
 
     // v0.4 § 6.6: `fwl_prog` for a single-program zone, or the wired
     // `fwl_stage_0` entry of a split tail-call pipeline.

@@ -218,7 +218,7 @@ def _bpf_oracle(
     )
   except bpf_runner.BpfUnavailable as exc:
     try:
-      bpf_runner.compile_c(c_source)
+      bpf_runner.check_compiles(c_source)
     except subprocess.CalledProcessError as cexc:
       stderr = cexc.stderr.decode("utf-8", "replace")
       return OracleResult(
@@ -346,8 +346,8 @@ def pipeline_equivalence(case: pkt.PktCase) -> OracleResult:
     split = bpf_runner.run_full(*_run_args(program, case, c_split))
   except bpf_runner.BpfUnavailable as exc:
     try:
-      bpf_runner.compile_c(c_single)
-      bpf_runner.compile_c(c_split)
+      bpf_runner.check_compiles(c_single)
+      bpf_runner.check_compiles(c_split)
     except subprocess.CalledProcessError as cexc:
       stderr = cexc.stderr.decode("utf-8", "replace")
       return OracleResult("pipeline", "fail", f"clang failed:\n{stderr}")
@@ -447,7 +447,7 @@ def _seq_bpf_oracle(case: pkt.PktCase) -> OracleResult:
     )
   except bpf_runner.BpfUnavailable as exc:
     try:
-      bpf_runner.compile_c(c_source)
+      bpf_runner.check_compiles(c_source)
     except subprocess.CalledProcessError as cexc:
       stderr = cexc.stderr.decode("utf-8", "replace")
       return OracleResult(

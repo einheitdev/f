@@ -56,11 +56,38 @@ class RunResult:
   output_packet: bytes = b""
 
 
-@dataclass(frozen=True)
+@dataclass
 class CompileResult:
-  """Output of compiling BPF C with clang."""
+  """Output of compiling BPF C with clang.
+
+  Also a context manager. `compile_c` makes a temporary directory when
+  the caller does not supply one, and leaving the `with` block removes
+  it; a caller that passed its own `work_dir` owns that directory and
+  it is never touched. Callers that only want to know whether the
+  source compiles should use `check_compiles`, which cleans up for
+  them.
+
+  Not cleaning up is a real failure mode, not an untidiness: one
+  directory per compile filled a 2 GiB tmpfs with 84k of them and
+  killed a measurement run with ENOSPC.
+  """
   obj_path: Path
   source_path: Path
+  # The directory to remove on cleanup, or None when the caller
+  # supplied `work_dir` and therefore owns it.
+  owned_dir: Path | None = None
+
+  def __enter__(self) -> "CompileResult":
+    return self
+
+  def __exit__(self, *exc_info) -> None:
+    self.cleanup()
+
+  def cleanup(self) -> None:
+    """Remove the temporary directory this compile created, if any."""
+    if self.owned_dir is not None:
+      shutil.rmtree(self.owned_dir, ignore_errors=True)
+      self.owned_dir = None
 
 
 def compile_c(c_source: str, work_dir: Path | None = None) -> CompileResult:
@@ -71,6 +98,10 @@ def compile_c(c_source: str, work_dir: Path | None = None) -> CompileResult:
   even when full BPF_PROG_RUN is unavailable: structurally broken
   emitter output fails here.
 
+  The result owns a temporary directory unless `work_dir` is given, so
+  use it as a context manager (or call `cleanup()`) once the object
+  file has been consumed.
+
   Raises BpfUnavailable if clang is missing.
   Raises subprocess.CalledProcessError if compilation fails — the
   stderr of clang is included in the exception.
@@ -78,8 +109,10 @@ def compile_c(c_source: str, work_dir: Path | None = None) -> CompileResult:
   if shutil.which("clang") is None:
     raise BpfUnavailable("clang not found on PATH")
 
+  owned_dir: Path | None = None
   if work_dir is None:
     work_dir = Path(tempfile.mkdtemp(prefix="fwl-bpf-"))
+    owned_dir = work_dir
   work_dir.mkdir(parents=True, exist_ok=True)
 
   src_path = work_dir / "fwl_prog.bpf.c"
@@ -98,8 +131,28 @@ def compile_c(c_source: str, work_dir: Path | None = None) -> CompileResult:
     if path.exists():
       cmd.extend(["-I", str(path)])
 
-  subprocess.run(cmd, check=True, capture_output=True)
-  return CompileResult(obj_path=obj_path, source_path=src_path)
+  try:
+    subprocess.run(cmd, check=True, capture_output=True)
+  except BaseException:
+    # A failed compile has no artifacts worth keeping, and its caller
+    # gets an exception rather than a result it could clean up.
+    if owned_dir is not None:
+      shutil.rmtree(owned_dir, ignore_errors=True)
+    raise
+  return CompileResult(
+    obj_path=obj_path, source_path=src_path, owned_dir=owned_dir
+  )
+
+
+def check_compiles(c_source: str) -> None:
+  """Compile `c_source` and discard the object.
+
+  For callers that use clang purely as an oracle — the object is never
+  loaded, only the absence of an exception matters. Raises the same
+  exceptions as `compile_c`.
+  """
+  with compile_c(c_source):
+    pass
 
 
 # Debian/Ubuntu multiarch installs put asm/* under a triplet path
@@ -177,11 +230,13 @@ def run_full(
       "kernel BPF load unavailable: not root and "
       "unprivileged_bpf_disabled is set"
     )
-  result = compile_c(c_source)
-  return _load_and_run(
-    result.obj_path, packet, map_init or {},
-    counter_slots, has_log,
-  )
+  # The object is read by the loader inside the block; nothing needs
+  # the file afterwards, so the temp dir goes with it.
+  with compile_c(c_source) as result:
+    return _load_and_run(
+      result.obj_path, packet, map_init or {},
+      counter_slots, has_log,
+    )
 
 
 def run_sequence(
@@ -202,10 +257,10 @@ def run_sequence(
       "kernel BPF load unavailable: not root and "
       "unprivileged_bpf_disabled is set"
     )
-  result = compile_c(c_source)
-  return _load_and_run_seq(
-    result.obj_path, packets, map_init or {}, counter_slots, has_log,
-  )
+  with compile_c(c_source) as result:
+    return _load_and_run_seq(
+      result.obj_path, packets, map_init or {}, counter_slots, has_log,
+    )
 
 
 def num_possible_cpus() -> int:

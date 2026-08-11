@@ -200,5 +200,79 @@ TEST(FirstZoneIpv4Test, FallsThroughToLaterInterface) {
             htonl(0x7F000001u));
 }
 
+// --- pinned-map conflict diagnostic ---------------------------------
+//
+// libbpf answers a pin-shape mismatch with -EINVAL and nothing else,
+// so the daemon's job is to convert that into the one sentence an
+// operator can act on: which map, which zones, which numbers.
+
+TEST(DescribePinConflictTest, NamesTheMapZonesAndValues) {
+  PinnedMapShape want;
+  want.type = 6;
+  want.key_size = 4;
+  want.value_size = 8;
+  want.max_entries = 3;
+  PinnedMapShape have = want;
+  have.max_entries = 1;
+
+  std::string message = DescribePinConflict(
+      "fwl_counters", "b", "zone 'a'", want, have);
+
+  EXPECT_NE(message.find("fwl_counters"), std::string::npos);
+  EXPECT_NE(message.find("zone 'b'"), std::string::npos);
+  EXPECT_NE(message.find("zone 'a'"), std::string::npos);
+  EXPECT_NE(message.find("max_entries 3 vs 1"), std::string::npos);
+}
+
+TEST(DescribePinConflictTest, ReportsEveryDifferingField) {
+  PinnedMapShape want;
+  want.type = 6;
+  want.key_size = 4;
+  want.value_size = 8;
+  want.max_entries = 3;
+  PinnedMapShape have;
+  have.type = 2;
+  have.key_size = 8;
+  have.value_size = 16;
+  have.max_entries = 3;
+
+  std::string message = DescribePinConflict(
+      "fwl_log_sample", "b", "zone 'a'", want, have);
+
+  EXPECT_NE(message.find("type 6 vs 2"), std::string::npos);
+  EXPECT_NE(message.find("key_size 4 vs 8"), std::string::npos);
+  EXPECT_NE(message.find("value_size 8 vs 16"), std::string::npos);
+  // Fields that agree must not be listed as differences.
+  EXPECT_EQ(message.find("max_entries"), std::string::npos);
+}
+
+TEST(DescribePinConflictTest, IdenticalShapesExplainNothing) {
+  // Not every failed load is a pin conflict. When the shapes agree
+  // there is nothing to say, and the caller keeps libbpf's own error
+  // rather than blaming an innocent map.
+  PinnedMapShape shape;
+  shape.type = 6;
+  shape.key_size = 4;
+  shape.value_size = 8;
+  shape.max_entries = 3;
+  EXPECT_TRUE(
+      DescribePinConflict("conntrack", "b", "zone 'a'", shape, shape)
+          .empty());
+}
+
+TEST(DescribePinConflictTest, SaysWhatToDoAboutIt) {
+  // The operator reading this at 3am needs the fix, not just the
+  // fault: a name that carries the zone, or a shape that does not
+  // come from a per-zone count.
+  PinnedMapShape want;
+  want.max_entries = 3;
+  PinnedMapShape have;
+  have.max_entries = 1;
+  std::string message = DescribePinConflict(
+      "fwl_counters", "b", "zone 'a'", want, have);
+  EXPECT_NE(message.find("per-zone"), std::string::npos);
+  EXPECT_NE(message.find("ONE kernel map"), std::string::npos);
+}
+
 }  // namespace
 }  // namespace f

@@ -191,7 +191,7 @@ class TestEmitter:
       WL + "@xdp(lan)\ndef f(pkt):\n  if pkt.zone == lan:\n"
       "    redirect to wan\n  drop\n",
     ):
-      bpf_runner.compile_c(_emit(src))  # raises on failure
+      bpf_runner.check_compiles(_emit(src))  # raises on failure
 
   def test_bundle_one_file_per_zone(self):
     prog = _analyze(WL + "@xdp(wan)\ndrop\n@xdp(lan)\nredirect to wan\n")
@@ -246,6 +246,12 @@ class TestEmitter:
     # when reusing a pin, so a divergence is either -EINVAL at load
     # (unequal sizes) or silent cross-zone aliasing (equal sizes).
     # Every construct that emits a map appears in at least one zone.
+    #
+    # This logic now also lives in the emitter
+    # (`_check_bundle_pinned_maps`), so it runs on every compile and
+    # not only here. The test stays as the readable statement of the
+    # property, and as a check on a real multi-construct policy —
+    # tests/unit/test_map_scope.py holds the invariant itself down.
     prog = _analyze(
       "zone wan = [wan0]\nzone lan = [lan0]\n"
       "@xdp(wan)\n"
@@ -295,7 +301,7 @@ class TestEmitter:
     files = emitter.emit_bundle(prog)
     for name, src in files.items():
       if name.endswith(".bpf.c"):
-        bpf_runner.compile_c(src)
+        bpf_runner.check_compiles(src)
 
 
 # --------------------------------------------------------------------
@@ -347,4 +353,4 @@ class TestBackwardCompat:
     assert prog.hook.interface == "eth0"
     assert len(prog.rules) == 1
     c = emitter.emit(prog)
-    bpf_runner.compile_c(c)
+    bpf_runner.check_compiles(c)

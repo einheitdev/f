@@ -242,9 +242,10 @@ def _build_geoip_bundle_file(
   import ipaddress
   tries: dict[str, dict] = {}
   for zone, call in calls:
-    # Matches the emitter's per-zone private-map naming
-    # (_suffix_private_maps): tries are zone-local state.
-    name = f"fwl_geoip_{zone}_{call.call_index}"
+    # The name comes from the emitter's own map registry rather than
+    # being spelled out again here: a trie is zone-private state, and a
+    # second copy of the naming rule is a second thing to forget.
+    name = emitter.MapNames(zone).geoip(call.call_index)
     prefixes: list[str] = []
     for code in call.codes:
       family_hits = 0

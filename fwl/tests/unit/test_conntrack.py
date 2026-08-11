@@ -203,7 +203,7 @@ class TestEmitter:
   ])
   def test_emitted_c_compiles(self, src):
     from fwl import bpf_runner
-    bpf_runner.compile_c(_emit(src))
+    bpf_runner.check_compiles(_emit(src))
 
 
 class TestPktLoader:

@@ -330,7 +330,7 @@ class TestEmitter:
     )
     src = emitter.emit(prog)
     assert src.count("} fwl_rl_g0 SEC") == 1
-    bpf_runner.compile_c(src)
+    bpf_runner.check_compiles(src)
 
   def test_single_object_path_emits_the_global_name_unpinned(self):
     src = emitter.emit(_analyze(
@@ -347,7 +347,7 @@ class TestEmitter:
       files = emitter.emit_bundle(_analyze(_two_zone_src(scope)))
       for name, src in files.items():
         if name.endswith(".bpf.c"):
-          bpf_runner.compile_c(src)
+          bpf_runner.check_compiles(src)
 
   def test_scope_does_not_change_the_gate_arithmetic(self):
     # Scope selects the map and nothing else: the firing predicate,

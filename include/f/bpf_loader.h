@@ -149,6 +149,35 @@ auto LoadZoneBundle(std::string_view bundle_dir,
 /// Detaches nothing — swap or detach first.
 auto CloseZoneBundle(ZoneBundleHandles& handles) -> void;
 
+/// The map properties libbpf compares when it reuses an existing bpffs
+/// pin. A difference in any of them makes the second zone object's
+/// load fail with -EINVAL — reported by libbpf as nothing more useful
+/// than "Invalid argument".
+struct PinnedMapShape {
+  uint32_t type = 0;
+  uint32_t key_size = 0;
+  uint32_t value_size = 0;
+  uint32_t max_entries = 0;
+  uint32_t map_flags = 0;
+};
+
+/// One sentence explaining a pinned-map shape conflict.
+///
+/// `want` is what the zone now loading declares; `have` is what the
+/// map already pinned under that name actually is. `owner` describes
+/// who holds the existing pin — "zone 'a'" when this bundle load
+/// pinned it, or a path when it is left over from an earlier load.
+/// Returns the empty string when the shapes agree: there is then
+/// nothing to explain and the caller should keep its own message.
+///
+/// Exposed for unit tests; the loader calls it on every failed zone
+/// object load.
+auto DescribePinConflict(std::string_view map_name,
+                         std::string_view loading_zone,
+                         std::string_view owner,
+                         const PinnedMapShape& want,
+                         const PinnedMapShape& have) -> std::string;
+
 /// Remove the bpffs pins of maps whose indices are numbered by a
 /// compilation (fwl_counters_*, fwl_rl_*, fwl_geoip_*,
 /// fwl_log_sample*) under `pin_root`, keeping the state that means the
