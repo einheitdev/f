@@ -21,7 +21,8 @@ program change costs ~2 s instead of the ~45 s a detach/attach cycle
 needs to get the wire back.
 
 Usage: corpus_replay.py <cases.json> [--limit N] [--out report.json]
-  cases.json: [[case_path, source_fw, builder, expected_action], ...]
+  cases.json: [[case_path, source_fw, builder, expected_action,
+                truncate_to?], ...]
 """
 import json
 import os
@@ -39,6 +40,8 @@ RECV_IF = os.environ.get("RECV_IF", "enp1s0f1")
 RULES = "/etc/f/rules.fw"
 BUNDLE_CURRENT = "/usr/share/f/compiled/current"
 REPEAT = 10
+# Minimum Ethernet payload+header on the wire, excluding FCS.
+ETH_MIN_FRAME = 60
 ETH_P_ALL = 0x0003
 
 
@@ -66,6 +69,44 @@ def zone_wrap(source_fw):
     lines.append(line)
   body = "\n".join(lines)
   return f"zone t = [{RECV_IF}]\n\n{body}\n"
+
+
+def flush_conntrack():
+  """Empty the pinned conntrack map.
+
+  The conntrack map is shared state that deliberately survives a
+  policy swap, so entries created by one corpus case are still there
+  for the next one. Three stateful cases "diverged" on the first full
+  run purely because an earlier case had already opened a matching
+  flow. Corpus cases assume a clean table; give them one.
+  """
+  pin = "/sys/fs/bpf/f/conntrack"
+  if not os.path.exists(pin):
+    return
+  try:
+    import ctypes
+    import ctypes.util
+    lib = ctypes.CDLL(ctypes.util.find_library("bpf"), use_errno=True)
+    lib.bpf_obj_get.argtypes = [ctypes.c_char_p]
+    lib.bpf_obj_get.restype = ctypes.c_int
+    fd = lib.bpf_obj_get(pin.encode())
+    if fd < 0:
+      return
+    # ConnKey is 16 bytes (two v4 addrs, two ports, proto + pad).
+    key = (ctypes.c_ubyte * 32)()
+    nxt = (ctypes.c_ubyte * 32)()
+    removed = 0
+    while lib.bpf_map_get_next_key(fd, None, ctypes.byref(nxt)) == 0:
+      ctypes.memmove(key, nxt, 32)
+      if lib.bpf_map_delete_elem(fd, ctypes.byref(key)) != 0:
+        break
+      removed += 1
+      if removed > 200000:
+        break
+  except Exception:
+    # Best effort: a stale entry costs a false divergence, not a
+    # crash, and the wire verdict is still recorded either way.
+    pass
 
 
 def deploy(source_fw, timeout=25.0):
@@ -151,6 +192,22 @@ class Wire:
     seen = self.send_and_count(frame)
     return ("allow" if seen > 0 else "drop"), seen
 
+  @staticmethod
+  def _variants(frame):
+    """Byte patterns that count as "this frame arrived".
+
+    The kernel software-untags 802.1Q before delivering to packet
+    sockets (which is why sniff.py reads PACKET_AUXDATA), so a frame
+    sent tagged comes back 4 bytes shorter with the inner EtherType
+    promoted. Matching only the sent bytes counted every VLAN case as
+    a drop — one of three artifact classes that made this harness's
+    first full run report 7 false divergences.
+    """
+    out = [frame]
+    if len(frame) >= 18 and frame[12:14] == b"\x81\x00":
+      out.append(frame[:12] + frame[16:])
+    return out
+
   def send_and_count(self, frame, repeat=REPEAT, settle=1.0):
     self.drain()
     for _ in range(repeat):
@@ -171,8 +228,10 @@ class Wire:
       if meta[2] == socket.PACKET_OUTGOING:
         continue
       # The NIC pads short frames; compare only what we sent.
-      if got[:len(frame)] == frame:
-        seen += 1
+      for want in self._variants(frame):
+        if got[:len(want)] == want:
+          seen += 1
+          break
     return seen
 
 
@@ -189,8 +248,16 @@ def main() -> int:
 
   # Group by program so each policy is deployed once.
   by_prog = {}
-  for path, src, builder, expected in cases:
-    by_prog.setdefault(src, []).append((path, builder, expected))
+  for case in cases:
+    path, src, builder, expected = case[:4]
+    # The .pkt format can cut a frame short to test what happens
+    # when a header the rule needs is simply not there. Ignoring
+    # it sends a FULL frame at a case written for a truncated one,
+    # which inverts the expected verdict — three of the first
+    # run's seven 'divergences' were exactly this.
+    truncate = case[4] if len(case) > 4 else None
+    by_prog.setdefault(src, []).append(
+      (path, builder, expected, truncate))
 
   wire = Wire()
   results = []
@@ -198,20 +265,45 @@ def main() -> int:
   t0 = time.monotonic()
 
   for i, (src, entries) in enumerate(by_prog.items(), 1):
+    flush_conntrack()
     if not deploy(src):
-      for path, _, _ in entries:
+      for path, _, _, _ in entries:
         results.append({"case": path, "verdict": "deploy-failed"})
         skipped += 1
       continue
     if not wire.probe():
-      for path, _, _ in entries:
+      for path, _, _, _ in entries:
         results.append({"case": path, "verdict": "wire-dead"})
         skipped += 1
       continue
 
-    for path, builder, expected in entries:
+    for path, builder, expected, truncate in entries:
       try:
         frame = pkt.build_packet(pkt.parse_builder(builder)).raw
+        if truncate:
+          frame = frame[:truncate]
+          if len(frame) < ETH_MIN_FRAME:
+            # Ethernet has a 60-byte minimum: the NIC pads anything
+            # shorter on transmit, so data_end at the receiver
+            # reflects 60 bytes, not the truncated length. The
+            # bounds check the case exists to exercise therefore
+            # PASSES and the field is readable — measured: a
+            # 38-byte frame arrives as 60 with dst_port intact, so
+            # the rule fires and the wire drops what the corpus
+            # expects to pass. That is a property of Ethernet, not
+            # a datapath defect, and no attacker can put a short
+            # frame on the wire either. BPF_PROG_TEST_RUN can feed
+            # arbitrary lengths; hardware cannot, so these cases
+            # are simply outside what a wire oracle can decide.
+            results.append({"case": path, "builder": builder,
+                            "expected": expected,
+                            "verdict": "not-wire-testable",
+                            "detail": (
+                              f"truncate_to={truncate} is below the "
+                              f"{ETH_MIN_FRAME}-byte Ethernet "
+                              "minimum; the NIC pads it back")})
+            skipped += 1
+            continue
       except Exception as exc:
         results.append({"case": path, "verdict": "build-failed",
                         "detail": str(exc)})
