@@ -883,6 +883,7 @@ def _load_sequence(doc: dict, path: Path) -> PktCase:
       packet=packet,
       expected=raw["expected"],
     ))
+  _seq_nat = _parse_nat_state((doc.get("state") or {}).get("nat"))
   return PktCase(
     name=doc["name"],
     source_fw=doc["source_fw"],
@@ -897,6 +898,12 @@ def _load_sequence(doc: dict, path: Path) -> PktCase:
     conntrack_seed=_parse_conntrack_seed(
       (doc.get("state") or {}).get("conntrack")
     ),
+    # `state.nat` was parsed for single-packet cases and silently
+    # dropped for sequences, so a sequence could declare a masquerade
+    # address or a reply mapping and have both oracles ignore it — the
+    # assertion looked present and did nothing.
+    nat_masq_ip=_seq_nat[0],
+    nat_mappings=_seq_nat[1],
     sequence=tuple(steps),
     ingress_zone=doc.get("ingress_zone"),
   )

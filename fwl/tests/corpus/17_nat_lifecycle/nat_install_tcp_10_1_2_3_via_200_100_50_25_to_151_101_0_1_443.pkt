@@ -1,0 +1,22 @@
+name: "nat install tcp 10.1.2.3 via 200.100.50.25 to 151.101.0.1 443"
+source_fw: |
+  @xdp(wan)
+  snat to 200.100.50.25 if pkt.proto == tcp and pkt.src_ip in [10.0.0.0/8]
+  allow
+sequence:
+  - name: outbound — translate and install the reply mapping
+    builder: tcp(src_ip="10.1.2.3", dst_ip="151.101.0.1", src_port=33333, dst_port=443, syn=true)
+    expected:
+      bpf_action: allow
+      output_packet:
+        src_ip: "200.100.50.25"
+        dst_ip: "151.101.0.1"
+        src_port: 33333
+  - name: reply — de-NAT via the mapping step 1 installed
+    builder: tcp(src_ip="151.101.0.1", dst_ip="200.100.50.25", src_port=443, dst_port=33333, ack=true)
+    expected:
+      bpf_action: allow
+      output_packet:
+        src_ip: "151.101.0.1"
+        dst_ip: "10.1.2.3"
+        dst_port: 33333

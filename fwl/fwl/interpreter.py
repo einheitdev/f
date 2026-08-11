@@ -161,6 +161,60 @@ class NatState:
       return None  # untracked frame: no reply mapping can apply
     return self._reply.get(key)
 
+  def install_egress_reply(
+    self, packet: dict[str, Any], new_saddr: int
+  ) -> None:
+    """Record how to de-NAT the reply to an egress SNAT/masquerade.
+
+    Mirrors `fwl_snat_egress` in the emitter, which writes the reply
+    mapping into `fwl_nat` before rewriting the frame. Until this
+    existed the interpreter modelled only the *lookup* half of NAT: it
+    could de-NAT a reply the .pkt pre-seeded via `state.nat.mappings`,
+    but nothing it did ever created a mapping. A program whose SNAT
+    stopped installing them was therefore indistinguishable from a
+    correct one on this oracle.
+
+    Keyed the way the reply arrives: source and destination swapped,
+    with the translated address in the destination position. SNAT is
+    port-preserving, so the reply's destination port is the original
+    source port.
+    """
+    old_saddr = _ipv4_to_int(packet.get("src_ip"))
+    daddr = _ipv4_to_int(packet.get("dst_ip"))
+    proto = packet.get("proto")
+    if old_saddr is None or daddr is None or proto is None:
+      return
+    sport = int(packet.get("src_port") or 0)
+    dport = int(packet.get("dst_port") or 0)
+    self._reply[(proto, daddr, new_saddr, dport, sport)] = (
+      "dnat", old_saddr, sport
+    )
+
+  def install_ingress_reply(
+    self, packet: dict[str, Any], new_daddr: int, new_dport: int | None
+  ) -> None:
+    """Record how to de-NAT the reply to an ingress DNAT.
+
+    Mirrors `fwl_dnat_ingress`. The reply comes back from the internal
+    host, so it is keyed on the translated address/port as source and
+    the original client as destination, and rewrites the source back to
+    the public address the client believes it is talking to.
+
+    The emitter only rewrites TCP and UDP here (it returns early for
+    anything else), so neither does this.
+    """
+    old_daddr = _ipv4_to_int(packet.get("dst_ip"))
+    saddr = _ipv4_to_int(packet.get("src_ip"))
+    proto = packet.get("proto")
+    if old_daddr is None or saddr is None or proto not in ("tcp", "udp"):
+      return
+    sport = int(packet.get("src_port") or 0)
+    old_dport = int(packet.get("dst_port") or 0)
+    reply_sport = old_dport if new_dport is None else int(new_dport)
+    self._reply[(proto, new_daddr, saddr, reply_sport, sport)] = (
+      "snat", old_daddr, old_dport
+    )
+
 
 def _program_uses_conntrack(program: ast.Program) -> bool:
   """True iff any rule or Tier 2 statement reads conntrack(pkt).state.
@@ -1004,14 +1058,24 @@ def _apply_nat(action: ast.Action, nat_addr: int | None,
   DNAT, the destination port) changes. masquerade rewrites the source
   to the masquerade IP (`state.nat.masq_ip`); snat to the literal
   target; dnat rewrites the destination address and port.
+
+  Each rewrite also records the reply mapping, mirroring the emitter,
+  which installs it before touching the frame. The mapping is derived
+  from `work` BEFORE the rewrite — the reply is keyed on where the
+  packet came from, not where it was translated to.
   """
   if action == ast.Action.SNAT and nat_addr is not None:
+    if nat is not None:
+      nat.install_egress_reply(work, nat_addr)
     work["src_ip"] = _int_to_ipv4(nat_addr)
   elif action == ast.Action.MASQUERADE:
     masq = nat.masq_ip if nat is not None else None
     if masq is not None:
+      nat.install_egress_reply(work, masq)
       work["src_ip"] = _int_to_ipv4(masq)
   elif action == ast.Action.DNAT and nat_addr is not None:
+    if nat is not None:
+      nat.install_ingress_reply(work, nat_addr, nat_port)
     work["dst_ip"] = _int_to_ipv4(nat_addr)
     if nat_port is not None:
       work["dst_port"] = nat_port

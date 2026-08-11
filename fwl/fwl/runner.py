@@ -406,17 +406,37 @@ def _seq_interpreter_oracle(case: pkt.PktCase) -> OracleResult:
       f"unexpected compile error: {exc.error.format()}",
     )
   ct = interpreter.ConntrackTable(case.conntrack_seed)
+  # NAT state is carried across the sequence for the same reason the
+  # conntrack table is: the BPF oracle loads the program once, so its
+  # `fwl_nat` map persists between packets. Passing no NatState here
+  # (the previous behaviour) meant a sequence's reply packet was
+  # evaluated with no mappings at all — the interpreter could not
+  # observe a mapping installed by an earlier step, which is precisely
+  # what makes an SNAT-then-reply case testable.
+  nat = _build_nat_state(case) or interpreter.NatState()
   for i, step in enumerate(case.sequence):
     want = _EXPECTED_TO_XDP[step.expected.get("bpf_action", "allow")]
     res = interpreter.evaluate_full(
       program, step.packet.fields, case.state,
-      geoip_data=(case.geoip_data or None), conntrack=ct,
+      geoip_data=(case.geoip_data or None), conntrack=ct, nat=nat,
     )
     if res.action != want:
       return OracleResult(
         "interpreter", "fail",
         f"step {i} ({step.name}): expected {want.value}, "
         f"got {res.action.value}",
+      )
+    # A sequence step may assert `output_packet` — the schema has always
+    # allowed it — but nothing checked it, so the assertion was a no-op
+    # and a case could claim to verify a rewrite while verifying only
+    # the action. It is the only way to observe a NAT rewrite across a
+    # sequence, since rule evaluation sees pre-rewrite values.
+    op_diff = _check_output_packet(
+      step.expected.get("output_packet"), res.output_packet, "interpreter"
+    )
+    if op_diff:
+      return OracleResult(
+        "interpreter", "fail", f"step {i} ({step.name}): {op_diff}"
       )
   return OracleResult("interpreter", "pass", "")
 
@@ -438,6 +458,13 @@ def _seq_bpf_oracle(case: pkt.PktCase) -> OracleResult:
   ct_seed = _build_conntrack_map_init(case.conntrack_seed)
   if ct_seed:
     map_init["conntrack"] = ct_seed
+  # Seed `fwl_nat` / `fwl_nat_cfg` here too. The single-packet path has
+  # always done this; omitting it meant a sequence that declared
+  # `state.nat` was run with those maps empty on this oracle and seeded
+  # on the interpreter — a divergence built into the harness rather
+  # than the compiler.
+  for name, entries in _build_nat_map_init(case).items():
+    map_init[name] = entries
   counter_slots = _parse_counter_table(c_source)
   has_log = any(r.action == ast.Action.LOG for r in program.rules)
   packets = [step.packet.raw for step in case.sequence]
@@ -469,6 +496,20 @@ def _seq_bpf_oracle(case: pkt.PktCase) -> OracleResult:
         f"step {i} ({step.name}): expected {want.value}, "
         f"got {res.action.value}",
       )
+    want_op = step.expected.get("output_packet")
+    if want_op is not None:
+      op_diff = _check_output_packet(
+        want_op, _decode_output_packet(res.output_packet), "bpf"
+      )
+      if op_diff:
+        return OracleResult(
+          "bpf", "fail", f"step {i} ({step.name}): {op_diff}"
+        )
+      csum_diff = _checksum_diag(res.output_packet)
+      if csum_diff:
+        return OracleResult(
+          "bpf", "fail", f"step {i} ({step.name}): {csum_diff}"
+        )
   return OracleResult("bpf", "pass", "")
 
 
