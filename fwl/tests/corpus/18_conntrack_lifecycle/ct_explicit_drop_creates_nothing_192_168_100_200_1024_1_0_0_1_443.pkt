@@ -1,0 +1,14 @@
+name: "ct explicit drop creates nothing 192.168.100.200 1024 1.0.0.1 443"
+source_fw: |
+  @xdp(eth0)
+  allow if conntrack(pkt).state == established
+  drop if pkt.proto == tcp and pkt.dst_port == 443
+  allow if pkt.proto == tcp and pkt.tcp.syn
+  default drop
+sequence:
+  - name: syn to a blocked port — dropped by an explicit rule
+    builder: tcp(src_ip="192.168.100.200", dst_ip="1.0.0.1", src_port=1024, dst_port=443, syn=true)
+    expected: { bpf_action: drop }
+  - name: its reply must NOT read established
+    builder: tcp(src_ip="1.0.0.1", dst_ip="192.168.100.200", src_port=443, dst_port=1024, ack=true)
+    expected: { bpf_action: drop }

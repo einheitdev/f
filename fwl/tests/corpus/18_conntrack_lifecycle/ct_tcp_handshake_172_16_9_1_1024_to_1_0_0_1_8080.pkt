@@ -1,0 +1,16 @@
+name: "ct tcp handshake 172.16.9.1 1024 to 1.0.0.1 8080"
+source_fw: |
+  @xdp(eth0)
+  allow if conntrack(pkt).state == established
+  allow if pkt.proto == tcp and pkt.tcp.syn and pkt.dst_port == 8080
+  default drop
+sequence:
+  - name: syn out (new, allowed, creates entry)
+    builder: tcp(src_ip="172.16.9.1", dst_ip="1.0.0.1", src_port=1024, dst_port=8080, syn=true)
+    expected: { bpf_action: allow }
+  - name: reply (established via the reverse tuple)
+    builder: tcp(src_ip="1.0.0.1", dst_ip="172.16.9.1", src_port=8080, dst_port=1024, ack=true)
+    expected: { bpf_action: allow }
+  - name: data out (established via the forward tuple)
+    builder: tcp(src_ip="172.16.9.1", dst_ip="1.0.0.1", src_port=1024, dst_port=8080, ack=true, psh=true)
+    expected: { bpf_action: allow }

@@ -1,0 +1,13 @@
+name: "ct symmetric tuple 10.0.0.7 5353"
+source_fw: |
+  @xdp(eth0)
+  allow if conntrack(pkt).state == established
+  allow if pkt.proto == tcp and pkt.tcp.syn and pkt.dst_port == 5353
+  default drop
+sequence:
+  - name: syn to self (new, allowed, creates entry)
+    builder: tcp(src_ip="10.0.0.7", dst_ip="10.0.0.7", src_port=5353, dst_port=5353, syn=true)
+    expected: { bpf_action: allow }
+  - name: ack to self (forward and reverse are one key)
+    builder: tcp(src_ip="10.0.0.7", dst_ip="10.0.0.7", src_port=5353, dst_port=5353, ack=true)
+    expected: { bpf_action: allow }
