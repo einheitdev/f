@@ -1,0 +1,20 @@
+name: "zone dispatch dmz drops while others allow sp80"
+source_fw: |
+  zone wan = [wan0]
+  zone lan = [lan0]
+  zone dmz = [dmz0]
+  zone guest = [guest0]
+  @xdp(wan)
+  allow
+  @xdp(lan)
+  allow
+  @xdp(dmz)
+  drop
+  @xdp(guest)
+  allow
+ingress_zone: dmz
+test_packet:
+  builder: tcp(src_ip="10.44.0.3", dst_ip="8.8.8.8", dst_port=80)
+expected:
+  compiles: true
+  bpf_action: drop

@@ -1,0 +1,20 @@
+name: "zone dispatch lan allows while others drop sp22"
+source_fw: |
+  zone wan = [wan0]
+  zone lan = [lan0]
+  zone dmz = [dmz0]
+  zone guest = [guest0]
+  @xdp(wan)
+  drop
+  @xdp(lan)
+  allow
+  @xdp(dmz)
+  drop
+  @xdp(guest)
+  drop
+ingress_zone: lan
+test_packet:
+  builder: tcp(src_ip="192.168.2.7", dst_ip="9.9.9.9", dst_port=22)
+expected:
+  compiles: true
+  bpf_action: allow

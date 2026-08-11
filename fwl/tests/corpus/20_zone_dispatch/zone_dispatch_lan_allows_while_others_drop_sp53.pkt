@@ -1,0 +1,20 @@
+name: "zone dispatch lan allows while others drop sp53"
+source_fw: |
+  zone wan = [wan0]
+  zone lan = [lan0]
+  zone dmz = [dmz0]
+  zone guest = [guest0]
+  @xdp(wan)
+  drop
+  @xdp(lan)
+  allow
+  @xdp(dmz)
+  drop
+  @xdp(guest)
+  drop
+ingress_zone: lan
+test_packet:
+  builder: tcp(src_ip="10.44.0.3", dst_ip="8.8.8.8", dst_port=53)
+expected:
+  compiles: true
+  bpf_action: allow
