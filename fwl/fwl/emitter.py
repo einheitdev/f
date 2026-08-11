@@ -2152,9 +2152,13 @@ def _emit_zone_source(
   """Emit one zone's complete BPF C source.
 
   `zp` is a single @xdp block. `pinned_shared` controls whether the
-  shared maps (conntrack, counters, rate-limit, log, geoip, devmaps)
-  carry LIBBPF_PIN_BY_NAME so they resolve to one bpffs-pinned kernel
-  map across every zone program in a bundle (v0.4 § 6.2).
+  bpffs-backed maps (conntrack, NAT, counters, log, geoip, devmaps)
+  carry LIBBPF_PIN_BY_NAME (v0.4 § 6.2). Pinning alone does NOT make a
+  map bundle-shared: the maps whose size or index meaning comes from
+  ONE zone's analysis are given a per-zone name by
+  `_suffix_private_maps` before the source is written, so they pin to
+  distinct kernel maps. Only the maps that are bundle-global by
+  construction resolve to one kernel map across every zone program.
 
   `helpers` are the unit's top-level helper defs (v0.4 § 6.5); the ones
   this zone reaches via CallStmt are emitted into this object as
@@ -2536,15 +2540,20 @@ def emit_bundle(program: ast.Program) -> dict[str, str]:
 
   Returns a mapping of filename -> C source:
     - `<zone>.bpf.c` per zone program — its prelude, rules/function,
-      redirect devmaps, and the shared maps it uses (conntrack,
-      counters, rate-limit, log, geoip) carrying LIBBPF_PIN_BY_NAME.
+      redirect devmaps, the cross-zone shared maps it uses (conntrack,
+      fwl_nat, fwl_nat_cfg, fwl_log_events) under their global names,
+      and its zone-private maps (counters, rate-limit, geoip,
+      log-sample) under per-zone names. Both kinds carry
+      LIBBPF_PIN_BY_NAME; the name is what decides sharing.
     - `fwl_shared.h` — a manifest header documenting the pinned maps
       every zone program shares via bpffs (the cross-zone state).
 
   Each zone compiles to its own .bpf.o. The daemon loads them with a
   common bpffs pin root so libbpf resolves the pin-by-name shared maps
   (above all, `conntrack`) to a single kernel map — established flows
-  tracked on one zone are visible to every other zone. The single-zone
+  tracked on one zone are visible to every other zone. A map may only
+  keep its global name when its contents are meaningful bundle-wide;
+  see `_suffix_private_maps` for why the rest must not. The single-zone
   degenerate case still goes through `emit()` (no pinning).
   """
   # When any zone uses NAT, every zone program emits the shared NAT map
@@ -2567,17 +2576,36 @@ def emit_bundle(program: ast.Program) -> dict[str, str]:
 def _suffix_private_maps(src: str, zone: str) -> str:
   """Give zone-PRIVATE maps a per-zone pinned name.
 
-  Counters, rate-limit state, and geoip tries are per-zone: their
-  layout (max_entries, slot meaning, call indices) comes from that
-  zone's own analysis. Pinning them by a bundle-global name would
-  either fail to load (different max_entries -> libbpf "parameter
-  mismatch" reusing the pin) or silently cross-wire two zones' state.
-  Genuinely shared cross-zone maps (conntrack, fwl_nat, fwl_nat_cfg,
-  fwl_log_events) keep their global names.
+  Counters, rate-limit state, geoip tries and log-sample accumulators
+  are per-zone: their layout (max_entries) and the meaning of every
+  index (counter slot, rule index, geoip call index) come from that
+  zone's own analysis, and the FWL spec scopes both counter names and
+  rule indices to a single program. Pinning them by a bundle-global
+  name is wrong in both directions:
+
+  - zones whose analysis yields DIFFERENT max_entries -> the second
+    object fails to load, libbpf "parameter mismatch" reusing the pin
+    (-EINVAL), and the whole bundle is dead;
+  - zones whose analysis happens to yield the SAME max_entries -> both
+    objects load and silently share one kernel map, so zone A's index
+    i and zone B's index i are the same cell. Counters accumulate each
+    other's packets and log-sample accumulators advance each other's
+    phase. No error, no symptom, wrong numbers.
+
+  The second case is why the name must carry the zone even when the
+  sizes happen to agree today: equal sizes are an accident of the
+  policy, not a guarantee.
+
+  Genuinely shared cross-zone maps keep their global names, because
+  their contents are bundle-global by construction: `conntrack` and
+  `fwl_nat` are keyed by the flow tuple, `fwl_nat_cfg` holds the one
+  egress masquerade address, `fwl_log_events` is one ring, and
+  `fwl_devmap_<zone>` is named for its DESTINATION zone.
   """
   src = re.sub(r"\bfwl_counters\b", f"fwl_counters_{zone}", src)
   src = re.sub(r"\bfwl_rl_map_(\d+)\b", rf"fwl_rl_{zone}_\1", src)
   src = re.sub(r"\bfwl_geoip_(\d+)", rf"fwl_geoip_{zone}_\1", src)
+  src = re.sub(r"\bfwl_log_sample\b", f"fwl_log_sample_{zone}", src)
   return src
 
 

@@ -488,8 +488,11 @@ auto PopulateGeoipTrie(struct bpf_object* obj,
 }  // namespace
 
 auto UnpinZonePrivateMaps(std::string_view pin_root) -> void {
+  // "fwl_log_sample" has no trailing underscore on purpose: it also
+  // matches the un-suffixed pin that pre-fix bundles left behind, so
+  // an upgrade cannot inherit a stale map of the wrong max_entries.
   static constexpr std::string_view kPrivatePrefixes[] = {
-      "fwl_counters_", "fwl_rl_", "fwl_geoip_"};
+      "fwl_counters_", "fwl_rl_", "fwl_geoip_", "fwl_log_sample"};
   std::error_code ec;
   std::filesystem::directory_iterator it(
       std::string(pin_root), ec);

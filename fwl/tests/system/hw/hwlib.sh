@@ -137,6 +137,43 @@ else:
 "
 }
 
+# hw::map_sum <pin-name> — total of every value in a pinned (per-CPU)
+# array, summed over all keys and all CPUs. Prints -1 when the pin
+# does not exist, so a missing map fails an assertion instead of
+# silently reading as zero.
+hw::map_sum() {
+  local pin="$PIN/$1"
+  if [ ! -e "$pin" ]; then
+    echo -1
+    return
+  fi
+  bpftool map dump pinned "$pin" 2>/dev/null | $PY -c "
+import json, sys
+total = 0
+for e in json.load(sys.stdin):
+  vals = e.get('values')
+  total += sum(v['value'] for v in vals) if vals else e.get('value', 0)
+print(total)
+"
+}
+
+# hw::map_id <pin-name> — kernel map id behind a pin, or -1. Two pins
+# resolving to the SAME id are one kernel map: that is what pin-by-name
+# sharing means, and what zone-private maps must never do. The kernel
+# map NAME cannot answer this — BPF_OBJ_NAME_LEN truncates it to 15
+# chars, so fwl_log_sample_a and fwl_log_sample_b both show as
+# 'fwl_log_sample_'. The id is the identity.
+hw::map_id() {
+  local pin="$PIN/$1"
+  if [ ! -e "$pin" ]; then
+    echo -1
+    return
+  fi
+  bpftool -j map show pinned "$pin" 2>/dev/null \
+    | $PY -c "import json,sys; print(json.load(sys.stdin)['id'])" \
+    2>/dev/null || echo -1
+}
+
 # hw::send <count> '<builder>' — batch-send builder frames out SEND_IF.
 hw::send() {
   $PY "$HERE/sendmany.py" "$SEND_IF" "$1" "$2"
