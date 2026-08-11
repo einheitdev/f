@@ -5,9 +5,12 @@
 
 #include <arpa/inet.h>
 #include <net/if.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/un.h>
 #include <unistd.h>
 
+#include <cstddef>
 #include <chrono>
 #include <cstring>
 #include <filesystem>
@@ -413,11 +416,83 @@ auto EngineInit(Engine& e,
   return {};
 }
 
+
+namespace {
+
+/// Minimal sd_notify(3): report readiness to the service manager.
+///
+/// Implemented directly rather than by linking libsystemd — the
+/// protocol is one datagram to the socket named in $NOTIFY_SOCKET,
+/// and a firewall daemon does not need another shared library on its
+/// critical path for it. A leading '@' denotes an abstract socket,
+/// encoded as a leading NUL. Silently does nothing when the variable
+/// is unset, so running fd by hand is unaffected.
+auto NotifySystemd(const std::string& message) -> void {
+  const char* path = ::getenv("NOTIFY_SOCKET");
+  if (path == nullptr || *path == '\0') {
+    return;
+  }
+  int fd = ::socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+  if (fd < 0) {
+    return;
+  }
+  struct sockaddr_un addr{};
+  addr.sun_family = AF_UNIX;
+  std::string p(path);
+  if (p.size() >= sizeof(addr.sun_path)) {
+    ::close(fd);
+    return;
+  }
+  std::memcpy(addr.sun_path, p.data(), p.size());
+  if (addr.sun_path[0] == '@') {
+    addr.sun_path[0] = '\0';  // abstract namespace
+  }
+  ::sendto(fd, message.data(), message.size(), MSG_NOSIGNAL,
+           reinterpret_cast<struct sockaddr*>(&addr),
+           static_cast<socklen_t>(offsetof(struct sockaddr_un, sun_path)
+                                  + p.size()));
+  ::close(fd);
+}
+
+}  // namespace
+
 auto EngineRun(Engine& e, std::stop_token stop)
     -> std::expected<void, Error<EngineError>> {
   e.state.store(EngineState::kRunning);
   spdlog::info("Engine running. {} interfaces.",
                e.ifaces.count);
+
+  // Readiness means "the datapath is armed", not "the process
+  // started". With Type=simple, systemd considers the unit started
+  // the moment exec() succeeds, so `Before=network.target` ordered
+  // the spawn and nothing more: on the rig, network.target was
+  // reached 17 ms BEFORE fd logged its first line, and the only
+  // reason no traffic passed unfiltered is that PHY autonegotiation
+  // happens to take ~1.4 s longer than loading a BPF program. That
+  // margin is physics, not a guarantee — a larger bundle or a faster
+  // link could invert it silently.
+  //
+  // With Type=notify, systemd holds network.target until this
+  // datagram arrives, so the ordering is enforced rather than
+  // observed.
+  if (e.ifaces.count == 0) {
+    // Nothing is attached, so nothing is being filtered. Staying
+    // silent here makes systemd fail the unit on TimeoutStartSec
+    // instead of reporting a healthy firewall that filters nothing
+    // — the failure mode is otherwise invisible: active, green, and
+    // forwarding everything.
+    spdlog::error(
+        "No interfaces attached — the datapath is NOT armed. "
+        "Refusing to report readiness; check the bundle's zone "
+        "interfaces exist and that XDP attach succeeded.");
+    NotifySystemd(
+        "STATUS=datapath NOT armed: 0 interfaces attached\n");
+  } else {
+    NotifySystemd(
+        std::format("READY=1\nSTATUS=datapath armed on {} "
+                    "interface(s)\n",
+                    e.ifaces.count));
+  }
 
   // Start slow path thread if ring buffer available.
   if (e.bpf.events_fd >= 0) {

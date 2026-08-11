@@ -7,7 +7,11 @@ Wants=sys-fs-bpf.mount network-pre.target
 ConditionPathIsMountPoint=/sys/fs/bpf
 
 [Service]
-Type=simple
+# Readiness is signalled by fd itself once XDP is attached, so
+# systemd holds network.target until the datapath is actually armed
+# rather than merely until the process has been exec'd.
+Type=notify
+NotifyAccess=main
 ExecStart=/usr/local/bin/fd -c /etc/f/fd.yaml run
 
 CapabilityBoundingSet=CAP_BPF CAP_NET_ADMIN CAP_PERFMON CAP_SYS_RESOURCE
