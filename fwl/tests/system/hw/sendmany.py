@@ -8,6 +8,12 @@ Two modes:
     (02:00:00:00:00:01 -> 02:00:00:00:00:02), which hw::teach_fdb has
     already taught to the switch.
 
+  sendmany.py --burst <iface> <count> '<builder>' [<count> '<b>' ...]
+    Send several bursts back to back out one interface, with every
+    frame pre-built and one socket shared, so the gap between bursts
+    is microseconds. Use when the bursts must land inside the same
+    one-second rate-limit window.
+
   sendmany.py --teach <recv_iface> <send_iface>
     Teach the EX2300 FDB where the two builder MACs live: the dst MAC
     (..:02) on the receiving port, the src MAC (..:01) on the sending
@@ -17,6 +23,7 @@ Two modes:
 """
 import socket
 import sys
+import time
 
 from fwl import pkt
 
@@ -123,7 +130,46 @@ def send(iface: str, count: int, builder: str,
   s.close()
   print(f"sent {count} x {len(frame)}B out {iface}: {builder}")
 
+def burst(iface: str, specs: list[tuple[int, str]]) -> None:
+  """Send several builder bursts back to back out one interface.
+
+  Every frame is built and the socket opened BEFORE the first send, so
+  the gap between bursts is a few microseconds rather than the ~0.3 s
+  of a second Python start-up. That matters for any test whose subject
+  is one-second-window state: two `hw::send` calls can straddle a
+  window boundary, and the resulting flake looks exactly like the bug
+  under test.
+  """
+  frames = [
+    (count, pkt.build_packet(pkt.parse_builder(b)).raw, b)
+    for count, b in specs
+  ]
+  s = _raw_socket(iface)
+  sent = []
+  for count, frame, _builder in frames:
+    n = 0
+    for i in range(count):
+      s.send(frame)
+      n += 1
+      # Same light pacing as send(): keeps receiver-side witnesses up
+      # without slowing the burst enough to matter to a 1 s window.
+      if i % 100 == 99:
+        time.sleep(0.01)
+    sent.append(n)
+  s.close()
+  for (count, _frame, builder), n in zip(frames, sent):
+    print(f"sent {n}/{count} out {iface}: {builder}")
+
+
 def main() -> int:
+  if sys.argv[1] == "--burst":
+    # --burst <iface> <count> '<builder>' [<count> '<builder>' ...]
+    rest = sys.argv[3:]
+    specs = [
+      (int(rest[i]), rest[i + 1]) for i in range(0, len(rest), 2)
+    ]
+    burst(sys.argv[2], specs)
+    return 0
   if sys.argv[1] == "--teach":
     teach(sys.argv[2], sys.argv[3])
     return 0

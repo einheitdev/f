@@ -99,7 +99,15 @@ else_clause   : "else" ":" _NL+ _INDENT block _DEDENT
 
 rule          : action ("if" condition)? modifier?
 
-modifier      : "limited" "by" "rate_limit" "(" INTEGER "," "per" "=" RL_FIELD ")"
+// v0.4 § 6.7: the optional `scope=` field. The value reuses the ZONE
+// keyword terminal for `scope=zone` (so `zone` stays one token
+// everywhere) and plain IDENTIFIER for everything else — `global` is
+// deliberately NOT a reserved word, so no existing policy that uses it
+// as a counter/zone/interface name changes meaning. The parser rejects
+// any identifier other than `global` with a typed error.
+modifier      : "limited" "by" "rate_limit" "(" INTEGER "," "per" "=" RL_FIELD rl_scope? ")"
+
+rl_scope      : "," "scope" "=" (ZONE | IDENTIFIER)
 
 RL_FIELD.10   : "src_ip" | "dst_ip" | "src_port" | "dst_port"
 

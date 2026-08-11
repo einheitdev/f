@@ -39,6 +39,28 @@ class FwlError:
     )
 
 
+@dataclass(frozen=True)
+class FwlWarning:
+  """A non-fatal diagnostic.
+
+  A warning never stops a compile — it names a construct whose
+  behaviour is legal but is more permissive (or otherwise more
+  surprising) than a naive reading of the source suggests. The
+  analyzer collects them on the Program; the CLI prints them to
+  stderr.
+  """
+  message: str
+  span: Span | None = None
+
+  def format(self) -> str:
+    """Format as a single-line warning message."""
+    if self.span is None:
+      return f"warning: {self.message}"
+    return (
+      f"warning: {self.span.line}:{self.span.column}: {self.message}"
+    )
+
+
 class FwlException(Exception):
   """Raised when the compiler encounters an error.
 

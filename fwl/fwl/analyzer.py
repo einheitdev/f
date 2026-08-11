@@ -15,8 +15,11 @@ any guard requirement.
 """
 from __future__ import annotations
 
+import dataclasses
+from enum import Enum
+
 from . import ast
-from .errors import FwlError, FwlException
+from .errors import FwlError, FwlException, FwlWarning
 from .iso3166 import ALPHA2_CODES
 
 
@@ -90,6 +93,7 @@ def analyze(program: ast.Program) -> ast.Program:
   `family` written during this pass; RateLimitCall nodes have
   `call_index` written. Every other AST node stays immutable.
   """
+  program.warnings.clear()
   declared = _collect_declared_zones(program)
   _check_xdp_zone_bindings(program, declared)
   # v0.4 § 6.5 multi-def: validate + type-check the shared helper defs
@@ -98,6 +102,12 @@ def analyze(program: ast.Program) -> ast.Program:
   for zp in program.programs:
     _check_zone_references(zp, declared)
     _analyze_program(zp, helper_names)
+  # v0.4 § 6.7 rate-limit scope. Both passes are bundle-wide by
+  # construction — a global bucket's slot number and the "how many
+  # zones does this rule reach" question are properties of the unit,
+  # not of any one zone — so they run after the per-zone analysis.
+  _assign_global_rate_limit_slots(program)
+  _warn_implicit_multizone_rate_limit(program)
   return program
 
 
@@ -242,6 +252,139 @@ def _reject_zone_field_expr(fname: str, expr) -> None:
   elif isinstance(expr, (ast.AndOp, ast.OrOp)):
     for c in expr.operands:
       _reject_zone_field_expr(fname, c)
+
+
+# --------------------------------------------------------------------
+# v0.4 § 6.7 — rate_limit zone scope.
+#
+# A `scope=global` bucket is bundle-SHARED state: the emitter pins its
+# map under one bundle-global name, so every zone object declaring it
+# resolves to the same kernel map. The audit in commit 4a944e6 fixed
+# the line such a name has to sit on — a map may only wear a
+# bundle-global name when its size and the meaning of its indices are
+# bundle-global too, never derived from one zone's own analysis. Both
+# halves are held here and in the emitter:
+#
+#   max_entries — a constant in the emitted declaration (not
+#     len(zone.rules)), so every object declares the map identically
+#     and libbpf's pin-reuse check cannot fail with -EINVAL.
+#   slot number — allocated over the WHOLE unit and from the rule's
+#     STRUCTURE, never from its index inside a zone. Two zones holding
+#     the same rule get the same slot, which is the sharing the author
+#     asked for; two different rules never collide, whatever their
+#     per-zone rule indices happen to be.
+#
+# Zone-scoped buckets are untouched: still one map per rule index, still
+# zone-suffixed, still unpinned.
+
+_SIGNATURE_SKIP_FIELDS = frozenset({
+  # Source position: two zones' copies of one rule sit on different
+  # lines and are still the same rule.
+  "span",
+  # Analyzer-assigned numbering — per-zone (geoip call_index) or the
+  # very thing being allocated (global_slot).
+  "call_index", "global_slot",
+  # Whether the author WROTE `scope=`. `scope` itself is in the key, so
+  # an explicit `scope=zone` and an omitted one are the same rule.
+  "scope_explicit",
+})
+
+
+def _structural_key(node):
+  """A hashable, source-position-free digest of an AST subtree.
+
+  Two rules with the same key are the same rule written twice — same
+  action, same condition, same rate-limit arguments — which is what
+  "one bucket per rule across the bundle" has to mean for a rule that
+  a multi-zone policy repeats once per zone.
+  """
+  if isinstance(node, Enum):
+    return (type(node).__name__, node.value)
+  if dataclasses.is_dataclass(node) and not isinstance(node, type):
+    return (type(node).__name__,) + tuple(
+      (f.name, _structural_key(getattr(node, f.name)))
+      for f in dataclasses.fields(node)
+      if f.name not in _SIGNATURE_SKIP_FIELDS
+    )
+  if isinstance(node, (list, tuple)):
+    return tuple(_structural_key(x) for x in node)
+  if isinstance(node, (set, frozenset)):
+    return tuple(sorted(repr(_structural_key(x)) for x in node))
+  if isinstance(node, dict):
+    return tuple(
+      (k, _structural_key(v)) for k, v in sorted(node.items())
+    )
+  return node
+
+
+def _rate_limit_rules(program: ast.Program):
+  """(zone_name, rule) for every Tier 1 rate_limit rule in the unit."""
+  for zp in program.programs:
+    for rule in zp.rules:
+      if rule.modifier is not None:
+        yield zp.zone_name, rule
+
+
+def _assign_global_rate_limit_slots(program: ast.Program) -> None:
+  """Number every `scope=global` bucket, bundle-wide, by rule identity.
+
+  Runs over the whole unit in source order so the numbering is a
+  property of the bundle and is therefore identical in every zone
+  object the emitter writes — the requirement that makes one pinned
+  name safe to share. ZONE-scoped modifiers keep slot -1; they are
+  addressed by their per-zone rule index as before.
+  """
+  slots: dict[tuple, int] = {}
+  for _zone, rule in _rate_limit_rules(program):
+    mod = rule.modifier
+    if mod.scope is not ast.RlScope.GLOBAL:
+      mod.global_slot = -1
+      continue
+    key = _structural_key(rule)
+    if key not in slots:
+      slots[key] = len(slots)
+    mod.global_slot = slots[key]
+
+
+def _warn_implicit_multizone_rate_limit(program: ast.Program) -> None:
+  """Warn when an unscoped rate_limit rule sits in more than one zone.
+
+  Per-zone is the default and the safe-for-existing-policy choice, but
+  it is more permissive than the naive reading: the same
+  `rate_limit(N)` written into three zones permits 3N packets per
+  second in total, and for a rule used as a DoS control that gap is
+  security-relevant. The warning names the effective aggregate.
+
+  It fires only for the IMPLICIT default. Once any copy of the rule
+  says `scope=`, the author has stated intent and is not nagged again.
+  """
+  groups: dict[tuple, list[tuple[str, ast.Rule]]] = {}
+  for zone, rule in _rate_limit_rules(program):
+    if rule.modifier.scope is not ast.RlScope.ZONE:
+      continue
+    groups.setdefault(_structural_key(rule), []).append((zone, rule))
+  for members in groups.values():
+    zones: list[str] = []
+    for zone, _rule in members:
+      if zone not in zones:
+        zones.append(zone)
+    if len(zones) < 2:
+      continue
+    if any(r.modifier.scope_explicit for _z, r in members):
+      continue
+    mod = members[0][1].modifier
+    aggregate = mod.threshold * len(members)
+    program.warnings.append(FwlWarning(
+      message=(
+        f"rate_limit({mod.threshold}, per={mod.per_field}) appears in "
+        f"{len(zones)} zones ({', '.join(zones)}) with no scope=; "
+        f"scope defaults to zone, so each zone keeps its own bucket "
+        f"and the bundle-wide aggregate is {aggregate}/s. Write "
+        f"scope=global for one shared bucket, or scope=zone to say "
+        f"per-zone is what you meant"
+      ),
+      span=mod.span,
+    ))
 
 
 def _collect_declared_zones(

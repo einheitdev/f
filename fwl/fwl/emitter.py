@@ -1730,6 +1730,24 @@ def _emit_rate_limit_overflow(overflow_slot: int | None) -> str:
     }}"""
 
 
+def rl_map_name(mod: ast.RateLimit, idx: int) -> str:
+  """The map a rate_limit rule's bucket lives in (v0.4 § 6.7).
+
+  ZONE scope keeps the historical `fwl_rl_map_<rule idx>`, which
+  `_suffix_private_maps` rewrites to `fwl_rl_<zone>_<idx>` in a bundle
+  — a private map per zone, addressed by that zone's own rule index.
+
+  GLOBAL scope uses `fwl_rl_g<slot>`, where the slot is the
+  bundle-wide number the analyzer assigned from the rule's structure.
+  The name is deliberately outside the `fwl_rl_map_` shape the
+  private-map rewriter matches, so it survives into every zone object
+  unchanged: one name, one kernel map, one budget.
+  """
+  if mod.scope is ast.RlScope.GLOBAL:
+    return f"fwl_rl_g{mod.global_slot}"
+  return f"fwl_rl_map_{idx}"
+
+
 def _emit_rate_limit_side_effect(
   mod: ast.RateLimit, idx: int, side_effect: str,
   overflow_slot: int | None,
@@ -1744,10 +1762,11 @@ def _emit_rate_limit_side_effect(
   """
   c_field = _RL_FIELD_TO_C[mod.per_field]
   ovf = _emit_rate_limit_overflow(overflow_slot)
+  rl_map = rl_map_name(mod, idx)
   return f"""__u32 rl_key = (__u32){c_field};
     __u64 now = bpf_ktime_get_ns();
     struct fwl_rl_state *st =
-      bpf_map_lookup_elem(&fwl_rl_map_{idx}, &rl_key);
+      bpf_map_lookup_elem(&{rl_map}, &rl_key);
     __u32 cur = 0;
     __u64 cur_ts = now;
     if (st && now - st->ts < 1000000000ULL) {{
@@ -1756,7 +1775,7 @@ def _emit_rate_limit_side_effect(
     }}
     struct fwl_rl_state new_st = {{ .ts = cur_ts, .count = cur + 1 }};
     int upd_rc = bpf_map_update_elem(
-      &fwl_rl_map_{idx}, &rl_key, &new_st, BPF_ANY);{ovf}
+      &{rl_map}, &rl_key, &new_st, BPF_ANY);{ovf}
     if (cur >= {mod.threshold}) {{
       {side_effect}
     }}"""
@@ -1778,10 +1797,11 @@ def _emit_rate_limit_gate(
   """
   c_field = _RL_FIELD_TO_C[mod.per_field]
   ovf = _emit_rate_limit_overflow(overflow_slot)
+  rl_map = rl_map_name(mod, idx)
   return f"""__u32 rl_key = (__u32){c_field};
     __u64 now = bpf_ktime_get_ns();
     struct fwl_rl_state *st =
-      bpf_map_lookup_elem(&fwl_rl_map_{idx}, &rl_key);
+      bpf_map_lookup_elem(&{rl_map}, &rl_key);
     __u32 cur = 0;
     __u64 cur_ts = now;
     if (st && now - st->ts < 1000000000ULL) {{
@@ -1790,26 +1810,52 @@ def _emit_rate_limit_gate(
     }}
     struct fwl_rl_state new_st = {{ .ts = cur_ts, .count = cur + 1 }};
     int upd_rc = bpf_map_update_elem(
-      &fwl_rl_map_{idx}, &rl_key, &new_st, BPF_ANY);{ovf}
+      &{rl_map}, &rl_key, &new_st, BPF_ANY);{ovf}
     if (cur >= {mod.threshold}) {{
       {ct_create}return {ret};
     }}"""
 
 
-def _emit_rl_maps(program: ast.Program) -> str:
-  """Emit per-CPU hash map declarations for each rate_limit modifier."""
+# Bucket-key capacity of every rate-limit map, zone- and global-scoped
+# alike. A CONSTANT on purpose: a globally named map must be declared
+# identically in every zone object or libbpf rejects the pin reuse
+# (-EINVAL) the moment two zones' analyses disagree. Nothing here may
+# ever be derived from a per-zone rule count.
+_RL_MAX_ENTRIES = 4096
+
+
+def _emit_rl_maps(program: ast.Program, pinned_shared: bool = False) -> str:
+  """Emit the per-CPU hash map declaration for each rate_limit bucket.
+
+  ZONE-scoped buckets get one map per rule index, unpinned — the name
+  is zone-qualified later by `_suffix_private_maps`, so two zones can
+  never land on one kernel map.
+
+  GLOBAL-scoped buckets get one map per bundle-wide slot, pinned by
+  name (in a bundle) so every zone object that holds the rule resolves
+  to the SAME kernel map. Several rules in one zone may share a slot —
+  that is the point — so the declarations are de-duplicated here.
+  """
   blocks: list[str] = []
+  emitted: set[str] = set()
   for idx, rule in enumerate(program.rules):
     if rule.modifier is None:
       continue
-    blocks.append(f"""\
+    name = rl_map_name(rule.modifier, idx)
+    if name in emitted:
+      continue
+    emitted.add(name)
+    decl = f"""\
 struct {{
   __uint(type, BPF_MAP_TYPE_PERCPU_HASH);
   __type(key, __u32);
   __type(value, struct fwl_rl_state);
-  __uint(max_entries, 4096);
-}} fwl_rl_map_{idx} SEC(".maps");
-""")
+  __uint(max_entries, {_RL_MAX_ENTRIES});
+}} {name} SEC(".maps");
+"""
+    if rule.modifier.scope is ast.RlScope.GLOBAL:
+      decl = _maybe_pin(decl, pinned_shared)
+    blocks.append(decl)
   return "\n".join(blocks)
 
 
@@ -2189,7 +2235,7 @@ def _emit_zone_source(
   # body and its `static __noinline` helper functions.
   units = [zp] + [_synth_unit(zp, h) for h in reachable]
   prelude = _emit_parse_prelude(zp)
-  rl_maps = _emit_rl_maps(zp)
+  rl_maps = _emit_rl_maps(zp, pinned_shared)
   geoip_block = _emit_geoip_maps_and_helpers(zp)
   uses_ct = any(_program_uses_conntrack(u) for u in units)
   conntrack_decl = _maybe_pin(_CONNTRACK_DECL, pinned_shared) if uses_ct else ""
@@ -2601,6 +2647,15 @@ def _suffix_private_maps(src: str, zone: str) -> str:
   `fwl_nat` are keyed by the flow tuple, `fwl_nat_cfg` holds the one
   egress masquerade address, `fwl_log_events` is one ring, and
   `fwl_devmap_<zone>` is named for its DESTINATION zone.
+
+  v0.4 § 6.7 puts a `scope=global` rate-limit bucket on the shared
+  side of that same line, and only because the author said so: the
+  budget is then bundle-wide state by declaration, its max_entries is
+  a constant rather than a per-zone count, and its slot number comes
+  from the unit-wide analysis rather than a zone's rule index. Those
+  maps are named `fwl_rl_g<slot>` — deliberately not matching the
+  `fwl_rl_map_<idx>` pattern rewritten below — so they pass through
+  untouched. A `scope=zone` bucket stays private and is rewritten.
   """
   src = re.sub(r"\bfwl_counters\b", f"fwl_counters_{zone}", src)
   src = re.sub(r"\bfwl_rl_map_(\d+)\b", rf"fwl_rl_{zone}_\1", src)

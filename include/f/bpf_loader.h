@@ -149,14 +149,18 @@ auto LoadZoneBundle(std::string_view bundle_dir,
 /// Detaches nothing — swap or detach first.
 auto CloseZoneBundle(ZoneBundleHandles& handles) -> void;
 
-/// Remove the bpffs pins of zone-PRIVATE maps (fwl_counters_*,
-/// fwl_rl_*, fwl_geoip_*, fwl_log_sample*) under `pin_root`, keeping
-/// the shared cross-reload state (conntrack, fwl_nat, fwl_nat_cfg,
-/// fwl_log_events). A reload's new objects must create fresh private
-/// maps — their shape follows the policy — while attached programs
-/// keep their own references until swapped out. Leaving a private pin
-/// behind is not a leak but a load failure: the next policy sizes the
-/// map from its own analysis and libbpf rejects the mismatched reuse.
+/// Remove the bpffs pins of maps whose indices are numbered by a
+/// compilation (fwl_counters_*, fwl_rl_*, fwl_geoip_*,
+/// fwl_log_sample*) under `pin_root`, keeping the state that means the
+/// same thing in every policy (conntrack, fwl_nat, fwl_nat_cfg,
+/// fwl_log_events). A reload's new objects must create fresh maps —
+/// their shape and their slot meanings follow the policy — while
+/// attached programs keep their own references until swapped out.
+/// Leaving such a pin behind is not a leak but a load failure: the
+/// next policy sizes the map from its own analysis and libbpf rejects
+/// the mismatched reuse. Most of these are zone-private; FWL v0.4
+/// § 6.7's global rate-limit buckets are bundle-shared but still
+/// bundle-numbered, so they belong here too.
 auto UnpinZonePrivateMaps(std::string_view pin_root) -> void;
 
 /// One LPM-trie entry parsed from a bundle's geoip.json.

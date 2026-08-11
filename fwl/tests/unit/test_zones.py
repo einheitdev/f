@@ -253,12 +253,14 @@ class TestEmitter:
       "log(sample=4) if pkt.proto == udp\n"
       "drop if pkt.src_ip in geoip(RU)\n"
       "drop limited by rate_limit(10, per=src_ip)\n"
+      "drop limited by rate_limit(7, per=src_ip, scope=global)\n"
       "allow if conntrack(pkt).state == established\n"
       "masquerade\ndrop\n"
       "@xdp(lan)\n"
       "count lan_only\n"
       "log(sample=8) if pkt.proto == tcp\n"
       "drop if pkt.src_ip in geoip(CN)\n"
+      "drop limited by rate_limit(7, per=src_ip, scope=global)\n"
       "redirect to wan\n"
     )
     files = emitter.emit_bundle(prog)
@@ -273,7 +275,12 @@ class TestEmitter:
         if "LIBBPF_PIN_BY_NAME" in body:
           pinned.setdefault(map_name, set()).add(body)
     # Sanity: the policy really did emit shared pinned maps to check.
+    # The two zones differ in rule count, counter count and geoip call
+    # count, so a map whose shape came from a zone's own analysis WOULD
+    # diverge here. `fwl_rl_g0` is the v0.4 § 6.7 global bucket: named
+    # bundle-wide on purpose, and therefore held to this invariant.
     assert "conntrack" in pinned
+    assert "fwl_rl_g0" in pinned
     divergent = {k: v for k, v in pinned.items() if len(v) > 1}
     assert not divergent, (
       f"pinned maps declared differently across zones: "

@@ -55,9 +55,12 @@ def _format_program(p: ast.Program) -> str:
       if rule.condition is not None:
         parts.append(f"if {_format_condition(rule.condition)}")
       if rule.modifier is not None:
+        scope = ""
+        if rule.modifier.scope is not ast.RlScope.ZONE:
+          scope = f", scope={rule.modifier.scope.value}"
         parts.append(
           f"limited by rate_limit({rule.modifier.threshold}, "
-          f"per={rule.modifier.per_field})"
+          f"per={rule.modifier.per_field}{scope})"
         )
       lines.append(f"  [{i}] {' '.join(parts)}")
     if zp.default is not None:
@@ -117,11 +120,22 @@ def check(source: Path) -> None:
   """Parse + semantic check of SOURCE without code generation."""
   text = source.read_text(encoding="utf-8")
   try:
-    analyzer.analyze(parser.parse(text))
+    program = analyzer.analyze(parser.parse(text))
   except FwlException as exc:
     click.echo(exc.error.format(), err=True)
     sys.exit(1)
+  _echo_warnings(program)
   click.echo("ok")
+
+
+def _echo_warnings(program: ast.Program) -> None:
+  """Print the analyzer's non-fatal diagnostics to stderr.
+
+  stderr, not stdout, so a warning never contaminates a compile whose
+  output is being piped — `fwl compile` writes C to stdout.
+  """
+  for warning in program.warnings:
+    click.echo(warning.format(), err=True)
 
 
 @main.command()
@@ -156,6 +170,7 @@ def compile(source: Path, output: Path | None, bundle_dir: Path | None,
   except FwlException as exc:
     click.echo(exc.error.format(), err=True)
     sys.exit(1)
+  _echo_warnings(program)
 
   geoip_data = None
   if geoip_file is not None:
@@ -350,7 +365,7 @@ def _which_rule_fired(
   interpreter doesn't carry diagnostic responsibilities into its
   oracle role.
   """
-  state = state or {}
+  state = interpreter.resolve_bucket_state(program, state)
   for idx, rule in enumerate(program.rules):
     if (rule.condition is not None
         and not interpreter._eval(rule.condition, packet)):

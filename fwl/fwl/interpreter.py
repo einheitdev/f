@@ -212,7 +212,7 @@ def _condition_uses_conntrack(node) -> bool:
 def evaluate(
   program: ast.Program,
   packet: dict[str, Any],
-  state: dict[int, dict[Any, int]] | None = None,
+  state: dict[Any, dict[Any, int]] | None = None,
   geoip_data: dict[str, list[str]] | None = None,
   conntrack: ConntrackTable | None = None,
   nat: "NatState | None" = None,
@@ -223,7 +223,11 @@ def evaluate(
   modulo rate-limit gating. The optional `state` argument supplies
   pre-existing rate-limit bucket counts keyed by the rule's index in
   the program; absent buckets are treated as count=0. State is read
-  but not mutated — the test harness compares the action only.
+  but not mutated — the test harness compares the action only. A
+  `scope=global` rule reads its bundle-wide slot instead of its rule
+  index (v0.4 § 6.7); `resolve_bucket_state` maps a rule-index seed
+  onto it, and a caller may also key the seed by the slot directly to
+  hand one shared budget to several zones' programs.
 
   v0.2 `geoip(...)` lookups consult `geoip_data` (a dict mapping
   country code → list of CIDR strings, mirroring the bundle's
@@ -250,7 +254,7 @@ def evaluate(
 def evaluate_full(
   program: ast.Program,
   packet: dict[str, Any],
-  state: dict[int, dict[Any, int]] | None = None,
+  state: dict[Any, dict[Any, int]] | None = None,
   geoip_data: dict[str, list[str]] | None = None,
   conntrack: ConntrackTable | None = None,
   nat: "NatState | None" = None,
@@ -268,7 +272,7 @@ def evaluate_full(
   XDP_PASS does not create an entry (only an explicit allow rule or
   `default allow` does).
   """
-  state = state or {}
+  state = resolve_bucket_state(program, state)
   geoip_data = geoip_data or {}
   packet = _gate_v6_packet_for_v01_program(program, packet)
   uses_ct = _program_uses_conntrack(program)
@@ -741,11 +745,69 @@ def _build_log_event(
   )
 
 
+def rl_state_key(mod: ast.RateLimit, rule_idx: int):
+  """Which entry of the bucket state a rate_limit rule addresses.
+
+  This is the interpreter's model of v0.4 § 6.7 scope, and it has to
+  mirror the emitter's map naming exactly or the two oracles disagree
+  on a program that compiles fine — the failure mode that reads as a
+  compiler bug and is not one.
+
+  ZONE scope (the default) addresses the rule's own index, so the
+  bucket is private to the program holding the rule; two zones never
+  meet even when their rate-limit rules sit at the same index, because
+  each zone is evaluated against its own state.
+
+  GLOBAL scope addresses the bundle-wide slot the analyzer assigned
+  from the rule's structure. Every zone program holding that rule
+  resolves to the same entry, so a budget spent on one zone is spent
+  for all of them — the exact counterpart of the one pinned map the
+  emitter gives them.
+  """
+  if mod.scope is ast.RlScope.GLOBAL:
+    return ("global", mod.global_slot)
+  return rule_idx
+
+
+def resolve_bucket_state(
+  program, state: dict[Any, dict[Any, int]] | None
+) -> dict[Any, dict[Any, int]]:
+  """Re-key a rule-index-keyed bucket seed onto the entries rules read.
+
+  A `.pkt` seeds `state.rate_limit` by rule index, which is the only
+  handle its author has. A GLOBAL-scoped rule reads its bundle slot
+  instead, so the seed is moved there — otherwise the interpreter would
+  quietly ignore a seed the BPF oracle honours (the runner writes it
+  into the map the rule actually uses), and the two oracles would
+  disagree on a program that compiles fine.
+
+  Seeds already given under a slot key are passed through untouched, so
+  a caller can seed one shared bucket for a whole bundle. When two
+  rules share a slot and both are seeded, the larger count wins — an
+  ill-formed seed either way, and taking the max keeps it conservative
+  for a `drop` gate.
+  """
+  if not state:
+    return {}
+  out: dict[Any, dict[Any, int]] = dict(state)
+  for idx, rule in enumerate(program.rules):
+    if rule.modifier is None or idx not in state:
+      continue
+    key = rl_state_key(rule.modifier, idx)
+    if key == idx:
+      continue
+    merged = dict(out.get(key, {}))
+    for bucket_key, count in state[idx].items():
+      merged[bucket_key] = max(merged.get(bucket_key, 0), count)
+    out[key] = merged
+  return out
+
+
 def _rate_limit_allows(
   mod: ast.RateLimit,
   rule_idx: int,
   packet: dict[str, Any],
-  state: dict[int, dict[Any, int]],
+  state: dict[Any, dict[Any, int]],
 ) -> bool:
   """True iff the rate_limit gate would let the rule fire for this packet.
 
@@ -754,6 +816,9 @@ def _rate_limit_allows(
   the rule fires when count >= threshold (i.e., the rate has been
   exceeded — `drop ... limited by rate_limit(N)` drops once traffic
   passes N/sec).
+
+  Which entry of `state` holds those buckets depends on the rule's
+  zone scope — see `rl_state_key`.
 
   Lookups try the raw key first (matching the .pkt spec, which says
   IP buckets are dotted-quad strings and port buckets are integers).
@@ -767,7 +832,7 @@ def _rate_limit_allows(
     # The per= field isn't available on this packet (e.g. src_port
     # for an ICMP packet). Treat as bucket count = 0.
     bucket_key = 0
-  buckets = state.get(rule_idx, {})
+  buckets = state.get(rl_state_key(mod, rule_idx), {})
   if bucket_key in buckets:
     return buckets[bucket_key] >= mod.threshold
   if mod.per_field in ("src_ip", "dst_ip") and isinstance(bucket_key, str):

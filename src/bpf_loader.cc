@@ -488,6 +488,18 @@ auto PopulateGeoipTrie(struct bpf_object* obj,
 }  // namespace
 
 auto UnpinZonePrivateMaps(std::string_view pin_root) -> void {
+  // The line this sweep draws is "does the meaning of an index in this
+  // map come from a COMPILATION's analysis?" — not "is it shared".
+  // Counters, geoip tries, log-sample accumulators and zone-scoped
+  // rate-limit buckets are per-zone, and FWL v0.4 § 6.7's global
+  // rate-limit buckets (fwl_rl_g<slot>, matched by "fwl_rl_") are
+  // shared across a bundle's zones but still numbered by that
+  // bundle's own analysis: slot 0 of the next policy is a different
+  // rule. Inheriting either across a reload carries stale counts into
+  // a rule that never earned them. What survives is state keyed by
+  // something that means the same thing in every policy — conntrack
+  // and fwl_nat, keyed by the flow tuple.
+  //
   // "fwl_log_sample" has no trailing underscore on purpose: it also
   // matches the un-suffixed pin that pre-fix bundles left behind, so
   // an upgrade cannot inherit a stale map of the wrong max_entries.

@@ -519,10 +519,15 @@ def _build_map_init(
 ) -> dict[str, dict[bytes, bytes]]:
   """Translate .pkt state into the {map_name: {key: value}} layout.
 
-  The emitter names rate_limit maps fwl_rl_map_<rule_idx>; the value
-  is `struct fwl_rl_state { __u64 ts; __u32 count; }` packed to 16
-  bytes by the C compiler. For per-CPU maps the kernel expects the
-  value buffer to be nr_possible_cpus * sizeof(struct).
+  The map a rule's bucket lives in depends on its zone scope, so the
+  name comes from the emitter's own `rl_map_name` rather than being
+  spelled out here — a seed that went to `fwl_rl_map_<idx>` for a
+  `scope=global` rule would land in a map the program never reads, and
+  the BPF oracle would silently diverge from the interpreter.
+
+  The value is `struct fwl_rl_state { __u64 ts; __u32 count; }` packed
+  to 16 bytes by the C compiler. For per-CPU maps the kernel expects
+  the value buffer to be nr_possible_cpus * sizeof(struct).
   """
   if not state:
     return {}
@@ -532,12 +537,12 @@ def _build_map_init(
   except OSError:
     nr_cpus = 1
   for rule_idx, buckets in state.items():
-    if rule_idx >= len(program.rules):
+    if not isinstance(rule_idx, int) or rule_idx >= len(program.rules):
       continue
     rule = program.rules[rule_idx]
     if rule.modifier is None:
       continue
-    map_name = f"fwl_rl_map_{rule_idx}"
+    map_name = emitter.rl_map_name(rule.modifier, rule_idx)
     entries: dict[bytes, bytes] = {}
     for raw_key, count in buckets.items():
       key_bytes = _encode_rl_key(rule.modifier.per_field, raw_key)

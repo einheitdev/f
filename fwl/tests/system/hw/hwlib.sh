@@ -217,6 +217,42 @@ hw::restore_smoke() {
   rm -rf "$BUNDLE_ROOT"/v-hw-* 2>/dev/null || true
 }
 
+# hw::pin_irqs_to_cpu <iface> [<iface> ...] — put every queue IRQ of
+# the named interfaces on one CPU (0 by default, override with
+# PIN_CPU). For tests whose subject is a PERCPU map: XDP runs in the
+# NAPI poll of the RX queue, i.e. on whichever CPU takes that queue's
+# interrupt, so two interfaces landing on different CPUs read different
+# cells of the same per-CPU map. Without this, such a test measures RSS
+# placement rather than the thing it claims to. Affinities are saved
+# and restored by hw::unpin_irqs.
+PINNED_IRQS=()
+PINNED_IRQ_SAVED=()
+hw::pin_irqs_to_cpu() {
+  local cpu="${PIN_CPU:-0}" iface irq old
+  for iface in "$@"; do
+    for irq in $(awk -v n="$iface" \
+        '$NF ~ "^"n"(-|$)" {sub(":","",$1); print $1}' \
+        /proc/interrupts); do
+      old=$(cat "/proc/irq/$irq/smp_affinity_list" 2>/dev/null) || continue
+      if echo "$cpu" > "/proc/irq/$irq/smp_affinity_list" 2>/dev/null; then
+        PINNED_IRQS+=("$irq")
+        PINNED_IRQ_SAVED+=("$old")
+      fi
+    done
+  done
+  log "pinned ${#PINNED_IRQS[@]} queue IRQs to CPU $cpu"
+}
+
+hw::unpin_irqs() {
+  local i
+  for i in "${!PINNED_IRQS[@]}"; do
+    echo "${PINNED_IRQ_SAVED[$i]}" \
+      > "/proc/irq/${PINNED_IRQS[$i]}/smp_affinity_list" 2>/dev/null || true
+  done
+  PINNED_IRQS=()
+  PINNED_IRQ_SAVED=()
+}
+
 # EX2300 port-mirror witness: the (pre-configured, deactivated)
 # analyzer `fmon` mirrors both directions of the DUT port ge-0/0/25
 # into VLAN f-mirror, whose only member is f0 — switch-made copies
