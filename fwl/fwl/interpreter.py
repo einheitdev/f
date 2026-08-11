@@ -322,7 +322,12 @@ def evaluate_full(
   XDP_PASS does not create an entry (only an explicit allow rule or
   `default allow` does).
   """
-  state = state or {}
+  # `state or {}` would substitute a FRESH dict whenever the caller
+  # passed an empty one, because {} is falsy. That silently discarded
+  # the rate_limit bucket updates below on every sequence whose case
+  # declared no `state:` block — the mutation landed in a throwaway
+  # dict and the next step started from nothing again.
+  state = {} if state is None else state
   geoip_data = geoip_data or {}
   packet = _gate_v6_packet_for_v01_program(program, packet)
   uses_ct = _program_uses_conntrack(program)
@@ -801,7 +806,11 @@ def _rate_limit_allows(
   packet: dict[str, Any],
   state: dict[int, dict[Any, int]],
 ) -> bool:
-  """True iff the rate_limit gate would let the rule fire for this packet.
+  """True iff the rate_limit gate lets the rule fire, and count this packet.
+
+  Not a pure predicate: this also records the packet in its bucket,
+  mirroring the emitted program, which updates the map on every packet
+  whose rule condition matched. The name is kept for its call sites.
 
   The bucket key is the runtime value of mod.per_field. Buckets in
   `state` carry the count "so far" within the current 1-second window;
@@ -821,14 +830,38 @@ def _rate_limit_allows(
     # The per= field isn't available on this packet (e.g. src_port
     # for an ICMP packet). Treat as bucket count = 0.
     bucket_key = 0
-  buckets = state.get(rule_idx, {})
-  if bucket_key in buckets:
-    return buckets[bucket_key] >= mod.threshold
-  if mod.per_field in ("src_ip", "dst_ip") and isinstance(bucket_key, str):
-    int_key = _ipv4_str_to_int(bucket_key)
+  buckets = state.setdefault(rule_idx, {})
+
+  # Resolve which key this packet's bucket is stored under. IP buckets
+  # may be seeded as dotted-quad (the .pkt spec's form) or as the
+  # integer the BPF map uses; both must reach the same bucket or the
+  # oracles silently disagree about what "1.2.3.4" means (Finding 2).
+  key = bucket_key
+  if key not in buckets and (
+    mod.per_field in ("src_ip", "dst_ip") and isinstance(key, str)
+  ):
+    int_key = _ipv4_str_to_int(key)
     if int_key in buckets:
-      return buckets[int_key] >= mod.threshold
-  return 0 >= mod.threshold
+      key = int_key
+
+  # Decide on the count BEFORE this packet, then record this packet.
+  # The emitted program does exactly this: it reads the stored count,
+  # writes back count+1 unconditionally, and compares the PRE-increment
+  # value against the threshold.
+  #
+  # The interpreter used to only read. That made it structurally
+  # incapable of noticing a rate_limit defect across packets: two
+  # identical packets both saw the seeded count, so the gate decided
+  # the same way twice while the real program's bucket climbed. Proven
+  # as root on deb-02 with a two-packet rate_limit(1) sequence — bpf
+  # dropped the second packet, the interpreter passed it.
+  #
+  # No window expiry is modelled. The emitter forgets a bucket older
+  # than one second, but BPF_PROG_TEST_RUN replays a sequence's packets
+  # back to back in microseconds, so every step is inside one window.
+  current = buckets.get(key, 0)
+  buckets[key] = current + 1
+  return current >= mod.threshold
 
 
 def _ipv4_str_to_int(addr: str) -> int:

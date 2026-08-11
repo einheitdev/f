@@ -1,0 +1,19 @@
+name: "rl climb 192.168.5.9 per src_ip threshold 3 port 12345"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.proto == tcp
+       limited by rate_limit(3, per=src_ip)
+  default allow
+sequence:
+  - name: packet 1 — bucket at 0, under the limit
+    builder: tcp(src_ip="192.168.5.9", dst_ip="1.1.1.1", dst_port=12345, syn=true)
+    expected: { bpf_action: allow }
+  - name: packet 2 — bucket at 1, under the limit
+    builder: tcp(src_ip="192.168.5.9", dst_ip="1.1.1.1", dst_port=12345, syn=true)
+    expected: { bpf_action: allow }
+  - name: packet 3 — bucket at 2, under the limit
+    builder: tcp(src_ip="192.168.5.9", dst_ip="1.1.1.1", dst_port=12345, syn=true)
+    expected: { bpf_action: allow }
+  - name: packet 4 — bucket at 3, limit reached
+    builder: tcp(src_ip="192.168.5.9", dst_ip="1.1.1.1", dst_port=12345, syn=true)
+    expected: { bpf_action: drop }

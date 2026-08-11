@@ -130,7 +130,7 @@ def _interpreter_oracle(
 
   program = _zone_program(program, case.ingress_zone)
   result = interpreter.evaluate_full(
-    program, case.packet.fields, case.state,
+    program, case.packet.fields, _private_rl_state(case),
     geoip_data=(case.geoip_data or None),
     conntrack=interpreter.ConntrackTable(case.conntrack_seed),
     nat=_build_nat_state(case),
@@ -414,10 +414,13 @@ def _seq_interpreter_oracle(case: pkt.PktCase) -> OracleResult:
   # observe a mapping installed by an earlier step, which is precisely
   # what makes an SNAT-then-reply case testable.
   nat = _build_nat_state(case) or interpreter.NatState()
+  # One private copy carried across the steps: the buckets must
+  # accumulate between packets, but must not reach the BPF oracle.
+  rl_state = _private_rl_state(case)
   for i, step in enumerate(case.sequence):
     want = _EXPECTED_TO_XDP[step.expected.get("bpf_action", "allow")]
     res = interpreter.evaluate_full(
-      program, step.packet.fields, case.state,
+      program, step.packet.fields, rl_state,
       geoip_data=(case.geoip_data or None), conntrack=ct, nat=nat,
     )
     if res.action != want:
@@ -618,6 +621,22 @@ def _build_conntrack_map_init(
 
 
 _NAT_TYPE_NUM = {"snat": 1, "dnat": 2}
+
+
+def _private_rl_state(case: pkt.PktCase) -> dict:
+  """A private copy of the case's rate_limit buckets.
+
+  The interpreter now *writes* these buckets (it models the emitted
+  program's per-packet update, not just the lookup). `case.state` is
+  shared by every oracle, and the BPF oracle seeds its maps from the
+  same object — so handing the interpreter the original let its
+  bucket updates leak into the BPF oracle's seed and drop a packet
+  that should have passed. The oracles have to reach their verdicts
+  from identical starting state and independent working copies; that
+  independence is the whole basis for comparing them
+  (F_DEVELOPMENT_METHODOLOGY.md:307-311).
+  """
+  return {idx: dict(buckets) for idx, buckets in (case.state or {}).items()}
 
 
 def _build_nat_state(case: pkt.PktCase):

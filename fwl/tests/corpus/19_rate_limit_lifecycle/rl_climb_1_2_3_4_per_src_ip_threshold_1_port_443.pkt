@@ -1,0 +1,13 @@
+name: "rl climb 1.2.3.4 per src_ip threshold 1 port 443"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.proto == tcp
+       limited by rate_limit(1, per=src_ip)
+  default allow
+sequence:
+  - name: packet 1 — bucket at 0, under the limit
+    builder: tcp(src_ip="1.2.3.4", dst_ip="9.9.9.9", dst_port=443, syn=true)
+    expected: { bpf_action: allow }
+  - name: packet 2 — bucket at 1, limit reached
+    builder: tcp(src_ip="1.2.3.4", dst_ip="9.9.9.9", dst_port=443, syn=true)
+    expected: { bpf_action: drop }
