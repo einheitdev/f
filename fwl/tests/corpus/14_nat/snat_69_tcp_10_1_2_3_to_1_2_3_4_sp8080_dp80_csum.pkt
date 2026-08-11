@@ -1,0 +1,14 @@
+name: "snat 69 tcp 10.1.2.3 to 1.2.3.4 sp8080 dp80 csum"
+source_fw: |
+  @xdp(lan)
+  snat to 1.2.3.4 if pkt.proto == tcp
+  allow
+test_packet:
+  builder: tcp(src_ip="10.1.2.3", dst_ip="13.107.21.200", src_port=8080, dst_port=80, syn=true)
+expected:
+  compiles: true
+  bpf_action: allow
+  output_packet:
+    src_ip: "1.2.3.4"
+    dst_ip: "13.107.21.200"
+    src_port: 8080

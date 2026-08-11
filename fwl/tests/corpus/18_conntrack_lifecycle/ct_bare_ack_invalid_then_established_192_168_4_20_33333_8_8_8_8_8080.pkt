@@ -1,0 +1,17 @@
+name: "ct bare ack invalid then established 192.168.4.20 33333 8.8.8.8 8080"
+source_fw: |
+  @xdp(eth0)
+  drop if conntrack(pkt).state == invalid
+  allow if conntrack(pkt).state == established
+  allow if pkt.proto == tcp and pkt.tcp.syn and pkt.dst_port == 8080
+  default drop
+sequence:
+  - name: bare ack, no entry (invalid -> drop)
+    builder: tcp(src_ip="192.168.4.20", dst_ip="8.8.8.8", src_port=33333, dst_port=8080, ack=true)
+    expected: { bpf_action: drop }
+  - name: syn (new, allowed, creates entry)
+    builder: tcp(src_ip="192.168.4.20", dst_ip="8.8.8.8", src_port=33333, dst_port=8080, syn=true)
+    expected: { bpf_action: allow }
+  - name: same bare ack again (now established)
+    builder: tcp(src_ip="192.168.4.20", dst_ip="8.8.8.8", src_port=33333, dst_port=8080, ack=true)
+    expected: { bpf_action: allow }

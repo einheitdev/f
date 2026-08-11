@@ -1,0 +1,15 @@
+name: "zone compare guest does not match dmz sp80"
+source_fw: |
+  zone wan = [wan0]
+  zone lan = [lan0]
+  zone dmz = [dmz0]
+  zone guest = [guest0]
+  @xdp(guest)
+  drop if pkt.zone == dmz
+  allow
+ingress_zone: guest
+test_packet:
+  builder: tcp(src_ip="172.20.1.9", dst_ip="8.8.8.8", dst_port=80)
+expected:
+  compiles: true
+  bpf_action: allow

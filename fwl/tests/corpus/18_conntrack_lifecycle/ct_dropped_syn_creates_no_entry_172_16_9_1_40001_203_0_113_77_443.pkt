@@ -1,0 +1,13 @@
+name: "ct dropped syn creates no entry 172.16.9.1 40001 203.0.113.77 443"
+source_fw: |
+  @xdp(eth0)
+  allow if conntrack(pkt).state == established
+  allow if pkt.proto == tcp and pkt.tcp.syn and pkt.dst_port == 53
+  default drop
+sequence:
+  - name: syn to a blocked port (dropped)
+    builder: tcp(src_ip="172.16.9.1", dst_ip="203.0.113.77", src_port=40001, dst_port=443, syn=true)
+    expected: { bpf_action: drop }
+  - name: its reply must NOT be established
+    builder: tcp(src_ip="203.0.113.77", dst_ip="172.16.9.1", src_port=443, dst_port=40001, ack=true)
+    expected: { bpf_action: drop }

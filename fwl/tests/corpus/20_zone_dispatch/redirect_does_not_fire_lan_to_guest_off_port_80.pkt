@@ -1,0 +1,15 @@
+name: "redirect does not fire lan to guest off port 80"
+source_fw: |
+  zone wan = [wan0]
+  zone lan = [lan0]
+  zone dmz = [dmz0]
+  zone guest = [guest0]
+  @xdp(lan)
+  redirect to guest if pkt.proto == tcp and pkt.dst_port == 53
+  drop
+ingress_zone: lan
+test_packet:
+  builder: tcp(src_ip="192.168.2.7", dst_ip="8.8.8.8", dst_port=80)
+expected:
+  compiles: true
+  bpf_action: drop

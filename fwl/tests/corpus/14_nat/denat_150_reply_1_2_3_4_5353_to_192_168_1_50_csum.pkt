@@ -1,0 +1,18 @@
+name: "denat 150 reply 1.2.3.4 5353 to 192.168.1.50 csum"
+source_fw: |
+  @xdp(wan)
+  snat to 1.2.3.4 if pkt.proto == udp
+  allow
+state:
+  nat:
+    mappings:
+      - { proto: tcp, src_ip: "185.199.108.1", dst_ip: "1.2.3.4", src_port: 80, dst_port: 5353, new_ip: "192.168.1.50", new_port: 5353, nat_type: dnat }
+test_packet:
+  builder: tcp(src_ip="185.199.108.1", dst_ip="1.2.3.4", src_port=80, dst_port=5353, ack=true)
+expected:
+  compiles: true
+  bpf_action: allow
+  output_packet:
+    src_ip: "185.199.108.1"
+    dst_ip: "192.168.1.50"
+    dst_port: 5353

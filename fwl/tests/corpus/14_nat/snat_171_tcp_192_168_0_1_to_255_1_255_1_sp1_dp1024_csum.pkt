@@ -1,0 +1,14 @@
+name: "snat 171 tcp 192.168.0.1 to 255.1.255.1 sp1 dp1024 csum"
+source_fw: |
+  @xdp(lan)
+  snat to 255.1.255.1 if pkt.proto == tcp
+  allow
+test_packet:
+  builder: tcp(src_ip="192.168.0.1", dst_ip="93.184.216.34", src_port=1, dst_port=1024, syn=true)
+expected:
+  compiles: true
+  bpf_action: allow
+  output_packet:
+    src_ip: "255.1.255.1"
+    dst_ip: "93.184.216.34"
+    src_port: 1

@@ -1,0 +1,16 @@
+name: "rl climb per dst_ip 140.82.112.3 from 8.8.4.4 port 80"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.proto == tcp
+       limited by rate_limit(2, per=dst_ip)
+  default allow
+sequence:
+  - name: packet 1 — bucket at 0
+    builder: tcp(src_ip="8.8.4.4", dst_ip="140.82.112.3", dst_port=80, syn=true)
+    expected: { bpf_action: allow }
+  - name: packet 2 — bucket at 1
+    builder: tcp(src_ip="8.8.4.4", dst_ip="140.82.112.3", dst_port=80, syn=true)
+    expected: { bpf_action: allow }
+  - name: packet 3 — bucket at 2, limit reached
+    builder: tcp(src_ip="8.8.4.4", dst_ip="140.82.112.3", dst_port=80, syn=true)
+    expected: { bpf_action: drop }

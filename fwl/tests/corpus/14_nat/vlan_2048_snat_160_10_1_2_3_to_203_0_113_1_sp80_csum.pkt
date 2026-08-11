@@ -1,0 +1,14 @@
+name: "vlan 2048 snat 160 10.1.2.3 to 203.0.113.1 sp80 csum"
+source_fw: |
+  @xdp(lan)
+  snat to 203.0.113.1 if pkt.proto == tcp
+  allow
+test_packet:
+  builder: tcp(src_ip="10.1.2.3", dst_ip="185.199.108.1", src_port=80, dst_port=53, syn=true, vlan_id=2048)
+expected:
+  compiles: true
+  bpf_action: allow
+  output_packet:
+    src_ip: "203.0.113.1"
+    dst_ip: "185.199.108.1"
+    src_port: 80

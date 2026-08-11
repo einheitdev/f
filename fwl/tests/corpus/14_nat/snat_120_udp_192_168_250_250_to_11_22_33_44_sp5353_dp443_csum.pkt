@@ -1,0 +1,14 @@
+name: "snat 120 udp 192.168.250.250 to 11.22.33.44 sp5353 dp443 csum"
+source_fw: |
+  @xdp(lan)
+  snat to 11.22.33.44 if pkt.proto == udp
+  allow
+test_packet:
+  builder: udp(src_ip="192.168.250.250", dst_ip="185.199.108.1", src_port=5353, dst_port=443)
+expected:
+  compiles: true
+  bpf_action: allow
+  output_packet:
+    src_ip: "11.22.33.44"
+    dst_ip: "185.199.108.1"
+    src_port: 5353

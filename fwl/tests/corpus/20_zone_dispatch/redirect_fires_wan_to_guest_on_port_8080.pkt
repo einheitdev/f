@@ -1,0 +1,16 @@
+name: "redirect fires wan to guest on port 8080"
+source_fw: |
+  zone wan = [wan0]
+  zone lan = [lan0]
+  zone dmz = [dmz0]
+  zone guest = [guest0]
+  @xdp(wan)
+  redirect to guest if pkt.proto == tcp and pkt.dst_port == 8080
+  drop
+ingress_zone: wan
+test_packet:
+  builder: tcp(src_ip="10.1.0.5", dst_ip="8.8.8.8", dst_port=8080)
+expected:
+  compiles: true
+  bpf_action: redirect
+  redirect_zone: guest

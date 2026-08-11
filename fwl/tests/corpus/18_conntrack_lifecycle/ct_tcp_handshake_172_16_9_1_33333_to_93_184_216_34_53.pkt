@@ -1,0 +1,16 @@
+name: "ct tcp handshake 172.16.9.1 33333 to 93.184.216.34 53"
+source_fw: |
+  @xdp(eth0)
+  allow if conntrack(pkt).state == established
+  allow if pkt.proto == tcp and pkt.tcp.syn and pkt.dst_port == 53
+  default drop
+sequence:
+  - name: syn out (new, allowed, creates entry)
+    builder: tcp(src_ip="172.16.9.1", dst_ip="93.184.216.34", src_port=33333, dst_port=53, syn=true)
+    expected: { bpf_action: allow }
+  - name: reply (established via the reverse tuple)
+    builder: tcp(src_ip="93.184.216.34", dst_ip="172.16.9.1", src_port=53, dst_port=33333, ack=true)
+    expected: { bpf_action: allow }
+  - name: data out (established via the forward tuple)
+    builder: tcp(src_ip="172.16.9.1", dst_ip="93.184.216.34", src_port=33333, dst_port=53, ack=true, psh=true)
+    expected: { bpf_action: allow }

@@ -1,0 +1,17 @@
+name: "masq 140 udp 172.31.255.9 via 11.22.33.44 sp1 csum"
+source_fw: |
+  @xdp(lan)
+  masquerade if pkt.proto == udp
+  allow
+state:
+  nat:
+    masq_ip: "11.22.33.44"
+test_packet:
+  builder: udp(src_ip="172.31.255.9", dst_ip="185.199.108.1", src_port=1, dst_port=12345)
+expected:
+  compiles: true
+  bpf_action: allow
+  output_packet:
+    src_ip: "11.22.33.44"
+    dst_ip: "185.199.108.1"
+    src_port: 1

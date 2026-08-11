@@ -1,0 +1,16 @@
+name: "rl per key independence 203.0.113.8 vs 8.8.4.4 port 53"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.proto == tcp
+       limited by rate_limit(1, per=src_ip)
+  default allow
+sequence:
+  - name: first source, first packet — allowed
+    builder: tcp(src_ip="203.0.113.8", dst_ip="151.101.0.1", dst_port=53, syn=true)
+    expected: { bpf_action: allow }
+  - name: first source again — its own bucket is full
+    builder: tcp(src_ip="203.0.113.8", dst_ip="151.101.0.1", dst_port=53, syn=true)
+    expected: { bpf_action: drop }
+  - name: second source — a different bucket, still empty
+    builder: tcp(src_ip="8.8.4.4", dst_ip="151.101.0.1", dst_port=53, syn=true)
+    expected: { bpf_action: allow }

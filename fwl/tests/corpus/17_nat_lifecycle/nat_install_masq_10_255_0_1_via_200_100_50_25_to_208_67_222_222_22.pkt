@@ -1,0 +1,25 @@
+name: "nat install masq 10.255.0.1 via 200.100.50.25 to 208.67.222.222 22"
+source_fw: |
+  @xdp(wan)
+  masquerade if pkt.proto == tcp and pkt.src_ip in [10.0.0.0/8]
+  allow
+state:
+  nat:
+    masq_ip: "200.100.50.25"
+sequence:
+  - name: outbound — masquerade and install the reply mapping
+    builder: tcp(src_ip="10.255.0.1", dst_ip="208.67.222.222", src_port=51000, dst_port=22, syn=true)
+    expected:
+      bpf_action: allow
+      output_packet:
+        src_ip: "200.100.50.25"
+        dst_ip: "208.67.222.222"
+        src_port: 51000
+  - name: reply — de-NAT via the mapping step 1 installed
+    builder: tcp(src_ip="208.67.222.222", dst_ip="200.100.50.25", src_port=22, dst_port=51000, ack=true)
+    expected:
+      bpf_action: allow
+      output_packet:
+        src_ip: "208.67.222.222"
+        dst_ip: "10.255.0.1"
+        dst_port: 51000

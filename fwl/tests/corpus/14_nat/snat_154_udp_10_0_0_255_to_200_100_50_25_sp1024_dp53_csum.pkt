@@ -1,0 +1,14 @@
+name: "snat 154 udp 10.0.0.255 to 200.100.50.25 sp1024 dp53 csum"
+source_fw: |
+  @xdp(lan)
+  snat to 200.100.50.25 if pkt.proto == udp
+  allow
+test_packet:
+  builder: udp(src_ip="10.0.0.255", dst_ip="140.82.112.3", src_port=1024, dst_port=53)
+expected:
+  compiles: true
+  bpf_action: allow
+  output_packet:
+    src_ip: "200.100.50.25"
+    dst_ip: "140.82.112.3"
+    src_port: 1024

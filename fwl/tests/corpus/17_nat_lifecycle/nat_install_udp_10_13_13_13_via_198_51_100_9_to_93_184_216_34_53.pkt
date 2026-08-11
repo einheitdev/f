@@ -1,0 +1,22 @@
+name: "nat install udp 10.13.13.13 via 198.51.100.9 to 93.184.216.34 53"
+source_fw: |
+  @xdp(wan)
+  snat to 198.51.100.9 if pkt.proto == udp and pkt.src_ip in [10.0.0.0/8]
+  allow
+sequence:
+  - name: outbound — translate and install the reply mapping
+    builder: udp(src_ip="10.13.13.13", dst_ip="93.184.216.34", src_port=40001, dst_port=53)
+    expected:
+      bpf_action: allow
+      output_packet:
+        src_ip: "198.51.100.9"
+        dst_ip: "93.184.216.34"
+        src_port: 40001
+  - name: reply — de-NAT via the mapping step 1 installed
+    builder: udp(src_ip="93.184.216.34", dst_ip="198.51.100.9", src_port=53, dst_port=40001)
+    expected:
+      bpf_action: allow
+      output_packet:
+        src_ip: "93.184.216.34"
+        dst_ip: "10.13.13.13"
+        dst_port: 40001

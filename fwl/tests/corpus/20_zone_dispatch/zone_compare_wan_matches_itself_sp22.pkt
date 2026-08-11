@@ -1,0 +1,15 @@
+name: "zone compare wan matches itself sp22"
+source_fw: |
+  zone wan = [wan0]
+  zone lan = [lan0]
+  zone dmz = [dmz0]
+  zone guest = [guest0]
+  @xdp(wan)
+  drop if pkt.zone == wan
+  allow
+ingress_zone: wan
+test_packet:
+  builder: tcp(src_ip="172.20.1.9", dst_ip="1.1.1.1", dst_port=22)
+expected:
+  compiles: true
+  bpf_action: drop

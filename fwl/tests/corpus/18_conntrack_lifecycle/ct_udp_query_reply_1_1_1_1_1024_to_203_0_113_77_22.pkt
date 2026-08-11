@@ -1,0 +1,13 @@
+name: "ct udp query reply 1.1.1.1 1024 to 203.0.113.77 22"
+source_fw: |
+  @xdp(eth0)
+  allow if conntrack(pkt).state == established
+  allow if pkt.proto == udp and  pkt.dst_port == 22
+  default drop
+sequence:
+  - name: query out (new, allowed, creates entry)
+    builder: udp(src_ip="1.1.1.1", dst_ip="203.0.113.77", src_port=1024, dst_port=22)
+    expected: { bpf_action: allow }
+  - name: reply (established via the reverse tuple)
+    builder: udp(src_ip="203.0.113.77", dst_ip="1.1.1.1", src_port=22, dst_port=1024)
+    expected: { bpf_action: allow }

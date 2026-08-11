@@ -1,0 +1,17 @@
+name: "masq 55 tcp 172.16.0.9 via 198.51.100.128 sp40000 csum"
+source_fw: |
+  @xdp(lan)
+  masquerade if pkt.proto == tcp
+  allow
+state:
+  nat:
+    masq_ip: "198.51.100.128"
+test_packet:
+  builder: tcp(src_ip="172.16.0.9", dst_ip="151.101.0.1", src_port=40000, dst_port=5353, syn=true)
+expected:
+  compiles: true
+  bpf_action: allow
+  output_packet:
+    src_ip: "198.51.100.128"
+    dst_ip: "151.101.0.1"
+    src_port: 40000
