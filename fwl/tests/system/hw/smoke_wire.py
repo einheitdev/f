@@ -54,13 +54,28 @@ def main() -> int:
   # each hw.sh scenario does on exit) lands here. Without this wait
   # the smoke test reports a false failure on a perfectly healthy
   # rig. Bounded: if the wire is genuinely dead, say so.
+  # The receiving NIC needs two settings the scenario harness sets
+  # in hw::deploy and this tool previously assumed: promiscuous mode
+  # (test frames carry a foreign destination MAC, which the i350
+  # filters in hardware otherwise) and VLAN offload off (the NIC
+  # strips 802.1Q before XDP sees it). NEITHER survives a reboot —
+  # so this check, the first thing an operator runs after a restart,
+  # reported "wire dead" and pointed at the link and the switch when
+  # the real cause was a NIC flag it had not set. Set them here.
+  subprocess.run(["ip", "link", "set", "dev", RECV_IF, "promisc", "on"],
+                 capture_output=True)
+  subprocess.run(["ethtool", "-K", RECV_IF, "rxvlan", "off"],
+                 capture_output=True)
+
   probe = subprocess.run(
     [sys.executable, str(HERE / "sendmany.py"), "--probe",
      SEND_IF, RECV_IF, "45"], capture_output=True, text=True,
   )
   if probe.returncode != 0:
     print(f"wire dead: no frame crossed {SEND_IF} -> {RECV_IF} in "
-          f"45 s. Check link state and the EX2300 port config.")
+          f"45 s.\n  Checked already: {RECV_IF} promisc + rxvlan.\n"
+          f"  Next: 'ip -br link show' for carrier, then the EX2300 "
+          f"port/VLAN config for {SEND_IF} and {RECV_IF}.")
     return 1
 
   subprocess.run(

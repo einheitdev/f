@@ -24,8 +24,10 @@ Usage: corpus_replay.py <cases.json> [--limit N] [--out report.json]
   cases.json: [[case_path, source_fw, builder, expected_action,
                 truncate_to?], ...]
 """
+import glob
 import json
 import os
+import subprocess
 import select
 import socket
 import sys
@@ -43,6 +45,55 @@ REPEAT = 10
 # Minimum Ethernet payload+header on the wire, excluding FCS.
 ETH_MIN_FRAME = 60
 ETH_P_ALL = 0x0003
+
+
+SMOKE_POLICY = """\
+# Layer-0 smoke policy: attach to all three data-plane ports, count
+# every frame, pass everything. Proves load+attach+counters only.
+zone data = [enp1s0f0, enp1s0f1, enp1s0f2]
+
+@xdp(data)
+
+count data_total
+default allow
+"""
+
+
+def restore_smoke():
+  """Put the bench back in its walk-up state.
+
+  Every scenario test restores via hwlib's hw::finish; this harness
+  did not, so a completed run left the rig on whichever corpus case
+  happened to be last — a single-port policy nobody would recognise.
+  That matters more now that hone's --wire mode drives this same
+  code: an unattended run would misconfigure the bench every time it
+  finished.
+  """
+  try:
+    with open(RULES, "w") as fh:
+      fh.write(SMOKE_POLICY)
+    subprocess.run(
+      ["fwl", "compile", "--bundle", "/usr/share/f/compiled/v-smoke",
+       RULES], capture_output=True, timeout=120,
+    )
+    subprocess.run(["systemctl", "stop", "fd"], capture_output=True)
+    pins = glob.glob("/sys/fs/bpf/f/fwl_*")
+    pins.append("/sys/fs/bpf/f/conntrack")
+    for pin in pins:
+      try:
+        os.unlink(pin)
+      except OSError:
+        pass
+    if os.path.islink(BUNDLE_CURRENT) or os.path.exists(BUNDLE_CURRENT):
+      os.unlink(BUNDLE_CURRENT)
+    os.symlink("/usr/share/f/compiled/v-smoke", BUNDLE_CURRENT)
+    subprocess.run(["systemctl", "start", "fd"], capture_output=True)
+    time.sleep(3)
+    print("bench restored to the smoke policy")
+  except Exception as exc:
+    print(f"WARNING: could not restore the smoke policy ({exc}). "
+          f"Run: bash /opt/fwl/tests/system/hw/hw.sh l1_01_proto_port_cidr "
+          f"or restore /etc/f/rules.fw by hand.")
 
 
 def current_bundle():
@@ -343,4 +394,10 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-  sys.exit(main())
+  try:
+    rc = main()
+  finally:
+    # Always: an interrupted run must not leave the bench on a
+    # corpus case either.
+    restore_smoke()
+  sys.exit(rc)
