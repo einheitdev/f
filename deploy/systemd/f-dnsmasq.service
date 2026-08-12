@@ -1,0 +1,69 @@
+[Unit]
+Description=f — DHCP and DNS for zoned testnets (dnsmasq)
+Documentation=man:dnsmasq(8)
+
+# The datapath is armed before the network comes up; services come
+# after both. Ordering only — deliberately NOT Requires=, because a
+# service dying must not take the firewall with it, and the firewall
+# failing must not be blamed on a service.
+After=network-online.target fd.service
+Wants=network-online.target
+
+# The config is a derived artifact. If it is not there, the model said
+# no service was bound to any zone, and this unit should not have been
+# enabled — so its absence is a fault, reported by failing to start,
+# never a silent no-op.
+AssertPathExists=/etc/f/generated/dnsmasq.conf
+
+# Stop retrying eventually. These belong in [Unit] — systemd parses
+# and ignores them under [Service], which makes a rate limit that
+# looks configured and is not.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+
+# Validate before binding anything. dnsmasq's own check is the
+# authority on its own syntax; a config that does not pass here never
+# gets as far as replacing a working one.
+ExecStartPre=/usr/sbin/dnsmasq --test \
+  --conf-file=/etc/f/generated/dnsmasq.conf
+ExecStart=/usr/sbin/dnsmasq --keep-in-foreground \
+  --conf-file=/etc/f/generated/dnsmasq.conf --pid-file=
+ExecReload=/bin/kill -HUP $MAINPID
+
+# Restart, but stop retrying eventually: a unit that flaps forever
+# looks alive in every dashboard while serving nobody. After the burst
+# it sits in `failed`, where `f show services` and systemd both say so.
+Restart=on-failure
+RestartSec=5s
+
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW \
+  CAP_SETGID CAP_SETUID
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET AF_INET6 AF_PACKET
+LockPersonality=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+SystemCallArchitectures=native
+
+# Leases must survive a restart, or every restart renumbers the boards.
+StateDirectory=f
+ReadWritePaths=/var/lib/f
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=f-dnsmasq
+
+[Install]
+WantedBy=multi-user.target

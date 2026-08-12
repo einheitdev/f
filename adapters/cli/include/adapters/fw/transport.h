@@ -31,6 +31,12 @@ struct FLocalConfig {
   std::string editor = "vim";
   /// Persistent config file for CLI preferences.
   std::string config_path;
+  /// The appliance system configuration: interfaces, zones, services.
+  /// The single source of truth for everything the daemons are told.
+  std::string system_config = "/etc/f/system.yaml";
+  /// Where the generated dnsmasq artifact is installed. Derived from
+  /// `system_config`; never hand-edited.
+  std::string dnsmasq_conf = "/etc/f/generated/dnsmasq.conf";
 };
 
 /// Construct a local transport that reads BPF maps in-process

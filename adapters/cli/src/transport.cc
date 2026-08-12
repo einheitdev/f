@@ -27,6 +27,13 @@
 #include <nlohmann/json.hpp>
 #include <zmq.hpp>
 
+#include "f/sysconfig/dnsmasq.h"
+#include "f/sysconfig/model.h"
+#include "f/sysconfig/networkd.h"
+#include "f/sysconfig/parse.h"
+#include "f/sysconfig/service_status.h"
+#include "f/sysconfig/validate.h"
+
 namespace fd_cmd {
 enum : uint8_t {
   kGetCounters = 2,
@@ -50,6 +57,7 @@ using json = nlohmann::json;
 using json_t = nlohmann::json;
 using Error_t = cli::Error<cli::transport::TransportError>;
 namespace proto = cli::protocol;
+namespace sc = ::f::sysconfig;
 
 auto MakeOk(const std::string& id, json data)
     -> proto::Response {
@@ -472,6 +480,18 @@ class FLocalTransport final
     }
     if (req.command == "show_log") {
       return HandleShowLog(req);
+    }
+    if (req.command == "show_system") {
+      return HandleShowSystem(req);
+    }
+    if (req.command == "show_services") {
+      return HandleShowServices(req);
+    }
+    if (req.command == "check_system") {
+      return HandleCheckSystem(req);
+    }
+    if (req.command == "apply_system") {
+      return HandleApplySystem(req);
     }
     return MakeErr(req.id, "unknown_command",
                    "Unknown command: " + req.command);
@@ -1188,6 +1208,215 @@ class FLocalTransport final
         {"message", "No log source available — fd is "
                     "not running as a systemd service "
                     "and no log file found"},
+    });
+  }
+
+  // -- system configuration model ------------------------------------
+  //
+  // The appliance's network configuration:
+  //     physical port -> interface -> zone -> services bind here
+  // The CLI reads and applies the same model f-sysconf does; there is
+  // one source of truth and one set of diagnostics.
+
+  static auto DiagsToJson(
+      const std::vector<sc::Diagnostic>& diags) -> json {
+    json out = json::array();
+    for (const auto& d : diags) {
+      out.push_back({
+          {"code", d.code},
+          {"severity", d.severity == sc::Severity::kError
+                           ? "error"
+                           : "warning"},
+          {"message", d.message},
+          {"line", d.span.line},
+          {"column", d.span.column},
+          {"hint", d.hint},
+          {"text", d.Format()},
+      });
+    }
+    return out;
+  }
+
+  auto SystemConfigPath() const -> std::string {
+    return cfg_.system_config;
+  }
+
+  /// Load the model. On failure, hands back the response the caller
+  /// should return, so every entry point reports a bad config the
+  /// same way.
+  auto LoadSystem(const proto::Request& req,
+                  sc::SystemConfig* out,
+                  std::optional<proto::Response>* fail)
+      -> bool {
+    auto parsed = sc::ParseSystemConfigFile(SystemConfigPath());
+    if (!parsed) {
+      auto resp = MakeOk(req.id, {
+          {"config", SystemConfigPath()},
+          {"ok", false},
+          {"diagnostics",
+           DiagsToJson(parsed.error().diagnostics)},
+      });
+      *fail = resp;
+      return false;
+    }
+    *out = *parsed;
+    return true;
+  }
+
+  auto HandleShowSystem(const proto::Request& req)
+      -> proto::Response {
+    sc::SystemConfig cfg;
+    std::optional<proto::Response> fail;
+    if (!LoadSystem(req, &cfg, &fail)) return *fail;
+
+    auto plan = sc::PlanDnsmasq(cfg);
+    json zones = json::array();
+    for (const auto& z : cfg.zones) {
+      zones.push_back({
+          {"zone", z.name},
+          {"ipv6", sc::Ipv6StanceName(z.ipv6)},
+          {"interfaces", cfg.InterfaceNamesInZone(z.name)},
+          {"dhcp", cfg.ZoneServesDhcp(z.name)},
+          {"services", cfg.ZoneHasService(z.name)},
+      });
+    }
+    json ifaces = json::array();
+    for (const auto& i : cfg.interfaces) {
+      ifaces.push_back({
+          {"name", i.name},
+          {"match_kind",
+           i.match.kind == sc::MatchKind::kMac ? "mac" : "path"},
+          {"match", i.match.value},
+          {"mode", sc::AddressModeName(i.mode)},
+          {"address", i.address},
+          {"gateway", i.gateway},
+          {"zone", i.zone},
+          {"present", i.name.empty()
+                          ? false
+                          : IfaceExists(i.name)},
+      });
+    }
+    auto result = sc::Validate(cfg);
+    return MakeOk(req.id, {
+        {"config", SystemConfigPath()},
+        {"ok", !result.HasErrors()},
+        {"zones", zones},
+        {"interfaces", ifaces},
+        {"listen", plan.allowed_interfaces},
+        {"excluded", plan.excluded_interfaces},
+        {"dhcp_on", plan.dhcp_interfaces},
+        {"diagnostics", DiagsToJson(result.diagnostics)},
+    });
+  }
+
+  auto HandleShowServices(const proto::Request& req)
+      -> proto::Response {
+    sc::SystemConfig cfg;
+    std::optional<proto::Response> fail;
+    if (!LoadSystem(req, &cfg, &fail)) return *fail;
+
+    json services = json::array();
+    for (const auto& s : sc::QueryServices(cfg)) {
+      services.push_back({
+          {"name", s.name},
+          {"unit", s.unit},
+          {"state", sc::ServiceStateName(s.state)},
+          {"expected", s.expected},
+          {"healthy", s.state == sc::ServiceState::kRunning ||
+                          s.state ==
+                              sc::ServiceState::kNotConfigured ||
+                          s.state ==
+                              sc::ServiceState::kActivating},
+          {"zones", s.zones},
+          {"interfaces", s.interfaces},
+          {"detail", s.detail},
+      });
+    }
+    auto drift = sc::CheckDnsmasqDrift(cfg, cfg_.dnsmasq_conf);
+    return MakeOk(req.id, {
+        {"services", services},
+        {"artifact", cfg_.dnsmasq_conf},
+        {"drift", sc::DriftKindName(drift)},
+    });
+  }
+
+  auto HandleCheckSystem(const proto::Request& req)
+      -> proto::Response {
+    sc::SystemConfig cfg;
+    std::optional<proto::Response> fail;
+    if (!LoadSystem(req, &cfg, &fail)) return *fail;
+    auto result = sc::Validate(cfg);
+    return MakeOk(req.id, {
+        {"config", SystemConfigPath()},
+        {"ok", !result.HasErrors()},
+        {"diagnostics", DiagsToJson(result.diagnostics)},
+    });
+  }
+
+  auto HandleApplySystem(const proto::Request& req)
+      -> proto::Response {
+    sc::SystemConfig cfg;
+    std::optional<proto::Response> fail;
+    if (!LoadSystem(req, &cfg, &fail)) return *fail;
+
+    auto result = sc::Validate(cfg);
+    if (result.HasErrors()) {
+      return MakeOk(req.id, {
+          {"config", SystemConfigPath()},
+          {"ok", false},
+          {"applied", false},
+          {"diagnostics", DiagsToJson(result.diagnostics)},
+      });
+    }
+
+    bool force = !req.args.empty() && req.args[0] == "force";
+    sc::NetworkdOptions net_opts;
+    net_opts.refuse_on_drift = !force;
+    auto net = sc::ApplyNetworkd(cfg, net_opts);
+    if (!net) {
+      return MakeErr(req.id, "drift", net.error(),
+                     "re-run with `apply system force` to discard "
+                     "the edit");
+    }
+
+    json written = json::array();
+    for (const auto& p : net->changed) written.push_back(p);
+
+    auto plan = sc::PlanDnsmasq(cfg);
+    if (!plan.needed) {
+      return MakeOk(req.id, {
+          {"config", SystemConfigPath()},
+          {"ok", true},
+          {"applied", true},
+          {"written", written},
+          {"dhcp_on", json::array()},
+          {"note", "no service is bound to any zone; dnsmasq is "
+                   "not needed"},
+          {"diagnostics", DiagsToJson(result.diagnostics)},
+      });
+    }
+
+    sc::DnsmasqOptions dm_opts;
+    dm_opts.conf_path = cfg_.dnsmasq_conf;
+    dm_opts.refuse_on_drift = !force;
+    auto dm = sc::ApplyDnsmasq(cfg, dm_opts);
+    if (!dm) {
+      const char* code =
+          dm.error().code == sc::BackendError::kDrift ? "drift"
+          : dm.error().code == sc::BackendError::kToolMissing
+              ? "tool_missing"
+              : "rejected";
+      return MakeErr(req.id, code, dm.error().message);
+    }
+    if (dm->changed) written.push_back(dm->conf_path);
+
+    return MakeOk(req.id, {
+        {"config", SystemConfigPath()},
+        {"ok", true},
+        {"applied", true},
+        {"written", written},
+        {"dhcp_on", dm->plan.dhcp_interfaces},
+        {"diagnostics", DiagsToJson(result.diagnostics)},
     });
   }
 };

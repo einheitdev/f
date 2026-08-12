@@ -78,6 +78,22 @@ config:
         type: enum
         values: [trace, debug, info, warn, error]
         default: "info"
+  system:
+    type: object
+    fields:
+      config:
+        type: string
+        help: "System configuration: interfaces, zones, services"
+        default: "/etc/f/system.yaml"
+        example: "/etc/f/system.yaml"
+      generated_dir:
+        type: string
+        help: "Where derived daemon configs are installed"
+        default: "/etc/f/generated"
+      networkd_dir:
+        type: string
+        help: "Where derived systemd-networkd units are installed"
+        default: "/etc/systemd/network"
   editor:
     type: string
     help: "Preferred editor for configure firewall"
@@ -678,6 +694,177 @@ auto RenderShowLog(const Response& resp,
   }
 }
 
+/// Diagnostics render the way FWL renders a bad policy: named,
+/// located, refused — and never collapsed into "invalid config".
+auto RenderDiagnostics(const json& j, Renderer& renderer) -> bool {
+  auto diags = j.value("diagnostics", json::array());
+  if (diags.empty()) return false;
+  auto& out = renderer.Out();
+  for (const auto& d : diags) {
+    out << d.value("text", "") << "\n";
+  }
+  return true;
+}
+
+auto RenderShowSystem(const Response& resp, Renderer& renderer)
+    -> void {
+  auto j = ParseData(resp);
+  auto& out = renderer.Out();
+
+  Table zt;
+  AddColumn(zt, "ZONE", Align::Left, Priority::High);
+  AddColumn(zt, "INTERFACES", Align::Left, Priority::High);
+  AddColumn(zt, "SERVICES", Align::Left, Priority::Medium);
+  AddColumn(zt, "IPV6", Align::Left, Priority::Low);
+  for (const auto& z : j.value("zones", json::array())) {
+    auto ifaces = JoinStrings(z.value("interfaces", json::array()));
+    bool has = z.value("services", false);
+    AddRow(zt, {
+        Cell{z.value("zone", ""), Semantic::Emphasis},
+        Cell{ifaces.empty() ? "(none)" : ifaces,
+             ifaces.empty() ? Semantic::Warn : Semantic::Default},
+        Cell{z.value("dhcp", false) ? "dhcp+dns"
+             : has                  ? "dns"
+                                    : "-",
+             has ? Semantic::Good : Semantic::Dim},
+        Cell{z.value("ipv6", "off"), Semantic::Dim},
+    });
+  }
+  RenderFormatted(zt, renderer);
+  out << "\n";
+
+  Table it;
+  AddColumn(it, "INTERFACE", Align::Left, Priority::High);
+  AddColumn(it, "PINNED TO", Align::Left, Priority::High);
+  AddColumn(it, "ADDRESS", Align::Left, Priority::High);
+  AddColumn(it, "ZONE", Align::Left, Priority::High);
+  AddColumn(it, "PRESENT", Align::Left, Priority::Medium);
+  for (const auto& i : j.value("interfaces", json::array())) {
+    auto match = i.value("match", "");
+    auto mode = i.value("mode", "none");
+    auto addr = mode == "static" ? i.value("address", "") : mode;
+    bool present = i.value("present", false);
+    AddRow(it, {
+        Cell{i.value("name", ""), Semantic::Emphasis},
+        Cell{match.empty() ? "(unpinned)" : match,
+             match.empty() ? Semantic::Bad : Semantic::Dim},
+        Cell{addr, mode == "dhcp" ? Semantic::Warn
+                                  : Semantic::Default},
+        Cell{i.value("zone", "").empty() ? "(none)"
+                                         : i.value("zone", "")},
+        Cell{present ? "yes" : "no",
+             present ? Semantic::Good : Semantic::Warn},
+    });
+  }
+  RenderFormatted(it, renderer);
+  out << "\n";
+
+  // The derived placement is the answer to "where will a service
+  // actually answer" — shown because it is computed, not configured.
+  Table pt;
+  AddColumn(pt, "DERIVED", Align::Left, Priority::High);
+  AddColumn(pt, "INTERFACES", Align::Left, Priority::High);
+  auto row = [&](const char* label, const char* key, Semantic sem) {
+    auto v = JoinStrings(j.value(key, json::array()));
+    AddRow(pt, {Cell{label, Semantic::Info},
+                Cell{v.empty() ? "(none)" : v, sem}});
+  };
+  row("services listen on", "listen", Semantic::Good);
+  row("dhcp answers on", "dhcp_on", Semantic::Good);
+  row("excluded", "excluded", Semantic::Dim);
+  RenderFormatted(pt, renderer);
+
+  if (RenderDiagnostics(j, renderer)) {
+    if (!j.value("ok", true)) {
+      out << "\nrefused: fix the errors above, then "
+             "`apply system`\n";
+    }
+  }
+}
+
+auto RenderShowServices(const Response& resp, Renderer& renderer)
+    -> void {
+  auto j = ParseData(resp);
+  Table t;
+  AddColumn(t, "SERVICE", Align::Left, Priority::High);
+  AddColumn(t, "STATE", Align::Left, Priority::High);
+  AddColumn(t, "ZONES", Align::Left, Priority::High);
+  AddColumn(t, "ANSWERS ON", Align::Left, Priority::High);
+  AddColumn(t, "UNIT", Align::Left, Priority::Low);
+  for (const auto& s : j.value("services", json::array())) {
+    auto state = s.value("state", "unknown");
+    auto sem = s.value("healthy", false) ? Semantic::Good
+               : state == "not configured" ? Semantic::Dim
+                                           : Semantic::Bad;
+    auto zones = JoinStrings(s.value("zones", json::array()));
+    auto ifaces =
+        JoinStrings(s.value("interfaces", json::array()));
+    AddRow(t, {
+        Cell{s.value("name", ""), Semantic::Emphasis},
+        Cell{state, sem},
+        Cell{zones.empty() ? "-" : zones},
+        Cell{ifaces.empty() ? "(nowhere)" : ifaces,
+             ifaces.empty() ? Semantic::Dim : Semantic::Default},
+        Cell{s.value("unit", ""), Semantic::Dim},
+    });
+  }
+  RenderFormatted(t, renderer);
+
+  auto& out = renderer.Out();
+  for (const auto& s : j.value("services", json::array())) {
+    auto detail = s.value("detail", "");
+    if (!detail.empty()) {
+      out << "\n" << s.value("name", "") << ": " << detail << "\n";
+    }
+  }
+  auto drift = j.value("drift", "none");
+  if (drift == "hand-edited") {
+    out << "\n" << j.value("artifact", "")
+        << " was edited by hand. It is generated from the system "
+           "config; fold the change back in, or `apply system "
+           "force` to discard it.\n";
+  } else if (drift == "stale") {
+    out << "\n" << j.value("artifact", "")
+        << " is older than the system config — run `apply "
+           "system`.\n";
+  }
+}
+
+auto RenderCheckSystem(const Response& resp, Renderer& renderer)
+    -> void {
+  auto j = ParseData(resp);
+  auto& out = renderer.Out();
+  bool any = RenderDiagnostics(j, renderer);
+  if (j.value("ok", false)) {
+    if (any) out << "\n";
+    out << "ok — " << j.value("config", "") << "\n";
+  } else {
+    out << "\nrefused — " << j.value("config", "") << "\n";
+  }
+}
+
+auto RenderApplySystem(const Response& resp, Renderer& renderer)
+    -> void {
+  auto j = ParseData(resp);
+  auto& out = renderer.Out();
+  RenderDiagnostics(j, renderer);
+  if (!j.value("applied", false)) {
+    out << "\nrefused — nothing was changed\n";
+    return;
+  }
+  for (const auto& p : j.value("written", json::array())) {
+    out << "wrote " << p.get<std::string>() << "\n";
+  }
+  if (j.value("written", json::array()).empty()) {
+    out << "already up to date\n";
+  }
+  auto note = j.value("note", "");
+  if (!note.empty()) out << note << "\n";
+  auto dhcp_on = JoinStrings(j.value("dhcp_on", json::array()));
+  out << "dhcp answers on: "
+      << (dhcp_on.empty() ? "(nowhere)" : dhcp_on) << "\n";
+}
+
 // -- Adapter class ---------------------------------------------------
 
 class FwAdapter final : public cli::ProductAdapter {
@@ -725,6 +912,12 @@ class FwAdapter final : public cli::ProductAdapter {
              "Active NAT translations and masquerade source"),
         Show("conntrack", "show_conntrack",
              "Connection-tracking table entries"),
+        Show("system", "show_system",
+             "Interfaces, zones and where services will answer"),
+        Show("services", "show_services",
+             "DHCP/DNS health, and what they are bound to"),
+        MakeCheckSystem(),
+        MakeApplySystem(),
         MakeShowLog(),
         MakeShowFiles(),
         MakeEdit(),
@@ -769,6 +962,14 @@ class FwAdapter final : public cli::ProductAdapter {
       RenderShowConntrack(response, renderer);
     } else if (wc == "show_log") {
       RenderShowLog(response, renderer);
+    } else if (wc == "show_system") {
+      RenderShowSystem(response, renderer);
+    } else if (wc == "show_services") {
+      RenderShowServices(response, renderer);
+    } else if (wc == "check_system") {
+      RenderCheckSystem(response, renderer);
+    } else if (wc == "apply_system") {
+      RenderApplySystem(response, renderer);
     } else if (wc == "show_files") {
       RenderShowFiles(response, renderer);
     } else if (wc == "edit" || wc == "new_file" ||
@@ -812,6 +1013,33 @@ class FwAdapter final : public cli::ProductAdapter {
     c.args = {{
         .name = "lines",
         .help = "Number of lines to show (default 20)",
+        .required = false,
+    }};
+    return c;
+  }
+
+  static auto MakeCheckSystem() -> CommandSpec {
+    CommandSpec c;
+    c.path = "check system";
+    c.wire_command = "check_system";
+    c.help = "Validate the system configuration without "
+             "applying it";
+    c.role = RoleGate::AnyAuthenticated;
+    return c;
+  }
+
+  static auto MakeApplySystem() -> CommandSpec {
+    CommandSpec c;
+    c.path = "apply system";
+    c.wire_command = "apply_system";
+    c.help = "Generate, validate and install the daemon configs "
+             "from the system configuration";
+    c.role = RoleGate::AdminOnly;
+    c.requires_session = true;
+    c.args = {{
+        .name = "force",
+        .help = "Pass 'force' to overwrite artifacts that were "
+                "edited by hand",
         .required = false,
     }};
     return c;

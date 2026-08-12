@@ -12,6 +12,11 @@ foreach(test_source ${test_sources})
       einheit_adapter_fw
       GTest::gtest_main
     )
+  elseif(test_name MATCHES "^test_sysconfig")
+    target_link_libraries(${test_name} PRIVATE
+      libf-sysconfig
+      GTest::gtest_main
+    )
   else()
     target_link_libraries(${test_name} PRIVATE
       libf-api

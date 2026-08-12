@@ -112,6 +112,39 @@ include("cmake/bpf.cmake")
 add_bpf_object(fw bpf/fw.bpf.c)
 
 # ============================================================================
+# yaml-cpp (system, for config file parsing)
+# ============================================================================
+if(NOT TARGET yaml-cpp::yaml-cpp)
+  find_package(yaml-cpp REQUIRED)
+endif()
+
+# ============================================================================
+# System configuration model (interfaces -> zones -> services)
+#
+# No BPF, no ZMQ, no HTTP: the model, its validation and its backends.
+# Kept separate so the CLI can reason about the appliance's network
+# configuration without linking the datapath.
+# ============================================================================
+add_library(libf-sysconfig STATIC
+  src/sysconfig/artifact.cc
+  src/sysconfig/dnsmasq.cc
+  src/sysconfig/model.cc
+  src/sysconfig/net.cc
+  src/sysconfig/networkd.cc
+  src/sysconfig/parse.cc
+  src/sysconfig/service_status.cc
+  src/sysconfig/validate.cc
+)
+
+target_include_directories(libf-sysconfig PUBLIC
+  ${PROJECT_SOURCE_DIR}/include
+)
+
+target_link_libraries(libf-sysconfig PUBLIC
+  yaml-cpp::yaml-cpp
+)
+
+# ============================================================================
 # Engine library (BPF + ZMQ, no HTTP)
 # ============================================================================
 add_library(libf-engine STATIC
@@ -187,18 +220,18 @@ add_subdirectory(
 )
 
 # ============================================================================
-# yaml-cpp (system, for fd config file parsing)
-# ============================================================================
-if(NOT TARGET yaml-cpp::yaml-cpp)
-  find_package(yaml-cpp REQUIRED)
-endif()
-
-# ============================================================================
 # fd — BPF engine daemon
 # ============================================================================
 add_executable(fd cmd/fd.cc)
 target_link_libraries(fd PRIVATE
   libf-engine CLI11::CLI11 yaml-cpp::yaml-cpp)
+
+# ============================================================================
+# f-sysconf — system configuration model tool
+# ============================================================================
+add_executable(f-sysconf cmd/f_sysconf.cc)
+target_link_libraries(f-sysconf PRIVATE
+  libf-sysconfig CLI11::CLI11)
 
 # ============================================================================
 # fctl — engine control CLI
@@ -247,7 +280,7 @@ target_compile_definitions(einheit-f-ui PRIVATE
 # ============================================================================
 # Install rules
 # ============================================================================
-install(TARGETS fd fctl einheit-f einheit-f-ui f-api
+install(TARGETS fd fctl f-sysconf einheit-f einheit-f-ui f-api
   RUNTIME DESTINATION bin
 )
 install(FILES deploy/fd.yaml
@@ -257,7 +290,11 @@ install(FILES
   deploy/systemd/fd.service
   deploy/systemd/einheit-f-ui.service
   deploy/systemd/f-firstboot.service
+  deploy/systemd/f-dnsmasq.service
   DESTINATION lib/systemd/system
+)
+install(FILES deploy/system.yaml.example
+  DESTINATION share/f
 )
 install(FILES
   deploy/networkd/10-eth0.network
