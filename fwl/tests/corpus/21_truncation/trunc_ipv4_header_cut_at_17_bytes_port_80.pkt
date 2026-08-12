@@ -1,0 +1,13 @@
+name: "trunc ipv4 header cut at 17 bytes port 80"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.proto == tcp
+  default allow
+# 17 bytes: the 14-byte Ethernet header fits, the 20-byte IPv4 header does not.
+# v4_ok stays 0, so the prelude's non-IP early-out fires and the program returns XDP_PASS without consulting its default — which is why even the `default drop` variant expects allow.
+test_packet:
+  builder: tcp(src_ip="192.168.1.50", dst_ip="8.8.8.8", dst_port=80, syn=true)
+  truncate_to: 17
+expected:
+  compiles: true
+  bpf_action: allow

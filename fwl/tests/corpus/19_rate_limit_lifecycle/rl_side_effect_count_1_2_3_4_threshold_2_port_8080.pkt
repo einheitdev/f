@@ -1,0 +1,30 @@
+name: "rl side effect count 1.2.3.4 threshold 2 port 8080"
+source_fw: |
+  @xdp(eth0)
+  count rl_hits if pkt.proto == tcp limited by rate_limit(2, per=src_ip)
+  default allow
+sequence:
+  - name: "packet 1 — bucket at 0, under the limit, no count"
+    builder: tcp(src_ip="1.2.3.4", dst_ip="9.9.9.9", dst_port=8080, syn=true)
+    expected:
+      bpf_action: allow
+      counter_changes:
+        rl_hits: 0
+  - name: "packet 2 — bucket at 1, under the limit, no count"
+    builder: tcp(src_ip="1.2.3.4", dst_ip="9.9.9.9", dst_port=8080, syn=true)
+    expected:
+      bpf_action: allow
+      counter_changes:
+        rl_hits: 0
+  - name: "packet 3 — bucket at 2, the gated count fires"
+    builder: tcp(src_ip="1.2.3.4", dst_ip="9.9.9.9", dst_port=8080, syn=true)
+    expected:
+      bpf_action: allow
+      counter_changes:
+        rl_hits: 1
+  - name: "packet 4 — still over, it fires again"
+    builder: tcp(src_ip="1.2.3.4", dst_ip="9.9.9.9", dst_port=8080, syn=true)
+    expected:
+      bpf_action: allow
+      counter_changes:
+        rl_hits: 1

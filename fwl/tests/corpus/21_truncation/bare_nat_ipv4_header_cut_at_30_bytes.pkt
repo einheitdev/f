@@ -1,0 +1,15 @@
+name: "bare nat ipv4 header cut at 30 bytes"
+source_fw: |
+  @xdp(wan)
+  masquerade
+  allow
+state:
+  nat:
+    masq_ip: "198.51.100.9"
+# 30 bytes, and no prelude to early-out first: reaches `(void *)(ip + 1) > data_end` inside fwl_find_ipv4.
+test_packet:
+  builder: tcp(src_ip="203.0.113.8", dst_ip="140.82.112.3", dst_port=443, syn=true)
+  truncate_to: 30
+expected:
+  compiles: true
+  bpf_action: allow

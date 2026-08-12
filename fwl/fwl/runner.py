@@ -441,6 +441,28 @@ def _seq_interpreter_oracle(case: pkt.PktCase) -> OracleResult:
       return OracleResult(
         "interpreter", "fail", f"step {i} ({step.name}): {op_diff}"
       )
+    # `counter_changes` and `log_events` have the same history as
+    # `output_packet` did: the schema accepts them on a sequence step
+    # (pkt._SEQUENCE_STEP_KEYS -> _EXPECTED_KEYS, and the counter names
+    # are even validated against the policy) and NOTHING checked them,
+    # so a case could claim to verify a rate-limited counter and verify
+    # only the action. It is also the only way to observe the
+    # side-effect emitter's bucket, which is per-packet state a
+    # single-packet case cannot reach.
+    cc_diff = _check_counter_changes(
+      step.expected.get("counter_changes", {}), res.counter_changes
+    )
+    if cc_diff:
+      return OracleResult(
+        "interpreter", "fail", f"step {i} ({step.name}): {cc_diff}"
+      )
+    log_diff = _check_log_events(
+      step.expected.get("log_events", []), res.log_events
+    )
+    if log_diff:
+      return OracleResult(
+        "interpreter", "fail", f"step {i} ({step.name}): {log_diff}"
+      )
   return OracleResult("interpreter", "pass", "")
 
 
@@ -512,6 +534,34 @@ def _seq_bpf_oracle(case: pkt.PktCase) -> OracleResult:
       if csum_diff:
         return OracleResult(
           "bpf", "fail", f"step {i} ({step.name}): {csum_diff}"
+        )
+    # See _seq_interpreter_oracle: the schema accepted these on a step
+    # and neither sequence oracle read them.
+    expected_cc = step.expected.get("counter_changes", {})
+    if expected_cc and counter_slots:
+      cc_diff = _check_counter_changes(
+        expected_cc,
+        _slot_deltas_to_named(res.counter_deltas, counter_slots),
+      )
+      if cc_diff:
+        return OracleResult(
+          "bpf", "fail", f"step {i} ({step.name}): {cc_diff}"
+        )
+    expected_le = step.expected.get("log_events", [])
+    if expected_le:
+      bpf_log = [
+        interpreter.LogEvent(
+          rule_index=e.rule_index, proto=e.proto,
+          src_ip=e.src_ip, dst_ip=e.dst_ip,
+          src_port=e.src_port, dst_port=e.dst_port,
+          syn=e.syn, ack=e.ack,
+        )
+        for e in res.log_events
+      ]
+      log_diff = _check_log_events(expected_le, bpf_log)
+      if log_diff:
+        return OracleResult(
+          "bpf", "fail", f"step {i} ({step.name}): {log_diff}"
         )
   return OracleResult("bpf", "pass", "")
 

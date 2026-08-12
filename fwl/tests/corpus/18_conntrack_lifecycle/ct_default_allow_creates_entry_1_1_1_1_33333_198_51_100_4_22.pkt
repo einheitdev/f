@@ -1,0 +1,13 @@
+name: "ct default allow creates entry 1.1.1.1 33333 198.51.100.4 22"
+source_fw: |
+  @xdp(eth0)
+  allow if conntrack(pkt).state == established
+  drop if pkt.proto == tcp and pkt.tcp.rst
+  default allow
+sequence:
+  - name: "syn matches no rule and is admitted by `default allow`"
+    builder: tcp(src_ip="1.1.1.1", dst_ip="198.51.100.4", src_port=33333, dst_port=22, syn=true)
+    expected: { bpf_action: allow }
+  - name: "rst on the same 5-tuple: established, so the first rule allows it before the rst rule can drop it"
+    builder: tcp(src_ip="1.1.1.1", dst_ip="198.51.100.4", src_port=33333, dst_port=22, rst=true)
+    expected: { bpf_action: allow }

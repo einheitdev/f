@@ -1,0 +1,13 @@
+name: "trunc udp header cut at 35 bytes port 80"
+source_fw: |
+  @xdp(eth0)
+  allow if pkt.proto == udp and pkt.dst_port == 80
+  default drop
+# 35 bytes: v4_ok is set, l4_ok is not — the UDP header needs 42.
+# Falsifies `(void *)(udp + 1) <= data_end` (543 programs).
+test_packet:
+  builder: udp(src_ip="192.168.1.50", dst_ip="8.8.8.8", dst_port=80)
+  truncate_to: 35
+expected:
+  compiles: true
+  bpf_action: drop

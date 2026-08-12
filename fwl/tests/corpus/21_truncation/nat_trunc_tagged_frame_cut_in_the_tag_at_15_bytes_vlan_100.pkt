@@ -1,0 +1,16 @@
+name: "nat trunc tagged frame cut in the tag at 15 bytes vlan 100"
+source_fw: |
+  @xdp(wan)
+  masquerade if pkt.proto == tcp
+  drop if pkt.proto == tcp and pkt.dst_port == 22
+  default allow
+state:
+  nat:
+    masq_ip: "198.51.100.9"
+# 15 bytes: falsifies `(void *)(vh + 1) <= data_end` inside fwl_find_ipv4 — the NAT helper's own VLAN bounds check, which is a separate branch from the prelude's.
+test_packet:
+  builder: tcp(src_ip="192.168.1.50", dst_ip="8.8.8.8", dst_port=443, vlan_id=100, syn=true)
+  truncate_to: 15
+expected:
+  compiles: true
+  bpf_action: allow

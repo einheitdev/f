@@ -1,0 +1,12 @@
+name: "ihl 2 below minimum with a full frame port 443"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.proto == tcp and pkt.dst_port == 443
+  default allow
+# ihl=2 -> ip_hlen=8 < 20, so the emitted header-length guard is false and no L4 parse happens.
+# v4_ok and `proto` are still set: the IP header itself is present, it just describes a shorter one.
+test_packet:
+  builder: tcp(src_ip="172.16.3.1", dst_ip="1.1.1.1", dst_port=443, ihl=2, syn=true)
+expected:
+  compiles: true
+  bpf_action: allow

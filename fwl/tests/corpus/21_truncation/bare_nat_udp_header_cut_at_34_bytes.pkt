@@ -1,0 +1,15 @@
+name: "bare nat udp header cut at 34 bytes"
+source_fw: |
+  @xdp(wan)
+  masquerade
+  allow
+state:
+  nat:
+    masq_ip: "198.51.100.9"
+# 34 bytes: the IPv4 header is complete, the UDP one is not. Reaches `(void *)(u + 1) > data_end` — the UDP arm of the helper, which the TCP cases cannot touch.
+test_packet:
+  builder: udp(src_ip="10.0.0.7", dst_ip="93.184.216.34", dst_port=53)
+  truncate_to: 34
+expected:
+  compiles: true
+  bpf_action: allow

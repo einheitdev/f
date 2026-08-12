@@ -62,6 +62,31 @@ class CompileResult:
   source_path: Path
 
 
+# Temp work dirs this process created and may still reclaim. Bounded,
+# because the alternative measured badly: `compile_c` used to mkdtemp
+# and never clean up, one long harness run left 84,000 directories,
+# and they filled a 2 GB /tmp and killed a corpus run mid-measurement.
+# A run that dies halfway through is worse than a slow one — it
+# reports a partial number that looks like a whole one.
+#
+# The bound rather than an atexit sweep: a soak process compiles tens
+# of thousands of programs before it exits, so deferring every removal
+# to exit only moves the same pile to the end of the run. Callers
+# consume `obj_path` immediately (load, or read stderr and discard),
+# and the only caller that keeps several objects alive at once is the
+# bundle loader, which holds one per zone. 256 is far above that and
+# far below anything that fills a disk.
+_TEMP_WORK_DIR_KEEP = 256
+_temp_work_dirs: list[Path] = []
+
+
+def _track_temp_work_dir(path: Path) -> None:
+  """Remember a temp dir, reclaiming the oldest beyond the bound."""
+  _temp_work_dirs.append(path)
+  while len(_temp_work_dirs) > _TEMP_WORK_DIR_KEEP:
+    shutil.rmtree(_temp_work_dirs.pop(0), ignore_errors=True)
+
+
 def compile_c(c_source: str, work_dir: Path | None = None) -> CompileResult:
   """Compile BPF C to a relocatable object via clang.
 
@@ -69,6 +94,11 @@ def compile_c(c_source: str, work_dir: Path | None = None) -> CompileResult:
   privileges required), so it acts as a partial verification oracle
   even when full BPF_PROG_RUN is unavailable: structurally broken
   emitter output fails here.
+
+  When `work_dir` is None a temporary directory is created, and this
+  module reclaims it once `_TEMP_WORK_DIR_KEEP` newer ones exist. A
+  caller that needs its object to outlive that must pass `work_dir`
+  explicitly, as `fwl compile --bundle-dir` does.
 
   Raises BpfUnavailable if clang is missing.
   Raises subprocess.CalledProcessError if compilation fails — the
@@ -79,6 +109,7 @@ def compile_c(c_source: str, work_dir: Path | None = None) -> CompileResult:
 
   if work_dir is None:
     work_dir = Path(tempfile.mkdtemp(prefix="fwl-bpf-"))
+    _track_temp_work_dir(work_dir)
   work_dir.mkdir(parents=True, exist_ok=True)
 
   src_path = work_dir / "fwl_prog.bpf.c"
@@ -332,6 +363,13 @@ def _load_and_run_seq(
     prog_fd = _resolve_entry_prog(libbpf, obj)
 
     results: list[RunResult] = []
+    # `fwl_counters` is cumulative across the whole loaded object, so a
+    # per-step delta is a difference of two readings. Reporting the raw
+    # total made step N of a sequence claim every increment since step
+    # 0 — matching the interpreter only on the first step, and only
+    # ever compared once a sequence step's `counter_changes` was
+    # actually checked (it was accepted and ignored until then).
+    prev_totals: dict[int, int] = {}
     for packet in packets:
       log_events: list[LogEvent] = []
       rb = _setup_ring_buffer(libbpf, obj, log_events) if has_log else None
@@ -343,9 +381,12 @@ def _load_and_run_seq(
 
       counter_deltas: dict[int, int] = {}
       if counter_slots > 0:
-        counter_deltas = _read_counter_deltas(
-          libbpf, obj, counter_slots
-        )
+        totals = _read_counter_totals(libbpf, obj, counter_slots)
+        for slot in set(totals) | set(prev_totals):
+          delta = totals.get(slot, 0) - prev_totals.get(slot, 0)
+          if delta:
+            counter_deltas[slot] = delta
+        prev_totals = totals
       results.append(RunResult(
         action=action,
         counter_deltas=counter_deltas,
@@ -478,10 +519,17 @@ def _setup_ring_buffer(libbpf, obj, log_events):
   return rb
 
 
-def _read_counter_deltas(
+def _read_counter_totals(
   libbpf, obj, n_slots: int
 ) -> dict[int, int]:
-  """Read fwl_counters per-CPU array and sum across CPUs."""
+  """Read fwl_counters per-CPU array and sum across CPUs.
+
+  ABSOLUTE totals since the object was loaded, not per-run deltas.
+  Callers running more than one packet against one loaded object must
+  subtract the previous reading themselves — see `_load_and_run_seq`,
+  where not doing so made every step of a sequence report the running
+  total while the interpreter reported that step alone.
+  """
   bpf_map = libbpf.bpf_object__find_map_by_name(
     obj, b"fwl_counters"
   )
@@ -493,7 +541,7 @@ def _read_counter_deltas(
   except OSError:
     nr_cpus = 1
   val_size = 8 * nr_cpus
-  deltas: dict[int, int] = {}
+  totals: dict[int, int] = {}
   for slot in range(n_slots):
     key = (ctypes.c_uint32)(slot)
     val_buf = (ctypes.c_ubyte * val_size)()
@@ -510,8 +558,8 @@ def _read_counter_deltas(
       )
       total += cpu_val[0]
     if total != 0:
-      deltas[slot] = total
-  return deltas
+      totals[slot] = total
+  return totals
 
 
 # union bpf_attr layout for BPF_PROG_TEST_RUN — minimal fields

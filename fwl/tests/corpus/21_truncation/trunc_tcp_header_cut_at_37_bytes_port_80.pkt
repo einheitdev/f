@@ -1,0 +1,12 @@
+name: "trunc tcp header cut at 37 bytes port 80"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.proto == tcp and pkt.dst_port == 80
+  default allow
+# 37 bytes: the TCP header needs 54. l4_ok stays 0 even where the port pair itself is present.
+test_packet:
+  builder: tcp(src_ip="192.168.1.50", dst_ip="8.8.8.8", dst_port=80, syn=true)
+  truncate_to: 37
+expected:
+  compiles: true
+  bpf_action: allow

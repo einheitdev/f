@@ -1,0 +1,15 @@
+name: "snat to self 10.1.2.3 sp80 dp8080 early out"
+source_fw: |
+  @xdp(lan)
+  snat to 10.1.2.3 if pkt.proto == tcp
+  allow
+test_packet:
+  builder: tcp(src_ip="10.1.2.3", dst_ip="140.82.112.3", src_port=80, dst_port=8080, syn=true)
+expected:
+  compiles: true
+  bpf_action: allow
+  output_packet:
+    src_ip: "10.1.2.3"
+    dst_ip: "140.82.112.3"
+    src_port: 80
+    dst_port: 8080

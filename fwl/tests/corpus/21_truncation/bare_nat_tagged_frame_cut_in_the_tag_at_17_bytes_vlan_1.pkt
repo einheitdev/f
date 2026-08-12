@@ -1,0 +1,15 @@
+name: "bare nat tagged frame cut in the tag at 17 bytes vlan 1"
+source_fw: |
+  @xdp(wan)
+  masquerade
+  allow
+state:
+  nat:
+    masq_ip: "198.51.100.9"
+# 17 bytes: reaches `(void *)(vh + 1) > data_end` — the NAT helper's own VLAN bounds check, a separate branch from the prelude's and one the prelude's early-out normally hides.
+test_packet:
+  builder: tcp(src_ip="1.2.3.4", dst_ip="9.9.9.9", dst_port=443, vlan_id=1, syn=true)
+  truncate_to: 17
+expected:
+  compiles: true
+  bpf_action: allow

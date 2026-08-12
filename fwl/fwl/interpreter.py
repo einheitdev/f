@@ -330,6 +330,11 @@ def evaluate_full(
   state = {} if state is None else state
   geoip_data = geoip_data or {}
   packet = _gate_v6_packet_for_v01_program(program, packet)
+  if _non_ip_early_out(program, packet):
+    # The compiled program returns here, before the rules and before
+    # the default. Nothing else runs: no counter, no log event, no
+    # conntrack entry.
+    return EvalResult(action=XdpAction.PASS)
   uses_ct = _program_uses_conntrack(program)
   ct = conntrack if conntrack is not None else ConntrackTable()
   ct_state = ct.state_for(packet)
@@ -367,7 +372,9 @@ def evaluate_full(
     ):
       continue
     if rule.modifier is not None:
-      if not _rate_limit_allows(rule.modifier, idx, packet, state):
+      if not _rate_limit_allows(
+        rule.modifier, idx, packet, state, counters
+      ):
         continue
     if rule.action in _TERMINAL_ACTION_TO_XDP:
       if (uses_ct and rule.action == ast.Action.ALLOW
@@ -383,7 +390,7 @@ def evaluate_full(
         ),
         output_packet=ctx.work if ctx.nat_fired else None,
       )
-    if rule.action in ast.NAT_ACTIONS:
+    if rule.action in ast.NAT_ACTIONS and _nat_can_parse(packet):
       # Non-terminal rewrite: translate the working packet and fall
       # through to the next rule (the terminal emits the rewrite).
       _apply_nat(rule.action, rule.nat_addr, rule.nat_port,
@@ -450,10 +457,12 @@ def _exec_stmts(
         ctx.redirect_zone = stmt.redirect_zone
         return XdpAction.REDIRECT
       if stmt.action in ast.NAT_ACTIONS:
-        # Non-terminal rewrite: translate and fall through.
-        _apply_nat(stmt.action, stmt.nat_addr, stmt.nat_port,
-                   ctx.work, ctx.nat)
-        ctx.nat_fired = True
+        # Non-terminal rewrite: translate and fall through. Gated on
+        # the same `fwl_find_ipv4` conditions the Tier 1 path uses.
+        if _nat_can_parse(packet):
+          _apply_nat(stmt.action, stmt.nat_addr, stmt.nat_port,
+                     ctx.work, ctx.nat)
+          ctx.nat_fired = True
         continue
       # LOG and COUNT are non-terminal: side effect omitted in test.
       continue
@@ -752,6 +761,114 @@ def _stmts_touch_v6(stmts) -> bool:
   return False
 
 
+def _referenced_field_names(program: ast.Program) -> set[str]:
+  """Every `pkt.<field>` name the program reads, Tier 1 and Tier 2.
+
+  Mirrors the PURPOSE of emitter._referenced_fields without importing
+  it (oracle independence, as `_program_uses_conntrack` does): the
+  emitted parse prelude — and with it the non-IP early-out — is
+  omitted entirely for a program that reads no packet field, so a
+  policy like `@xdp(eth0)\\ndefault drop` really does drop an ARP
+  frame while one that reads a single field does not.
+
+  A generic structural walk rather than a per-node-type match: the
+  set of AST node types that can carry a FieldRef grows with the
+  language, and a walk that misses one would silently under-report,
+  which reads exactly like "no fields" — the shape this harness
+  exists to prevent.
+  """
+  names: set[str] = set()
+  seen: set[int] = set()
+
+  def visit(node) -> None:
+    if node is None or isinstance(node, (str, bytes, int, float, bool)):
+      return
+    if isinstance(node, (list, tuple, set, frozenset)):
+      for item in node:
+        visit(item)
+      return
+    if isinstance(node, dict):
+      for item in node.values():
+        visit(item)
+      return
+    if id(node) in seen:
+      return
+    seen.add(id(node))
+    if isinstance(node, ast.FieldRef):
+      names.add(node.name)
+      return
+    attrs = getattr(node, "__dict__", None)
+    if attrs:
+      for value in attrs.values():
+        visit(value)
+
+  for rule in program.rules:
+    visit(rule.condition)
+    if rule.modifier is not None:
+      names.add(rule.modifier.per_field)
+    if rule.action == ast.Action.LOG:
+      # The log_event struct carries the whole L4 tuple, so a `log`
+      # rule forces the full prelude even with no field in its
+      # condition.
+      names.add(ast.FIELD_SRC_IP)
+  if program.function is not None:
+    visit(program.function.body)
+  if _program_uses_conntrack(program):
+    names.add(ast.FIELD_PROTO)
+  return names
+
+
+# Decoded-dict keys that exist only once the L3 header has parsed.
+# `pkt._strip_truncated_fields` removes the whole group on the same
+# boundary the emitter sets v4_ok / v6_ok on.
+_L3_PRESENCE_KEYS = (
+  "proto", "src_ip", "dst_ip", "src_ip6", "dst_ip6",
+)
+
+
+def _program_reads_vlan(program: ast.Program) -> bool:
+  """True iff any rule reads a VLAN field (the emitter's needs_vlan)."""
+  names = _referenced_field_names(program)
+  return bool(names & {ast.FIELD_VLAN_ID, ast.FIELD_VLAN_PRIORITY})
+
+
+def _non_ip_early_out(
+  program: ast.Program, packet: dict[str, Any]
+) -> bool:
+  """True when the emitted program returns XDP_PASS before any rule.
+
+  The prelude's last line is
+  `if (!v4_ok && !v6_ok [&& !vlan_ok]) return XDP_PASS;` — a frame
+  whose L3 header never parsed leaves the program immediately,
+  *ignoring the policy's default action*. Introduced in v0.2 so an
+  explicit `default drop` would not silently drop ARP and kill the
+  management plane (emitter.py:1005-1019, SOAK_INCIDENTS #3).
+
+  The interpreter did not model it, so every `default drop` policy
+  disagreed with the compiled program on any unparseable frame.
+  Measured root on deb-02 before the fix: a 20-byte frame into
+  `allow if pkt.proto == tcp / default drop` gave interpreter DROP,
+  BPF PASS. No corpus case paired an unparseable frame with a `drop`
+  default, which is why 1127 cases never noticed.
+
+  `v4_ok || v6_ok` reads on the decoded dict as "any L3 field is
+  present": the builders set `proto` together with the addresses, and
+  `pkt._strip_truncated_fields` drops all of them on exactly the
+  boundary the emitter gates v4_ok/v6_ok on. Testing the whole group
+  rather than `proto` alone also keeps hand-built packet dicts (unit
+  tests, generators) out of the early-out path.
+  """
+  if not _referenced_field_names(program):
+    return False  # no prelude is emitted at all, so no early-out
+  if any(key in packet for key in _L3_PRESENCE_KEYS):
+    return False  # v4_ok or v6_ok
+  if _program_reads_vlan(program) and (
+    "vlan_id" in packet or "vlan_priority" in packet
+  ):
+    return False  # vlan_ok keeps a tagged non-IP frame in the rules
+  return True
+
+
 def _condition_touches_v6(node) -> bool:
   if node is None:
     return False
@@ -800,11 +917,24 @@ def _build_log_event(
   )
 
 
+# The emitter declares every rate-limit bucket map as
+# `BPF_MAP_TYPE_PERCPU_HASH` with `max_entries = 4096`
+# (emitter._emit_rl_maps). A preallocated hash map refuses an insert of
+# a NEW key once it is full: `bpf_map_update_elem` returns -E2BIG and
+# the emitted program ticks the reserved `__rate_limit_overflow`
+# counter. Modelled here because that is the ONLY divergence a
+# key-space-exhaustion case can observe, and an oracle that cannot
+# model the write cannot notice a defect in it.
+RATE_LIMIT_MAP_MAX_ENTRIES = 4096
+RATE_LIMIT_OVERFLOW_COUNTER = "__rate_limit_overflow"
+
+
 def _rate_limit_allows(
   mod: ast.RateLimit,
   rule_idx: int,
   packet: dict[str, Any],
   state: dict[int, dict[Any, int]],
+  counters: dict[str, int] | None = None,
 ) -> bool:
   """True iff the rate_limit gate lets the rule fire, and count this packet.
 
@@ -860,6 +990,18 @@ def _rate_limit_allows(
   # than one second, but BPF_PROG_TEST_RUN replays a sequence's packets
   # back to back in microseconds, so every step is inside one window.
   current = buckets.get(key, 0)
+  # A full bucket map cannot take a new key. The emitted program reads
+  # `cur = 0` (the lookup missed), tries the insert, gets -E2BIG, ticks
+  # __rate_limit_overflow and carries on with cur = 0 — so the gate for
+  # that key can never fire again. Rate limiting silently stops working
+  # for every key past capacity; that is the behaviour under test, not
+  # an approximation of it.
+  if key not in buckets and len(buckets) >= RATE_LIMIT_MAP_MAX_ENTRIES:
+    if counters is not None:
+      counters[RATE_LIMIT_OVERFLOW_COUNTER] = (
+        counters.get(RATE_LIMIT_OVERFLOW_COUNTER, 0) + 1
+      )
+    return current >= mod.threshold
   buckets[key] = current + 1
   return current >= mod.threshold
 
@@ -1058,6 +1200,23 @@ def _nat_work_init(packet: dict[str, Any]) -> dict[str, Any]:
   return work
 
 
+def _nat_can_parse(packet: dict[str, Any]) -> bool:
+  """Mirror `fwl_find_ipv4`: which frames the NAT helpers will touch.
+
+  The emitted helper bails on a non-IPv4 EtherType, on a frame too
+  short for the fixed header, and — the case nothing modelled — on
+  `ip->ihl != 5`. An IP-options packet therefore passes through every
+  NAT rule completely untranslated. Without this the interpreter
+  rewrote a frame the compiled program leaves alone, and the
+  divergence would have been reported as a compiler defect.
+  """
+  if packet.get("ether_type") not in (None, 0x0800):
+    return False
+  if "proto" not in packet:
+    return False
+  return packet.get("_ihl", 5) == 5
+
+
 def _apply_ingress_denat(packet: dict[str, Any], ctx: "_Ctx") -> None:
   """Rewrite return traffic before rule evaluation (Phase 5).
 
@@ -1065,6 +1224,8 @@ def _apply_ingress_denat(packet: dict[str, Any], ctx: "_Ctx") -> None:
   translated tuple; the seeded reply mapping restores the original
   internal destination. Mirrors the BPF program's pre-rule de-NAT."""
   if ctx.nat is None:
+    return
+  if not _nat_can_parse(packet):
     return
   hit = ctx.nat.denat(packet)
   if hit is None:
@@ -1079,6 +1240,22 @@ def _apply_ingress_denat(packet: dict[str, Any], ctx: "_Ctx") -> None:
     if new_port is not None:
       ctx.work["src_port"] = new_port
   ctx.nat_fired = True
+
+
+def _snat_is_noop(work: dict[str, Any], new_addr: int) -> bool:
+  """True when SNAT would translate a source to the address it has.
+
+  `fwl_snat_egress` returns at `if (old_saddr == new_saddr)` — before
+  the reply mapping is installed. So translating to self is not merely
+  a no-op rewrite: no return-path state is created either, and a later
+  reply packet must NOT de-NAT. The interpreter installed the mapping
+  anyway, which only shows up as a divergence on the second packet of
+  a sequence.
+  """
+  src = work.get("src_ip")
+  if not isinstance(src, str):
+    return False
+  return src == _int_to_ipv4(new_addr)
 
 
 def _apply_nat(action: ast.Action, nat_addr: int | None,
@@ -1098,12 +1275,16 @@ def _apply_nat(action: ast.Action, nat_addr: int | None,
   packet came from, not where it was translated to.
   """
   if action == ast.Action.SNAT and nat_addr is not None:
+    if _snat_is_noop(work, nat_addr):
+      return
     if nat is not None:
       nat.install_egress_reply(work, nat_addr)
     work["src_ip"] = _int_to_ipv4(nat_addr)
   elif action == ast.Action.MASQUERADE:
     masq = nat.masq_ip if nat is not None else None
     if masq is not None:
+      if _snat_is_noop(work, masq):
+        return
       nat.install_egress_reply(work, masq)
       work["src_ip"] = _int_to_ipv4(masq)
   elif action == ast.Action.DNAT and nat_addr is not None:

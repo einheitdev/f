@@ -1,0 +1,13 @@
+name: "trunc tagged frame cut in the tag at 16 bytes vlan 4094"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.src_ip6 in fd00::5/128
+  drop if pkt.proto == tcp and pkt.dst_port == 22
+  default allow
+# 16 bytes: the 802.1Q tag needs 18. l3_proto is never re-read, so it stays 0x8100 — neither ETH_P_IP nor ETH_P_IPV6.
+test_packet:
+  builder: tcp6(src_ip="fd00::5", dst_ip="fd00::9", dst_port=22, vlan_id=4094, syn=true)
+  truncate_to: 16
+expected:
+  compiles: true
+  bpf_action: allow

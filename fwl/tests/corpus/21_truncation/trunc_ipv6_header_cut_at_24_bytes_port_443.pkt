@@ -1,0 +1,12 @@
+name: "trunc ipv6 header cut at 24 bytes port 443"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.src_ip6 in fd00::5/128
+  default allow
+# 24 bytes: falsifies `(void *)(ip6 + 1) <= data_end` — 76 programs carry it and every one of them has only ever been sent a whole IPv6 frame.
+test_packet:
+  builder: tcp6(src_ip="fd00::5", dst_ip="fd00::9", dst_port=443, syn=true)
+  truncate_to: 24
+expected:
+  compiles: true
+  bpf_action: allow

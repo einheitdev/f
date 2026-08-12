@@ -1,0 +1,19 @@
+name: "denat zero checksum udp reply to 10.1.2.3 dp8080"
+source_fw: |
+  @xdp(wan)
+  snat to 203.0.113.250 if pkt.proto == tcp
+  allow
+state:
+  nat:
+    mappings:
+      - { proto: udp, src_ip: "140.82.112.3", dst_ip: "203.0.113.250", src_port: 53, dst_port: 8080, new_ip: "10.1.2.3", new_port: 8080, nat_type: dnat }
+test_packet:
+  builder: udp(src_ip="140.82.112.3", dst_ip="203.0.113.250", src_port=53, dst_port=8080, udp_csum_zero=true)
+expected:
+  compiles: true
+  bpf_action: allow
+  output_packet:
+    src_ip: "140.82.112.3"
+    dst_ip: "10.1.2.3"
+    src_port: 53
+    dst_port: 8080

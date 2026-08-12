@@ -1,0 +1,12 @@
+name: "trunc ipv6 header cut at 34 bytes port 8080"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.src_ip6 in 2001:db8:1::99/128
+  default allow
+# 34 bytes: falsifies `(void *)(ip6 + 1) <= data_end` — 76 programs carry it and every one of them has only ever been sent a whole IPv6 frame.
+test_packet:
+  builder: tcp6(src_ip="2001:db8:1::99", dst_ip="2606:4700::1111", dst_port=8080, syn=true)
+  truncate_to: 34
+expected:
+  compiles: true
+  bpf_action: allow

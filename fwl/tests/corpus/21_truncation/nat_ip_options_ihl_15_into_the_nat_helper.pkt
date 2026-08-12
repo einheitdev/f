@@ -1,0 +1,15 @@
+name: "nat ip options ihl 15 into the nat helper"
+source_fw: |
+  @xdp(wan)
+  masquerade if pkt.proto == tcp
+  drop if pkt.proto == tcp and pkt.dst_port == 22
+  default allow
+state:
+  nat:
+    masq_ip: "198.51.100.9"
+# ihl=15 reaches `ip->ihl != 5` in fwl_find_ipv4. The helper declines, so an options-bearing packet crosses a masquerading firewall with its ORIGINAL source address — visible here as the absence of a rewrite.
+test_packet:
+  builder: tcp(src_ip="172.16.3.1", dst_ip="1.1.1.1", dst_port=443, ihl=15, syn=true)
+expected:
+  compiles: true
+  bpf_action: allow

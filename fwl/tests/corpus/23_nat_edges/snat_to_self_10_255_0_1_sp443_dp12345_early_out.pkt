@@ -1,0 +1,15 @@
+name: "snat to self 10.255.0.1 sp443 dp12345 early out"
+source_fw: |
+  @xdp(lan)
+  snat to 10.255.0.1 if pkt.proto == tcp
+  allow
+test_packet:
+  builder: tcp(src_ip="10.255.0.1", dst_ip="208.67.222.222", src_port=443, dst_port=12345, syn=true)
+expected:
+  compiles: true
+  bpf_action: allow
+  output_packet:
+    src_ip: "10.255.0.1"
+    dst_ip: "208.67.222.222"
+    src_port: 443
+    dst_port: 12345

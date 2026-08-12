@@ -174,12 +174,22 @@ _TCP_BUILDER_FIELDS = frozenset({
 _VLAN_BUILDER_FIELDS = frozenset({
   "vlan_id", "vlan_priority", "inner_vlan_id", "inner_vlan_priority",
 })
+# Malformed/edge IPv4 header knobs, accepted by the v4 builders only.
+# `ihl` writes the IHL nibble (and inserts (ihl-5)*4 bytes of NOP
+# options when > 5) so a case can reach the emitter's header-length
+# guard and the NAT helper's `ip->ihl != 5` bail-out; `udp_csum_zero`
+# emits the RFC 768 "no checksum" datagram the NAT rewrite must leave
+# alone. Both are branch-coverage instruments: nothing else in the
+# builder language can produce those frames.
+_IPV4_EDGE_FIELDS = frozenset({"ihl"})
 _BUILDER_FIELD_TABLE: dict[str, frozenset[str]] = {
-  "tcp": _TCP_BUILDER_FIELDS | _VLAN_BUILDER_FIELDS,
-  "udp": frozenset({"src_ip", "dst_ip", "src_port",
-                    "dst_port"}) | _VLAN_BUILDER_FIELDS,
-  "icmp": frozenset({"src_ip", "dst_ip", "type",
-                     "code"}) | _VLAN_BUILDER_FIELDS,
+  "tcp": (_TCP_BUILDER_FIELDS | _VLAN_BUILDER_FIELDS
+          | _IPV4_EDGE_FIELDS),
+  "udp": (frozenset({"src_ip", "dst_ip", "src_port", "dst_port",
+                     "udp_csum_zero"})
+          | _VLAN_BUILDER_FIELDS | _IPV4_EDGE_FIELDS),
+  "icmp": (frozenset({"src_ip", "dst_ip", "type", "code"})
+           | _VLAN_BUILDER_FIELDS | _IPV4_EDGE_FIELDS),
   # v0.2 IPv6 builders. Per PKT_V02_SPEC.md, the field names src_ip
   # and dst_ip are reused for symmetry with the v4 builders; the
   # values are RFC 4291 IPv6 strings, so the type is unambiguous to
@@ -239,6 +249,15 @@ def parse_builder(text: str) -> dict[str, Any]:
     fields[name] = _parse_value(raw_value)
   return fields
 
+
+# Decoded-field groups the emitted parser gates behind `l4_ok` and
+# `icmp_ok` / `icmp6_ok`. Shared by the truncation mirror and the IHL
+# mirror so the two cannot drift apart.
+_L4_GATED_KEYS = (
+  "src_port", "dst_port",
+  "syn", "ack", "fin", "rst", "psh", "urg", "ece", "cwr",
+)
+_ICMP_GATED_KEYS = ("icmp_type", "icmp_code", "icmp6_type", "icmp6_code")
 
 _DEFAULT_SRC_MAC = b"\x02\x00\x00\x00\x00\x01"
 _DEFAULT_DST_MAC = b"\x02\x00\x00\x00\x00\x02"
@@ -579,10 +598,18 @@ def build_packet(fields: dict[str, Any]) -> Packet:
   else:
     raise ValueError(f"unknown proto: {proto!r}")
 
-  total_len = 20 + len(l4)
+  ihl = _validated_ihl(fields.get("ihl"))
+  # ihl > 5 means IP options: (ihl-5)*4 bytes between the fixed header
+  # and L4. NOP (0x01) padding keeps the option area well-formed. ihl
+  # < 5 is deliberately malformed — the nibble lies about a header that
+  # is still 20 bytes, which is what the emitter's `ip_hlen >=
+  # sizeof(struct iphdr)` guard exists to reject.
+  opt_len = max(0, (ihl - 5) * 4)
+  options = b"\x01" * opt_len
+  total_len = 20 + opt_len + len(l4)
   ip_header = struct.pack(
     ">BBHHHBBH4s4s",
-    0x45,                         # version=4, IHL=5
+    0x40 | (ihl & 0x0F),          # version=4, IHL as requested
     0,                            # DSCP/ECN
     total_len,
     0,                            # id
@@ -593,7 +620,11 @@ def build_packet(fields: dict[str, Any]) -> Packet:
     _ipv4_to_bytes(src_ip, "src_ip"),
     _ipv4_to_bytes(dst_ip, "dst_ip"),
   )
-  checksum = _ipv4_checksum(ip_header)
+  # The header checksum covers the options too (RFC 791), and the
+  # runner's post-rewrite checksum diagnostic reads exactly ihl*4
+  # bytes — computing it over the fixed header alone would report every
+  # options frame as corrupt.
+  checksum = _ipv4_checksum(ip_header + options)
   ip_header = ip_header[:10] + struct.pack(">H", checksum) + ip_header[12:]
 
   # Fill a valid TCP/UDP checksum (ICMP keeps its zero placeholder —
@@ -605,7 +636,14 @@ def build_packet(fields: dict[str, Any]) -> Packet:
     c = _l4_checksum(src4, dst4, proto_num, l4)
     l4 = l4[:16] + struct.pack(">H", c) + l4[18:]
   elif proto == "udp":
-    c = _l4_checksum(src4, dst4, proto_num, l4) or 0xFFFF
+    # RFC 768 lets a UDP sender skip the checksum by transmitting zero.
+    # The emitter's NAT rewrite is required to leave such a datagram's
+    # checksum at zero rather than "fixing" it, so the builder has to
+    # be able to produce one.
+    if fields.get("udp_csum_zero"):
+      c = 0
+    else:
+      c = _l4_checksum(src4, dst4, proto_num, l4) or 0xFFFF
     l4 = l4[:6] + struct.pack(">H", c) + l4[8:]
 
   eth, vlan_decoded, is_qinq = _eth_header(
@@ -616,8 +654,57 @@ def build_packet(fields: dict[str, Any]) -> Packet:
   # headers are unreachable, so the decoded dict exposes just the
   # outer VLAN fields (mirrors the emitter leaving v4_ok/l4_ok at 0).
   decoded = vlan_decoded if is_qinq else {**decoded, **vlan_decoded}
-  raw = eth + ip_header + l4
+  decoded = _apply_ihl_to_decoded(decoded, ihl, is_qinq)
+  raw = eth + ip_header + options + l4
   return Packet(raw=raw, fields=decoded)
+
+
+# Builder-only keys: they shape the frame but are not FWL packet
+# fields, so they must not survive into the decoded dict a rule reads.
+_NON_FIELD_BUILDER_KEYS = ("ihl", "udp_csum_zero")
+
+
+def _validated_ihl(raw: Any) -> int:
+  """Resolve + range-check the builder's `ihl`, defaulting to 5."""
+  if raw is None:
+    return 5
+  if isinstance(raw, bool) or not isinstance(raw, int):
+    raise ValueError(f"builder ihl must be an integer 0..15: {raw!r}")
+  if not (0 <= raw <= 15):
+    raise ValueError(f"builder ihl out of range 0..15: {raw}")
+  return raw
+
+
+def _apply_ihl_to_decoded(
+  decoded: dict[str, Any], ihl: int, is_qinq: bool
+) -> dict[str, Any]:
+  """Mirror the emitter's IHL guard on the decoded-fields dict.
+
+  The emitted prelude parses L4 only inside
+  `if (ip_hlen >= sizeof(struct iphdr) && (void *)ip + ip_hlen <=
+  data_end)`, so an IHL below 5 leaves `l4_ok` / `icmp_ok` at zero and
+  every port, TCP-flag and ICMP field unreadable. The interpreter
+  consumes this dict, so it has to lose the same fields or the two
+  oracles disagree on a frame neither of them is wrong about.
+
+  `_ihl` is recorded (never stripped) because the NAT helpers bail on
+  `ip->ihl != 5` — the interpreter's NAT model reads it to mirror that
+  bail-out. The leading underscore keeps it out of the FWL field
+  namespace.
+  """
+  out = dict(decoded)
+  for key in _NON_FIELD_BUILDER_KEYS:
+    out.pop(key, None)
+  if is_qinq:
+    # A double-tagged frame exposes no L3/L4 fields at all; the IHL of
+    # an unreachable header is not a property anything can observe.
+    return out
+  out["_ihl"] = ihl
+  if ihl >= 5:
+    return out
+  for key in _L4_GATED_KEYS + _ICMP_GATED_KEYS:
+    out.pop(key, None)
+  return out
 
 
 _TOP_LEVEL_KEYS = frozenset({
@@ -863,6 +950,14 @@ def _check_counter_changes_declared(doc: dict, expected: dict) -> None:
         raise ValueError(f"counter '{name}' not declared in source_fw")
 
 
+# The emitter appends this reserved slot to any program that uses a
+# rate_limit primitive (emitter.RATE_LIMIT_OVERFLOW_COUNTER). It is not
+# spelled by a `count` rule, so `_declared_counter_names` cannot see it,
+# but it is the ONLY observable of a rate-limit map whose key space is
+# exhausted — without it that path is unassertable from a .pkt.
+RATE_LIMIT_OVERFLOW_COUNTER = "__rate_limit_overflow"
+
+
 def _load_sequence(doc: dict, path: Path) -> PktCase:
   """Load a multi-packet `sequence:` case (v0.4 conntrack)."""
   raw_steps = doc["sequence"]
@@ -1004,11 +1099,8 @@ def _strip_truncated_fields(
   # L4 port/TCP-flag fields (gated by l4_ok) and ICMP type/code fields
   # (gated by icmp_ok/icmp6_ok) parse at different header sizes, so
   # they get separate truncation boundaries below.
-  l4_keys = (
-    "src_port", "dst_port",
-    "syn", "ack", "fin", "rst", "psh", "urg", "ece", "cwr",
-  )
-  icmp_keys = ("icmp_type", "icmp_code", "icmp6_type", "icmp6_code")
+  l4_keys = _L4_GATED_KEYS
+  icmp_keys = _ICMP_GATED_KEYS
   # VLAN fields are readable only once the full 4-byte tag fits
   # (bytes 12..16). A frame truncated inside the tag leaves them
   # unreadable, mirroring the emitter's vlan_ok gate.
@@ -1056,10 +1148,21 @@ def _rate_limit_rule_indices(source_fw: str) -> frozenset[int]:
 
 
 def _declared_counter_names(source_fw: str) -> frozenset[str]:
-  """Counter names declared by `count <name>` rules in `source_fw`."""
+  """Counter names a .pkt may assert on for `source_fw`.
+
+  `count <name>` rules, plus the reserved `__rate_limit_overflow` slot
+  when the program carries any rate_limit modifier — the emitter
+  allocates that slot itself, so a case can assert it without the
+  policy naming it.
+  """
   from . import analyzer, ast, parser
   program = analyzer.analyze(parser.parse(source_fw))
-  return frozenset(
+  reserved = (
+    {RATE_LIMIT_OVERFLOW_COUNTER}
+    if any(rule.modifier is not None for rule in program.rules)
+    else set()
+  )
+  return frozenset(reserved) | frozenset(
     rule.counter_name
     for rule in program.rules
     if rule.action == ast.Action.COUNT and rule.counter_name

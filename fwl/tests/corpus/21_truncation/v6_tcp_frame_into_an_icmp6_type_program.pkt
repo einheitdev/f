@@ -1,0 +1,11 @@
+name: "v6 tcp frame into an icmp6 type program"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.proto == icmp6 and pkt.icmp6.type == 128
+  default allow
+# next_header is TCP, so `proto == IPPROTO_ICMPV6` is false and the ICMPv6 fields stay at zero. A parser that read type/code at the fixed offset regardless would see the TCP source port's high byte as an ICMPv6 type.
+test_packet:
+  builder: tcp6(src_ip="2001:db8::1", dst_ip="2001:db8::2", dst_port=443, syn=true)
+expected:
+  compiles: true
+  bpf_action: allow

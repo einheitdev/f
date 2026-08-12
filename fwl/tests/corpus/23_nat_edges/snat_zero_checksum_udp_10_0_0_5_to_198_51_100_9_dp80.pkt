@@ -1,0 +1,15 @@
+name: "snat zero checksum udp 10.0.0.5 to 198.51.100.9 dp80"
+source_fw: |
+  @xdp(lan)
+  snat to 198.51.100.9 if pkt.proto == udp
+  allow
+test_packet:
+  builder: udp(src_ip="10.0.0.5", dst_ip="93.184.216.34", src_port=12345, dst_port=80, udp_csum_zero=true)
+expected:
+  compiles: true
+  bpf_action: allow
+  output_packet:
+    src_ip: "198.51.100.9"
+    dst_ip: "93.184.216.34"
+    src_port: 12345
+    dst_port: 80

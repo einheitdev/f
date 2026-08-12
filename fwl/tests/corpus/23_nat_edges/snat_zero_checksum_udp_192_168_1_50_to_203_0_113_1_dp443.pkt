@@ -1,0 +1,15 @@
+name: "snat zero checksum udp 192.168.1.50 to 203.0.113.1 dp443"
+source_fw: |
+  @xdp(lan)
+  snat to 203.0.113.1 if pkt.proto == udp
+  allow
+test_packet:
+  builder: udp(src_ip="192.168.1.50", dst_ip="8.8.8.8", src_port=12345, dst_port=443, udp_csum_zero=true)
+expected:
+  compiles: true
+  bpf_action: allow
+  output_packet:
+    src_ip: "203.0.113.1"
+    dst_ip: "8.8.8.8"
+    src_port: 12345
+    dst_port: 443

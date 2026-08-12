@@ -1,0 +1,19 @@
+name: "denat snat type reply restores source 11.22.33.44 to 10.255.0.1"
+source_fw: |
+  @xdp(lan)
+  dnat to 10.255.0.1:80 if pkt.proto == udp
+  allow
+state:
+  nat:
+    mappings:
+      - { proto: tcp, src_ip: "10.255.0.1", dst_ip: "208.67.222.222", src_port: 12345, dst_port: 80, new_ip: "11.22.33.44", new_port: 12345, nat_type: snat }
+test_packet:
+  builder: tcp(src_ip="10.255.0.1", dst_ip="208.67.222.222", src_port=12345, dst_port=80, syn=true)
+expected:
+  compiles: true
+  bpf_action: allow
+  output_packet:
+    src_ip: "11.22.33.44"
+    dst_ip: "208.67.222.222"
+    src_port: 12345
+    dst_port: 80

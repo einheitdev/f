@@ -1,0 +1,16 @@
+name: "nat trunc ipv4 header cut at 14 bytes"
+source_fw: |
+  @xdp(wan)
+  masquerade if pkt.proto == tcp
+  drop if pkt.proto == tcp and pkt.dst_port == 22
+  default allow
+state:
+  nat:
+    masq_ip: "198.51.100.9"
+# 14 bytes: fwl_find_ipv4 bails, so `masquerade` is a no-op and the frame is forwarded untranslated.
+test_packet:
+  builder: tcp(src_ip="10.0.0.7", dst_ip="93.184.216.34", dst_port=443, syn=true)
+  truncate_to: 14
+expected:
+  compiles: true
+  bpf_action: allow

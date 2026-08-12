@@ -1,0 +1,11 @@
+name: "ihl 8 with options and a matching rule port 443"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.proto == tcp and pkt.dst_port == 443
+  default allow
+# ihl=8 -> 12 bytes of options. L4 parses at ip + ip_hlen, so the port rule still fires and the packet is dropped — an emitter that assumed a fixed 20-byte header would read the options as a TCP header and allow it.
+test_packet:
+  builder: tcp(src_ip="172.16.3.1", dst_ip="1.1.1.1", dst_port=443, ihl=8, syn=true)
+expected:
+  compiles: true
+  bpf_action: drop

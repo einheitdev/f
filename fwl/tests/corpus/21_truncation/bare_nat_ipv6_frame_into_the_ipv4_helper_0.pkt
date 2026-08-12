@@ -1,0 +1,14 @@
+name: "bare nat ipv6 frame into the ipv4 helper 0"
+source_fw: |
+  @xdp(wan)
+  masquerade
+  allow
+state:
+  nat:
+    masq_ip: "198.51.100.9"
+# An IPv6 frame reaches `h_proto != bpf_htons(ETH_P_IP)`. A NAT policy that GUARDS on a field cannot get here: the guard's program has no v6 parse path, so the frame early-outs before any helper runs.
+test_packet:
+  builder: tcp6(src_ip="2001:db8::1", dst_ip="2001:db8::2", dst_port=443, syn=true)
+expected:
+  compiles: true
+  bpf_action: allow

@@ -1,0 +1,13 @@
+name: "trunc udp header cut at 36 bytes port 443"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.proto == udp and pkt.dst_port == 443
+  default allow
+# 36 bytes: v4_ok is set, l4_ok is not — the UDP header needs 42.
+# Falsifies `(void *)(udp + 1) <= data_end` (543 programs).
+test_packet:
+  builder: udp(src_ip="172.16.3.1", dst_ip="1.1.1.1", dst_port=443)
+  truncate_to: 36
+expected:
+  compiles: true
+  bpf_action: allow

@@ -1,0 +1,12 @@
+name: "trunc icmpv6 header cut at 54 bytes"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.proto == icmp6 and pkt.icmp6.type == 128
+  default allow
+# 54 bytes: v6_ok is set (54 bytes of IPv6 header) and icmp6_ok is not (the type/code pair needs 56). Falsifies `(void *)(icmp6 + 1) <= data_end`.
+test_packet:
+  builder: icmp6(src_ip="2001:db8::1", dst_ip="2001:db8::2", type=128)
+  truncate_to: 54
+expected:
+  compiles: true
+  bpf_action: allow

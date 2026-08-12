@@ -1,0 +1,16 @@
+name: "nat trunc tcp header cut at 42 bytes"
+source_fw: |
+  @xdp(wan)
+  masquerade if pkt.proto == tcp
+  drop if pkt.proto == tcp and pkt.dst_port == 22
+  default allow
+state:
+  nat:
+    masq_ip: "198.51.100.9"
+# 42 bytes: the IPv4 header is complete but the TCP header is not, so fwl_snat_egress returns before installing a mapping.
+test_packet:
+  builder: tcp(src_ip="172.16.3.1", dst_ip="1.1.1.1", dst_port=443, syn=true)
+  truncate_to: 42
+expected:
+  compiles: true
+  bpf_action: allow

@@ -1,0 +1,15 @@
+name: "nat ipv6 frame into an ipv4 nat helper 2"
+source_fw: |
+  @xdp(wan)
+  masquerade if pkt.proto == tcp
+  drop if pkt.proto == tcp and pkt.dst_port == 22
+  default allow
+state:
+  nat:
+    masq_ip: "198.51.100.9"
+# An IPv6 frame reaches `h_proto != bpf_htons(ETH_P_IP)` in fwl_find_ipv4 and the helper returns 0. NAT is IPv4-only by design; this proves the frame is passed through rather than mangled.
+test_packet:
+  builder: tcp6(src_ip="fd00::5", dst_ip="fd00::9", dst_port=443, syn=true)
+expected:
+  compiles: true
+  bpf_action: allow
