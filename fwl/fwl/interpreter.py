@@ -857,6 +857,20 @@ def _non_ip_early_out(
   boundary the emitter gates v4_ok/v6_ok on. Testing the whole group
   rather than `proto` alone also keeps hand-built packet dicts (unit
   tests, generators) out of the early-out path.
+
+  **Do not extend this to the v0.1-shaped-program / IPv6-frame route.**
+  That route is `finding/2026-06-28-arp-early-out-overrides-default-
+  drop-v6`, an OPEN product finding: a v0.1-shaped program emits no v6
+  parse path, so v6_ok stays 0 and an IPv6 packet bypasses its
+  `default drop`. `v01_shaped_vs_v6_packet.pkt` is declared KNOWN_RED
+  to keep that visible on every run, and it stays red precisely
+  because the decoded dict still carries `src_ip6` — the group test
+  above does not fire. Mirroring it here would make the two oracles
+  agree and delete the harness's only standing report of the finding.
+
+  Modelling the emitter faithfully is this function's job; whether the
+  early-out is the right SECURITY semantic is a product question, and
+  it is recorded as one.
   """
   if not _referenced_field_names(program):
     return False  # no prelude is emitted at all, so no early-out
