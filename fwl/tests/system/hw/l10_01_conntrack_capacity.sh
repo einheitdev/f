@@ -47,7 +47,7 @@ except Exception:
 
 log "start: entries=$(ct entries) enabled=$(ct enabled) \
 timeout=$(ct timeout_s)s sweep=$(ct gc_interval_s)s"
-assert_eq "GC is enabled (the fix is in this build)" \
+assert_str "GC is enabled (the fix is in this build)" \
   "$(ct enabled)" "True"
 
 # --- 1. fill the table ---------------------------------------------

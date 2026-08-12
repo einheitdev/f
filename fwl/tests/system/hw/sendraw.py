@@ -26,6 +26,16 @@ Kinds (key=value overrides in parentheses):
   qinq        802.1ad double VLAN tag (outer, inner, src_ip, dport)
   v6ext       IPv6 carrying a hop-by-hop extension header before
               TCP (src_ip6, dst_ip6, dport)
+  icmperr     a real RFC 1191 ICMP error: type/code (default 3.4,
+              "fragmentation needed"), the next-hop MTU, and the
+              embedded IP header + first 8 bytes of the datagram that
+              provoked it. `fwl.pkt`'s icmp builder emits an 8-byte
+              header with a zero body, which no router ever sends and
+              which cannot exercise the path-MTU question at all —
+              the embedded header IS the flow identity a NAT would
+              have to read to steer the error home.
+              (src_ip, dst_ip, type, code, mtu, orig_src, orig_dst,
+               orig_sport, orig_dport, orig_len)
 """
 import socket
 import struct
@@ -142,6 +152,39 @@ def build(kind: str, o: dict) -> bytes:
     )
     return (DST_MAC + SRC_MAC
             + struct.pack(">HH", ETH_P_8021AD, outer) + body)
+
+  if kind == "bigudp":
+    # A frame of exactly `size` bytes on the wire. Used to ask a much
+    # blunter question than TCP can: does this link accept a frame
+    # larger than its MTU, or drop it? TCP cannot answer it, because
+    # MSS negotiation stops the sender from ever emitting one.
+    size = int(o.get("size", 1514))
+    pad = size - 14 - 20 - 8
+    if pad < 0:
+      raise SystemExit("bigudp size must be at least 42")
+    return eth(ETH_P_IP, ipv4(
+      src, dst, 17, udp_hdr(sport, dport, b"P" * pad),
+    ))
+
+  if kind == "icmperr":
+    # RFC 792/1191: 8-byte ICMP header (the "unused" word carries the
+    # next-hop MTU for code 4), then the IP header and first 8 bytes
+    # of the datagram that could not be forwarded.
+    itype = int(o.get("type", 3))
+    icode = int(o.get("code", 4))
+    mtu = int(o.get("mtu", 1400))
+    o_src = o.get("orig_src", "10.99.40.1")
+    o_dst = o.get("orig_dst", "10.99.45.9")
+    o_sport = int(o.get("orig_sport", 40000))
+    o_dport = int(o.get("orig_dport", 443))
+    o_len = int(o.get("orig_len", 1500))
+    inner = ipv4(
+      o_src, o_dst, 6, tcp_hdr(o_sport, o_dport, 0x10),
+      tot_len=o_len,
+    )[:28]
+    body = struct.pack(">BBHHH", itype, icode, 0, 0, mtu) + inner
+    body = (body[:2] + struct.pack(">H", csum16(body)) + body[4:])
+    return eth(ETH_P_IP, ipv4(src, dst, 1, body))
 
   if kind == "v6ext":
     s6 = o.get("src_ip6", "2001:db8:99:aa::1")

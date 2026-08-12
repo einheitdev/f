@@ -16,8 +16,17 @@ Key format (JSON object printed on exit):
 With --detail (NAT evidence), TCP/UDP keys instead carry both
 addresses and a checksum verdict:
   tcp:<src_ip>>{dst_ip}:<dst_port>:<ok|badcsum>
+and ICMP keys carry both addresses plus type and code:
+  icmp:<src_ip>>{dst_ip}:<type>.<code>
 
-Usage: sniff.py <iface> <seconds> [--detail]
+With --srcport (on top of --detail), the TCP/UDP key also names the
+SOURCE port:
+  tcp:<src_ip>:<src_port>>{dst_ip}:<dst_port>:<ok|badcsum>
+That is the only way to witness whether a NAT rewrote the port or
+preserved it, which is the difference between a masquerade that can
+multiplex several hosts and one that cannot.
+
+Usage: sniff.py <iface> <seconds> [--detail] [--srcport]
 """
 import json
 import select
@@ -113,7 +122,8 @@ def _v6_key(frame: bytes, l3_off: int, vlan_id) -> str | None:
   return base
 
 
-def flow_key(frame: bytes, detail: bool = False) -> str | None:
+def flow_key(frame: bytes, detail: bool = False,
+             srcport: bool = False) -> str | None:
   if len(frame) < 34:
     return None
   ethertype = struct.unpack_from(">H", frame, 12)[0]
@@ -147,17 +157,25 @@ def flow_key(frame: bytes, detail: bool = False) -> str | None:
   if proto == 6 or proto == 17:
     if len(frame) < l4_off + 4:
       return None
-    dst_port = struct.unpack_from(">H", frame, l4_off + 2)[0]
+    src_port, dst_port = struct.unpack_from(">HH", frame, l4_off)
     name = "tcp" if proto == 6 else "udp"
     if detail:
       verdict = "ok" if checksums_ok(frame, l3_off) else "badcsum"
-      base = f"{name}:{src_ip}>{dst_ip}:{dst_port}:{verdict}"
+      left = f"{src_ip}:{src_port}" if srcport else src_ip
+      base = f"{name}:{left}>{dst_ip}:{dst_port}:{verdict}"
     else:
       base = f"{name}:{src_ip}:{dst_port}"
   elif proto == 1:
     if len(frame) < l4_off + 2:
       return None
-    base = f"icmp:{src_ip}:{frame[l4_off]}"
+    if detail:
+      # An ICMP error is only interesting together with WHO it was
+      # delivered to: a frag-needed that reaches the NAT address but
+      # not the host behind it has not been delivered at all.
+      base = (f"icmp:{src_ip}>{dst_ip}:"
+              f"{frame[l4_off]}.{frame[l4_off + 1]}")
+    else:
+      base = f"icmp:{src_ip}:{frame[l4_off]}"
   else:
     base = f"proto{proto}:{src_ip}:0"
   if vlan_id is not None:
@@ -168,6 +186,7 @@ def flow_key(frame: bytes, detail: bool = False) -> str | None:
 def main() -> int:
   iface, seconds = sys.argv[1], float(sys.argv[2])
   detail = "--detail" in sys.argv[3:]
+  srcport = "--srcport" in sys.argv[3:]
   s = socket.socket(
     socket.AF_PACKET, socket.SOCK_RAW, socket.htons(ETH_P_ALL)
   )
@@ -211,7 +230,7 @@ def main() -> int:
                      + struct.pack(">HH", ETH_P_8021Q, tci)
                      + frame[12:])
           break
-      key = flow_key(frame, detail)
+      key = flow_key(frame, detail, srcport)
       if key is not None:
         tallies[key] = tallies.get(key, 0) + 1
   # PACKET_STATISTICS: (packets, drops) since socket creation. A

@@ -32,6 +32,22 @@ assert_eq() {
   fi
 }
 
+# assert_str <label> <actual> <expected> — string equality.
+#
+# assert_eq is NUMERIC (`[ -eq ]`), so feeding it a word silently
+# routes every comparison to fail: `[ True -eq True ]` is an error, the
+# error is swallowed by 2>/dev/null, and the test reports
+# "= True, expected True" as a FAILURE. l10_01 has been carrying
+# exactly that since it was written. Use this for anything that is not
+# an integer.
+assert_str() {
+  if [ "$2" = "$3" ]; then
+    pass "$1 = $2"
+  else
+    fail "$1 = $2, expected $3"
+  fi
+}
+
 # assert_range <label> <actual> <min> <max>
 assert_range() {
   if [ "$2" -ge "$3" ] 2>/dev/null && [ "$2" -le "$4" ] 2>/dev/null; then

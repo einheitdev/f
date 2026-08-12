@@ -49,8 +49,53 @@ on exit, so the rig is always left in the walk-up state.
   validates each record's ABI header, and resolves `zone_id` to a zone
   name through the running bundle's `manifest.json["zone_ids"]`. Exits
   3 if it ever rejected a record.
+- `sendraw.py` — deliberately ugly frames the builders cannot make:
+  fragments, IP options, truncated L4, QinQ, and (`icmperr`) a real
+  RFC 1191 ICMP error carrying a next-hop MTU and the embedded header
+  of the datagram that provoked it.
 - `l1_*.sh` — one script per test-plan row.
 - `run_l1.sh` — runs every `l1_*` script, prints a summary table.
+- `natsoak_*` — the NAT/masquerade soak (policy, traffic generator,
+  per-sample wire probe, sampler, report). See below.
+- `run_l11.sh` — the ceiling probes; several FAIL by design.
+
+### Ceiling probes (`l10_*`, `l11_*`) — read the evidence, not the code
+
+These do not ask "does the feature work". They ask "where does it stop
+working", and they are written to RECORD the answer rather than to
+assert a hoped-for one. `l11_04` and `l11_05` end in FAIL because the
+ceilings they found are real; the failure text is the finding.
+
+They all share one property that keeps them out of the `.pkt` corpus:
+each is about the system over TIME or over the SET of loaded state — a
+table that fills after 65536 packets, a mapping a later packet
+overwrites, a garbage collector running in the daemon's main loop, a
+de-NAT ordered after a conntrack lookup. `BPF_PROG_RUN` evaluates one
+packet against one object with a fresh map and can see none of it.
+
+`l11_05` moves the send port into a network namespace so a real TCP
+transfer is forced onto the copper (both i350 ports are on the same
+machine, so a plain socket would go over loopback). Its cleanup
+deletes the namespace unconditionally — that is what returns the
+interface to the root namespace — because leaving it there would stop
+the smoke policy attaching and leave the rig broken for whoever walks
+up next.
+
+### The NAT soak
+
+`natsoak_start.sh` is the 48 h soak's discipline pointed at the code
+path the office deployment depends on. The difference that matters is
+`natsoak_probe.py`: every sample sends a known burst and reads the
+frames back off the receiving port, so a sample records what the
+firewall DID, not just that it was running. Every counter in that
+policy would keep climbing with the NAT rewrite disabled entirely.
+
+Its traffic generator recomputes BOTH checksums after patching a
+frame's addresses and ports. Fixing only the IPv4 one is not cosmetic:
+the NAT rewrite updates the L4 checksum incrementally, so a wrong
+value going in stays wrong going out, and the soak's own witness then
+reports every translated frame as corrupt — a generator artefact that
+looks exactly like the defect being watched for.
 
 ### Tests that need more than one zone loaded at once
 
