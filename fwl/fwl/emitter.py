@@ -44,6 +44,38 @@ class MapScope(enum.Enum):
   PRIVATE = "private"
 
 
+class MapLifetime(enum.Enum):
+  """Whether a map's CONTENTS still mean anything under the next policy.
+
+  A second, independent axis from `MapScope`. Scope answers "may two
+  zones of ONE bundle land on one kernel map?"; lifetime answers "may
+  the contents of this map, left pinned in bpffs by a PREVIOUS
+  compilation, be carried into the next one?" The two do not coincide:
+  `fwl_rl_g<slot>` is SHARED — bundle-wide by declaration — and still
+  POLICY, because slot 0 of the next policy is a different rule.
+
+  POLICY — the size, or the meaning of an index, or the contents come
+    from ONE compilation's analysis. A pin left by a previous policy is
+    worthless and actively misleading: adopting it reports a dead
+    policy's numbers against live rules, or fails the load outright when
+    the shape moved. `fd` discards these before every load.
+
+  FLOW — keyed by something a policy does not define (today: the flow
+    5-tuple), so an entry means the same thing under any policy. These
+    are what `fd` may adopt across a policy change or a process
+    restart, and dropping them drops established connections.
+
+  There is no default, for the same reason MapScope has none: a map
+  whose lifetime nobody declared would be adopted by whatever the
+  daemon's fallback happens to be, and being wrong that way is silent.
+  Discarding is the safe direction — at worst it costs state that could
+  have been kept — so a new map that nobody thought about must land in
+  POLICY, which is what `_MapKind` requiring the field guarantees.
+  """
+  POLICY = "policy"
+  FLOW = "flow"
+
+
 @dataclasses.dataclass(frozen=True)
 class _MapKind:
   """One map the emitter can declare, with its sharing scope declared.
@@ -54,10 +86,19 @@ class _MapKind:
   `\\1`..`\\9` backreferences into `base`'s groups — or None when the
   map is never pinned, so no name change is needed for two zones to
   keep separate kernel maps.
+
+  `lifetime` says whether the contents survive a recompilation, and
+  `lifetime_why` says on what grounds. Both are required: the daemon
+  reads the FLOW names out of the bundle manifest and discards every
+  other pin under its root, so a row that skipped the question would
+  have its map silently discarded (or, under the old prefix-list
+  loader, silently adopted).
   """
   base: str
   scope: MapScope
   why: str
+  lifetime: MapLifetime
+  lifetime_why: str
   private_name: str | None = None
 
 
@@ -77,52 +118,120 @@ _MAP_KINDS: tuple[_MapKind, ...] = (
     r"conntrack", MapScope.SHARED,
     "keyed by the flow 5-tuple: a flow established on one zone is "
     "ESTABLISHED for every other zone (v0.4 § 6.2)",
+    lifetime=MapLifetime.FLOW,
+    lifetime_why=(
+      "an established connection is a fact about the wire, not about "
+      "the policy that admitted it. Discarding this map on a reload "
+      "or a restart drops every established connection, which is the "
+      "outage the state exists to prevent. The daemon adopts it only "
+      "when the incoming bundle declares the same definition, and "
+      "sweeps it against the GC's own age rule before arming the "
+      "datapath"
+    ),
   ),
   _MapKind(
     r"fwl_nat", MapScope.SHARED,
     "keyed by the flow 5-tuple; the egress zone installs the reply "
     "mapping that the ingress zone consumes",
+    lifetime=MapLifetime.FLOW,
+    lifetime_why=(
+      "same key, same argument, and the consequence of losing it is "
+      "worse than losing conntrack: a reply whose mapping is gone is "
+      "not merely re-evaluated, it is forwarded un-translated to a "
+      "host that never sent the request"
+    ),
   ),
   _MapKind(
     r"fwl_nat_cfg", MapScope.SHARED,
     "one unit-wide masquerade address, written once by the daemon",
+    lifetime=MapLifetime.POLICY,
+    lifetime_why=(
+      "derived by the daemon at every load from THIS bundle's "
+      "redirect topology and the live interface addresses, so nothing "
+      "is lost by dropping it — while a stale value would translate "
+      "to an address the new policy never named"
+    ),
   ),
   _MapKind(
     r"fwl_log_events", MapScope.SHARED,
     "one ring buffer per bundle; every event carries its own zone tag",
+    lifetime=MapLifetime.POLICY,
+    lifetime_why=(
+      "an unconsumed event carries the rule_index of the compilation "
+      "that emitted it; read back against the next policy it names "
+      "the wrong rule"
+    ),
   ),
   _MapKind(
     r"fwl_devmap_\w+", MapScope.SHARED,
     "named for its DESTINATION zone, so every zone redirecting there "
     "must resolve to the same devmap (v0.4 § 6.3)",
+    lifetime=MapLifetime.POLICY,
+    lifetime_why=(
+      "holds ifindexes the daemon resolves from THIS bundle's "
+      "manifest at every load. A zone interface that is not up yet is "
+      "skipped rather than written (interfaces may appear after "
+      "boot), so an adopted entry would survive un-overwritten and "
+      "redirect packets out of an interface the new policy never "
+      "named — the one stale-state failure here that misdirects "
+      "traffic instead of miscounting it"
+    ),
   ),
   _MapKind(
     r"fwl_rl_g\d+", MapScope.SHARED,
     "v0.4 § 6.7 scope=global bucket: a bundle-wide budget BY "
     "DECLARATION, slot numbered unit-wide, sized from the "
     "_RL_MAX_ENTRIES constant and never from a zone's rule count",
+    lifetime=MapLifetime.POLICY,
+    lifetime_why=(
+      "the case where the two axes visibly disagree: bundle-wide by "
+      "declaration, yet slot g0 of the next policy is a different "
+      "rule with a different budget, and inheriting its accumulated "
+      "token state throttles a rule that never spent them"
+    ),
   ),
   _MapKind(
     r"fwl_counters", MapScope.PRIVATE,
     "sized by this zone's counter count; slot i means this zone's "
     "i-th counter and nothing else",
+    lifetime=MapLifetime.POLICY,
+    lifetime_why=(
+      "slot i is the i-th counter THIS compilation allocated; the "
+      "next one numbers its own"
+    ),
     private_name=r"fwl_counters_{zone}",
   ),
   _MapKind(
     r"fwl_log_sample", MapScope.PRIVATE,
     "sized by this zone's rule count; index i is this zone's i-th "
     "rule, and the value is that rule's sampling phase",
+    lifetime=MapLifetime.POLICY,
+    lifetime_why=(
+      "indexed by this compilation's rule numbering, and the value is "
+      "a sampling phase that belongs to that rule"
+    ),
     private_name=r"fwl_log_sample_{zone}",
   ),
   _MapKind(
     r"fwl_rl_map_(\d+)", MapScope.PRIVATE,
     "addressed by this zone's own rule index (v0.4 § 6.7 scope=zone, "
     "the default)",
+    lifetime=MapLifetime.POLICY,
+    lifetime_why=(
+      "named for a rule index this compilation assigned; the same "
+      "name in the next policy is a different rule"
+    ),
     private_name=r"fwl_rl_{zone}_\1",
   ),
   _MapKind(
     r"fwl_geoip_(\d+)", MapScope.PRIVATE,
     "one LPM trie per geoip() call site, numbered within the zone",
+    lifetime=MapLifetime.POLICY,
+    lifetime_why=(
+      "numbered per geoip() call site, and repopulated from the "
+      "bundle's geoip.json at every load — an adopted trie would "
+      "answer for a country the new call site never asked about"
+    ),
     private_name=r"fwl_geoip_{zone}_\1",
   ),
   _MapKind(
@@ -130,11 +239,21 @@ _MAP_KINDS: tuple[_MapKind, ...] = (
     "per-packet per-CPU parse metadata for THIS object's tail-call "
     "chain; never pinned, or two split zones would cross-wire their "
     "pipelines (v0.4 § 6.6)",
+    lifetime=MapLifetime.POLICY,
+    lifetime_why=(
+      "never pinned, so nothing of it reaches bpffs to be adopted; "
+      "its contents do not outlive a single packet either way"
+    ),
   ),
   _MapKind(
     r"fwl_stages", MapScope.PRIVATE,
     "this object's own stage prog_array; never pinned, for the same "
     "reason as fwl_scratch",
+    lifetime=MapLifetime.POLICY,
+    lifetime_why=(
+      "never pinned, and holds program fds belonging to one loaded "
+      "object"
+    ),
   ),
 )
 
@@ -145,6 +264,51 @@ def _map_kind(base_name: str) -> _MapKind | None:
     if re.fullmatch(kind.base, base_name):
       return kind
   return None
+
+
+# A `base` pattern that is just a name — no regex metacharacters, so the
+# name it matches is the name itself.
+_LITERAL_NAME_RE = re.compile(r"\w+")
+
+
+def persistent_map_names() -> tuple[str, ...]:
+  """The pinned map names whose contents survive a policy change.
+
+  Written into every bundle's manifest as `persistent_maps`. `fd`
+  reconciles bpffs against this list before each load: a pin named here
+  may be adopted (if the incoming bundle declares the same definition),
+  and every other pin under its root is removed. The daemon therefore
+  never has to re-derive the rule from name prefixes — a second copy of
+  this decision, in another language, which is how the same defect got
+  in three times before `_MAP_KINDS` existed.
+
+  A FLOW map must be SHARED and must have a literal name: the manifest
+  carries names, not patterns, and a per-zone or numbered map cannot be
+  keyed by something a policy does not define in the first place. A row
+  that breaks either rule is a contradiction in the registry, not a
+  compile error in the user's policy, so it raises here.
+  """
+  names: list[str] = []
+  for kind in _MAP_KINDS:
+    if kind.lifetime is not MapLifetime.FLOW:
+      continue
+    if not _LITERAL_NAME_RE.fullmatch(kind.base):
+      raise _codegen_error(
+        f"_MAP_KINDS row '{kind.base}' is MapLifetime.FLOW but its "
+        f"name is a pattern. The bundle manifest carries the "
+        f"persistent names literally, so fd can compare them against "
+        f"what is pinned in bpffs; give the row a literal name or "
+        f"classify it POLICY."
+      )
+    if kind.scope is not MapScope.SHARED:
+      raise _codegen_error(
+        f"map '{kind.base}' is MapLifetime.FLOW but MapScope.PRIVATE. "
+        f"A map that survives a policy change is keyed by something "
+        f"the policy does not define, which is exactly what makes it "
+        f"safe to share across zones; a per-zone map cannot qualify."
+      )
+    names.append(kind.base)
+  return tuple(names)
 
 
 def _codegen_error(message: str) -> FwlException:
@@ -2895,6 +3059,31 @@ def emit_bundle(program: ast.Program) -> dict[str, str]:
   _check_bundle_pinned_maps(files)
   files["fwl_shared.h"] = _emit_shared_header(program)
   return files
+
+
+def shared_pinned_map_names(files: dict[str, str]) -> list[str]:
+  """The bundle-global pinned names an emitted bundle actually declares.
+
+  Read back out of the generated sources rather than listed by hand:
+  the manifest used to state `["conntrack"]` unconditionally, which was
+  wrong in both directions — it omitted fwl_nat, the devmaps, the log
+  ring and the scope=global rate-limit buckets, and it claimed
+  conntrack for bundles whose policy never reads it.
+  """
+  names: list[str] = []
+  for fname, src in sorted(files.items()):
+    if not fname.endswith(".bpf.c"):
+      continue
+    for decl in _scan_map_decls(src):
+      kind = _map_kind(decl.name)
+      if (
+        decl.pinned
+        and kind is not None
+        and kind.scope is MapScope.SHARED
+        and decl.name not in names
+      ):
+        names.append(decl.name)
+  return sorted(names)
 
 
 # A `struct { ... } name SEC(".maps");` declaration in generated C.

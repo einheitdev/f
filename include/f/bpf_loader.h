@@ -178,19 +178,113 @@ auto DescribePinConflict(std::string_view map_name,
                          const PinnedMapShape& want,
                          const PinnedMapShape& have) -> std::string;
 
-/// Remove the bpffs pins of maps whose indices are numbered by a
-/// compilation (fwl_counters_*, fwl_rl_*, fwl_geoip_*,
-/// fwl_log_sample*) under `pin_root`, keeping the state that means the
-/// same thing in every policy (conntrack, fwl_nat, fwl_nat_cfg,
-/// fwl_log_events). A reload's new objects must create fresh maps —
-/// their shape and their slot meanings follow the policy — while
-/// attached programs keep their own references until swapped out.
-/// Leaving such a pin behind is not a leak but a load failure: the
-/// next policy sizes the map from its own analysis and libbpf rejects
-/// the mismatched reuse. Most of these are zone-private; FWL v0.4
-/// § 6.7's global rate-limit buckets are bundle-shared but still
-/// bundle-numbered, so they belong here too.
-auto UnpinZonePrivateMaps(std::string_view pin_root) -> void;
+/// Which incarnation of the daemon left the pins being reconciled, and
+/// therefore what a pin that cannot be reused costs.
+enum class PinPolicy : uint8_t {
+  /// Cold boot. The pins belong to a PREVIOUS `fd` process: this one
+  /// has no in-memory state to match them against and nothing attached
+  /// to fall back to. A pin that cannot be reused is removed, because
+  /// the alternative is a daemon that will not start — and a firewall
+  /// that is down filters nothing at all.
+  kColdBoot,
+  /// Hot reload. The pins belong to the policy this same process has
+  /// attached and running. A pin that cannot be reused is LEFT ALONE:
+  /// the load then fails, ExplainPinConflict says which map and which
+  /// definitions, and the running policy stays up. There is a fallback
+  /// here, so silently destroying live state to force the new bundle
+  /// in would be the wrong trade.
+  kReload,
+};
+
+/// What ReconcilePinnedMaps did, for the journal and for tests.
+struct PinReconcileReport {
+  /// Pins removed: policy-scoped leftovers, plus (kColdBoot only) any
+  /// persistent pin the incoming bundle cannot reuse.
+  std::vector<std::string> discarded;
+  /// Persistent pins carried into the load, definition checked.
+  std::vector<std::string> adopted;
+  /// Entries dropped from an adopted conntrack map because the
+  /// daemon's own GC rule had already condemned them (kColdBoot only).
+  uint32_t conntrack_swept = 0;
+};
+
+/// The persistent map names assumed for a bundle whose manifest predates
+/// `persistent_maps` (compiled by an older `fwl`).
+///
+/// MUST equal `emitter.persistent_map_names()`;
+/// fwl/tests/unit/test_map_lifetime.py reads this function's source and
+/// fails if the two drift.
+auto DefaultPersistentMapNames() -> std::vector<std::string>;
+
+/// The `persistent_maps` list from `<bundle_dir>/manifest.json`, or
+/// DefaultPersistentMapNames() when the manifest is missing the field.
+auto ReadPersistentMapNames(std::string_view bundle_dir)
+    -> std::vector<std::string>;
+
+/// What to do with one pin found under the root, given what the bundle
+/// about to load declares.
+enum class PinVerdict : uint8_t {
+  kAdopt,    ///< carry it into the load: same name, same definition
+  kDiscard,  ///< remove it: stale by policy, by name, or by definition
+  kDefer,    ///< leave it for the loader to fail on (reload only)
+};
+
+/// The whole cold-boot/reload pin decision, as one pure function.
+///
+/// `persistent` is the bundle's `persistent_maps`. `declared` is the
+/// definition the incoming bundle gives this name, or nullptr when no
+/// zone object declares it at all. `existing` is what is actually
+/// pinned. Exposed so the decision is testable without bpffs or root;
+/// ReconcilePinnedMaps is the loop that applies it.
+auto DecidePinFate(std::string_view name,
+                   const std::vector<std::string>& persistent,
+                   const PinnedMapShape* declared,
+                   const PinnedMapShape& existing,
+                   PinPolicy policy) -> PinVerdict;
+
+/// Reconcile the pins under `pin_root` against the bundle at
+/// `bundle_dir`, before it is loaded.
+///
+/// A pinned map outlives the process that made it: bpffs holds a
+/// reference, so every pin an `fd` incarnation left behind is still
+/// there for the next one. Only a reboot clears it (bpffs is a fresh
+/// mount), which is why the symptom of getting this wrong is the
+/// especially nasty "works after a reboot, fails after a restart".
+///
+/// Two questions decide each pin, and they are different questions:
+///
+///   Do the CONTENTS still mean anything? Answered per map by
+///   `_MAP_KINDS`' MapLifetime and carried in the manifest as
+///   `persistent_maps`. Only flow-keyed state qualifies — conntrack and
+///   fwl_nat. Everything else is numbered, sized or populated by one
+///   compilation, and adopting it reports a dead policy's numbers
+///   against live rules (or, when the shape moved, fails the load).
+///
+///   Does the DEFINITION still match? A name that survives the first
+///   question is still only adoptable if the incoming bundle declares
+///   it exactly as it is pinned — the same check libbpf makes, made
+///   before libbpf gets a chance to answer it with -EINVAL and no
+///   detail. Adopting without it would reintroduce the load failure
+///   through the map that is allowed to persist.
+///
+/// The sweep is an ALLOWLIST of what survives, not a blocklist of what
+/// goes: a map added to the emitter and forgotten here is discarded,
+/// which costs state at worst, where the previous prefix-blocklist
+/// adopted it and was silently wrong.
+///
+/// On kColdBoot an adopted conntrack map is also swept of entries older
+/// than `conntrack_timeout_s` — the rule the daemon's GC applies
+/// anyway, applied here so it lands BEFORE the datapath is armed rather
+/// than up to one GC interval after. Without it, a table adopted after
+/// a long stop would answer ESTABLISHED for flows that ended hours ago.
+/// Removing a pin never disturbs a program still using that map: an
+/// attached XDP program holds its own reference, which is what keeps
+/// the datapath filtering while `fd` is dead.
+auto ReconcilePinnedMaps(std::string_view bundle_dir,
+                         std::string_view pin_root,
+                         PinPolicy policy,
+                         uint32_t conntrack_timeout_s)
+    -> PinReconcileReport;
 
 /// One LPM-trie entry parsed from a bundle's geoip.json.
 struct GeoipTrieEntry {

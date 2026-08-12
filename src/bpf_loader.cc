@@ -14,6 +14,7 @@
 #include <unistd.h>
 
 #include <cerrno>
+#include <chrono>
 #include <cstring>
 #include <filesystem>
 #include <format>
@@ -587,39 +588,244 @@ auto ExplainPinConflict(
 
 }  // namespace
 
-auto UnpinZonePrivateMaps(std::string_view pin_root) -> void {
-  // The line this sweep draws is "does the meaning of an index in this
-  // map come from a COMPILATION's analysis?" — not "is it shared".
-  // Counters, geoip tries, log-sample accumulators and zone-scoped
-  // rate-limit buckets are per-zone, and FWL v0.4 § 6.7's global
-  // rate-limit buckets (fwl_rl_g<slot>, matched by "fwl_rl_") are
-  // shared across a bundle's zones but still numbered by that
-  // bundle's own analysis: slot 0 of the next policy is a different
-  // rule. Inheriting either across a reload carries stale counts into
-  // a rule that never earned them. What survives is state keyed by
-  // something that means the same thing in every policy — conntrack
-  // and fwl_nat, keyed by the flow tuple.
-  //
-  // "fwl_log_sample" has no trailing underscore on purpose: it also
-  // matches the un-suffixed pin that pre-fix bundles left behind, so
-  // an upgrade cannot inherit a stale map of the wrong max_entries.
-  static constexpr std::string_view kPrivatePrefixes[] = {
-      "fwl_counters_", "fwl_rl_", "fwl_geoip_", "fwl_log_sample"};
-  std::error_code ec;
-  std::filesystem::directory_iterator it(
-      std::string(pin_root), ec);
-  if (ec) {
-    return;
+auto DefaultPersistentMapNames() -> std::vector<std::string> {
+  // Mirrors emitter.persistent_map_names() for bundles compiled before
+  // manifests carried `persistent_maps`. Keep in step with the
+  // registry; test_map_lifetime.py reads this list back out of this
+  // file and fails when it drifts.
+  return {"conntrack", "fwl_nat"};
+}
+
+auto ReadPersistentMapNames(std::string_view bundle_dir)
+    -> std::vector<std::string> {
+  using nlohmann::json;
+  std::ifstream mf(std::filesystem::path(bundle_dir) / "manifest.json");
+  if (!mf) {
+    return DefaultPersistentMapNames();
   }
-  for (const auto& entry : it) {
-    auto name = entry.path().filename().string();
-    for (auto prefix : kPrivatePrefixes) {
-      if (name.starts_with(prefix)) {
-        std::filesystem::remove(entry.path(), ec);
-        break;
-      }
+  std::stringstream ss;
+  ss << mf.rdbuf();
+  json manifest;
+  try {
+    manifest = json::parse(ss.str());
+  } catch (const std::exception&) {
+    return DefaultPersistentMapNames();
+  }
+  if (!manifest.contains("persistent_maps") ||
+      !manifest["persistent_maps"].is_array()) {
+    // An older bundle. Falling back rather than sweeping everything
+    // matters: treating a pre-upgrade bundle as "nothing persists"
+    // would drop the conntrack table on the first reload after a
+    // package upgrade, which is precisely the outage this whole
+    // mechanism exists to avoid.
+    return DefaultPersistentMapNames();
+  }
+  std::vector<std::string> names;
+  for (const auto& n : manifest["persistent_maps"]) {
+    if (n.is_string()) {
+      names.push_back(n.get<std::string>());
     }
   }
+  return names;
+}
+
+auto DecidePinFate(std::string_view name,
+                   const std::vector<std::string>& persistent,
+                   const PinnedMapShape* declared,
+                   const PinnedMapShape& existing,
+                   PinPolicy policy) -> PinVerdict {
+  bool may_persist = false;
+  for (const auto& p : persistent) {
+    if (p == name) {
+      may_persist = true;
+      break;
+    }
+  }
+  if (!may_persist) {
+    // Numbered, sized or populated by the compilation that pinned it.
+    return PinVerdict::kDiscard;
+  }
+  if (declared == nullptr) {
+    // Flow-keyed, but no zone in the incoming bundle uses it. Nothing
+    // will read it, nothing will age it out (conntrack GC only runs
+    // while a bundle carries the map), and it would be adopted with
+    // entries of arbitrary age by whichever later policy re-adds it.
+    return PinVerdict::kDiscard;
+  }
+  bool same = declared->type == existing.type &&
+              declared->key_size == existing.key_size &&
+              declared->value_size == existing.value_size &&
+              declared->max_entries == existing.max_entries &&
+              declared->map_flags == existing.map_flags;
+  if (same) {
+    return PinVerdict::kAdopt;
+  }
+  // The definition moved — a compiler upgrade that changed a struct or
+  // a capacity, or something else pinned at this name. libbpf will
+  // refuse to reuse it, so the state is unreachable either way; all
+  // that is left to decide is who finds out.
+  return policy == PinPolicy::kColdBoot ? PinVerdict::kDiscard
+                                        : PinVerdict::kDefer;
+}
+
+namespace {
+
+/// The pins the bundle at `bundle_dir` will try to reuse, and the
+/// definition each of its zone objects declares for them.
+///
+/// Opens each zone object WITHOUT loading it: opening resolves the
+/// pin-by-name paths and parses the map definitions, which is all this
+/// needs, and it runs no verifier and creates no maps. An object that
+/// will not even open is skipped — the load proper is where that gets
+/// reported.
+auto BundlePinnedDeclarations(const std::string& bundle_dir,
+                              const std::string& pin_root)
+    -> std::map<std::string, PinnedMapShape> {
+  using nlohmann::json;
+  std::map<std::string, PinnedMapShape> declared;
+  std::filesystem::path dir(bundle_dir);
+  std::ifstream mf(dir / "manifest.json");
+  if (!mf) {
+    return declared;
+  }
+  std::stringstream ss;
+  ss << mf.rdbuf();
+  json manifest;
+  try {
+    manifest = json::parse(ss.str());
+  } catch (const std::exception&) {
+    return declared;
+  }
+  for (const auto& p : manifest.value("programs", json::array())) {
+    if (p.value("object", json()).is_null()) {
+      continue;
+    }
+    std::string obj_path =
+        (dir / p.at("object").get<std::string>()).string();
+    LIBBPF_OPTS(bpf_object_open_opts, open_opts);
+    open_opts.pin_root_path = pin_root.c_str();
+    struct bpf_object* obj =
+        bpf_object__open_file(obj_path.c_str(), &open_opts);
+    if (!obj) {
+      continue;
+    }
+    struct bpf_map* map = nullptr;
+    bpf_object__for_each_map(map, obj) {
+      // Only maps that pin by name can collide with bpffs; an
+      // object-private map (fwl_scratch, fwl_stages) has no pin path
+      // and must not be mistaken for one that does.
+      if (bpf_map__pin_path(map) == nullptr) {
+        continue;
+      }
+      const char* name = bpf_map__name(map);
+      if (name == nullptr) {
+        continue;
+      }
+      // First declaration wins. Two zones declaring one pinned name
+      // differently is a compile error (_check_bundle_pinned_maps);
+      // should one reach here anyway, the load reports it properly.
+      declared.emplace(name, DeclaredShape(map));
+    }
+    bpf_object__close(obj);
+  }
+  return declared;
+}
+
+/// Drop the entries of an adopted conntrack map that the daemon's GC
+/// would already have condemned.
+///
+/// Same rule, same clock: the program stamps last_seen_ns with
+/// bpf_ktime_get_ns() (CLOCK_MONOTONIC), which survives a process
+/// restart and resets only on reboot — where bpffs is empty and there
+/// is nothing to adopt. So the ages an adopted table carries are
+/// directly comparable with the ones the incoming program will write.
+auto SweepAdoptedConntrack(const std::string& path,
+                           uint32_t timeout_s) -> uint32_t {
+  if (timeout_s == 0) {
+    return 0;
+  }
+  int fd = bpf_obj_get(path.c_str());
+  if (fd < 0) {
+    return 0;
+  }
+  auto now_ns = static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now().time_since_epoch())
+          .count());
+  uint64_t timeout_ns =
+      static_cast<uint64_t>(timeout_s) * 1'000'000'000ULL;
+  ConnKey key{}, next{};
+  ConnValue val{};
+  std::vector<ConnKey> stale;
+  while (bpf_map_get_next_key(fd, &key, &next) == 0) {
+    if (bpf_map_lookup_elem(fd, &next, &val) == 0 &&
+        now_ns > val.last_seen_ns &&
+        now_ns - val.last_seen_ns > timeout_ns) {
+      stale.push_back(next);
+    }
+    key = next;
+  }
+  uint32_t evicted = 0;
+  for (const auto& k : stale) {
+    if (bpf_map_delete_elem(fd, &k) == 0) {
+      evicted++;
+    }
+  }
+  ::close(fd);
+  return evicted;
+}
+
+}  // namespace
+
+auto ReconcilePinnedMaps(std::string_view bundle_dir,
+                         std::string_view pin_root,
+                         PinPolicy policy,
+                         uint32_t conntrack_timeout_s)
+    -> PinReconcileReport {
+  PinReconcileReport report;
+  std::string root(pin_root);
+  std::error_code ec;
+  std::filesystem::directory_iterator it(root, ec);
+  if (ec) {
+    // No pin root yet: a first boot, or bpffs freshly mounted. Nothing
+    // to reconcile.
+    return report;
+  }
+  auto persistent = ReadPersistentMapNames(bundle_dir);
+  auto declared = BundlePinnedDeclarations(std::string(bundle_dir), root);
+
+  for (const auto& entry : it) {
+    auto name = entry.path().filename().string();
+    auto existing = PinnedShape(entry.path().string());
+    if (!existing) {
+      // Not a map pin we can inspect (a directory, or a pin we cannot
+      // open). Leave it: removing what we cannot identify is worse
+      // than leaving it, and it cannot be adopted either.
+      continue;
+    }
+    auto found = declared.find(name);
+    const PinnedMapShape* want =
+        found == declared.end() ? nullptr : &found->second;
+    switch (DecidePinFate(name, persistent, want, *existing, policy)) {
+      case PinVerdict::kDiscard: {
+        std::error_code rm_ec;
+        std::filesystem::remove(entry.path(), rm_ec);
+        report.discarded.push_back(name);
+        break;
+      }
+      case PinVerdict::kAdopt: {
+        report.adopted.push_back(name);
+        if (policy == PinPolicy::kColdBoot && name == "conntrack") {
+          report.conntrack_swept += SweepAdoptedConntrack(
+              entry.path().string(), conntrack_timeout_s);
+        }
+        break;
+      }
+      case PinVerdict::kDefer:
+        break;
+    }
+  }
+  return report;
 }
 
 auto DescribePinConflict(std::string_view map_name,

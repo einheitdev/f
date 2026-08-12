@@ -216,10 +216,24 @@ auto ApplyBundle(Engine& e, std::string_view bundle_dir)
     // first would reset the NIC (igb drops the link for seconds) and
     // leave a policy-off window — measured on the i350 rig.
     //
-    // The new objects need fresh per-zone private maps (their shape
-    // follows the new policy); the shared state pins (conntrack,
-    // fwl_nat, ...) stay so established flows survive the reload.
-    UnpinZonePrivateMaps(e.pin_path);
+    // The new objects need fresh policy-scoped maps (their shape and
+    // their slot meanings follow the new policy); the flow-keyed pins
+    // — conntrack, fwl_nat — stay, so established connections survive
+    // the policy change. That preservation is the point of the
+    // distinction and must not be traded away: a firewall that drops
+    // every established connection when a rule is edited is not
+    // reloadable in production.
+    //
+    // kReload: a pin whose definition the new bundle disagrees with is
+    // NOT removed here. The currently attached policy is still running
+    // and is a real fallback, so the load is allowed to fail and say
+    // which map and which numbers — see PinPolicy for why cold boot
+    // decides that trade the other way.
+    auto pins = ReconcilePinnedMaps(dir.string(), e.pin_path,
+                                    PinPolicy::kReload,
+                                    e.conntrack.timeout_s);
+    spdlog::info("reload: pins adopted={} discarded={}",
+                 pins.adopted.size(), pins.discarded.size());
     const ZoneBundleHandles* old =
         e.zone_bundle.programs.empty() ? nullptr : &e.zone_bundle;
     auto loaded = LoadZoneBundle(dir.string(), e.pin_path, old);

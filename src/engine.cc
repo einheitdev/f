@@ -282,6 +282,38 @@ auto EngineInit(Engine& e,
   if (multi_zone) {
     spdlog::info("Cold-boot: loading multi-zone bundle from {}...",
                  current_dir);
+    // A pin outlives the process that made it. bpffs holds a reference,
+    // so every map a previous `fd` pinned is still there — with the
+    // previous POLICY's shape and the previous policy's numbering. The
+    // reload path has always reconciled that; cold boot did not, and
+    // the result was a daemon that could not start at all: libbpf
+    // refuses to reuse a pin whose definition differs (-EINVAL), the
+    // load fails, and systemd's Restart= turns it into a loop with no
+    // XDP attached anywhere. A reboot cleared it (bpffs is a fresh
+    // mount) and a restart did not, so the fault presented as "works
+    // after a reboot, fails after a restart" — measured on the rig,
+    // tests/system/hw/l8_09_stale_pins_cold_boot.sh.
+    //
+    // kColdBoot: there is no running policy to fall back on, so an
+    // unusable pin is discarded rather than deferred to the loader.
+    // Losing state hurts; not coming up at all is worse.
+    auto pins = ReconcilePinnedMaps(current_dir, e.pin_path,
+                                    PinPolicy::kColdBoot,
+                                    e.conntrack.timeout_s);
+    for (const auto& name : pins.discarded) {
+      spdlog::info("Cold-boot: discarded stale pin '{}' "
+                   "(left by a previous policy).", name);
+    }
+    for (const auto& name : pins.adopted) {
+      spdlog::info("Cold-boot: adopted pinned '{}' (flow-keyed state, "
+                   "definition matches this bundle).", name);
+    }
+    if (pins.conntrack_swept > 0) {
+      spdlog::info(
+          "Cold-boot: swept {} conntrack entries older than {}s from "
+          "the adopted table.",
+          pins.conntrack_swept, e.conntrack.timeout_s);
+    }
     auto zb = LoadZoneBundle(current_dir, e.pin_path);
     if (!zb) {
       return MakeError(EngineError::kBpfLoadFailed,

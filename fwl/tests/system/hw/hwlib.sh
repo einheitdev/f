@@ -70,9 +70,14 @@ hw::deploy() {
     hw::abort "bundle has uncompiled zone objects"
   fi
   systemctl stop fd
-  # Pinned maps persist across fd restarts; stale shapes from the
-  # previous policy would collide with the new object's maps.
-  rm -f "$PIN"/fwl_* "$PIN"/conntrack 2>/dev/null || true
+  # Pinned maps persist across an fd restart (bpffs holds a reference;
+  # only a reboot clears it). Clearing them here used to be this
+  # function's job, and that workaround is exactly why no test could
+  # see the cold-boot stale-pin defect: every deploy handed fd a clean
+  # bpffs that the field never has. Reconciling the pin root against
+  # the incoming bundle is the daemon's job — see ReconcilePinnedMaps —
+  # so the harness now hands it the same dirty state a restart does.
+  # (hw::restore_smoke still clears, as a recovery path; see there.)
   ln -sfT "$ver" "$BUNDLE_ROOT/current"
   systemctl start fd
   local i
@@ -204,7 +209,27 @@ with open('$SNIFF_OUT') as fh:
 "
 }
 
+# hw::map_entries <pin-name> — number of entries in a pinned map, or
+# -1 when the pin does not exist (so a missing map fails an assertion
+# instead of reading as an empty one).
+hw::map_entries() {
+  local pin="$PIN/$1"
+  if [ ! -e "$pin" ]; then
+    echo -1
+    return
+  fi
+  bpftool -j map dump pinned "$pin" 2>/dev/null \
+    | $PY -c "import json,sys; print(len(json.load(sys.stdin)))" \
+    2>/dev/null || echo -1
+}
+
 # Recompile the operator smoke policy and leave fd running on it.
+#
+# This is the recovery path, not a measurement path: it runs from the
+# EXIT trap of every test, including ones that failed with fd in a
+# restart loop. Wiping the pin root here is deliberate belt-and-braces
+# so a walk-up operator always finds a working rig — unlike hw::deploy,
+# where clearing pins hid a real defect from every test that used it.
 hw::restore_smoke() {
   local ver="$BUNDLE_ROOT/v-smoke"
   rm -rf "$ver"
@@ -212,6 +237,7 @@ hw::restore_smoke() {
   systemctl stop fd
   rm -f "$PIN"/fwl_* "$PIN"/conntrack 2>/dev/null || true
   ln -sfT "$ver" "$BUNDLE_ROOT/current"
+  systemctl reset-failed fd 2>/dev/null || true
   systemctl start fd
   # Drop the per-test bundle dirs; `current` points at v-smoke now.
   rm -rf "$BUNDLE_ROOT"/v-hw-* 2>/dev/null || true

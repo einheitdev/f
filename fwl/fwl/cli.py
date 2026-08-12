@@ -319,7 +319,12 @@ def _emit_bundle_dir(program: ast.Program, bundle_dir: Path,
       for z in program.zones
     ],
     "programs": programs_meta,
-    "shared_pinned_maps": ["conntrack"],
+    "shared_pinned_maps": emitter.shared_pinned_map_names(files),
+    # The pins fd may carry across a policy change; everything else
+    # under its pin root is left over from a previous compilation and
+    # is removed before the load. Taken from _MAP_KINDS so the decision
+    # lives in one place and reaches the daemon without being restated.
+    "persistent_maps": list(emitter.persistent_map_names()),
   }
   (bundle_dir / "manifest.json").write_text(
     json.dumps(manifest, indent=2), encoding="utf-8"

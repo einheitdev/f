@@ -274,5 +274,183 @@ TEST(DescribePinConflictTest, SaysWhatToDoAboutIt) {
   EXPECT_NE(message.find("ONE kernel map"), std::string::npos);
 }
 
+// --- Pin reconciliation ---------------------------------------------
+//
+// What a load may inherit from bpffs. The pins are left by a PREVIOUS
+// compilation — on reload by the policy still attached, on cold boot by
+// a process that is gone — and the two questions are separate: do the
+// contents still mean anything (MapLifetime, carried in the manifest as
+// `persistent_maps`), and does the definition still match (the check
+// libbpf makes, made early enough to say something useful).
+//
+// DecidePinFate is the whole decision as a pure function so it can be
+// tested without bpffs or root; ReconcilePinnedMaps is the loop that
+// applies it, covered on hardware by l8_09/l8_10.
+
+namespace {
+
+/// A shape distinct enough that any field mismatch is visible.
+auto SomeShape() -> PinnedMapShape {
+  PinnedMapShape s;
+  s.type = 1;
+  s.key_size = 16;
+  s.value_size = 24;
+  s.max_entries = 65536;
+  s.map_flags = 0;
+  return s;
+}
+
+const std::vector<std::string> kPersistent = {"conntrack", "fwl_nat"};
+
+}  // namespace
+
+TEST(DecidePinFateTest, PolicyScopedPinsAlwaysGo) {
+  // Numbered or sized by the compilation that pinned them. Their shape
+  // agreeing with the new bundle's proves nothing — slot 0 of the next
+  // policy is a different rule — so a matching declaration must not
+  // rescue them on either path.
+  auto shape = SomeShape();
+  for (auto policy : {PinPolicy::kColdBoot, PinPolicy::kReload}) {
+    for (const char* name : {"fwl_counters_a", "fwl_log_sample_a",
+                             "fwl_rl_a_0", "fwl_rl_g0", "fwl_geoip_a_0",
+                             "fwl_devmap_wan", "fwl_log_events",
+                             "fwl_nat_cfg"}) {
+      EXPECT_EQ(DecidePinFate(name, kPersistent, &shape, shape, policy),
+                PinVerdict::kDiscard)
+          << name;
+    }
+  }
+}
+
+TEST(DecidePinFateTest, FlowKeyedPinsAreAdoptedWhenTheyStillFit) {
+  // conntrack and fwl_nat are keyed by the flow 5-tuple, which means
+  // the same thing under any policy. This is the case that keeps
+  // established connections alive across a reload AND across a
+  // process restart.
+  auto shape = SomeShape();
+  for (auto policy : {PinPolicy::kColdBoot, PinPolicy::kReload}) {
+    EXPECT_EQ(
+        DecidePinFate("conntrack", kPersistent, &shape, shape, policy),
+        PinVerdict::kAdopt);
+    EXPECT_EQ(
+        DecidePinFate("fwl_nat", kPersistent, &shape, shape, policy),
+        PinVerdict::kAdopt);
+  }
+}
+
+TEST(DecidePinFateTest, AdoptionStillRequiresTheDefinitionToMatch) {
+  // The back door: a map allowed to persist is still only reusable if
+  // the incoming bundle declares it exactly as it is pinned. Skipping
+  // this check would reintroduce the -EINVAL load failure through the
+  // one map that is permitted to survive.
+  auto have = SomeShape();
+  auto want = have;
+  want.max_entries = 4096;
+  EXPECT_NE(DecidePinFate("conntrack", kPersistent, &want, have,
+                          PinPolicy::kColdBoot),
+            PinVerdict::kAdopt);
+  EXPECT_NE(DecidePinFate("conntrack", kPersistent, &want, have,
+                          PinPolicy::kReload),
+            PinVerdict::kAdopt);
+}
+
+TEST(DecidePinFateTest, ColdBootDiscardsWhatItCannotReuse) {
+  // No running policy to fall back on: deferring to the loader means
+  // fd exits, systemd restarts it, and it fails the same way forever
+  // with nothing attached. Discarding costs a conntrack table; not
+  // starting costs the whole firewall.
+  auto have = SomeShape();
+  auto want = have;
+  want.value_size = 32;
+  EXPECT_EQ(DecidePinFate("conntrack", kPersistent, &want, have,
+                          PinPolicy::kColdBoot),
+            PinVerdict::kDiscard);
+}
+
+TEST(DecidePinFateTest, ReloadDefersToTheLoaderInstead) {
+  // On reload the old policy is attached and filtering. Destroying
+  // live state to force the new bundle in would be the wrong trade:
+  // let the load fail, keep what is running, and let
+  // ExplainPinConflict name the map and the numbers.
+  auto have = SomeShape();
+  auto want = have;
+  want.value_size = 32;
+  EXPECT_EQ(DecidePinFate("conntrack", kPersistent, &want, have,
+                          PinPolicy::kReload),
+            PinVerdict::kDefer);
+}
+
+TEST(DecidePinFateTest, UndeclaredPersistentPinIsDroppedNotHoarded) {
+  // conntrack pinned, but no zone of the incoming bundle uses
+  // conntrack. Nothing reads it and nothing ages it out — GC only runs
+  // while a loaded bundle carries the map — so keeping it means a
+  // later policy that re-adds conntrack would adopt entries of
+  // arbitrary age.
+  auto have = SomeShape();
+  EXPECT_EQ(DecidePinFate("conntrack", kPersistent, nullptr, have,
+                          PinPolicy::kColdBoot),
+            PinVerdict::kDiscard);
+}
+
+TEST(DecidePinFateTest, AnUnknownNameIsDiscarded) {
+  // The sweep is an allowlist of what survives, not a blocklist of
+  // what goes. A map added to the emitter and forgotten here is
+  // discarded — at worst that costs state that could have been kept.
+  // The previous prefix-blocklist adopted it instead, which is the
+  // silent-wrong direction and how this class of defect kept
+  // recurring.
+  auto shape = SomeShape();
+  EXPECT_EQ(DecidePinFate("fwl_something_new", kPersistent, &shape,
+                          shape, PinPolicy::kColdBoot),
+            PinVerdict::kDiscard);
+}
+
+TEST(DefaultPersistentMapNamesTest, IsExactlyTheFlowKeyedPair) {
+  // Used for bundles compiled before manifests carried
+  // `persistent_maps`. Must equal emitter.persistent_map_names();
+  // fwl/tests/unit/test_map_lifetime.py reads this source file and
+  // fails if the registry and this list drift apart.
+  EXPECT_EQ(DefaultPersistentMapNames(),
+            (std::vector<std::string>{"conntrack", "fwl_nat"}));
+}
+
+TEST_F(BpfLoaderResolverTest, ManifestPersistentMapsAreRead) {
+  auto bundle = scratch_ / "bundle";
+  fs::create_directories(bundle);
+  std::ofstream(bundle / "manifest.json")
+      << R"({"version":"0.4","persistent_maps":["conntrack"]})";
+  EXPECT_EQ(ReadPersistentMapNames(bundle.string()),
+            (std::vector<std::string>{"conntrack"}));
+}
+
+TEST_F(BpfLoaderResolverTest, OlderManifestFallsBackRatherThanSweeping) {
+  // A bundle compiled before this field existed. Reading "no
+  // persistent maps" out of its silence would drop the conntrack table
+  // on the first reload after a package upgrade — the exact outage the
+  // mechanism exists to prevent.
+  auto bundle = scratch_ / "bundle";
+  fs::create_directories(bundle);
+  std::ofstream(bundle / "manifest.json")
+      << R"({"version":"0.4","zones":[],"programs":[]})";
+  EXPECT_EQ(ReadPersistentMapNames(bundle.string()),
+            DefaultPersistentMapNames());
+}
+
+TEST_F(BpfLoaderResolverTest, UnreadableManifestFallsBackToo) {
+  EXPECT_EQ(ReadPersistentMapNames((scratch_ / "absent").string()),
+            DefaultPersistentMapNames());
+}
+
+TEST_F(BpfLoaderResolverTest, ReconcileOnAnAbsentPinRootIsQuiet) {
+  // First boot, or bpffs freshly mounted. Nothing pinned, nothing to
+  // reconcile, and no error either.
+  auto report = ReconcilePinnedMaps((scratch_ / "bundle").string(),
+                                    (scratch_ / "nopins").string(),
+                                    PinPolicy::kColdBoot, 300);
+  EXPECT_TRUE(report.discarded.empty());
+  EXPECT_TRUE(report.adopted.empty());
+  EXPECT_EQ(report.conntrack_swept, 0u);
+}
+
 }  // namespace
 }  // namespace f
