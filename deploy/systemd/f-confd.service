@@ -1,0 +1,55 @@
+[Unit]
+Description=f — appliance configuration daemon (commit-confirmed)
+Documentation=https://github.com/einheitdev/f
+
+# It owns the anti-lockout revert timer, so it has to be up before an
+# operator can arm one and it must stay up while a window is open.
+# Ordering only against the datapath: a configuration daemon that
+# cannot start must not take the firewall with it.
+After=network-pre.target fd.service
+Wants=network-pre.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/f-confd \
+  --config /etc/f/system.yaml \
+  --state-dir /var/lib/f/confd \
+  --control ipc:///run/f/confd.sock \
+  --events ipc:///run/f/confd.pub
+
+# It writes networkd units, the generated service configs and the
+# system configuration itself, and reloads what it wrote.
+CapabilityBoundingSet=CAP_NET_ADMIN
+AmbientCapabilities=CAP_NET_ADMIN
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
+LockPersonality=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+SystemCallArchitectures=native
+
+ReadWritePaths=/etc/f /etc/systemd/network /var/lib/f
+StateDirectory=f
+RuntimeDirectory=f
+RuntimeDirectoryPreserve=yes
+
+# A restart must not lose an open confirm window: the deadline is
+# durable, and an expired one fires as soon as the daemon is back.
+Restart=on-failure
+RestartSec=2s
+TimeoutStopSec=10s
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=f-confd
+
+[Install]
+WantedBy=multi-user.target

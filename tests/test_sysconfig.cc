@@ -1237,12 +1237,13 @@ interfaces:
   EXPECT_EQ(out[0].state, ServiceState::kNotConfigured);
 }
 
-/// The older ad-hoc `set address` path writes the same
-/// `10-f-<iface>.network` filename by hand. It predates the model and
+/// Anything that writes `10-f-<iface>.network` by hand — the shape the
+/// CLI's old `set address` used to emit, an operator with an editor —
 /// has no digest header, so the model must see it as an edit rather
-/// than quietly adopting or overwriting it — two writers on one file
-/// is exactly the drift the artifact discipline exists to surface.
-TEST(NetworkdTest, LegacySetAddressWritesShowUpAsDrift) {
+/// than quietly adopting or overwriting it. `set address` now edits the
+/// system configuration instead (see test_fw_set_address.cc); this
+/// keeps the guard on the file itself.
+TEST(NetworkdTest, HandWrittenUnitsShowUpAsDrift) {
   TempDir dir;
   NetworkdOptions opts;
   opts.dir = dir.Path();

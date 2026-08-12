@@ -274,12 +274,25 @@ auto SetupRoutes(crow::SimpleApp& app,
 
       zmq::message_t reply;
       if (sock.recv(reply, zmq::recv_flags::none)) {
+        auto body = std::string(
+            static_cast<char*>(reply.data()),
+            reply.size());
         crow::response resp;
         resp.set_header("Content-Type",
                         "application/json");
-        resp.write(std::string(
-            static_cast<char*>(reply.data()),
-            reply.size()));
+        // A reply is not an acceptance: the engine answers a
+        // rejected config with an `error` payload, and echoing
+        // that back as 200 tells the client the rules are live
+        // when they are not.
+        try {
+          auto j = nlohmann::json::parse(body);
+          if (j.is_object() && j.contains("error")) {
+            resp.code = 502;
+          }
+        } catch (const std::exception&) {
+          resp.code = 502;
+        }
+        resp.write(body);
         return resp;
       }
       return crow::response(504, "Engine timeout");

@@ -22,5 +22,5 @@
   </tbody>
 </table>
 {% else %}
-<div class="empty">no tracked connections</div>
+<div class="empty">{{ conntrack_empty }}</div>
 {% endif %}

@@ -37,6 +37,13 @@ struct FLocalConfig {
   /// Where the generated dnsmasq artifact is installed. Derived from
   /// `system_config`; never hand-edited.
   std::string dnsmasq_conf = "/etc/f/generated/dnsmasq.conf";
+  /// Where the generated networkd units are installed.
+  std::string networkd_dir = "/etc/systemd/network";
+  /// f-confd's control socket. f-confd owns the commit-confirmed
+  /// revert timer, which has to outlive the session that armed it —
+  /// so applying the system configuration goes through it whenever it
+  /// is running.
+  std::string confd_socket = "ipc:///run/f/confd.sock";
 };
 
 /// Construct a local transport that reads BPF maps in-process

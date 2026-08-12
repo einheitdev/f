@@ -128,6 +128,7 @@ endif()
 add_library(libf-sysconfig STATIC
   src/sysconfig/artifact.cc
   src/sysconfig/dnsmasq.cc
+  src/sysconfig/edit.cc
   src/sysconfig/model.cc
   src/sysconfig/net.cc
   src/sysconfig/networkd.cc
@@ -220,6 +221,33 @@ add_subdirectory(
 )
 
 # ============================================================================
+# System config plane (confd backend)
+#
+# The system configuration as a confd ConfigBackend, so `apply system`
+# gets candidate/commit/rollback and — the reason it exists — the
+# server-side commit-confirmed revert timer.
+# ============================================================================
+add_library(libf-confd STATIC
+  src/confd/system_backend.cc
+)
+
+target_include_directories(libf-confd PUBLIC
+  ${PROJECT_SOURCE_DIR}/include
+)
+
+target_link_libraries(libf-confd PUBLIC
+  libf-sysconfig
+  einheit_cli
+)
+
+# ============================================================================
+# f-confd — configuration daemon (owns the anti-lockout revert timer)
+# ============================================================================
+add_executable(f-confd cmd/f_confd.cc)
+target_link_libraries(f-confd PRIVATE
+  libf-confd CLI11::CLI11 spdlog::spdlog)
+
+# ============================================================================
 # fd — BPF engine daemon
 # ============================================================================
 add_executable(fd cmd/fd.cc)
@@ -280,7 +308,7 @@ target_compile_definitions(einheit-f-ui PRIVATE
 # ============================================================================
 # Install rules
 # ============================================================================
-install(TARGETS fd fctl f-sysconf einheit-f einheit-f-ui f-api
+install(TARGETS fd fctl f-sysconf f-confd einheit-f einheit-f-ui f-api
   RUNTIME DESTINATION bin
 )
 install(FILES deploy/fd.yaml
@@ -291,6 +319,7 @@ install(FILES
   deploy/systemd/einheit-f-ui.service
   deploy/systemd/f-firstboot.service
   deploy/systemd/f-dnsmasq.service
+  deploy/systemd/f-confd.service
   DESTINATION lib/systemd/system
 )
 install(FILES deploy/system.yaml.example

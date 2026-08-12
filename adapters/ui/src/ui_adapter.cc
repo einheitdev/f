@@ -186,42 +186,25 @@ auto ReadRules(const f::BpfHandles& maps) -> json {
   return rules;
 }
 
-auto ReadDaemonStatus(const std::string& fd_socket)
-    -> json {
-  json j = {{"connected", false}};
-  try {
-    zmq::context_t ctx(1);
-    zmq::socket_t sock(ctx, zmq::socket_type::req);
-    sock.set(zmq::sockopt::linger, 0);
-    sock.set(zmq::sockopt::rcvtimeo, 1000);
-    sock.set(zmq::sockopt::sndtimeo, 1000);
-    sock.connect(fd_socket);
-    std::string msg;
-    msg += static_cast<char>(
-        static_cast<uint8_t>(f::Cmd::kGetStatus));
-    zmq::message_t req(msg.size());
-    std::memcpy(req.data(), msg.data(), msg.size());
-    if (sock.send(req, zmq::send_flags::none)) {
-      zmq::message_t reply;
-      if (sock.recv(reply, zmq::recv_flags::none)) {
-        auto resp = std::string(
-            static_cast<char*>(reply.data()),
-            reply.size());
-        try {
-          j = json::parse(resp);
-          j["connected"] = true;
-        } catch (...) {}
-      }
-    }
-  } catch (...) {}
-  return j;
-}
+// What fd said, and whether it is an answer at all. A reply arriving
+// is not the same thing as fd having the data: every command can come
+// back with an `error` payload, and rendering that as an empty table
+// tells the operator there are no zones / no NAT when the truth is
+// that nobody could ask.
+struct DaemonReply {
+  bool ok = false;
+  /// fd's own words for why not, or why we could not reach it.
+  std::string error;
+  json body;
+};
 
-// Send a single-byte control command to fd and return the parsed JSON
-// reply, or null on any failure. The v0.4 zone/NAT/conntrack views read
-// their data from the daemon's control surface (same commands the CLI
-// uses) rather than the pinned maps.
-auto QueryDaemon(const std::string& fd_socket, f::Cmd cmd) -> json {
+// Send a single-byte control command to fd and classify the answer.
+// The v0.4 zone/NAT/conntrack views read their data from the daemon's
+// control surface (same commands the CLI uses) rather than the pinned
+// maps.
+auto AskDaemon(const std::string& fd_socket, f::Cmd cmd)
+    -> DaemonReply {
+  DaemonReply out;
   try {
     zmq::context_t ctx(1);
     zmq::socket_t sock(ctx, zmq::socket_type::req);
@@ -232,14 +215,52 @@ auto QueryDaemon(const std::string& fd_socket, f::Cmd cmd) -> json {
     char b = static_cast<char>(static_cast<uint8_t>(cmd));
     zmq::message_t req(1);
     std::memcpy(req.data(), &b, 1);
-    if (!sock.send(req, zmq::send_flags::none)) return json();
+    if (!sock.send(req, zmq::send_flags::none)) {
+      out.error = "fd did not accept the request";
+      return out;
+    }
     zmq::message_t reply;
-    if (!sock.recv(reply, zmq::recv_flags::none)) return json();
-    return json::parse(std::string(
+    if (!sock.recv(reply, zmq::recv_flags::none)) {
+      out.error = "fd is not answering";
+      return out;
+    }
+    out.body = json::parse(std::string(
         static_cast<char*>(reply.data()), reply.size()));
-  } catch (...) {
-    return json();
+    if (out.body.is_object() && out.body.contains("error")) {
+      out.error = out.body["error"].is_string()
+                      ? out.body["error"].get<std::string>()
+                      : out.body["error"].dump();
+      return out;
+    }
+    out.ok = true;
+  } catch (const std::exception& e) {
+    out.error = e.what();
   }
+  return out;
+}
+
+auto ReadDaemonStatus(const std::string& fd_socket) -> json {
+  auto reply = AskDaemon(fd_socket, f::Cmd::kGetStatus);
+  if (!reply.ok) {
+    return {{"connected", false}, {"error", reply.error}};
+  }
+  json j = reply.body;
+  j["connected"] = true;
+  return j;
+}
+
+// Body only, for the paths that just want the data.
+auto QueryDaemon(const std::string& fd_socket, f::Cmd cmd) -> json {
+  auto reply = AskDaemon(fd_socket, cmd);
+  return reply.ok ? reply.body : json();
+}
+
+// The message a view shows instead of a table: never a claim that the
+// thing is empty when the truth is that we could not read it.
+auto UnavailableText(const DaemonReply& reply,
+                     const std::string& empty_text) -> std::string {
+  if (reply.ok) return empty_text;
+  return "cannot read this from fd: " + reply.error;
 }
 
 auto JoinArr(const json& arr) -> std::string {
@@ -506,8 +527,12 @@ class FwUiAdapter final : public ui::ProductUiAdapter {
     // -- Zones (v0.4) --
     CROW_ROUTE(app, "/zones")
     ([eng, nav, this](const crow::request& req) {
-      auto zones = QueryDaemon(cfg_.fd_socket, f::Cmd::kGetZones);
-      json data = {{"zones", DecorateZones(zones)}};
+      auto zones = AskDaemon(cfg_.fd_socket, f::Cmd::kGetZones);
+      json data = {
+          {"zones", DecorateZones(zones.body)},
+          {"zones_empty", UnavailableText(
+               zones, "no zones (single-program mode)")},
+      };
       ui::RenderArgs args;
       args.fragment = "fw/zones";
       args.layout = "layout";
@@ -529,17 +554,20 @@ class FwUiAdapter final : public ui::ProductUiAdapter {
     // -- NAT translations (v0.4) --
     CROW_ROUTE(app, "/nat")
     ([eng, nav, this](const crow::request& req) {
-      auto nat = QueryDaemon(cfg_.fd_socket, f::Cmd::kGetNat);
+      auto nat = AskDaemon(cfg_.fd_socket, f::Cmd::kGetNat);
       json data;
       data["translations"] =
-          nat.is_object() ? nat.value("translations", json::array())
-                          : json::array();
+          nat.body.is_object()
+              ? nat.body.value("translations", json::array())
+              : json::array();
       data["has_masq"] =
-          nat.is_object() && nat.contains("masq_source");
+          nat.body.is_object() && nat.body.contains("masq_source");
       data["masq_source"] =
           data["has_masq"].get<bool>()
-              ? nat["masq_source"].get<std::string>()
+              ? nat.body["masq_source"].get<std::string>()
               : std::string();
+      data["translations_empty"] =
+          UnavailableText(nat, "no active translations");
       ui::RenderArgs args;
       args.fragment = "fw/nat";
       args.layout = "layout";
@@ -561,8 +589,12 @@ class FwUiAdapter final : public ui::ProductUiAdapter {
     // -- Conntrack (v0.4) --
     CROW_ROUTE(app, "/conntrack")
     ([eng, nav, this](const crow::request& req) {
-      auto ct = QueryDaemon(cfg_.fd_socket, f::Cmd::kGetConntrack);
-      json data = {{"conntrack", DecorateConntrack(ct)}};
+      auto ct = AskDaemon(cfg_.fd_socket, f::Cmd::kGetConntrack);
+      json data = {
+          {"conntrack", DecorateConntrack(ct.body)},
+          {"conntrack_empty",
+           UnavailableText(ct, "no tracked connections")},
+      };
       ui::RenderArgs args;
       args.fragment = "fw/conntrack";
       args.layout = "layout";
@@ -644,25 +676,31 @@ class FwUiAdapter final : public ui::ProductUiAdapter {
         if (sampler_stop_.load()) break;
         // v0.4 zone/NAT/conntrack come from the daemon, independent of
         // whether the pinned rule maps are open.
-        auto zones =
-            QueryDaemon(cfg_.fd_socket, f::Cmd::kGetZones);
-        if (zones.is_array()) {
-          events->Publish("fw.zones",
-                          {{"zones", DecorateZones(zones)}});
-        }
-        auto nat = QueryDaemon(cfg_.fd_socket, f::Cmd::kGetNat);
-        if (nat.is_object()) {
-          events->Publish(
-              "fw.nat",
-              {{"translations",
-                nat.value("translations", json::array())}});
-        }
-        auto ct =
-            QueryDaemon(cfg_.fd_socket, f::Cmd::kGetConntrack);
-        if (ct.is_array()) {
-          events->Publish("fw.conntrack",
-                          {{"conntrack", DecorateConntrack(ct)}});
-        }
+        // Publish even when the daemon refuses or disappears: a live
+        // view that silently keeps showing the last good table is
+        // showing something that is no longer true.
+        auto zones = AskDaemon(cfg_.fd_socket, f::Cmd::kGetZones);
+        events->Publish(
+            "fw.zones",
+            {{"zones", DecorateZones(zones.body)},
+             {"zones_empty",
+              UnavailableText(zones,
+                              "no zones (single-program mode)")}});
+        auto nat = AskDaemon(cfg_.fd_socket, f::Cmd::kGetNat);
+        events->Publish(
+            "fw.nat",
+            {{"translations",
+              nat.body.is_object()
+                  ? nat.body.value("translations", json::array())
+                  : json::array()},
+             {"translations_empty",
+              UnavailableText(nat, "no active translations")}});
+        auto ct = AskDaemon(cfg_.fd_socket, f::Cmd::kGetConntrack);
+        events->Publish(
+            "fw.conntrack",
+            {{"conntrack", DecorateConntrack(ct.body)},
+             {"conntrack_empty",
+              UnavailableText(ct, "no tracked connections")}});
         if (!maps_open_) continue;
         auto rules = ReadRules(maps_);
         events->Publish("fw.rules", {{"rules", rules}});

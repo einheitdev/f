@@ -27,7 +27,11 @@
 #include <nlohmann/json.hpp>
 #include <zmq.hpp>
 
+#include "einheit/cli/transport/zmq_local.h"
+#include "f/confd/system_backend.h"
+#include "f/sysconfig/artifact.h"
 #include "f/sysconfig/dnsmasq.h"
+#include "f/sysconfig/edit.h"
 #include "f/sysconfig/model.h"
 #include "f/sysconfig/networkd.h"
 #include "f/sysconfig/parse.h"
@@ -387,6 +391,10 @@ class FLocalTransport final
     zmq_sock_.reset();
     zmq_ctx_.reset();
     fd_connected_ = false;
+    if (confd_) {
+      confd_->Disconnect();
+      confd_.reset();
+    }
     // BPF map FDs are closed by the OS on process exit.
   }
 
@@ -493,6 +501,12 @@ class FLocalTransport final
     if (req.command == "apply_system") {
       return HandleApplySystem(req);
     }
+    if (req.command == "apply_system_confirmed") {
+      return HandleApplySystemConfirmed(req);
+    }
+    if (req.command == "confirm_system") {
+      return HandleConfirmSystem(req);
+    }
     return MakeErr(req.id, "unknown_command",
                    "Unknown command: " + req.command);
   }
@@ -514,6 +528,58 @@ class FLocalTransport final
   std::unique_ptr<zmq::socket_t> zmq_sock_;
   bool fd_connected_ = false;
   CandidateConfig candidate_;
+  // Client onto f-confd, the process that owns the commit-confirmed
+  // revert timer. Created on first use; a CLI on a box without it must
+  // still be able to do everything else.
+  std::unique_ptr<cli::transport::Transport> confd_;
+  bool confd_probed_ = false;
+  bool confd_up_ = false;
+
+  /// Connect to f-confd and prove it answers. The connection alone
+  /// proves nothing — a ZMQ connect to a dead ipc:// path succeeds.
+  auto ConfdAvailable() -> bool {
+    if (confd_probed_) return confd_up_;
+    confd_probed_ = true;
+    cli::transport::ZmqLocalConfig tcfg;
+    tcfg.control_endpoint = cfg_.confd_socket;
+    auto tx = cli::transport::NewZmqLocalTransport(tcfg);
+    if (!tx) return false;
+    if (!(*tx)->Connect()) return false;
+    confd_ = std::move(*tx);
+    proto::Request probe;
+    probe.id = "probe";
+    probe.command = "show_status";
+    auto resp = confd_->SendRequest(
+        probe, std::chrono::milliseconds(500));
+    confd_up_ = resp.has_value() &&
+                resp->status == proto::ResponseStatus::Ok;
+    if (!confd_up_) {
+      confd_->Disconnect();
+      confd_.reset();
+    }
+    return confd_up_;
+  }
+
+  /// One request to f-confd, with the caller's identity carried over.
+  auto ConfdRequest(const proto::Request& from,
+                    const std::string& command,
+                    std::vector<std::string> args = {},
+                    std::optional<std::string> session = {},
+                    std::chrono::milliseconds timeout =
+                        std::chrono::seconds(10))
+      -> std::expected<proto::Response, std::string> {
+    if (!confd_) return std::unexpected("f-confd is not running");
+    proto::Request req;
+    req.id = from.id;
+    req.user = from.user;
+    req.role = from.role;
+    req.command = command;
+    req.args = std::move(args);
+    req.session_id = std::move(session);
+    auto resp = confd_->SendRequest(req, timeout);
+    if (!resp) return std::unexpected(resp.error().message);
+    return *resp;
+  }
 
   auto RequireFd(const std::string& id)
       -> std::optional<proto::Response> {
@@ -525,24 +591,62 @@ class FLocalTransport final
     return std::nullopt;
   }
 
-  auto FdQuery(const std::string& id, uint8_t cmd)
-      -> proto::Response {
-    if (auto err = RequireFd(id)) return *err;
-    auto resp = SendRawToFd(*zmq_sock_, cmd);
+  /// What fd said. A reply arriving is not the same thing as fd having
+  /// done the work: every command can answer with an `error` payload,
+  /// so nothing may treat "we got bytes back" as success.
+  struct FdReply {
+    /// True only when fd answered without an `error` field.
+    bool ok = false;
+    /// fd's own words for why not — verbatim, so the operator sees the
+    /// daemon's reason and not our paraphrase of it.
+    std::string error;
+    /// Parsed reply body on success.
+    json body = json::object();
+  };
+
+  /// Send `cmd` (with optional payload) and classify the answer.
+  /// The single place that decides whether fd succeeded.
+  auto AskFd(uint8_t cmd, const std::string& payload = "")
+      -> FdReply {
+    FdReply out;
+    if (!fd_connected_ || !zmq_sock_) {
+      out.error = "fd is not running";
+      return out;
+    }
+    auto resp = SendRawToFd(*zmq_sock_, cmd, payload);
     if (!resp) {
-      return MakeErr(id, "fd_error", resp.error());
+      out.error = std::format("fd did not answer: {}",
+                              resp.error());
+      return out;
     }
     json j;
     try {
       j = json::parse(*resp);
     } catch (...) {
-      j = {{"raw", *resp}};
+      out.error = std::format(
+          "fd sent a reply that is not JSON: {}", *resp);
+      return out;
     }
-    if (j.contains("error")) {
-      return MakeErr(id, "fd_error",
-                     j["error"].get<std::string>());
+    if (j.is_object() && j.contains("error")) {
+      // The field is fd's, so do not assume it is a string.
+      out.error = j["error"].is_string()
+                      ? j["error"].get<std::string>()
+                      : j["error"].dump();
+      return out;
     }
-    return MakeOk(id, j);
+    out.ok = true;
+    out.body = std::move(j);
+    return out;
+  }
+
+  auto FdQuery(const std::string& id, uint8_t cmd)
+      -> proto::Response {
+    if (auto err = RequireFd(id)) return *err;
+    auto reply = AskFd(cmd);
+    if (!reply.ok) {
+      return MakeErr(id, "fd_error", reply.error);
+    }
+    return MakeOk(id, reply.body);
   }
 
   auto HandleShowStatus(const proto::Request& req)
@@ -635,16 +739,40 @@ class FLocalTransport final
             "Fix errors, then commit again");
       }
     }
-    // All valid — trigger reload if fd is running.
-    json result = {{"status", "committed"}};
-    if (fd_connected_) {
-      auto resp = SendRawToFd(
-          *zmq_sock_, fd_cmd::kReloadProg);
-      result["reload"] = resp ? "triggered"
-                              : "watcher will apply";
-    } else {
-      result["reload"] =
-          "fd not running — applied on next start";
+    // The sources are valid. They are not yet *live*: fd has to
+    // recompile and swap them in, and that is a second outcome with
+    // its own way of failing. There is exactly one mechanism that
+    // applies a change — the kReloadProg command below. fd starts no
+    // file watcher (nothing calls WatcherStart), and a cold start
+    // loads the last compiled bundle rather than the source, so a
+    // commit fd did not apply is not applied at all.
+    auto reload = AskFd(fd_cmd::kReloadProg);
+    if (!reload.ok) {
+      // Leave the session open: the snapshots are the only way back to
+      // the previous policy, and the operator needs `rollback` to
+      // still work after a commit that did not take.
+      return MakeErr(req.id, "not_applied",
+          std::format(
+              "saved to {}, but the running policy is UNCHANGED: {}",
+              cfg_.fw_source, reload.error),
+          "fix the cause and run `reload firewall`, or `rollback` to "
+          "restore the previous configuration");
+    }
+
+    json result = {
+        {"status", "committed"},
+        {"applied", true},
+        // Name the mechanism, not the intent: fd completed the swap
+        // before it answered.
+        {"mechanism", "fd hot-reload"},
+        {"reload", "applied by fd"},
+    };
+    // fd's own account of what it installed.
+    for (const char* field :
+         {"version", "rules_installed", "program_updated"}) {
+      if (reload.body.contains(field)) {
+        result[field] = reload.body[field];
+      }
     }
     candidate_.active = false;
     candidate_.snapshots.clear();
@@ -941,84 +1069,86 @@ class FLocalTransport final
         std::format("/sys/class/net/{}", name));
   }
 
-  // Path to the networkd unit this adapter manages for `iface`.
-  auto NetworkdPath(const std::string& iface) -> std::string {
-    return std::format(
-        "/etc/systemd/network/10-f-{}.network", iface);
-  }
+  // -- addressing ------------------------------------------------------
+  //
+  // `set address` is a statement about the appliance's network, which
+  // is what the system configuration is. It therefore edits *that* —
+  // the one document — and lets the model generate the networkd unit,
+  // rather than writing the same unit itself from a second place. Two
+  // writers for one file is how an operator ends up with a running
+  // address that no configuration explains.
 
-  // Parsed view of the managed .network file. `extra` preserves any
-  // [Network] keys the adapter does not itself manage (Gateway=, DNS=,
-  // ...) so a hand-edited file is not clobbered on rewrite.
-  struct IfaceNet {
-    std::vector<std::string> addrs;
-    std::string mtu;
-    std::vector<std::string> extra;
-  };
+  /// Put `document` in place as the system configuration and make it
+  /// live, through f-confd when it is running. Returns the fields to
+  /// merge into the reply.
+  auto InstallSystemDocument(const proto::Request& req,
+                             const std::string& document,
+                             json* out)
+      -> std::optional<proto::Response> {
+    auto parsed = sc::ParseSystemConfigString(document);
+    if (!parsed) {
+      return MakeErr(req.id, "invalid_config",
+          "the edited system configuration does not parse");
+    }
+    auto validation = sc::Validate(*parsed);
+    if (validation.HasErrors()) {
+      auto resp = MakeOk(req.id, {
+          {"config", SystemConfigPath()},
+          {"ok", false},
+          {"applied", false},
+          {"diagnostics", DiagsToJson(validation.diagnostics)},
+      });
+      return resp;
+    }
+    auto installed =
+        sc::InstallArtifact(SystemConfigPath(), document);
+    if (!installed) {
+      return MakeErr(req.id, "write_failed", installed.error(),
+                     "root is needed to change the system "
+                     "configuration");
+    }
 
-  // Read-modify basis: parse the managed .network file so add/remove
-  // merges with what is already persisted, preserving unmanaged keys.
-  auto ReadNetworkd(const std::string& iface) -> IfaceNet {
-    IfaceNet n;
-    std::ifstream f(NetworkdPath(iface));
-    std::string line, section;
-    while (std::getline(f, line)) {
-      if (!line.empty() && line.front() == '[') {
-        section = line;
-        continue;
+    if (ConfdAvailable()) {
+      auto sid = StageSystemConfig(req, false);
+      if (!sid) return sid.error();
+      auto committed = ConfdRequest(req, "commit", {}, *sid,
+                                    std::chrono::seconds(30));
+      if (!committed) {
+        return MakeErr(req.id, "confd_error", committed.error());
       }
-      if (line.rfind("Address=", 0) == 0) {
-        n.addrs.push_back(line.substr(8));
-      } else if (line.rfind("MTUBytes=", 0) == 0) {
-        n.mtu = line.substr(9);
-      } else if (line.rfind("Name=", 0) == 0) {
-        // regenerated from `iface`
-      } else if (section == "[Network]" && !line.empty()) {
-        n.extra.push_back(line);
+      if (committed->status != proto::ResponseStatus::Ok) {
+        return MakeErr(req.id, "apply_failed",
+            committed->error ? committed->error->message
+                             : "f-confd refused the change");
       }
+      auto body = ParseKv(std::string(committed->data.begin(),
+                                      committed->data.end()));
+      (*out)["via"] = "f-confd";
+      (*out)["commit_id"] = body.value("commit_id", "");
+      (*out)["live"] = true;
+      return std::nullopt;
     }
-    return n;
-  }
 
-  // Rewrite the managed .network file atomically (temp + rename) so a
-  // crash mid-write cannot corrupt the unit. Returns false if the file
-  // could not be written (e.g. missing privileges).
-  auto WriteNetworkd(const std::string& iface, const IfaceNet& n)
-      -> bool {
-    std::string out;
-    out += "[Match]\n";
-    out += std::format("Name={}\n\n", iface);
-    out += "[Network]\n";
-    for (const auto& a : n.addrs) {
-      out += std::format("Address={}\n", a);
+    sc::NetworkdOptions net_opts;
+    net_opts.dir = cfg_.networkd_dir;
+    auto net = sc::ApplyNetworkd(*parsed, net_opts);
+    if (!net) {
+      return MakeErr(req.id, "drift", net.error(),
+                     "fold the hand edit into the system "
+                     "configuration, or `apply system force`");
     }
-    for (const auto& e : n.extra) {
-      out += e + "\n";
-    }
-    if (!n.mtu.empty()) {
-      out += std::format("\n[Link]\nMTUBytes={}\n", n.mtu);
-    }
-    auto tmp = NetworkdPath(iface) + ".tmp";
-    {
-      std::ofstream f(tmp);
-      if (!f) return false;
-      f << out;
-      if (!f.good()) return false;
-    }
-    std::error_code ec;
-    std::filesystem::rename(tmp, NetworkdPath(iface), ec);
-    if (ec) {
-      std::filesystem::remove(tmp, ec);
-      return false;
-    }
-    return true;
+    (*out)["via"] = "direct";
+    json written = json::array();
+    for (const auto& p : net->changed) written.push_back(p);
+    (*out)["written"] = written;
+    return std::nullopt;
   }
 
   auto HandleIfaceSetAddress(const proto::Request& req)
       -> proto::Response {
     if (req.args.size() < 2) {
       return MakeErr(req.id, "missing_args",
-          "Usage: set address <interface> <addr/prefix>");
+          "Usage: set address <interface> <addr/prefix|dhcp>");
     }
     const auto& iface = req.args[0];
     const auto& addr = req.args[1];
@@ -1026,56 +1156,77 @@ class FLocalTransport final
       return MakeErr(req.id, "no_such_interface",
           std::format("interface {} not found", iface));
     }
-    // Apply immediately; treat "exists" as success (idempotent).
-    auto [rc, out] = RunSubprocess(
-        {"ip", "addr", "add", addr, "dev", iface});
-    bool applied = rc == 0 ||
-                   out.find("File exists") != std::string::npos;
-    // Persist: merge into the managed networkd file.
-    auto net = ReadNetworkd(iface);
-    if (std::find(net.addrs.begin(), net.addrs.end(), addr) ==
-        net.addrs.end()) {
-      net.addrs.push_back(addr);
+    sc::InterfaceSeed seed;
+    seed.mac = ReadSysfs(iface, "address");
+    auto edited = sc::SetInterfaceAddress(
+        ReadFile(SystemConfigPath()), iface, addr, seed);
+    if (!edited) {
+      return MakeErr(req.id, "invalid_edit", edited.error());
     }
-    bool persisted = WriteNetworkd(iface, net);
+
     json j = {
-        {"interface", iface}, {"action", "set address"},
-        {"value", addr}, {"applied", applied},
-        {"persisted", persisted},
-        {"config", NetworkdPath(iface)},
+        {"interface", iface},
+        {"action", "set address"},
+        {"value", addr},
+        {"config", SystemConfigPath()},
+        {"live", false},
     };
-    if (!applied && !out.empty()) j["warning"] = out;
-    if (!persisted) {
-      j["warning"] = "could not write networkd config "
-                     "(need root?)";
+    if (auto fail = InstallSystemDocument(req, *edited, &j)) {
+      return *fail;
     }
+    // Without f-confd nothing reloads networkd, so put the address on
+    // the link directly — otherwise the operator is told about a
+    // change the box is not carrying yet.
+    if (j.value("via", "") == "direct" && addr != "dhcp" &&
+        addr != "none") {
+      auto [rc, out] = RunSubprocess(
+          {"ip", "addr", "add", addr, "dev", iface});
+      j["live"] = rc == 0 ||
+                  out.find("File exists") != std::string::npos;
+      if (!j["live"].get<bool>() && !out.empty()) {
+        j["warning"] = out;
+      }
+    }
+    j["applied"] = true;
+    j["persisted"] = true;
     return MakeOk(req.id, j);
   }
 
   auto HandleIfaceDelAddress(const proto::Request& req)
       -> proto::Response {
-    if (req.args.size() < 2) {
+    if (req.args.empty()) {
       return MakeErr(req.id, "missing_args",
-          "Usage: no address <interface> <addr/prefix>");
+          "Usage: no address <interface> [addr/prefix]");
     }
     const auto& iface = req.args[0];
-    const auto& addr = req.args[1];
-    auto [rc, out] = RunSubprocess(
-        {"ip", "addr", "del", addr, "dev", iface});
-    bool applied = rc == 0 ||
-                   out.find("Cannot assign") != std::string::npos;
-    auto net = ReadNetworkd(iface);
-    net.addrs.erase(
-        std::remove(net.addrs.begin(), net.addrs.end(), addr),
-        net.addrs.end());
-    bool persisted = WriteNetworkd(iface, net);
+    auto edited =
+        sc::ClearInterfaceAddress(ReadFile(SystemConfigPath()),
+                                  iface);
+    if (!edited) {
+      return MakeErr(req.id, "invalid_edit", edited.error());
+    }
+
     json j = {
-        {"interface", iface}, {"action", "remove address"},
-        {"value", addr}, {"applied", applied},
-        {"persisted", persisted},
-        {"config", NetworkdPath(iface)},
+        {"interface", iface},
+        {"action", "remove address"},
+        {"value", req.args.size() > 1 ? req.args[1] : "all"},
+        {"config", SystemConfigPath()},
+        {"live", false},
     };
-    if (!applied && !out.empty()) j["warning"] = out;
+    if (auto fail = InstallSystemDocument(req, *edited, &j)) {
+      return *fail;
+    }
+    if (j.value("via", "") == "direct" && req.args.size() > 1) {
+      auto [rc, out] = RunSubprocess(
+          {"ip", "addr", "del", req.args[1], "dev", iface});
+      j["live"] = rc == 0 ||
+                  out.find("Cannot assign") != std::string::npos;
+      if (!j["live"].get<bool>() && !out.empty()) {
+        j["warning"] = out;
+      }
+    }
+    j["applied"] = true;
+    j["persisted"] = true;
     return MakeOk(req.id, j);
   }
 
@@ -1093,14 +1244,17 @@ class FLocalTransport final
     }
     auto [rc, out] = RunSubprocess(
         {"ip", "link", "set", "dev", iface, "mtu", mtu});
-    auto net = ReadNetworkd(iface);
-    net.mtu = mtu;
-    bool persisted = WriteNetworkd(iface, net);
+    // MTU is not (yet) part of the system configuration, and the
+    // generated networkd unit belongs to the model — so this changes
+    // the live link and says plainly that it will not survive a
+    // reboot, rather than writing a rival copy of the model's file.
     json j = {
         {"interface", iface}, {"action", "set mtu"},
         {"value", mtu}, {"applied", rc == 0},
-        {"persisted", persisted},
-        {"config", NetworkdPath(iface)},
+        {"persisted", false},
+        {"warning", "applied to the live link only — the system "
+                    "configuration has no MTU setting, so this does "
+                    "not survive a reboot"},
     };
     if (rc != 0 && !out.empty()) j["warning"] = out;
     return MakeOk(req.id, j);
@@ -1305,6 +1459,9 @@ class FLocalTransport final
         {"listen", plan.allowed_interfaces},
         {"excluded", plan.excluded_interfaces},
         {"dhcp_on", plan.dhcp_interfaces},
+        // An operator who reconnects after a confirmed apply must be
+        // told the clock is running without having to know to ask.
+        {"confirm", ConfirmState()},
         {"diagnostics", DiagsToJson(result.diagnostics)},
     });
   }
@@ -1353,6 +1510,184 @@ class FLocalTransport final
     });
   }
 
+  // -- applying the system configuration ------------------------------
+  //
+  // Two routes, and the operator is always told which one ran:
+  //
+  //  - through f-confd, which records the revision and — for a
+  //    confirmed apply — counts down the revert in a process that
+  //    survives the session. This is the one that protects against
+  //    locking yourself out of the box you are reconfiguring.
+  //  - directly, when f-confd is not running. Same artifacts, no
+  //    revision history, no revert timer, and nothing is reloaded.
+
+  /// Parse confd's `key=value ...` reply body.
+  static auto ParseKv(const std::string& body) -> json {
+    json out = json::object();
+    std::istringstream ss(body);
+    std::string tok;
+    while (ss >> tok) {
+      auto eq = tok.find('=');
+      if (eq == std::string::npos) continue;
+      out[tok.substr(0, eq)] = tok.substr(eq + 1);
+    }
+    return out;
+  }
+
+  /// Open a candidate on f-confd holding the system configuration
+  /// currently on disk. Returns the session id.
+  auto StageSystemConfig(const proto::Request& req, bool force)
+      -> std::expected<std::string, proto::Response> {
+    auto text = ReadFile(SystemConfigPath());
+    if (text.empty()) {
+      return std::unexpected(MakeErr(req.id, "no_config",
+          std::format("{} is empty or unreadable",
+                      SystemConfigPath())));
+    }
+    auto opened = ConfdRequest(req, "configure");
+    if (!opened) {
+      return std::unexpected(
+          MakeErr(req.id, "confd_error", opened.error()));
+    }
+    if (opened->status != proto::ResponseStatus::Ok) {
+      return std::unexpected(MakeErr(req.id, "confd_error",
+          opened->error ? opened->error->message
+                        : "f-confd refused to open a candidate"));
+    }
+    std::string sid(opened->data.begin(), opened->data.end());
+    // f-confd resolves the digest against the same file; it refuses if
+    // the two do not match, so a config edited between here and there
+    // is never applied unseen.
+    auto set = ConfdRequest(req, "set",
+        {::f::confd::kConfigKey, sc::BodyDigest(text)}, sid);
+    if (!set || set->status != proto::ResponseStatus::Ok) {
+      return std::unexpected(MakeErr(req.id, "confd_error",
+          set ? (set->error ? set->error->message : "set refused")
+              : set.error()));
+    }
+    auto forced = ConfdRequest(req, "set",
+        {::f::confd::kForceKey, force ? "true" : "false"}, sid);
+    if (!forced || forced->status != proto::ResponseStatus::Ok) {
+      return std::unexpected(MakeErr(req.id, "confd_error",
+          forced ? "set force refused" : forced.error()));
+    }
+    return sid;
+  }
+
+  auto HandleApplySystemConfirmed(const proto::Request& req)
+      -> proto::Response {
+    sc::SystemConfig cfg;
+    std::optional<proto::Response> fail;
+    if (!LoadSystem(req, &cfg, &fail)) return *fail;
+    auto result = sc::Validate(cfg);
+    if (result.HasErrors()) {
+      return MakeOk(req.id, {
+          {"config", SystemConfigPath()},
+          {"ok", false},
+          {"applied", false},
+          {"diagnostics", DiagsToJson(result.diagnostics)},
+      });
+    }
+    if (req.args.empty()) {
+      return MakeErr(req.id, "missing_args",
+          "usage: apply system confirmed <minutes> [force]");
+    }
+    if (!ConfdAvailable()) {
+      return MakeErr(req.id, "no_confd",
+          "the revert timer lives in f-confd, which is not "
+          "running — a confirmed apply would have nothing to "
+          "undo it",
+          "start it (systemctl start f-confd), or use `apply "
+          "system` and accept that a change which severs your "
+          "access will not be rolled back");
+    }
+    bool force = req.args.size() > 1 && req.args[1] == "force";
+    auto sid = StageSystemConfig(req, force);
+    if (!sid) return sid.error();
+
+    auto committed = ConfdRequest(req, "commit_confirmed",
+                                  {req.args[0]}, *sid,
+                                  std::chrono::seconds(30));
+    if (!committed) {
+      return MakeErr(req.id, "confd_error", committed.error());
+    }
+    if (committed->status != proto::ResponseStatus::Ok) {
+      return MakeErr(req.id, "apply_failed",
+          committed->error ? committed->error->message
+                           : "f-confd refused the apply",
+          "the running configuration is unchanged");
+    }
+    auto body = ParseKv(
+        std::string(committed->data.begin(),
+                    committed->data.end()));
+    body["config"] = SystemConfigPath();
+    body["ok"] = true;
+    body["applied"] = true;
+    body["via"] = "f-confd";
+    body["confirm_required"] = true;
+    body["diagnostics"] = DiagsToJson(result.diagnostics);
+    return MakeOk(req.id, body);
+  }
+
+  auto HandleConfirmSystem(const proto::Request& req)
+      -> proto::Response {
+    if (!ConfdAvailable()) {
+      return MakeErr(req.id, "no_confd",
+          "f-confd is not running, so no confirm window is open");
+    }
+    auto resp = ConfdRequest(req, "confirm");
+    if (!resp) {
+      return MakeErr(req.id, "confd_error", resp.error());
+    }
+    if (resp->status != proto::ResponseStatus::Ok) {
+      return MakeErr(req.id, "not_pending",
+          resp->error ? resp->error->message
+                      : "no commit-confirm is pending");
+    }
+    return MakeOk(req.id, {
+        {"status", "confirmed"},
+        {"detail", std::string(resp->data.begin(),
+                               resp->data.end())},
+    });
+  }
+
+  /// The open confirm window, if f-confd reports one. Folded into
+  /// `show system` so a reconnecting operator sees the countdown
+  /// without knowing to ask.
+  auto ConfirmState() -> json {
+    json out = {{"pending", false}};
+    if (!ConfdAvailable()) {
+      out["confd"] = "not running";
+      return out;
+    }
+    out["confd"] = "running";
+    proto::Request probe;
+    probe.id = "status";
+    probe.command = "show_status";
+    auto resp = ConfdRequest(probe, "show_status", {}, {},
+                             std::chrono::seconds(2));
+    if (!resp || resp->status != proto::ResponseStatus::Ok) {
+      return out;
+    }
+    std::string body(resp->data.begin(), resp->data.end());
+    std::istringstream ss(body);
+    std::string line;
+    while (std::getline(ss, line)) {
+      auto eq = line.find('=');
+      if (eq == std::string::npos) continue;
+      auto key = line.substr(0, eq);
+      auto val = line.substr(eq + 1);
+      if (key == "confirm_pending") {
+        out["pending"] = val == "yes";
+      } else if (key == "confirm_seconds_remaining") {
+        out["seconds_remaining"] = val;
+      } else if (key == "confirm_commit") {
+        out["commit"] = val;
+      }
+    }
+    return out;
+  }
+
   auto HandleApplySystem(const proto::Request& req)
       -> proto::Response {
     sc::SystemConfig cfg;
@@ -1370,7 +1705,39 @@ class FLocalTransport final
     }
 
     bool force = !req.args.empty() && req.args[0] == "force";
+
+    // Prefer f-confd: one writer, a recorded revision, and a box that
+    // can be rolled back to a named configuration afterwards.
+    if (ConfdAvailable()) {
+      auto sid = StageSystemConfig(req, force);
+      if (!sid) return sid.error();
+      auto committed = ConfdRequest(req, "commit", {}, *sid,
+                                    std::chrono::seconds(30));
+      if (!committed) {
+        return MakeErr(req.id, "confd_error", committed.error());
+      }
+      if (committed->status != proto::ResponseStatus::Ok) {
+        return MakeErr(req.id, "apply_failed",
+            committed->error ? committed->error->message
+                             : "f-confd refused the apply",
+            "the running configuration is unchanged");
+      }
+      auto body = ParseKv(std::string(committed->data.begin(),
+                                      committed->data.end()));
+      body["config"] = SystemConfigPath();
+      body["ok"] = true;
+      body["applied"] = true;
+      body["via"] = "f-confd";
+      body["note"] =
+          "applied without a confirm window — use `apply system "
+          "confirmed <minutes>` when the change could cut your "
+          "own access";
+      body["diagnostics"] = DiagsToJson(result.diagnostics);
+      return MakeOk(req.id, body);
+    }
+
     sc::NetworkdOptions net_opts;
+    net_opts.dir = cfg_.networkd_dir;
     net_opts.refuse_on_drift = !force;
     auto net = sc::ApplyNetworkd(cfg, net_opts);
     if (!net) {
@@ -1382,16 +1749,25 @@ class FLocalTransport final
     json written = json::array();
     for (const auto& p : net->changed) written.push_back(p);
 
+    // Said on every direct apply, because it is the difference
+    // between "the files are right" and "the box is running them".
+    const std::string kDirectNote =
+        "f-confd is not running: no revision was recorded, no "
+        "revert timer is armed, and nothing was reloaded — run "
+        "`networkctl reload` to adopt the new units";
+
     auto plan = sc::PlanDnsmasq(cfg);
     if (!plan.needed) {
       return MakeOk(req.id, {
           {"config", SystemConfigPath()},
           {"ok", true},
           {"applied", true},
+          {"via", "direct"},
+          {"activated", false},
           {"written", written},
           {"dhcp_on", json::array()},
           {"note", "no service is bound to any zone; dnsmasq is "
-                   "not needed"},
+                   "not needed. " + kDirectNote},
           {"diagnostics", DiagsToJson(result.diagnostics)},
       });
     }
@@ -1414,8 +1790,11 @@ class FLocalTransport final
         {"config", SystemConfigPath()},
         {"ok", true},
         {"applied", true},
+        {"via", "direct"},
+        {"activated", false},
         {"written", written},
         {"dhcp_on", dm->plan.dhcp_interfaces},
+        {"note", kDirectNote},
         {"diagnostics", DiagsToJson(result.diagnostics)},
     });
   }

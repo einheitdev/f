@@ -645,6 +645,16 @@ auto RenderIfaceConfig(const Response& resp,
   row("persisted", persisted ? j.value("config", "yes")
                              : "no",
       persisted ? Semantic::Good : Semantic::Dim);
+  // "in the configuration" and "on the wire" are different claims, so
+  // they get different rows.
+  if (j.contains("via")) {
+    row("applied via", j["via"].get<std::string>(),
+        j["via"] == "f-confd" ? Semantic::Good : Semantic::Warn);
+  }
+  if (j.contains("commit_id") &&
+      !j["commit_id"].get<std::string>().empty()) {
+    row("revision", j["commit_id"].get<std::string>());
+  }
   if (j.contains("warning")) {
     row("warning", j["warning"].get<std::string>(),
         Semantic::Warn);
@@ -852,17 +862,38 @@ auto RenderApplySystem(const Response& resp, Renderer& renderer)
     out << "\nrefused — nothing was changed\n";
     return;
   }
+  auto via = j.value("via", "direct");
+  if (via == "f-confd") {
+    out << "applied via f-confd, revision "
+        << j.value("commit_id", "?") << "\n";
+  }
   for (const auto& p : j.value("written", json::array())) {
     out << "wrote " << p.get<std::string>() << "\n";
   }
-  if (j.value("written", json::array()).empty()) {
+  if (via == "direct" && j.value("written", json::array()).empty()) {
     out << "already up to date\n";
+  }
+  // The countdown is the only thing standing between the operator and
+  // a box they cannot reach, so it goes first and it is loud.
+  if (j.value("confirm_required", false)) {
+    out << "\nCONFIRM WITHIN "
+        << j.value("confirm_within_s", "?")
+        << "s — run `confirm system`, or the previous "
+           "configuration is restored automatically.\n";
   }
   auto note = j.value("note", "");
   if (!note.empty()) out << note << "\n";
   auto dhcp_on = JoinStrings(j.value("dhcp_on", json::array()));
-  out << "dhcp answers on: "
-      << (dhcp_on.empty() ? "(nowhere)" : dhcp_on) << "\n";
+  if (!dhcp_on.empty()) {
+    out << "dhcp answers on: " << dhcp_on << "\n";
+  }
+}
+
+auto RenderConfirmSystem(const Response& resp, Renderer& renderer)
+    -> void {
+  auto j = ParseData(resp);
+  renderer.Out() << "confirmed — the change stays ("
+                 << j.value("detail", "") << ")\n";
 }
 
 // -- Adapter class ---------------------------------------------------
@@ -918,6 +949,8 @@ class FwAdapter final : public cli::ProductAdapter {
              "DHCP/DNS health, and what they are bound to"),
         MakeCheckSystem(),
         MakeApplySystem(),
+        MakeApplySystemConfirmed(),
+        MakeConfirmSystem(),
         MakeShowLog(),
         MakeShowFiles(),
         MakeEdit(),
@@ -968,8 +1001,11 @@ class FwAdapter final : public cli::ProductAdapter {
       RenderShowServices(response, renderer);
     } else if (wc == "check_system") {
       RenderCheckSystem(response, renderer);
-    } else if (wc == "apply_system") {
+    } else if (wc == "apply_system" ||
+               wc == "apply_system_confirmed") {
       RenderApplySystem(response, renderer);
+    } else if (wc == "confirm_system") {
+      RenderConfirmSystem(response, renderer);
     } else if (wc == "show_files") {
       RenderShowFiles(response, renderer);
     } else if (wc == "edit" || wc == "new_file" ||
@@ -1042,6 +1078,42 @@ class FwAdapter final : public cli::ProductAdapter {
                 "edited by hand",
         .required = false,
     }};
+    return c;
+  }
+
+  static auto MakeApplySystemConfirmed() -> CommandSpec {
+    CommandSpec c;
+    c.path = "apply system confirmed";
+    c.wire_command = "apply_system_confirmed";
+    c.help = "Apply the system configuration and roll it back "
+             "automatically unless `confirm system` is run within "
+             "the window. Use this for any change that could cut "
+             "your own access to the box.";
+    c.role = RoleGate::AdminOnly;
+    c.requires_session = true;
+    c.args = {
+        {
+            .name = "minutes",
+            .help = "How long you have to confirm",
+            .required = true,
+        },
+        {
+            .name = "force",
+            .help = "Pass 'force' to overwrite artifacts that "
+                    "were edited by hand",
+            .required = false,
+        },
+    };
+    return c;
+  }
+
+  static auto MakeConfirmSystem() -> CommandSpec {
+    CommandSpec c;
+    c.path = "confirm system";
+    c.wire_command = "confirm_system";
+    c.help = "Keep the configuration applied by `apply system "
+             "confirmed` — cancels the automatic rollback";
+    c.role = RoleGate::AdminOnly;
     return c;
   }
 
@@ -1136,8 +1208,8 @@ class FwAdapter final : public cli::ProductAdapter {
     CommandSpec c;
     c.path = "set address";
     c.wire_command = "iface_set_address";
-    c.help = "Assign an IPv4/IPv6 address to an interface "
-             "(persists to networkd, applies immediately)";
+    c.help = "Set an interface's address in the system "
+             "configuration (accepts a CIDR or 'dhcp') and apply it";
     c.role = RoleGate::OperatorOrAdmin;
     c.args = {
         {.name = "interface",

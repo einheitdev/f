@@ -22,5 +22,5 @@
   </tbody>
 </table>
 {% else %}
-<div class="empty">no active translations</div>
+<div class="empty">{{ translations_empty }}</div>
 {% endif %}
