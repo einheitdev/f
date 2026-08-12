@@ -149,7 +149,8 @@ A sequence of expected log_event records emitted by `log` rules, in the order th
 
 | Field | Type | Meaning |
 |---|---|---|
-| `rule_index` | integer | Zero-based index of the `log` rule that emitted the record |
+| `zone` | string | Name of the `@xdp` block that emitted the record (v0.4 § 6.8) |
+| `rule_index` | integer | Zero-based index of the `log` rule that emitted the record, **within its zone** |
 | `proto` | string | `"tcp"`, `"udp"`, or `"icmp"` |
 | `src_ip` | string | Dotted quad |
 | `dst_ip` | string | Dotted quad |
@@ -159,6 +160,8 @@ A sequence of expected log_event records emitted by `log` rules, in the order th
 | `ack` | bool | True if the ACK flag was set |
 
 `timestamp_ns` is intentionally excluded from comparison — it changes every run.
+
+`rule_index` alone does not identify a rule: `fwl_log_events` is one ring buffer for a whole bundle and indices are numbered per zone, so `zone` + `rule_index` is the pair that does (v0.4 § 6.8). A field name the runner does not recognise is a failure, not a skipped assertion — a typo'd log-event field used to pass silently.
 
 ```yaml
 expected:
@@ -471,6 +474,7 @@ properties:
           type: object
           additionalProperties: false
           properties:
+            zone: {type: string}
             rule_index: {type: integer, minimum: 0}
             proto: {type: string, enum: [tcp, udp, icmp]}
             src_ip: {type: string}

@@ -42,7 +42,7 @@ class TestSlotDeltasToNamed:
 class TestCheckLogEvents:
   def _ev(self, **kw):
     defaults = dict(
-      rule_index=0, proto="tcp", src_ip="1.1.1.1",
+      zone="lan", rule_index=0, proto="tcp", src_ip="1.1.1.1",
       dst_ip="2.2.2.2", src_port=12345, dst_port=80,
       syn=False, ack=False,
     )
@@ -53,6 +53,18 @@ class TestCheckLogEvents:
     assert runner._check_log_events(
       [{"rule_index": 0}], [self._ev()]
     ) == ""
+
+  def test_zone_matches(self):
+    assert runner._check_log_events(
+      [{"zone": "lan", "rule_index": 0}], [self._ev()]
+    ) == ""
+
+  def test_zone_mismatch(self):
+    # The defect this field exists for: same rule index, other zone.
+    diff = runner._check_log_events(
+      [{"zone": "wan", "rule_index": 0}], [self._ev(zone="lan")]
+    )
+    assert "zone" in diff
 
   def test_count_mismatch(self):
     diff = runner._check_log_events([{"rule_index": 0}], [])

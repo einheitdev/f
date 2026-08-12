@@ -20,6 +20,7 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
+from . import log_abi
 from .interpreter import XdpAction
 
 
@@ -33,7 +34,15 @@ class BpfUnavailable(RuntimeError):
 
 @dataclass(frozen=True)
 class LogEvent:
-  """A log event read from the BPF ring buffer."""
+  """A log event read from the BPF ring buffer.
+
+  `zone_id` is the raw tag the datapath wrote (`log_abi.zone_id` of
+  the emitting zone's name). It is kept numeric here because this
+  module reads a ring, not a compilation: resolving it to a zone name
+  needs the id -> name table, which the caller has (the AST it emitted,
+  or a bundle's `manifest.json["zone_ids"]`) and this module does not.
+  """
+  zone_id: int
   rule_index: int
   proto: str
   src_ip: str
@@ -390,12 +399,19 @@ def _load_and_run_seq(
     results: list[RunResult] = []
     for packet in packets:
       log_events: list[LogEvent] = []
-      rb = _setup_ring_buffer(libbpf, obj, log_events) if has_log else None
+      abi_errors: list[str] = []
+      rb = _setup_ring_buffer(
+        libbpf, obj, log_events, abi_errors
+      ) if has_log else None
       action, out_packet = _bpf_prog_test_run_out(prog_fd, packet)
       if rb:
         libbpf.ring_buffer__consume(rb)
         libbpf.ring_buffer__free(rb)
         rb = None
+      if abi_errors:
+        raise RuntimeError(
+          "fwl_log_events record rejected: " + abi_errors[0]
+        )
 
       counter_deltas: dict[int, int] = {}
       if counter_slots > 0:
@@ -496,11 +512,16 @@ _RING_BUFFER_SAMPLE_FN = ctypes.CFUNCTYPE(
   ctypes.c_size_t,
 )
 
-_LOG_EVENT_STRUCT = struct.Struct("<Q II HH BB xx I")
 
+def _setup_ring_buffer(libbpf, obj, log_events, abi_errors):
+  """Set up a ring buffer consumer for fwl_log_events.
 
-def _setup_ring_buffer(libbpf, obj, log_events):
-  """Set up a ring buffer consumer for fwl_log_events."""
+  `abi_errors` collects records the shared `log_abi` decoder rejects.
+  A ctypes callback cannot usefully raise — the exception would be
+  swallowed inside libbpf's poll loop — so the failure is carried out
+  and raised by the caller, which is what turns a layout mismatch into
+  a test error instead of a silently short event list.
+  """
   bpf_map = libbpf.bpf_object__find_map_by_name(
     obj, b"fwl_log_events"
   )
@@ -510,20 +531,22 @@ def _setup_ring_buffer(libbpf, obj, log_events):
 
   @_RING_BUFFER_SAMPLE_FN
   def callback(ctx, data, size):
-    if size < _LOG_EVENT_STRUCT.size:
+    raw = ctypes.string_at(data, min(size, log_abi.SIZE))
+    try:
+      ev = log_abi.decode(raw)
+    except log_abi.LogAbiError as exc:
+      abi_errors.append(str(exc))
       return 0
-    raw = ctypes.string_at(data, _LOG_EVENT_STRUCT.size)
-    (ts, src_ip, dst_ip, src_port, dst_port,
-     proto, flags, rule_index) = _LOG_EVENT_STRUCT.unpack(raw)
     log_events.append(LogEvent(
-      rule_index=rule_index,
-      proto=_PROTO_NUM_TO_STR.get(proto, str(proto)),
-      src_ip=_u32_to_ip(src_ip),
-      dst_ip=_u32_to_ip(dst_ip),
-      src_port=src_port,
-      dst_port=dst_port,
-      syn=bool(flags & 0x01),
-      ack=bool(flags & 0x02),
+      zone_id=ev["zone_id"],
+      rule_index=ev["rule_index"],
+      proto=_PROTO_NUM_TO_STR.get(ev["proto"], str(ev["proto"])),
+      src_ip=_u32_to_ip(ev["src_ip"]),
+      dst_ip=_u32_to_ip(ev["dst_ip"]),
+      src_port=ev["src_port"],
+      dst_port=ev["dst_port"],
+      syn=bool(ev["flags"] & 0x01),
+      ack=bool(ev["flags"] & 0x02),
     ))
     return 0
 

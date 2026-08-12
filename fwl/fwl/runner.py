@@ -16,7 +16,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from . import analyzer, ast, bpf_runner, emitter, interpreter, parser, pkt
+from . import (
+  analyzer, ast, bpf_runner, emitter, interpreter, log_abi, parser, pkt
+)
 from .errors import FwlException
 
 
@@ -279,10 +281,33 @@ def _bpf_oracle(
     if counter_diff:
       return OracleResult("bpf", "fail", counter_diff)
 
+  # Every record's zone tag must resolve, through the compilation's own
+  # id -> name table, to the zone this object was emitted for. Checked
+  # on every logging case rather than only where a .pkt asserts `zone`:
+  # the tag is a constant that travels source -> clang -> ring, and the
+  # failure it guards against (a struct-layout slip putting the right
+  # bytes at the wrong offset) is invisible to a field-by-field
+  # comparison that never looks at it.
+  zone_by_id = {
+    zid: name for name, zid in
+    log_abi.zone_ids(emitter.emitting_zone_names(program)).items()
+  }
+  emitted_zone = program.hook.interface
+  for i, e in enumerate(result.log_events):
+    got = zone_by_id.get(e.zone_id)
+    if got != emitted_zone:
+      return OracleResult(
+        "bpf", "fail",
+        f"log_events[{i}].zone_id 0x{e.zone_id:08X} resolves to "
+        f"{got!r}, but this object was emitted for zone "
+        f"{emitted_zone!r}",
+      )
+
   expected_le = case.expected.get("log_events", [])
   if expected_le:
     bpf_log = [
       interpreter.LogEvent(
+        zone=zone_by_id[e.zone_id],
         rule_index=e.rule_index, proto=e.proto,
         src_ip=e.src_ip, dst_ip=e.dst_ip,
         src_port=e.src_port, dst_port=e.dst_port,
@@ -776,6 +801,7 @@ def _check_log_events(
 
 
 _LOG_FIELD_GETTERS = {
+  "zone": lambda e: e.zone,
   "rule_index": lambda e: e.rule_index,
   "proto": lambda e: e.proto,
   "src_ip": lambda e: e.src_ip,
@@ -796,7 +822,13 @@ def _compare_log_event(
   for field_name, value in expected.items():
     getter = _LOG_FIELD_GETTERS.get(field_name)
     if getter is None:
-      continue
+      # An unknown field used to be skipped, which made a typo'd
+      # assertion pass — the same shape of silence as an untagged
+      # event. Name it instead.
+      return (
+        f"log_events[{idx}]: no such field {field_name!r} "
+        f"(known: {', '.join(sorted(_LOG_FIELD_GETTERS))})"
+      )
     actual_val = getter(actual)
     if actual_val != value:
       return (

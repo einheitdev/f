@@ -45,16 +45,29 @@ on exit, so the rig is always left in the walk-up state.
 - `sendmany.py` — batch AF_PACKET sender using `fwl.pkt` builders.
 - `sniff.py` — receiving-port witness; JSON tallies by flow key.
 - `ringlog.py` — consumes the pinned `fwl_log_events` ring buffer.
+  Decodes with `fwl.log_abi` (the same layout the .pkt oracle reads),
+  validates each record's ABI header, and resolves `zone_id` to a zone
+  name through the running bundle's `manifest.json["zone_ids"]`. Exits
+  3 if it ever rejected a record.
 - `l1_*.sh` — one script per test-plan row.
 - `run_l1.sh` — runs every `l1_*` script, prints a summary table.
 
 ### Tests that need more than one zone loaded at once
 
-`l8_07_bundle_map_isolation.sh` and `l8_08_rate_limit_scope.sh` assert
-on properties of the artifact SET rather than of one program: which
-pinned names two zone objects share, and what that sharing does to
-traffic. `BPF_PROG_RUN` loads one object at a time, so the whole corpus
-is blind to both — they can only run here.
+`l8_07_bundle_map_isolation.sh`, `l8_08_rate_limit_scope.sh` and
+`l8_11_log_zone_attribution.sh` assert on properties of the artifact
+SET rather than of one program: which pinned names two zone objects
+share, what that sharing does to traffic, and whether two zones writing
+into one ring buffer stay distinguishable. `BPF_PROG_RUN` loads one
+object at a time, so the whole corpus is blind to all three — they can
+only run here.
+
+`l8_11` is also the only test in which BOTH data-plane ports receive
+traffic (each zone has to log something of its own). That needs
+`hw::open_reverse_path` — promisc on the normal sending port plus a
+reverse wire probe — and `hw::send_reverse`, which swaps the builder
+frame's MACs so it unicasts back down the taught path instead of being
+addressed at the port it just left.
 
 `l8_08` also pins the data-plane ports' queue IRQs to one CPU for its
 duration (`hw::pin_irqs_to_cpu`, restored on exit). The rate-limit map

@@ -16,7 +16,8 @@ from pathlib import Path
 import click
 
 from . import (
-  __version__, analyzer, ast, emitter, interpreter, parser, pkt, runner
+  __version__, analyzer, ast, emitter, interpreter, log_abi, parser,
+  pkt, runner
 )
 from .errors import FwlException
 
@@ -319,6 +320,13 @@ def _emit_bundle_dir(program: ast.Program, bundle_dir: Path,
       for z in program.zones
     ],
     "programs": programs_meta,
+    # zone name -> the id its log events carry. The lookup table for
+    # `fwl_log_events`, which is one ring for the whole bundle: a
+    # record is (zone_id, rule_index), and a numeric id a consumer
+    # cannot resolve to a name is no better than no id at all. It
+    # ships with the bundle so the resolution needs nothing but the
+    # artifact the events came from.
+    "zone_ids": log_abi.zone_ids(emitter.emitting_zone_names(program)),
     "shared_pinned_maps": emitter.shared_pinned_map_names(files),
     # The pins fd may carry across a policy change; everything else
     # under its pin root is left over from a previous compilation and

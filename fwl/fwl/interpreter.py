@@ -28,7 +28,15 @@ class XdpAction(Enum):
 
 @dataclass
 class LogEvent:
-  """A log event emitted by a `log` rule."""
+  """A log event emitted by a `log` rule.
+
+  `rule_index` is numbered within `zone`, never across the unit, so the
+  pair identifies the rule. The BPF record carries `zone` as
+  `log_abi.zone_id(zone)`; the oracle keeps the name, because the name
+  is what a .pkt asserts on and what a bundle's `zone_ids` table
+  resolves an id back to.
+  """
+  zone: str
   rule_index: int
   proto: str
   src_ip: str
@@ -343,7 +351,7 @@ def evaluate_full(
       if sample is not None and sample > 1:
         pass
       else:
-        log_events.append(_build_log_event(idx, packet))
+        log_events.append(_build_log_event(idx, packet, zone_name))
   if program.default is not None:
     action = _TERMINAL_ACTION_TO_XDP[program.default.action]
     # An explicit `default allow` of a NEW packet creates state, the
@@ -730,10 +738,11 @@ def _condition_touches_v6(node) -> bool:
 
 
 def _build_log_event(
-  rule_idx: int, packet: dict[str, Any]
+  rule_idx: int, packet: dict[str, Any], zone: str
 ) -> LogEvent:
   """Construct a LogEvent from the current packet fields."""
   return LogEvent(
+    zone=zone,
     rule_index=rule_idx,
     proto=packet.get("proto", ""),
     src_ip=packet.get("src_ip", "0.0.0.0"),

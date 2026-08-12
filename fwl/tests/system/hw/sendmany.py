@@ -20,6 +20,17 @@ Two modes:
     port. Uses inert experimental EtherType 0x88B5 frames. The first
     frame may flood once within the test VLAN (unknown unicast); every
     later test frame unicasts port-to-port.
+
+  sendmany.py --reverse <iface> <count> '<builder>'
+    As the plain form, but with the frame's source and destination MAC
+    swapped, so it unicasts back down the taught path: out of the
+    normal RECEIVING port, into the normal SENDING port. The builder
+    hardcodes ..:01 -> ..:02, and the switch has learned ..:02 on the
+    recv port, so an unmodified frame sent from there would be
+    addressed at the port it left. Needed by any test where BOTH
+    interfaces must receive traffic (a bundle whose zones each log).
+    The receiving port must be promiscuous: ..:01 is not its hardware
+    address, and native XDP runs after the NIC's MAC filter.
 """
 import socket
 import sys
@@ -56,13 +67,21 @@ def teach(recv_iface: str, send_iface: str) -> None:
     s.send(DST_MAC + SRC_MAC + TEACH_ETHERTYPE + pad)
   s.close()
 
-def probe(send_iface: str, recv_iface: str, timeout: float) -> bool:
+def probe(send_iface: str, recv_iface: str, timeout: float,
+          reverse: bool = False) -> bool:
   """Wait until the send->switch->recv path actually forwards.
 
   XDP attach resets the igb NICs; the link and the switch port need
   seconds to renegotiate and re-enter forwarding. Sends an inert
   teach-style frame every 0.5 s and listens for it on the receiving
   port; returns True once one crosses.
+
+  `reverse` probes the taught path backwards (out of the normal
+  receiving port, into the normal sending port). The frame must be
+  addressed the other way round for that: the switch has learned ..:02
+  on the recv port, so a frame sent from there to ..:02 goes nowhere.
+  The receiving end must be promiscuous, ..:01 not being its hardware
+  address.
   """
   import select
   import time
@@ -72,12 +91,13 @@ def probe(send_iface: str, recv_iface: str, timeout: float) -> bool:
   rx.bind((recv_iface, 0))
   rx.setblocking(False)
   tx = _raw_socket(send_iface)
+  macs = (SRC_MAC + DST_MAC) if reverse else (DST_MAC + SRC_MAC)
   pad = b"FWL-WIRE-PROBE" + bytes(46)
   deadline = time.monotonic() + timeout
   ok = False
   while time.monotonic() < deadline and not ok:
     try:
-      tx.send(DST_MAC + SRC_MAC + TEACH_ETHERTYPE + pad)
+      tx.send(macs + TEACH_ETHERTYPE + pad)
     except OSError:
       # Link still down; keep trying.
       time.sleep(0.5)
@@ -95,10 +115,17 @@ def probe(send_iface: str, recv_iface: str, timeout: float) -> bool:
   rx.close()
   return ok
 
+def _swap_macs(frame: bytes) -> bytes:
+  """Exchange the frame's destination and source MAC."""
+  return frame[6:12] + frame[0:6] + frame[12:]
+
+
 def send(iface: str, count: int, builder: str,
-         pps: float | None = None) -> None:
+         pps: float | None = None, reverse: bool = False) -> None:
   import time
   frame = pkt.build_packet(pkt.parse_builder(builder)).raw
+  if reverse:
+    frame = _swap_macs(frame)
   s = _raw_socket(iface)
   if pps:
     # Steady paced stream (reload/soak tests): absolute schedule so
@@ -173,9 +200,14 @@ def main() -> int:
   if sys.argv[1] == "--teach":
     teach(sys.argv[2], sys.argv[3])
     return 0
-  if sys.argv[1] == "--probe":
-    # --probe <send_iface> <recv_iface> <timeout_s>
-    if probe(sys.argv[2], sys.argv[3], float(sys.argv[4])):
+  if sys.argv[1] == "--reverse":
+    # --reverse <iface> <count> '<builder>'
+    send(sys.argv[2], int(sys.argv[3]), sys.argv[4], reverse=True)
+    return 0
+  if sys.argv[1] in ("--probe", "--probe-rev"):
+    # --probe[-rev] <send_iface> <recv_iface> <timeout_s>
+    rev = sys.argv[1] == "--probe-rev"
+    if probe(sys.argv[2], sys.argv[3], float(sys.argv[4]), reverse=rev):
       print("wire live")
       return 0
     print("wire dead: probe frames never crossed", file=sys.stderr)

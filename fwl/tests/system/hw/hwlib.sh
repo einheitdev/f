@@ -184,6 +184,25 @@ hw::send() {
   $PY "$HERE/sendmany.py" "$SEND_IF" "$1" "$2"
 }
 
+# hw::send_reverse <count> '<builder>' — the same burst the other way:
+# out of RECV_IF, into SEND_IF, MACs swapped so it unicasts rather
+# than being addressed at the port it just left. For a test where BOTH
+# interfaces must receive traffic — a multi-zone bundle in which every
+# zone has to log something of its own. Call hw::open_reverse_path
+# first; SEND_IF needs promisc and the wire needs to be proven in that
+# direction, the same way hw::deploy proves the forward one.
+hw::send_reverse() {
+  $PY "$HERE/sendmany.py" --reverse "$RECV_IF" "$1" "$2"
+}
+
+# hw::open_reverse_path — make SEND_IF a usable receiver.
+hw::open_reverse_path() {
+  ip link set dev "$SEND_IF" promisc on
+  ethtool -K "$SEND_IF" rxvlan off 2>/dev/null || true
+  $PY "$HERE/sendmany.py" --probe-rev "$RECV_IF" "$SEND_IF" 45 \
+    || hw::abort "reverse wire never came up ($RECV_IF -> $SEND_IF)"
+}
+
 # hw::sniff_start <seconds> — start the receiver witness in the
 # background; hw::sniff_get <key> reads a tally after hw::sniff_wait.
 SNIFF_OUT=""

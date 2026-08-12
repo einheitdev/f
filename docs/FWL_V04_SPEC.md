@@ -904,6 +904,116 @@ drop limited by rate_limit(1000, per=src_ip, scope=zone)
 allow
 ```
 
+### 6.8 Log-event record ABI
+
+`log` submits one record to `fwl_log_events`, a `BPF_MAP_TYPE_RINGBUF`
+that is **bundle-wide**: every zone object in a unit pins it by name
+and writes into one kernel ring. That is deliberate — the ring is fixed
+size and genuinely unit-wide, and splitting it per zone would push
+multiplexing onto every consumer for no gain.
+
+It does mean a record is only meaningful *with* its zone. `rule_index`
+is numbered within a zone, so zone `wan`'s rule 2 and zone `lan`'s rule
+2 write the same number into the same ring. **A logged rule is
+identified by the pair `(zone_id, rule_index)`, never by `rule_index`
+alone.**
+
+#### Record layout (v1)
+
+```c
+#define FWL_LOG_EVENT_MAGIC 0x464C4745u   /* "FLGE" */
+#define FWL_LOG_EVENT_VERSION 1u
+
+struct fwl_log_event {
+  __u32 magic;          /* offset  0 */
+  __u16 version;        /*         4 */
+  __u16 event_size;     /*         6 — sizeof(struct fwl_log_event) */
+  __u64 timestamp_ns;   /*         8 */
+  __u32 zone_id;        /*        16 */
+  __u32 rule_index;     /*        20 */
+  __u32 src_ip;         /*        24 */
+  __u32 dst_ip;         /*        28 */
+  __u16 src_port;       /*        32 */
+  __u16 dst_port;       /*        34 */
+  __u8  proto;          /*        36 */
+  __u8  flags;          /*        37 — bit 0 SYN, bit 1 ACK */
+  __u8  pad[2];         /*        38 */
+};                      /* 40 bytes */
+```
+
+The layout is defined once, in `fwl/log_abi.py`: both the C the
+emitter stamps into every object and the `struct` format its consumers
+unpack come from that module, and a unit test compiles the struct and
+asserts each offset against the format. Two copies of a record layout
+is how a reader and a datapath drift apart without either reporting an
+error.
+
+#### Header fields
+
+A consumer **must** validate `magic`, `version` and `event_size`
+before reading any other field, and **must** treat a mismatch as an
+error rather than skipping the record. The failure this guards against
+is not a crash: a changed layout unpacks into values that all look
+legal — a rule index that names a real rule, a port in range — so
+without the header a mismatch produces plausible wrong data and no
+diagnostic anywhere.
+
+#### `zone_id`
+
+`zone_id` is FNV-1a 32 over the UTF-8 zone name (offset basis
+`0x811C9DC5`, prime `0x01000193`).
+
+It is a hash of the name and not an ordinal assigned at emit time,
+because an ordinal is a property of a zone's *position* in the unit:
+inserting a zone renumbers every zone after it, and a table read back
+against a previous compilation then names the wrong zone — silently.
+The name is what every other artifact already keys on
+(`fwl_counters_<zone>`, the manifest, `pkt.zone`), so the id follows
+the name.
+
+A hash's one failure mode is a collision, and a collision restores
+exactly the ambiguity this field removes. It is therefore a **compile
+error**, checked across the whole unit's zone set:
+
+```
+error: zones 'wan' and 'lan' share log-event zone id 0x0BADC0DE. Log
+events identify their zone by a hash of its name, so a collision makes
+the two zones' events indistinguishable — the ambiguity the zone tag
+removes. Rename one of them.
+```
+
+`zone_id == 0` is reserved to mean "unattributed" and no zone may
+compile to it.
+
+#### The lookup table
+
+A numeric id a consumer cannot resolve to a name is no improvement on
+no id at all, so the table ships **with the bundle**. Every bundle's
+`manifest.json` carries a `zone_ids` object mapping name to id, over
+every zone the unit can emit an event from (including the degenerate
+`@xdp(eth0)` case, which declares no zones and still tags its records
+`eth0`):
+
+```json
+"zone_ids": {
+  "lan": 1449164816,
+  "wan": 736289537
+}
+```
+
+`fwl_shared.h` repeats the table as a comment for a human reading the
+bundle; `manifest.json` is the machine-readable copy.
+
+#### Rejected alternatives
+
+- **Bundle-global rule numbering.** Would couple every zone object to
+  whole-unit knowledge at emit time — the same coupling that made the
+  shared-counter-map defect possible.
+- **Packing the zone into the high bits of `rule_index`.** Saves four
+  bytes, costs clarity, and caps the rule count.
+- **One ring buffer per zone.** The shared ring is correct; splitting
+  it moves multiplexing into every consumer and buys nothing.
+
 ### Examples
 
 ```

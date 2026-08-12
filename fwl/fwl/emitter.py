@@ -17,6 +17,7 @@ import enum
 import re
 
 from . import ast
+from . import log_abi
 from . import splitter
 from .errors import FwlError, FwlException
 
@@ -154,7 +155,9 @@ _MAP_KINDS: tuple[_MapKind, ...] = (
   ),
   _MapKind(
     r"fwl_log_events", MapScope.SHARED,
-    "one ring buffer per bundle; every event carries its own zone tag",
+    "one ring buffer per bundle; every record carries the zone id of "
+    "the object that wrote it, so the per-zone rule_index they share "
+    "is disambiguated in the record rather than by the map name",
     lifetime=MapLifetime.POLICY,
     lifetime_why=(
       "an unconsumed event carries the rule_index of the compilation "
@@ -314,6 +317,51 @@ def persistent_map_names() -> tuple[str, ...]:
 def _codegen_error(message: str) -> FwlException:
   """An emitter-detected error that stops the compile."""
   return FwlException(FwlError(category="codegen", message=message))
+
+
+def emitting_zone_names(program: ast.Program) -> list[str]:
+  """Every zone name a log event of this unit can carry, in order.
+
+  The declared zones plus every @xdp block's zone. They are usually the
+  same list, but not always: the degenerate `@xdp(eth0)` unit declares
+  no zones at all and still emits events tagged `eth0`, so a table
+  built from `program.zones` alone would not resolve its own records.
+  """
+  names: list[str] = [z.name for z in program.zones]
+  for zp in program.programs:
+    if zp.zone_name not in names:
+      names.append(zp.zone_name)
+  return names
+
+
+def _check_zone_ids(program: ast.Program) -> None:
+  """Every zone that can emit a log event needs a distinct `zone_id`.
+
+  Runs on every compile, single-object and bundle alike. A collision is
+  the one failure mode `log_abi.zone_id`'s hash has, and it is silent
+  in exactly the way the zone tag exists to prevent: two zones' events
+  become indistinguishable again, and a consumer reads one zone's rule
+  numbering against the other's rules. So it fails the compile, with
+  both names in the message, rather than reaching a bundle.
+  """
+  seen: dict[int, str] = {}
+  for name in emitting_zone_names(program):
+    tag = log_abi.zone_id(name)
+    if tag == log_abi.ZONE_ID_NONE:
+      raise _codegen_error(
+        f"zone '{name}' hashes to the reserved zone id 0, which a log "
+        f"consumer reads as 'unattributed'. Rename the zone."
+      )
+    other = seen.get(tag)
+    if other is not None and other != name:
+      raise _codegen_error(
+        f"zones '{other}' and '{name}' share log-event zone id "
+        f"0x{tag:08X}. Log events identify their zone by a hash of "
+        f"its name, so a collision makes the two zones' events "
+        f"indistinguishable — the ambiguity the zone tag removes. "
+        f"Rename one of them."
+      )
+    seen[tag] = name
 
 
 def _unclassified_map_error(name: str) -> FwlException:
@@ -811,23 +859,10 @@ static __always_inline void fwl_nat_denat(struct xdp_md *ctx) {
 """
 
 
-_LOG_EVENT_DECL = """\
-struct fwl_log_event {
-  __u64 timestamp_ns;
-  __u32 src_ip;
-  __u32 dst_ip;
-  __u16 src_port;
-  __u16 dst_port;
-  __u8  proto;
-  __u8  flags;
-  __u32 rule_index;
-};
-
-struct {
-  __uint(type, BPF_MAP_TYPE_RINGBUF);
-  __uint(max_entries, 1 << 20);
-} fwl_log_events SEC(".maps");
-"""
+# The record layout is `log_abi`'s, not the emitter's: its Python
+# consumers unpack the same bytes, and one definition is the only way
+# the two stay in step.
+_LOG_EVENT_DECL = log_abi.C_DECL
 
 
 _COUNTER_MAP_DECL_TEMPLATE = """\
@@ -2035,7 +2070,7 @@ def _emit_rule(
   else:
     # Non-terminal: emit the side effect, no return.
     if rule.action == ast.Action.LOG:
-      side_effect = _emit_log(names, idx, rule.log_sample)
+      side_effect = _emit_log(names, idx, zone_name, rule.log_sample)
     elif rule.action == ast.Action.COUNT:
       slot = counter_slots[rule.counter_name]  # type: ignore[index]
       side_effect = _emit_count(names, slot)
@@ -2061,20 +2096,36 @@ def _emit_rule(
 
 
 def _emit_log(
-  names: MapNames, rule_idx: int, sample: int | None = None
+  names: MapNames, rule_idx: int, zone_name: str | None,
+  sample: int | None = None,
 ) -> str:
-  """Emit code that submits a log_event for rule `rule_idx`."""
+  """Emit code that submits a log_event for rule `rule_idx`.
+
+  `zone_name` is the @xdp block being emitted. It is stamped into the
+  record as `log_abi.zone_id(zone_name)` because `fwl_log_events` is
+  one ring for the whole bundle while `rule_idx` is numbered per zone:
+  without the tag, zone `wan`'s rule 2 and zone `lan`'s rule 2 are the
+  same record and no consumer can separate them.
+  """
+  tag = log_abi.ZONE_ID_NONE if zone_name is None \
+    else log_abi.zone_id(zone_name)
   submit = f"""struct fwl_log_event *ev =
       bpf_ringbuf_reserve(&fwl_log_events, sizeof(*ev), 0);
     if (ev) {{
+      ev->magic = FWL_LOG_EVENT_MAGIC;
+      ev->version = FWL_LOG_EVENT_VERSION;
+      ev->event_size = sizeof(*ev);
       ev->timestamp_ns = bpf_ktime_get_ns();
+      ev->zone_id = 0x{tag:08X}u;
+      ev->rule_index = {rule_idx};
       ev->src_ip = src_ip;
       ev->dst_ip = dst_ip;
       ev->src_port = src_port;
       ev->dst_port = dst_port;
       ev->proto = proto;
       ev->flags = (tcp_syn ? 0x01 : 0) | (tcp_ack ? 0x02 : 0);
-      ev->rule_index = {rule_idx};
+      ev->pad[0] = 0;
+      ev->pad[1] = 0;
       bpf_ringbuf_submit(ev, 0);
     }}"""
   if sample is not None and sample > 1:
@@ -2593,6 +2644,7 @@ def emit(program: ast.Program, *, split: bool | None = None) -> str:
   harness emits the same program both ways and checks identical
   behavior.
   """
+  _check_zone_ids(program)
   return _emit_zone_source(
     program.programs[0], pinned_shared=False, helpers=program.helpers,
     split=split,
@@ -3036,15 +3088,20 @@ def emit_bundle(program: ast.Program) -> dict[str, str]:
   tracked on one zone are visible to every other zone. The single-zone
   degenerate case still goes through `emit()` (no pinning).
 
-  Two invariants run here, on every compile:
+  Three invariants run here, on every compile:
     - per zone, `_check_map_scopes` — every map in the generated source
       has a declared scope, and carries (or does not carry) the pinning
       attribute and the zone qualifier that scope demands;
     - across zones, `_check_bundle_pinned_maps` — a name pinned by more
-      than one object is declared identically in all of them.
+      than one object is declared identically in all of them;
+    - across zones, `_check_zone_ids` — no two zones share the
+      `zone_id` their log events are tagged with.
   The first catches a map nobody classified; the second catches one
-  classified SHARED whose shape still comes from a per-zone analysis.
+  classified SHARED whose shape still comes from a per-zone analysis;
+  the third catches the shared ring buffer's records becoming
+  ambiguous again.
   """
+  _check_zone_ids(program)
   # When any zone uses NAT, every zone program emits the shared NAT map
   # + de-NAT pass so return traffic is un-translated on whichever zone
   # it lands (the egress zone installs the reply mapping; the ingress
@@ -3266,6 +3323,12 @@ def _emit_shared_header(program: ast.Program) -> str:
     f"//   zone {z.name} = [{', '.join(z.interfaces)}]"
     for z in program.zones
   )
+  zone_id_lines = "\n".join(
+    f"//   0x{zid:08X}  {name}"
+    for name, zid in log_abi.zone_ids(
+      emitting_zone_names(program)
+    ).items()
+  )
   redirect_lines = "\n".join(
     f"//   @xdp({zp.zone_name}) redirects to: "
     f"{', '.join(_collect_redirect_zones(zp)) or '(none)'}"
@@ -3286,6 +3349,12 @@ def _emit_shared_header(program: ast.Program) -> str:
 //
 // Redirect topology (devmaps, daemon-populated with egress ifindexes):
 {redirect_lines}
+//
+// Log-event zone ids. `fwl_log_events` is ONE ring for the bundle and
+// `rule_index` is numbered per zone, so a record is read as
+// (zone_id, rule_index). The machine-readable copy of this table is
+// manifest.json's "zone_ids" — use that, not this comment.
+{zone_id_lines or '//   (none)'}
 """
 
 
@@ -3453,7 +3522,9 @@ def _emit_tier2_stmt(stmt, ctx: _Tier2EmitCtx, indent: str) -> str:
     if stmt.action == ast.Action.LOG:
       return (
         f"{indent}{{\n{indent}  "
-        + _emit_log(ctx.names, 0).replace("\n", f"\n{indent}  ")
+        + _emit_log(ctx.names, 0, ctx.zone_name).replace(
+          "\n", f"\n{indent}  "
+        )
         + f"\n{indent}}}\n"
       )
     if stmt.action == ast.Action.COUNT:
