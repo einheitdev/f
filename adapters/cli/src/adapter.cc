@@ -721,6 +721,18 @@ auto RenderShowSystem(const Response& resp, Renderer& renderer)
   auto j = ParseData(resp);
   auto& out = renderer.Out();
 
+  // First, because somebody reconnecting after a confirmed apply has a
+  // deadline running whether or not they came here to look for one.
+  auto confirm = j.value("confirm", json::object());
+  if (confirm.value("pending", false)) {
+    out << "CONFIRM PENDING — "
+        << confirm.value("seconds_remaining", "?")
+        << "s left on revision "
+        << confirm.value("commit", "?")
+        << ". Run `confirm system` to keep this configuration, or "
+           "wait and the previous one is restored.\n\n";
+  }
+
   Table zt;
   AddColumn(zt, "ZONE", Align::Left, Priority::High);
   AddColumn(zt, "INTERFACES", Align::Left, Priority::High);
