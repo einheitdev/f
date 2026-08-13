@@ -310,7 +310,11 @@ def _emit_bundle_dir(program: ast.Program, bundle_dir: Path,
       "zone": zp.zone_name,
       "source": c_name,
       "object": o_name if compiled else None,
-      "redirects_to": emitter._collect_redirect_zones(zp),
+      # Helpers included: the daemon fills each `fwl_devmap_<zone>`
+      # from this list, and a redirect performed inside a helper emits
+      # the devmap all the same.
+      "redirects_to": emitter._collect_redirect_zones(
+        zp, program.helpers),
       # The daemon seeds fwl_nat_cfg (the masquerade source address)
       # only for zones that actually masquerade; a zone that merely
       # carries the shared de-NAT pass must not be treated as one.

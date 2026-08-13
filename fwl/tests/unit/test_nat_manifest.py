@@ -125,6 +125,35 @@ def test_a_nat_program_declares_conntrack_it_never_reads(source, tmp_path):
   assert "fwl_nat_cfg" in manifest["shared_pinned_maps"]
 
 
+def test_a_redirect_through_a_helper_reaches_the_manifest(tmp_path):
+  """Same shape as the masquerade flag, worse consequence.
+
+  The daemon fills `fwl_devmap_<zone>` from `redirects_to`. A redirect
+  performed inside a helper emits the devmap into the object, so an
+  empty list leaves that map unpopulated — and XDP_REDIRECT into an
+  empty devmap drops the packet. Silent, and it drops traffic rather
+  than miscounting it.
+  """
+  source = (
+    "zone lan = [veth0]\n"
+    "zone wan = [veth1]\n"
+    "def out(pkt):\n"
+    "  redirect to wan\n"
+    "@xdp(lan)\n"
+    "def l(pkt):\n"
+    "  out(pkt)\n"
+    "@xdp(wan)\n"
+    "def w(pkt):\n"
+    "  allow\n"
+  )
+  manifest = _manifest(source, tmp_path)
+  by_zone = {p["zone"]: p["redirects_to"] for p in manifest["programs"]}
+  assert by_zone["lan"] == ["wan"]
+  # And the devmap it names is really in the bundle, so the manifest is
+  # describing the object rather than agreeing with itself.
+  assert "fwl_devmap_wan" in manifest["shared_pinned_maps"]
+
+
 def test_conntrack_is_absent_when_nothing_needs_it(tmp_path):
   """The declaration follows a need; it is not unconditional.
 

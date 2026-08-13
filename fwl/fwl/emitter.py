@@ -2440,8 +2440,19 @@ static __always_inline int fwl_geoip_{call.call_index}_v6(
   return "\n".join(blocks)
 
 
-def _collect_redirect_zones(zp: ast.ZoneProgram) -> list[str]:
-  """Ordered, de-duplicated list of zones `zp` redirects to (v0.4 § 6.3)."""
+def _collect_redirect_zones(
+  zp: ast.ZoneProgram,
+  helpers: list[ast.FunctionDef] | None = None,
+) -> list[str]:
+  """Ordered, de-duplicated list of zones `zp` redirects to (v0.4 § 6.3).
+
+  `helpers` are the unit's top-level defs. A `redirect to <zone>` that
+  a helper performs emits a `fwl_devmap_<zone>` into this object just
+  the same, and the daemon fills that devmap from the manifest's
+  `redirects_to` — so a caller building the manifest must pass them,
+  or the map stays empty and every redirected packet is dropped with
+  nothing logged. `_emit_zone_source` scans the same closure.
+  """
   out: list[str] = []
   seen: set[str] = set()
 
@@ -2450,11 +2461,15 @@ def _collect_redirect_zones(zp: ast.ZoneProgram) -> list[str]:
       seen.add(z)
       out.append(z)
 
-  for rule in zp.rules:
-    if rule.action == ast.Action.REDIRECT:
-      _add(rule.redirect_zone)
-  if zp.function is not None:
-    _collect_redirect_zones_stmts(zp.function.body, _add)
+  units = [zp] + [
+    _synth_unit(zp, h) for h in _reachable_helpers(zp, helpers or [])
+  ]
+  for u in units:
+    for rule in u.rules:
+      if rule.action == ast.Action.REDIRECT:
+        _add(rule.redirect_zone)
+    if u.function is not None:
+      _collect_redirect_zones_stmts(u.function.body, _add)
   return out
 
 
