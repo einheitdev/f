@@ -1,6 +1,6 @@
 """What a NAT bundle tells the daemon, and what it must carry to work.
 
-Two facts the compiler is the only one who knows, and the daemon cannot
+Facts the compiler is the only one who knows, and the daemon cannot
 re-derive:
 
   - WHICH zone masquerades. Every zone object in a NAT bundle embeds
@@ -16,8 +16,13 @@ re-derive:
     5-tuple so the reply reads `established`; without the map declared
     the return path is not tracked and the gateway is one-way.
 
-Both are silent when wrong: the program compiles, loads, attaches, and
-translates nothing (or translates to the wrong address).
+  - WHERE a zone redirects, helpers included, since the daemon fills
+    each `fwl_devmap_<zone>` from that list and redirecting into an
+    empty devmap drops the frame.
+
+Each is silent when wrong: the program compiles, loads, attaches, and
+translates nothing, translates to the wrong address, or drops what it
+was supposed to forward.
 """
 import json
 
