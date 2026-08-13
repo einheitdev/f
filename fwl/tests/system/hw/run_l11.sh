@@ -26,8 +26,10 @@ echo "================ ceiling-probe summary ================"
 for line in "${RESULTS[@]}"; do echo "  $line"; done
 echo
 echo "A FAIL here may be the finding rather than a regression:"
-echo "  l11_04 FAILs because masquerade and 'allow if established'"
-echo "         do not compose (measured, not suspected)."
 echo "  l11_05 FAILs because ICMP unreachables are dropped by a"
 echo "         stateful policy and cannot be de-NAT'd under any."
+echo
+echo "l11_04 used to be on that list — masquerade and 'allow if"
+echo "established' did not compose. fwl_snat_egress now tracks the"
+echo "post-NAT tuple, so it passes; a FAIL there is a regression."
 exit $RC

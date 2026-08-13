@@ -19,6 +19,13 @@
 # guest's outbound SYN under the tuple it had before translation
 # (GUEST -> peer). Two different keys for the same connection.
 #
+# ANSWERED, and the answer changed: they do compose. `fwl_snat_egress`
+# now also inserts the POST-translation tuple into conntrack, so the
+# key a real reply arrives carrying is a key that exists. This probe
+# measured the gap before that landed; it is kept because the gap is
+# one emitter edit away from returning, and the verdict block below
+# reports either outcome on its own evidence.
+#
 # Structured as a controlled experiment: the identical conntrack policy
 # is run twice, once without NAT and once with, against the identical
 # traffic. If only the NAT run loses the reply, NAT is the cause.
@@ -122,8 +129,16 @@ assert_eq "with NAT: the outbound half is translated correctly" \
   "$NAT_OUT" 20
 assert_eq "with NAT: the reply mapping was installed" \
   "$NAT_ENTRIES" 1
-assert_eq "with NAT: the flow IS in the conntrack table" \
-  "$CT_ENTRIES" 1
+# TWO entries, and the second one is the answer to this whole probe.
+# The `allow` rule inserts the tuple the packet had when it matched —
+# pre-translation, (GUEST -> peer) — and `fwl_snat_egress` inserts the
+# post-NAT tuple, (MASQ_ADDR -> peer). A reply from the internet
+# carries the reverse of the SECOND one, which is why it now reads
+# established at all. Asserting 1 here was correct only while the
+# egress helper did not track the flow; the count is the mechanism,
+# so it is checked rather than loosened.
+assert_eq "with NAT: BOTH the pre- and post-translation tuples are in \
+the conntrack table" "$CT_ENTRIES" 2
 
 # Third leg, to make the diagnosis exact rather than merely suggestive.
 # The same NAT build, the same conntrack entry, but a reply addressed
@@ -143,8 +158,9 @@ DIRECT_BACK=$(hw::sniff_get "tcp:$PEER:443>$GUEST:$SPORT:ok")
 assert_eq "with NAT: a reply presenting the PRE-translation tuple \
 still reads ESTABLISHED" "$DIRECT_EST" 20
 assert_eq "... and is delivered" "$DIRECT_BACK" 20
-pass "conntrack itself is intact in a NAT build — the entry is there \
-and readable. The only thing wrong is which key a real reply carries"
+pass "conntrack is intact in a NAT build under BOTH keys: the \
+pre-translation tuple this leg presents, and the post-translation one \
+a real reply carries. That second entry is what closed the gap"
 
 log "=== the composition, measured ==="
 log "reply: est counter $NAT_EST/20 (control was $CTRL_EST/20); \
