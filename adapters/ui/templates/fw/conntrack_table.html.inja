@@ -1,0 +1,26 @@
+{% if length(conntrack) > 0 %}
+<table class="data-table">
+  <thead>
+    <tr>
+      <th>proto</th>
+      <th>source</th>
+      <th>destination</th>
+      <th>state</th>
+      <th class="right">packets</th>
+    </tr>
+  </thead>
+  <tbody>
+{% for c in conntrack %}
+    <tr>
+      <td>{{ c.proto }}</td>
+      <td class="mono">{{ c.src }}:{{ c.src_port }}</td>
+      <td class="mono">{{ c.dst }}:{{ c.dst_port }}</td>
+      <td><span class="badge badge-{{ c.state_semantic }}">{{ c.state }}</span></td>
+      <td class="right">{{ c.packets }}</td>
+    </tr>
+{% endfor %}
+  </tbody>
+</table>
+{% else %}
+<div class="empty">{{ conntrack_empty }}</div>
+{% endif %}

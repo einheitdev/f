@@ -11,9 +11,16 @@ that drifts does not fail loudly; it produces a divergence that reads
 as a compiler bug, which is the most expensive kind of false positive
 this harness can generate.
 """
+import pathlib
+import subprocess
+
 import pytest
 
 from fwl import analyzer, interpreter, parser, pkt
+
+# Compiles fast and is not BPF: these tests are about the temporary
+# directory's lifetime, not about the emitted program.
+_MINIMAL_C = "int main(void) { return 0; }\n"
 
 
 def _build(builder: str, truncate_to=None):
@@ -301,12 +308,16 @@ class TestRateLimitMapCapacity:
     assert actions[1] is interpreter.XdpAction.DROP
 
   def test_capacity_matches_the_emitter(self):
-    """A mirror of a literal in another module, pinned to it."""
+    """A mirror of a literal in another module, pinned to it.
+
+    `MapNames()` with no zone is the single-object form the BPF oracle
+    itself emits under, which is the compilation this mirror describes.
+    """
     from fwl import emitter
     program = analyzer.analyze(parser.parse(self.SOURCE))
     assert (
       f"__uint(max_entries, {interpreter.RATE_LIMIT_MAP_MAX_ENTRIES});"
-      in emitter._emit_rl_maps(program)
+      in emitter._emit_rl_maps(program, emitter.MapNames())
     )
 
 
@@ -405,39 +416,55 @@ class TestRateLimitOverflowIsAssertable:
       pkt.load(path)
 
 
-class TestCompileTempDirsAreBounded:
+class TestCompileTempDirsAreReclaimed:
   """One long run used to leave 84,000 directories behind.
 
   They filled a 2 GB /tmp and killed a corpus run mid-measurement,
   which is worse than a slow run: a measurement that dies halfway
   through reports a partial number that looks like a whole one.
+
+  This branch originally bounded the pile at 256 live directories. The
+  merged line fixes the cause instead — `CompileResult` owns the
+  directory it made and removes it on exit — so these assert the
+  ownership rule rather than the bound.
   """
 
-  def test_a_tracked_dir_is_reclaimed_once_the_bound_is_passed(
-    self, tmp_path, monkeypatch
-  ):
-    from fwl import bpf_runner
-    monkeypatch.setattr(bpf_runner, "_TEMP_WORK_DIR_KEEP", 3)
-    monkeypatch.setattr(bpf_runner, "_temp_work_dirs", [])
-    made = []
-    for i in range(6):
-      path = tmp_path / f"d{i}"
-      path.mkdir()
-      made.append(path)
-      bpf_runner._track_temp_work_dir(path)
-    assert [p.exists() for p in made] == [
-      False, False, False, True, True, True
-    ]
-
-  def test_an_explicit_work_dir_is_never_tracked(self, tmp_path):
-    """`fwl compile --bundle-dir` needs its objects to survive."""
-    import pytest as _pytest
+  def test_an_owned_dir_is_removed_when_the_block_exits(self):
     from fwl import bpf_runner
     try:
-      bpf_runner.compile_c("int main(void) { return 0; }\n",
-                           work_dir=tmp_path / "bundle")
+      with bpf_runner.compile_c(_MINIMAL_C) as result:
+        owned = result.owned_dir
+        assert owned is not None and owned.exists()
     except bpf_runner.BpfUnavailable:
-      _pytest.skip("clang not installed")
-    except Exception:
-      pass  # a compile failure is fine; tracking is what is asserted
-    assert (tmp_path / "bundle") not in bpf_runner._temp_work_dirs
+      pytest.skip("clang not installed")
+    assert not owned.exists()
+
+  def test_a_failed_compile_leaves_nothing_behind(self, monkeypatch):
+    """The path that ran most often in the leak: clang as an oracle."""
+    from fwl import bpf_runner
+    made: list = []
+    real_mkdtemp = bpf_runner.tempfile.mkdtemp
+
+    def spy(*args, **kwargs):
+      path = real_mkdtemp(*args, **kwargs)
+      made.append(pathlib.Path(path))
+      return path
+
+    monkeypatch.setattr(bpf_runner.tempfile, "mkdtemp", spy)
+    try:
+      with pytest.raises(subprocess.CalledProcessError):
+        bpf_runner.check_compiles("this is not C\n")
+    except bpf_runner.BpfUnavailable:
+      pytest.skip("clang not installed")
+    assert made and not any(p.exists() for p in made)
+
+  def test_an_explicit_work_dir_is_never_reclaimed(self, tmp_path):
+    """`fwl compile --bundle-dir` needs its objects to survive."""
+    from fwl import bpf_runner
+    bundle = tmp_path / "bundle"
+    try:
+      with bpf_runner.compile_c(_MINIMAL_C, work_dir=bundle) as result:
+        assert result.owned_dir is None
+    except bpf_runner.BpfUnavailable:
+      pytest.skip("clang not installed")
+    assert bundle.exists()

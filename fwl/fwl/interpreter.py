@@ -28,7 +28,15 @@ class XdpAction(Enum):
 
 @dataclass
 class LogEvent:
-  """A log event emitted by a `log` rule."""
+  """A log event emitted by a `log` rule.
+
+  `rule_index` is numbered within `zone`, never across the unit, so the
+  pair identifies the rule. The BPF record carries `zone` as
+  `log_abi.zone_id(zone)`; the oracle keeps the name, because the name
+  is what a .pkt asserts on and what a bundle's `zone_ids` table
+  resolves an id back to.
+  """
+  zone: str
   rule_index: int
   proto: str
   src_ip: str
@@ -266,7 +274,7 @@ def _condition_uses_conntrack(node) -> bool:
 def evaluate(
   program: ast.Program,
   packet: dict[str, Any],
-  state: dict[int, dict[Any, int]] | None = None,
+  state: dict[Any, dict[Any, int]] | None = None,
   geoip_data: dict[str, list[str]] | None = None,
   conntrack: ConntrackTable | None = None,
   nat: "NatState | None" = None,
@@ -276,8 +284,20 @@ def evaluate(
   Rules execute top to bottom; first matching rule's action wins,
   modulo rate-limit gating. The optional `state` argument supplies
   pre-existing rate-limit bucket counts keyed by the rule's index in
-  the program; absent buckets are treated as count=0. State is read
-  but not mutated — the test harness compares the action only.
+  the program; absent buckets are treated as count=0. A
+  `scope=global` rule reads its bundle-wide slot instead of its rule
+  index (v0.4 § 6.7); `resolve_bucket_state` maps a rule-index seed
+  onto it, and a caller may also key the seed by the slot directly to
+  hand one shared budget to several zones' programs.
+
+  **`state` IS MUTATED.** The emitted program writes its bucket on
+  every packet whose rule condition matched, so this models the write
+  as well as the read — otherwise two identical packets both see the
+  seeded count and the gate decides the same way twice while the real
+  program's bucket climbs. A caller that shares one seed between
+  oracles must hand each of them its own copy, or the interpreter's
+  updates leak into the other's starting state and the comparison is
+  no longer between independent evaluations (`runner._private_rl_state`).
 
   v0.2 `geoip(...)` lookups consult `geoip_data` (a dict mapping
   country code → list of CIDR strings, mirroring the bundle's
@@ -304,7 +324,7 @@ def evaluate(
 def evaluate_full(
   program: ast.Program,
   packet: dict[str, Any],
-  state: dict[int, dict[Any, int]] | None = None,
+  state: dict[Any, dict[Any, int]] | None = None,
   geoip_data: dict[str, list[str]] | None = None,
   conntrack: ConntrackTable | None = None,
   nat: "NatState | None" = None,
@@ -322,12 +342,15 @@ def evaluate_full(
   XDP_PASS does not create an entry (only an explicit allow rule or
   `default allow` does).
   """
-  # `state or {}` would substitute a FRESH dict whenever the caller
-  # passed an empty one, because {} is falsy. That silently discarded
-  # the rate_limit bucket updates below on every sequence whose case
-  # declared no `state:` block — the mutation landed in a throwaway
-  # dict and the next step started from nothing again.
-  state = {} if state is None else state
+  # `resolve_bucket_state` re-keys a rule-index seed onto the entry a
+  # `scope=global` rule actually reads, and returns the caller's own
+  # dict rather than a copy. Both halves matter: substituting a fresh
+  # dict — which `state or {}` did for any empty one, because {} is
+  # falsy — silently discarded the rate_limit bucket updates below on
+  # every sequence whose case declared no `state:` block, so the
+  # mutation landed in a throwaway and the next step started from
+  # nothing again.
+  state = resolve_bucket_state(program, state)
   geoip_data = geoip_data or {}
   packet = _gate_v6_packet_for_v01_program(program, packet)
   if _non_ip_early_out(program, packet):
@@ -347,6 +370,7 @@ def evaluate_full(
     nat=nat,
     helpers={h.name: h for h in getattr(program, "helpers", [])},
   )
+  ctx.ct = ct
   # Seed the NAT working packet with the input header fields, then apply
   # ingress de-NAT (return traffic) before any rule evaluates — the BPF
   # program rewrites the destination of a reply before the rule body
@@ -393,9 +417,11 @@ def evaluate_full(
     if rule.action in ast.NAT_ACTIONS and _nat_can_parse(packet):
       # Non-terminal rewrite: translate the working packet and fall
       # through to the next rule (the terminal emits the rewrite).
+      _before_src = ctx.work.get("src_ip")
       _apply_nat(rule.action, rule.nat_addr, rule.nat_port,
                  ctx.work, ctx.nat)
       ctx.nat_fired = True
+      _track_source_nat(rule.action, ctx, _before_src)
     if rule.action == ast.Action.COUNT and rule.counter_name:
       counters[rule.counter_name] = (
         counters.get(rule.counter_name, 0) + 1
@@ -405,7 +431,7 @@ def evaluate_full(
       if sample is not None and sample > 1:
         pass
       else:
-        log_events.append(_build_log_event(idx, packet))
+        log_events.append(_build_log_event(idx, packet, zone_name))
   if program.default is not None:
     action = _TERMINAL_ACTION_TO_XDP[program.default.action]
     # An explicit `default allow` of a NEW packet creates state, the
@@ -460,9 +486,11 @@ def _exec_stmts(
         # Non-terminal rewrite: translate and fall through. Gated on
         # the same `fwl_find_ipv4` conditions the Tier 1 path uses.
         if _nat_can_parse(packet):
+          _before_src = ctx.work.get("src_ip")
           _apply_nat(stmt.action, stmt.nat_addr, stmt.nat_port,
                      ctx.work, ctx.nat)
           ctx.nat_fired = True
+          _track_source_nat(stmt.action, ctx, _before_src)
         continue
       # LOG and COUNT are non-terminal: side effect omitted in test.
       continue
@@ -916,10 +944,11 @@ def _condition_touches_v6(node) -> bool:
 
 
 def _build_log_event(
-  rule_idx: int, packet: dict[str, Any]
+  rule_idx: int, packet: dict[str, Any], zone: str
 ) -> LogEvent:
   """Construct a LogEvent from the current packet fields."""
   return LogEvent(
+    zone=zone,
     rule_index=rule_idx,
     proto=packet.get("proto", ""),
     src_ip=packet.get("src_ip", "0.0.0.0"),
@@ -943,11 +972,77 @@ RATE_LIMIT_MAP_MAX_ENTRIES = 4096
 RATE_LIMIT_OVERFLOW_COUNTER = "__rate_limit_overflow"
 
 
+def rl_state_key(mod: ast.RateLimit, rule_idx: int):
+  """Which entry of the bucket state a rate_limit rule addresses.
+
+  This is the interpreter's model of v0.4 § 6.7 scope, and it has to
+  mirror the emitter's map naming exactly or the two oracles disagree
+  on a program that compiles fine — the failure mode that reads as a
+  compiler bug and is not one.
+
+  ZONE scope (the default) addresses the rule's own index, so the
+  bucket is private to the program holding the rule; two zones never
+  meet even when their rate-limit rules sit at the same index, because
+  each zone is evaluated against its own state.
+
+  GLOBAL scope addresses the bundle-wide slot the analyzer assigned
+  from the rule's structure. Every zone program holding that rule
+  resolves to the same entry, so a budget spent on one zone is spent
+  for all of them — the exact counterpart of the one pinned map the
+  emitter gives them.
+  """
+  if mod.scope is ast.RlScope.GLOBAL:
+    return ("global", mod.global_slot)
+  return rule_idx
+
+
+def resolve_bucket_state(
+  program, state: dict[Any, dict[Any, int]] | None
+) -> dict[Any, dict[Any, int]]:
+  """Re-key a rule-index-keyed bucket seed onto the entries rules read.
+
+  A `.pkt` seeds `state.rate_limit` by rule index, which is the only
+  handle its author has. A GLOBAL-scoped rule reads its bundle slot
+  instead, so the seed is moved there — otherwise the interpreter would
+  quietly ignore a seed the BPF oracle honours (the runner writes it
+  into the map the rule actually uses), and the two oracles would
+  disagree on a program that compiles fine.
+
+  Seeds already given under a slot key are passed through untouched, so
+  a caller can seed one shared bucket for a whole bundle. When two
+  rules share a slot and both are seeded, the larger count wins — an
+  ill-formed seed either way, and taking the max keeps it conservative
+  for a `drop` gate.
+
+  The caller's own dict is re-keyed IN PLACE and handed back, never
+  copied. `_rate_limit_allows` records each packet in its bucket, and
+  a sequence hands one dict to every step so the counts accumulate
+  across packets the way the loaded program's map does. A copy here —
+  or the `state or {}` this replaced, which substituted a fresh dict
+  for any empty one because {} is falsy — drops every update made
+  under a key the seed did not already carry, and the interpreter
+  silently stops modelling the write.
+  """
+  if state is None:
+    return {}
+  for idx, rule in enumerate(program.rules):
+    if rule.modifier is None or idx not in state:
+      continue
+    key = rl_state_key(rule.modifier, idx)
+    if key == idx:
+      continue
+    target = state.setdefault(key, {})
+    for bucket_key, count in state[idx].items():
+      if count > target.get(bucket_key, 0):
+        target[bucket_key] = count
+  return state
+
+
 def _rate_limit_allows(
   mod: ast.RateLimit,
   rule_idx: int,
   packet: dict[str, Any],
-  state: dict[int, dict[Any, int]],
+  state: dict[Any, dict[Any, int]],
   counters: dict[str, int] | None = None,
 ) -> bool:
   """True iff the rate_limit gate lets the rule fire, and count this packet.
@@ -962,6 +1057,9 @@ def _rate_limit_allows(
   exceeded — `drop ... limited by rate_limit(N)` drops once traffic
   passes N/sec).
 
+  Which entry of `state` holds those buckets depends on the rule's
+  zone scope — see `rl_state_key`.
+
   Lookups try the raw key first (matching the .pkt spec, which says
   IP buckets are dotted-quad strings and port buckets are integers).
   If that misses, IP keys are renormalized to integer form so the
@@ -974,7 +1072,12 @@ def _rate_limit_allows(
     # The per= field isn't available on this packet (e.g. src_port
     # for an ICMP packet). Treat as bucket count = 0.
     bucket_key = 0
-  buckets = state.setdefault(rule_idx, {})
+  # `rl_state_key`, not `rule_idx`: a scope=global rule keeps its
+  # buckets in the bundle-wide slot, which is the entry the emitter's
+  # one pinned map corresponds to. `setdefault`, not `get`: the count
+  # written below has to land in the caller's state, not in a
+  # throwaway that the next packet of the sequence never sees.
+  buckets = state.setdefault(rl_state_key(mod, rule_idx), {})
 
   # Resolve which key this packet's bucket is stored under. IP buckets
   # may be seeded as dotted-quad (the .pkt spec's form) or as the
@@ -1057,6 +1160,9 @@ class _Ctx:
     self.nat = nat
     self.work: dict[str, Any] = {}
     self.nat_fired = False
+    # Conntrack table, so a source-NAT action can track the flow (insert
+    # the post-NAT 5-tuple) from either the Tier 1 or Tier 2 walk.
+    self.ct: "ConntrackTable | None" = None
     # The conntrack state of the packet under evaluation, computed once
     # from the conntrack table (v0.4). Every conntrack(pkt).state read
     # in this packet's evaluation sees the same value.
@@ -1256,6 +1362,25 @@ def _apply_ingress_denat(packet: dict[str, Any], ctx: "_Ctx") -> None:
   ctx.nat_fired = True
 
 
+# `fwl_snat_egress` has TWO side effects on the maps, and the next two
+# functions model one each. It writes the reply mapping into `fwl_nat`
+# (so the reply can be de-NAT'd) AND inserts the post-NAT forward
+# 5-tuple into conntrack (so the reply reads `established`). They are
+# not two versions of the same model, and dropping either one leaves
+# the interpreter modelling half a helper: without the mapping an SNAT
+# that stopped installing them is indistinguishable from a correct one;
+# without the conntrack insert, `masquerade` composed with `allow if
+# conntrack(pkt).state == established` reports a divergence against a
+# compiler that is right.
+#
+# They share one gate, the helper's `if (old_saddr == new_saddr)
+# return;` early-out, which precedes both writes. `_snat_is_noop` is
+# that gate read ahead of the rewrite; `_track_source_nat` reads it
+# after, as "the source did not change" — so a translate-to-self
+# creates neither a mapping nor a conntrack entry, which is what the
+# helper does.
+
+
 def _snat_is_noop(work: dict[str, Any], new_addr: int) -> bool:
   """True when SNAT would translate a source to the address it has.
 
@@ -1270,6 +1395,27 @@ def _snat_is_noop(work: dict[str, Any], new_addr: int) -> bool:
   if not isinstance(src, str):
     return False
   return src == _int_to_ipv4(new_addr)
+
+
+def _track_source_nat(action: ast.Action, ctx: "_Ctx",
+                      before_src: Any) -> None:
+  """Track a source-NAT flow in conntrack (mirrors fwl_snat_egress).
+
+  A `masquerade`/`snat` that actually rewrote the source inserts the
+  post-NAT forward 5-tuple, so the reply (its reverse 5-tuple) reads
+  `established`. Only when the source changed — the BPF returns early
+  when old == new — and only for IPv4 (ct.create is a no-op otherwise).
+
+  The tuple is taken from `ctx.work`, i.e. AFTER the rewrite, and that
+  is the whole mechanism behind masquerade composing with `allow if
+  established`: the reply arrives addressed to the translated source,
+  so only a post-NAT tuple makes its reverse match.
+  """
+  if action not in (ast.Action.MASQUERADE, ast.Action.SNAT):
+    return
+  if ctx.ct is None or ctx.work.get("src_ip") == before_src:
+    return
+  ctx.ct.create(ctx.work)
 
 
 def _apply_nat(action: ast.Action, nat_addr: int | None,

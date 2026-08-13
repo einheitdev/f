@@ -68,6 +68,29 @@ systemctl status fd.service
 sudo journalctl -u fd.service -f
 ```
 
+### 4. `f-confd` — the configuration daemon
+
+`f-confd` owns the appliance's system configuration lifecycle: candidate, commit, revision history, rollback, and the **commit-confirmed revert timer**.
+
+The timer is the reason it is a daemon. Changing an interface, an address or a zone can sever the session you are changing it from, and the protection against that is a countdown that keeps running after the session dies. A timer inside the CLI would die with the SSH connection it exists to protect — so it lives here, and survives a restart of `f-confd` itself (an expired window fires as soon as the daemon is back).
+
+```sh
+sudo cp deploy/systemd/f-confd.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now f-confd.service
+```
+
+With it running:
+
+```
+f# apply system confirmed 5          # applied, 5 minutes to confirm
+f# confirm system                    # keep it
+```
+
+If nobody confirms, the previous configuration — the exact document, not a re-derivation — is put back and the derived networkd/dnsmasq artifacts are regenerated from it.
+
+Without `f-confd`, `apply system` still works as a direct apply, and says so: no revision is recorded, no revert timer is armed, and nothing is reloaded. `apply system confirmed` is *refused* rather than performed, because a confirmed apply with no timer behind it is the one thing worse than no timer at all.
+
 ## Capabilities
 
 The unit grants `fd` the smallest cap set that supports the BPF program lifecycle:

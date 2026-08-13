@@ -12,8 +12,426 @@ to 0 (or the rule's condition naturally evaluates to false).
 """
 from __future__ import annotations
 
+import dataclasses
+import enum
+import re
+
 from . import ast
+from . import log_abi
 from . import splitter
+from .errors import FwlError, FwlException
+
+
+class MapScope(enum.Enum):
+  """Whether a generated BPF map's contents are bundle-wide or per-zone.
+
+  SHARED — the map keeps one bundle-global name, so every zone object
+    in a bundle resolves it (through the common bpffs pin root) to the
+    SAME kernel map. Legitimate only when the contents are meaningful
+    bundle-wide by construction: keyed by a flow tuple, holding one
+    unit-wide setting, or sized from a constant.
+
+  PRIVATE — the map's size, or the meaning of its indices, comes from
+    ONE zone's analysis. Two zones must never land on one kernel map,
+    so the name carries the zone (or the map is never pinned at all
+    and the object boundary isolates it).
+
+  There is no third value and no default. A map that reaches the
+  generated source without a scope is a hard compile error, because
+  the failure mode of forgetting is silent: two zones' objects load
+  cleanly, share one kernel map, and report each other's numbers.
+  """
+  SHARED = "shared"
+  PRIVATE = "private"
+
+
+class MapLifetime(enum.Enum):
+  """Whether a map's CONTENTS still mean anything under the next policy.
+
+  A second, independent axis from `MapScope`. Scope answers "may two
+  zones of ONE bundle land on one kernel map?"; lifetime answers "may
+  the contents of this map, left pinned in bpffs by a PREVIOUS
+  compilation, be carried into the next one?" The two do not coincide:
+  `fwl_rl_g<slot>` is SHARED — bundle-wide by declaration — and still
+  POLICY, because slot 0 of the next policy is a different rule.
+
+  POLICY — the size, or the meaning of an index, or the contents come
+    from ONE compilation's analysis. A pin left by a previous policy is
+    worthless and actively misleading: adopting it reports a dead
+    policy's numbers against live rules, or fails the load outright when
+    the shape moved. `fd` discards these before every load.
+
+  FLOW — keyed by something a policy does not define (today: the flow
+    5-tuple), so an entry means the same thing under any policy. These
+    are what `fd` may adopt across a policy change or a process
+    restart, and dropping them drops established connections.
+
+  There is no default, for the same reason MapScope has none: a map
+  whose lifetime nobody declared would be adopted by whatever the
+  daemon's fallback happens to be, and being wrong that way is silent.
+  Discarding is the safe direction — at worst it costs state that could
+  have been kept — so a new map that nobody thought about must land in
+  POLICY, which is what `_MapKind` requiring the field guarantees.
+  """
+  POLICY = "policy"
+  FLOW = "flow"
+
+
+@dataclasses.dataclass(frozen=True)
+class _MapKind:
+  """One map the emitter can declare, with its sharing scope declared.
+
+  `base` is a regex fullmatched against the map name as written at the
+  declaration site (before any zone qualification). `private_name` is
+  the zone-qualified name template for a PRIVATE map — `{zone}` plus
+  `\\1`..`\\9` backreferences into `base`'s groups — or None when the
+  map is never pinned, so no name change is needed for two zones to
+  keep separate kernel maps.
+
+  `lifetime` says whether the contents survive a recompilation, and
+  `lifetime_why` says on what grounds. Both are required: the daemon
+  reads the FLOW names out of the bundle manifest and discards every
+  other pin under its root, so a row that skipped the question would
+  have its map silently discarded (or, under the old prefix-list
+  loader, silently adopted).
+  """
+  base: str
+  scope: MapScope
+  why: str
+  lifetime: MapLifetime
+  lifetime_why: str
+  private_name: str | None = None
+
+
+# EVERY map the emitter can declare appears here, with its sharing
+# stated. This table is where a map's sharing is decided — not the
+# declaration site, and not a rewrite pass over the generated text.
+#
+# A map that reaches the output without a row here fails the compile
+# (`_check_map_scopes`). That is deliberate: an allowlist of the maps
+# that are private makes *sharing* the default, and the same defect
+# has been found three times under that default (fwl_counters,
+# fwl_log_sample, and again past a docstring explaining it). Two of the
+# three were omissions rather than misjudgements, so the protection
+# has to be against omission.
+_MAP_KINDS: tuple[_MapKind, ...] = (
+  _MapKind(
+    r"conntrack", MapScope.SHARED,
+    "keyed by the flow 5-tuple: a flow established on one zone is "
+    "ESTABLISHED for every other zone (v0.4 § 6.2)",
+    lifetime=MapLifetime.FLOW,
+    lifetime_why=(
+      "an established connection is a fact about the wire, not about "
+      "the policy that admitted it. Discarding this map on a reload "
+      "or a restart drops every established connection, which is the "
+      "outage the state exists to prevent. The daemon adopts it only "
+      "when the incoming bundle declares the same definition, and "
+      "sweeps it against the GC's own age rule before arming the "
+      "datapath"
+    ),
+  ),
+  _MapKind(
+    r"fwl_nat", MapScope.SHARED,
+    "keyed by the flow 5-tuple; the egress zone installs the reply "
+    "mapping that the ingress zone consumes",
+    lifetime=MapLifetime.FLOW,
+    lifetime_why=(
+      "same key, same argument, and the consequence of losing it is "
+      "worse than losing conntrack: a reply whose mapping is gone is "
+      "not merely re-evaluated, it is forwarded un-translated to a "
+      "host that never sent the request"
+    ),
+  ),
+  _MapKind(
+    r"fwl_nat_cfg", MapScope.SHARED,
+    "one unit-wide masquerade address, written once by the daemon",
+    lifetime=MapLifetime.POLICY,
+    lifetime_why=(
+      "derived by the daemon at every load from THIS bundle's "
+      "redirect topology and the live interface addresses, so nothing "
+      "is lost by dropping it — while a stale value would translate "
+      "to an address the new policy never named"
+    ),
+  ),
+  _MapKind(
+    r"fwl_log_events", MapScope.SHARED,
+    "one ring buffer per bundle; every record carries the zone id of "
+    "the object that wrote it, so the per-zone rule_index they share "
+    "is disambiguated in the record rather than by the map name",
+    lifetime=MapLifetime.POLICY,
+    lifetime_why=(
+      "an unconsumed event carries the rule_index of the compilation "
+      "that emitted it; read back against the next policy it names "
+      "the wrong rule"
+    ),
+  ),
+  _MapKind(
+    r"fwl_devmap_\w+", MapScope.SHARED,
+    "named for its DESTINATION zone, so every zone redirecting there "
+    "must resolve to the same devmap (v0.4 § 6.3)",
+    lifetime=MapLifetime.POLICY,
+    lifetime_why=(
+      "holds ifindexes the daemon resolves from THIS bundle's "
+      "manifest at every load. A zone interface that is not up yet is "
+      "skipped rather than written (interfaces may appear after "
+      "boot), so an adopted entry would survive un-overwritten and "
+      "redirect packets out of an interface the new policy never "
+      "named — the one stale-state failure here that misdirects "
+      "traffic instead of miscounting it"
+    ),
+  ),
+  _MapKind(
+    r"fwl_rl_g\d+", MapScope.SHARED,
+    "v0.4 § 6.7 scope=global bucket: a bundle-wide budget BY "
+    "DECLARATION, slot numbered unit-wide, sized from the "
+    "_RL_MAX_ENTRIES constant and never from a zone's rule count",
+    lifetime=MapLifetime.POLICY,
+    lifetime_why=(
+      "the case where the two axes visibly disagree: bundle-wide by "
+      "declaration, yet slot g0 of the next policy is a different "
+      "rule with a different budget, and inheriting its accumulated "
+      "token state throttles a rule that never spent them"
+    ),
+  ),
+  _MapKind(
+    r"fwl_counters", MapScope.PRIVATE,
+    "sized by this zone's counter count; slot i means this zone's "
+    "i-th counter and nothing else",
+    lifetime=MapLifetime.POLICY,
+    lifetime_why=(
+      "slot i is the i-th counter THIS compilation allocated; the "
+      "next one numbers its own"
+    ),
+    private_name=r"fwl_counters_{zone}",
+  ),
+  _MapKind(
+    r"fwl_log_sample", MapScope.PRIVATE,
+    "sized by this zone's rule count; index i is this zone's i-th "
+    "rule, and the value is that rule's sampling phase",
+    lifetime=MapLifetime.POLICY,
+    lifetime_why=(
+      "indexed by this compilation's rule numbering, and the value is "
+      "a sampling phase that belongs to that rule"
+    ),
+    private_name=r"fwl_log_sample_{zone}",
+  ),
+  _MapKind(
+    r"fwl_rl_map_(\d+)", MapScope.PRIVATE,
+    "addressed by this zone's own rule index (v0.4 § 6.7 scope=zone, "
+    "the default)",
+    lifetime=MapLifetime.POLICY,
+    lifetime_why=(
+      "named for a rule index this compilation assigned; the same "
+      "name in the next policy is a different rule"
+    ),
+    private_name=r"fwl_rl_{zone}_\1",
+  ),
+  _MapKind(
+    r"fwl_geoip_(\d+)", MapScope.PRIVATE,
+    "one LPM trie per geoip() call site, numbered within the zone",
+    lifetime=MapLifetime.POLICY,
+    lifetime_why=(
+      "numbered per geoip() call site, and repopulated from the "
+      "bundle's geoip.json at every load — an adopted trie would "
+      "answer for a country the new call site never asked about"
+    ),
+    private_name=r"fwl_geoip_{zone}_\1",
+  ),
+  _MapKind(
+    r"fwl_scratch", MapScope.PRIVATE,
+    "per-packet per-CPU parse metadata for THIS object's tail-call "
+    "chain; never pinned, or two split zones would cross-wire their "
+    "pipelines (v0.4 § 6.6)",
+    lifetime=MapLifetime.POLICY,
+    lifetime_why=(
+      "never pinned, so nothing of it reaches bpffs to be adopted; "
+      "its contents do not outlive a single packet either way"
+    ),
+  ),
+  _MapKind(
+    r"fwl_stages", MapScope.PRIVATE,
+    "this object's own stage prog_array; never pinned, for the same "
+    "reason as fwl_scratch",
+    lifetime=MapLifetime.POLICY,
+    lifetime_why=(
+      "never pinned, and holds program fds belonging to one loaded "
+      "object"
+    ),
+  ),
+)
+
+
+def _map_kind(base_name: str) -> _MapKind | None:
+  """The registry row for `base_name`, or None if it has no scope."""
+  for kind in _MAP_KINDS:
+    if re.fullmatch(kind.base, base_name):
+      return kind
+  return None
+
+
+# A `base` pattern that is just a name — no regex metacharacters, so the
+# name it matches is the name itself.
+_LITERAL_NAME_RE = re.compile(r"\w+")
+
+
+def persistent_map_names() -> tuple[str, ...]:
+  """The pinned map names whose contents survive a policy change.
+
+  Written into every bundle's manifest as `persistent_maps`. `fd`
+  reconciles bpffs against this list before each load: a pin named here
+  may be adopted (if the incoming bundle declares the same definition),
+  and every other pin under its root is removed. The daemon therefore
+  never has to re-derive the rule from name prefixes — a second copy of
+  this decision, in another language, which is how the same defect got
+  in three times before `_MAP_KINDS` existed.
+
+  A FLOW map must be SHARED and must have a literal name: the manifest
+  carries names, not patterns, and a per-zone or numbered map cannot be
+  keyed by something a policy does not define in the first place. A row
+  that breaks either rule is a contradiction in the registry, not a
+  compile error in the user's policy, so it raises here.
+  """
+  names: list[str] = []
+  for kind in _MAP_KINDS:
+    if kind.lifetime is not MapLifetime.FLOW:
+      continue
+    if not _LITERAL_NAME_RE.fullmatch(kind.base):
+      raise _codegen_error(
+        f"_MAP_KINDS row '{kind.base}' is MapLifetime.FLOW but its "
+        f"name is a pattern. The bundle manifest carries the "
+        f"persistent names literally, so fd can compare them against "
+        f"what is pinned in bpffs; give the row a literal name or "
+        f"classify it POLICY."
+      )
+    if kind.scope is not MapScope.SHARED:
+      raise _codegen_error(
+        f"map '{kind.base}' is MapLifetime.FLOW but MapScope.PRIVATE. "
+        f"A map that survives a policy change is keyed by something "
+        f"the policy does not define, which is exactly what makes it "
+        f"safe to share across zones; a per-zone map cannot qualify."
+      )
+    names.append(kind.base)
+  return tuple(names)
+
+
+def _codegen_error(message: str) -> FwlException:
+  """An emitter-detected error that stops the compile."""
+  return FwlException(FwlError(category="codegen", message=message))
+
+
+def emitting_zone_names(program: ast.Program) -> list[str]:
+  """Every zone name a log event of this unit can carry, in order.
+
+  The declared zones plus every @xdp block's zone. They are usually the
+  same list, but not always: the degenerate `@xdp(eth0)` unit declares
+  no zones at all and still emits events tagged `eth0`, so a table
+  built from `program.zones` alone would not resolve its own records.
+  """
+  names: list[str] = [z.name for z in program.zones]
+  for zp in program.programs:
+    if zp.zone_name not in names:
+      names.append(zp.zone_name)
+  return names
+
+
+def _check_zone_ids(program: ast.Program) -> None:
+  """Every zone that can emit a log event needs a distinct `zone_id`.
+
+  Runs on every compile, single-object and bundle alike. A collision is
+  the one failure mode `log_abi.zone_id`'s hash has, and it is silent
+  in exactly the way the zone tag exists to prevent: two zones' events
+  become indistinguishable again, and a consumer reads one zone's rule
+  numbering against the other's rules. So it fails the compile, with
+  both names in the message, rather than reaching a bundle.
+  """
+  seen: dict[int, str] = {}
+  for name in emitting_zone_names(program):
+    tag = log_abi.zone_id(name)
+    if tag == log_abi.ZONE_ID_NONE:
+      raise _codegen_error(
+        f"zone '{name}' hashes to the reserved zone id 0, which a log "
+        f"consumer reads as 'unattributed'. Rename the zone."
+      )
+    other = seen.get(tag)
+    if other is not None and other != name:
+      raise _codegen_error(
+        f"zones '{other}' and '{name}' share log-event zone id "
+        f"0x{tag:08X}. Log events identify their zone by a hash of "
+        f"its name, so a collision makes the two zones' events "
+        f"indistinguishable — the ambiguity the zone tag removes. "
+        f"Rename one of them."
+      )
+    seen[tag] = name
+
+
+def _unclassified_map_error(name: str) -> FwlException:
+  """The error for a map that reached the output with no scope."""
+  return _codegen_error(
+    f"map '{name}' is emitted with no declared sharing scope. Every "
+    f"map the emitter can produce needs a row in emitter._MAP_KINDS "
+    f"saying MapScope.SHARED (bundle-wide state: one kernel map for "
+    f"every zone) or MapScope.PRIVATE (sized or indexed from one "
+    f"zone's analysis, so its name must carry the zone). There is no "
+    f"default on purpose: an unclassified map keeps a bundle-global "
+    f"pinned name, and zones whose shapes happen to agree then share "
+    f"one kernel map with no error and no symptom."
+  )
+
+
+class MapNames:
+  """The names one zone object's maps are emitted under.
+
+  Constructed once per object being emitted. `zone` is None for
+  single-object emission (`emit()`, the test runner's BPF oracle),
+  where nothing is pinned and the base names are unambiguous; in a
+  bundle it is the zone being emitted, and every PRIVATE map's name
+  carries it.
+
+  Every declaration site takes its name from here, so a map's name and
+  its sharing decision are made in one place. Asking for a name the
+  registry does not classify raises immediately, before any C is
+  generated.
+  """
+
+  def __init__(self, zone: str | None = None):
+    self.zone = zone
+    # Emitted name -> the registry row it came from. `_check_map_scopes`
+    # uses this to tell a name that was issued here from one that was
+    # hardcoded at a declaration site.
+    self.issued: dict[str, _MapKind] = {}
+
+  def qualified(self, base: str) -> str:
+    """The emitted name for the map whose base name is `base`."""
+    kind = _map_kind(base)
+    if kind is None:
+      raise _unclassified_map_error(base)
+    name = base
+    if (
+      kind.scope is MapScope.PRIVATE
+      and kind.private_name is not None
+      and self.zone is not None
+    ):
+      match = re.fullmatch(kind.base, base)
+      assert match is not None
+      name = match.expand(kind.private_name.format(zone=self.zone))
+    self.issued[name] = kind
+    return name
+
+  def counters(self) -> str:
+    """The per-zone counter array."""
+    return self.qualified("fwl_counters")
+
+  def log_sample(self) -> str:
+    """The per-zone log-sampling accumulator."""
+    return self.qualified("fwl_log_sample")
+
+  def geoip(self, call_index: int) -> str:
+    """The LPM trie backing geoip call site `call_index`."""
+    return self.qualified(f"fwl_geoip_{call_index}")
+
+  def rate_limit(self, mod: ast.RateLimit, rule_idx: int) -> str:
+    """The bucket map for a rate_limit rule (v0.4 § 6.7)."""
+    return self.qualified(_rl_base_name(mod, rule_idx))
 
 
 _PROTO_TO_IPPROTO = {
@@ -286,6 +704,18 @@ static __always_inline void fwl_snat_egress(
     .nat_type = FWL_NAT_DNAT,
   };
   bpf_map_update_elem(&fwl_nat, &rk, &rv, BPF_ANY);
+  // Track the flow: insert the post-NAT forward 5-tuple so the reply
+  // (its reverse 5-tuple) reads `established`, letting a stateful WAN
+  // program redirect return traffic back in. BPF_NOEXIST is idempotent.
+  struct fwl_conn_key _ct_nk = {
+    .src_addr = new_saddr, .dst_addr = daddr,
+    .src_port = bpf_ntohs(sport), .dst_port = bpf_ntohs(dport),
+    .proto = proto,
+  };
+  struct fwl_conn_value _ct_nv = {
+    .last_seen_ns = bpf_ktime_get_ns(), .packets = 1, .state = 1,
+  };
+  bpf_map_update_elem(&conntrack, &_ct_nk, &_ct_nv, BPF_NOEXIST);
   ip->saddr = new_saddr;
   fwl_fix_ip_csum(ip);
   if (proto == IPPROTO_TCP) {
@@ -441,23 +871,10 @@ static __always_inline void fwl_nat_denat(struct xdp_md *ctx) {
 """
 
 
-_LOG_EVENT_DECL = """\
-struct fwl_log_event {
-  __u64 timestamp_ns;
-  __u32 src_ip;
-  __u32 dst_ip;
-  __u16 src_port;
-  __u16 dst_port;
-  __u8  proto;
-  __u8  flags;
-  __u32 rule_index;
-};
-
-struct {
-  __uint(type, BPF_MAP_TYPE_RINGBUF);
-  __uint(max_entries, 1 << 20);
-} fwl_log_events SEC(".maps");
-"""
+# The record layout is `log_abi`'s, not the emitter's: its Python
+# consumers unpack the same bytes, and one definition is the only way
+# the two stay in step.
+_LOG_EVENT_DECL = log_abi.C_DECL
 
 
 _COUNTER_MAP_DECL_TEMPLATE = """\
@@ -466,7 +883,17 @@ struct {{
   __type(key, __u32);
   __type(value, __u64);
   __uint(max_entries, {n_slots});
-}} fwl_counters SEC(".maps");
+}} {name} SEC(".maps");
+"""
+
+
+_LOG_SAMPLE_MAP_DECL_TEMPLATE = """\
+struct {{
+  __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+  __type(key, __u32);
+  __type(value, __u64);
+  __uint(max_entries, {n_rules});
+}} {name} SEC(".maps");
 """
 
 
@@ -766,7 +1193,30 @@ def _emit_parse_prelude(
   """
   fields = _referenced_fields(program)
   if not fields:
-    return ""
+    # No referenced fields still gets the non-IP early-out. FWL has
+    # no L2 fields, so no construct can meaningfully act on ARP, STP,
+    # LLDP, or other L2 control frames — and a program built from
+    # unconditional actions otherwise WOULD act on them: an
+    # unconditional `redirect` re-emits the switch's own BPDUs out
+    # another port, which real switch fabric answers by blocking the
+    # port (loop protection). Found on the EX2300 by the hardware
+    # storm_shield test; veth-based tests cannot see it.
+    return f"""\
+  {{
+    void *data = (void *)(long)ctx->data;
+    void *data_end = (void *)(long)ctx->data_end;
+    struct ethhdr *eth = data;
+    if ((void *)(eth + 1) > data_end) return {early_out};
+    __u16 fwl_l3p = eth->h_proto;
+    if (fwl_l3p == bpf_htons(ETH_P_8021Q)) {{
+      struct fwl_vlanhdr *vh = (void *)(eth + 1);
+      if ((void *)(vh + 1) > data_end) return {early_out};
+      fwl_l3p = vh->inner_proto;
+    }}
+    if (fwl_l3p != bpf_htons(ETH_P_IP) &&
+        fwl_l3p != bpf_htons(ETH_P_IPV6)) return {early_out};
+  }}
+"""
 
   needs_l4 = _needs_l4(fields)
   needs_tcp = _needs_tcp(fields)
@@ -782,6 +1232,13 @@ def _emit_parse_prelude(
   # inside the IPv4 branch after the fixed-header bounds check
   # succeeds, mirroring the v6_ok pattern.
   decls.append("__u8 v4_ok = 0;")
+  # Records "this frame is IPv6" independently of whether the v6
+  # parse path was generated. The non-IP early-out must not swallow
+  # IPv6 frames: FWL_V02_SPEC.md:937 requires that in a v0.1-shaped
+  # program they "fall through every rule ... and reach the default
+  # action". Passing them instead makes `default drop` forward all
+  # IPv6 traffic.
+  decls.append("__u8 is_v6_frame = 0;")
   # l4_ok gates port and TCP-flag reads. Set to 1 only inside the
   # TCP/UDP guard blocks after the L4 bounds check succeeds.
   if _needs_l4(fields):
@@ -928,9 +1385,23 @@ def _emit_parse_prelude(
             }}
           }}"""
 
+    # A non-first fragment (offset != 0) carries no L4 header — the
+    # bytes at ip_hlen are ordinary payload. Reading them as ports or
+    # flags lets an attacker choose what the filter sees, which is the
+    # classic tiny-fragment bypass: payload crafted to mimic an
+    # allowed port walks through a `default drop` policy. Verified on
+    # hardware before this guard existed (tests/system/hw/
+    # l6_01_fragments.sh: 50/50 such fragments passed).
+    #
+    # Gating the whole L4 parse block leaves l4_ok/icmp_ok at 0, so
+    # every port, TCP-flag, and ICMP type/code guard fails closed,
+    # while pkt.proto / src_ip / dst_ip (read outside this block)
+    # still match — exactly what FWL_V01_SPEC:204 specifies.
     l4_block = f"""
         __u32 ip_hlen = ip->ihl * 4;
-        if (ip_hlen >= sizeof(struct iphdr) &&
+        __u8 fwl_first_frag =
+            (bpf_ntohs(ip->frag_off) & 0x1FFF) == 0;
+        if (fwl_first_frag && ip_hlen >= sizeof(struct iphdr) &&
             (void *)ip + ip_hlen <= data_end) \
 {{{tcp_block}{udp_block}{icmp_block}
         }}"""
@@ -1017,7 +1488,13 @@ def _emit_parse_prelude(
   # v0.4: when the program reads vlan fields, vlan_ok joins the gate
   # so a tagged non-IP frame (or a tagged frame truncated before L3)
   # still reaches the vlan-matching rules instead of early-passing.
+  # ...but an IPv6 frame is IP, and the spec requires it to reach the
+  # default action even when the v6 parse path was not generated.
+  # Excluding it from the early-out is what makes `default drop`
+  # actually deny IPv6 (verified on wire:
+  # tests/system/hw/l1_13_ipv6_activation.sh).
   vlan_gate = " && !vlan_ok" if needs_vlan else ""
+  vlan_gate += " && !is_v6_frame"
   return f"""\
 {decl_block}
   void *data = (void *)(long)ctx->data;
@@ -1026,6 +1503,9 @@ def _emit_parse_prelude(
   if ((void *)(eth + 1) <= data_end) {{
     __u16 l3_proto = eth->h_proto;
     void *l3 = (void *)(eth + 1);{vlan_block}
+    if (l3_proto == bpf_htons(ETH_P_IPV6)) {{
+      is_v6_frame = 1;
+    }}
     if (l3_proto == bpf_htons(ETH_P_IP)) {{
       struct iphdr *ip = l3;
       if ((void *)(ip + 1) <= data_end) {{
@@ -1571,7 +2051,8 @@ def _redirect_return(zone: str) -> str:
 
 
 def _emit_rule(
-  rule: ast.Rule, idx: int, counter_slots: dict[str, int],
+  names: MapNames, rule: ast.Rule, idx: int,
+  counter_slots: dict[str, int],
   ct_create: str = "", zone_name: str | None = None,
 ) -> str:
   """Emit C statements for one rule.
@@ -1594,17 +2075,17 @@ def _emit_rule(
     create = ct_create if rule.action == ast.Action.ALLOW else ""
     if rule.modifier is not None:
       fire_block = _emit_rate_limit_gate(
-        rule.modifier, idx, ret, overflow_slot, create
+        names, rule.modifier, idx, ret, overflow_slot, create
       )
     else:
       fire_block = f"{create}return {ret};"
   else:
     # Non-terminal: emit the side effect, no return.
     if rule.action == ast.Action.LOG:
-      side_effect = _emit_log(idx, rule.log_sample)
+      side_effect = _emit_log(names, idx, zone_name, rule.log_sample)
     elif rule.action == ast.Action.COUNT:
       slot = counter_slots[rule.counter_name]  # type: ignore[index]
-      side_effect = _emit_count(slot)
+      side_effect = _emit_count(names, slot)
     elif rule.action in ast.NAT_ACTIONS:
       side_effect = _emit_nat_call(
         rule.action, rule.nat_addr, rule.nat_port
@@ -1615,7 +2096,7 @@ def _emit_rule(
       )
     if rule.modifier is not None:
       fire_block = _emit_rate_limit_side_effect(
-        rule.modifier, idx, side_effect, overflow_slot
+        names, rule.modifier, idx, side_effect, overflow_slot
       )
     else:
       fire_block = side_effect
@@ -1627,25 +2108,41 @@ def _emit_rule(
 
 
 def _emit_log(
-  rule_idx: int, sample: int | None = None
+  names: MapNames, rule_idx: int, zone_name: str | None,
+  sample: int | None = None,
 ) -> str:
-  """Emit code that submits a log_event for rule `rule_idx`."""
+  """Emit code that submits a log_event for rule `rule_idx`.
+
+  `zone_name` is the @xdp block being emitted. It is stamped into the
+  record as `log_abi.zone_id(zone_name)` because `fwl_log_events` is
+  one ring for the whole bundle while `rule_idx` is numbered per zone:
+  without the tag, zone `wan`'s rule 2 and zone `lan`'s rule 2 are the
+  same record and no consumer can separate them.
+  """
+  tag = log_abi.ZONE_ID_NONE if zone_name is None \
+    else log_abi.zone_id(zone_name)
   submit = f"""struct fwl_log_event *ev =
       bpf_ringbuf_reserve(&fwl_log_events, sizeof(*ev), 0);
     if (ev) {{
+      ev->magic = FWL_LOG_EVENT_MAGIC;
+      ev->version = FWL_LOG_EVENT_VERSION;
+      ev->event_size = sizeof(*ev);
       ev->timestamp_ns = bpf_ktime_get_ns();
+      ev->zone_id = 0x{tag:08X}u;
+      ev->rule_index = {rule_idx};
       ev->src_ip = src_ip;
       ev->dst_ip = dst_ip;
       ev->src_port = src_port;
       ev->dst_port = dst_port;
       ev->proto = proto;
       ev->flags = (tcp_syn ? 0x01 : 0) | (tcp_ack ? 0x02 : 0);
-      ev->rule_index = {rule_idx};
+      ev->pad[0] = 0;
+      ev->pad[1] = 0;
       bpf_ringbuf_submit(ev, 0);
     }}"""
   if sample is not None and sample > 1:
     return f"""__u32 lsk = {rule_idx};
-    __u64 *lsc = bpf_map_lookup_elem(&fwl_log_sample, &lsk);
+    __u64 *lsc = bpf_map_lookup_elem(&{names.log_sample()}, &lsk);
     __u64 lsv = lsc ? *lsc + 1 : 1;
     if (lsc) {{ *lsc = lsv; }}
     if ((lsv - 1) % {sample} == 0) {{
@@ -1654,29 +2151,62 @@ def _emit_log(
   return submit
 
 
-def _emit_count(slot: int) -> str:
+def _emit_count(names: MapNames, slot: int) -> str:
   """Emit code that bumps the counter at `slot`."""
   return f"""__u32 ck = {slot};
-    __u64 *cnt = bpf_map_lookup_elem(&fwl_counters, &ck);
+    __u64 *cnt = bpf_map_lookup_elem(&{names.counters()}, &ck);
     if (cnt) {{
       __sync_fetch_and_add(cnt, 1);
     }}"""
 
 
-def _emit_rate_limit_overflow(overflow_slot: int | None) -> str:
+def _emit_rate_limit_overflow(
+  names: MapNames, overflow_slot: int | None
+) -> str:
   """Emit the post-update overflow check (or empty when no slot)."""
   if overflow_slot is None:
     return ""
   return f"""
     if (upd_rc == -7) {{
       __u32 ovf_slot = {overflow_slot};
-      __u64 *ovf = bpf_map_lookup_elem(&fwl_counters, &ovf_slot);
+      __u64 *ovf = bpf_map_lookup_elem(&{names.counters()}, &ovf_slot);
       if (ovf) __sync_fetch_and_add(ovf, 1);
     }}"""
 
 
+def _rl_base_name(mod: ast.RateLimit, idx: int) -> str:
+  """The unqualified name of a rate_limit rule's bucket map.
+
+  ZONE scope uses `fwl_rl_map_<rule idx>`: PRIVATE in the registry, so
+  in a bundle `MapNames` gives it the zone (`fwl_rl_<zone>_<idx>`) and
+  two zones can never address one kernel map by their own rule
+  indices.
+
+  GLOBAL scope uses `fwl_rl_g<slot>`, where the slot is the
+  bundle-wide number the analyzer assigned from the rule's structure.
+  That name is SHARED in the registry — one name, one kernel map, one
+  budget — and is therefore held to the bundle invariant that every
+  zone declare it identically.
+  """
+  if mod.scope is ast.RlScope.GLOBAL:
+    return f"fwl_rl_g{mod.global_slot}"
+  return f"fwl_rl_map_{idx}"
+
+
+def rl_map_name(
+  mod: ast.RateLimit, idx: int, zone: str | None = None
+) -> str:
+  """The map a rate_limit rule's bucket lives in (v0.4 § 6.7).
+
+  `zone` is None for a single-object emission (the test runner's BPF
+  oracle seeds bucket state by this name) and the emitting zone in a
+  bundle.
+  """
+  return MapNames(zone).rate_limit(mod, idx)
+
+
 def _emit_rate_limit_side_effect(
-  mod: ast.RateLimit, idx: int, side_effect: str,
+  names: MapNames, mod: ast.RateLimit, idx: int, side_effect: str,
   overflow_slot: int | None,
 ) -> str:
   """Wrap a non-terminal side effect with rate_limit gating.
@@ -1688,11 +2218,12 @@ def _emit_rate_limit_side_effect(
   insert.
   """
   c_field = _RL_FIELD_TO_C[mod.per_field]
-  ovf = _emit_rate_limit_overflow(overflow_slot)
+  ovf = _emit_rate_limit_overflow(names, overflow_slot)
+  rl_map = names.rate_limit(mod, idx)
   return f"""__u32 rl_key = (__u32){c_field};
     __u64 now = bpf_ktime_get_ns();
     struct fwl_rl_state *st =
-      bpf_map_lookup_elem(&fwl_rl_map_{idx}, &rl_key);
+      bpf_map_lookup_elem(&{rl_map}, &rl_key);
     __u32 cur = 0;
     __u64 cur_ts = now;
     if (st && now - st->ts < 1000000000ULL) {{
@@ -1701,14 +2232,14 @@ def _emit_rate_limit_side_effect(
     }}
     struct fwl_rl_state new_st = {{ .ts = cur_ts, .count = cur + 1 }};
     int upd_rc = bpf_map_update_elem(
-      &fwl_rl_map_{idx}, &rl_key, &new_st, BPF_ANY);{ovf}
+      &{rl_map}, &rl_key, &new_st, BPF_ANY);{ovf}
     if (cur >= {mod.threshold}) {{
       {side_effect}
     }}"""
 
 
 def _emit_rate_limit_gate(
-  mod: ast.RateLimit, idx: int, ret: str,
+  names: MapNames, mod: ast.RateLimit, idx: int, ret: str,
   overflow_slot: int | None,
   ct_create: str = "",
 ) -> str:
@@ -1722,11 +2253,12 @@ def _emit_rate_limit_gate(
   exhaustion, the reserved `__rate_limit_overflow` counter ticks.
   """
   c_field = _RL_FIELD_TO_C[mod.per_field]
-  ovf = _emit_rate_limit_overflow(overflow_slot)
+  ovf = _emit_rate_limit_overflow(names, overflow_slot)
+  rl_map = names.rate_limit(mod, idx)
   return f"""__u32 rl_key = (__u32){c_field};
     __u64 now = bpf_ktime_get_ns();
     struct fwl_rl_state *st =
-      bpf_map_lookup_elem(&fwl_rl_map_{idx}, &rl_key);
+      bpf_map_lookup_elem(&{rl_map}, &rl_key);
     __u32 cur = 0;
     __u64 cur_ts = now;
     if (st && now - st->ts < 1000000000ULL) {{
@@ -1735,26 +2267,54 @@ def _emit_rate_limit_gate(
     }}
     struct fwl_rl_state new_st = {{ .ts = cur_ts, .count = cur + 1 }};
     int upd_rc = bpf_map_update_elem(
-      &fwl_rl_map_{idx}, &rl_key, &new_st, BPF_ANY);{ovf}
+      &{rl_map}, &rl_key, &new_st, BPF_ANY);{ovf}
     if (cur >= {mod.threshold}) {{
       {ct_create}return {ret};
     }}"""
 
 
-def _emit_rl_maps(program: ast.Program) -> str:
-  """Emit per-CPU hash map declarations for each rate_limit modifier."""
+# Bucket-key capacity of every rate-limit map, zone- and global-scoped
+# alike. A CONSTANT on purpose: a globally named map must be declared
+# identically in every zone object or libbpf rejects the pin reuse
+# (-EINVAL) the moment two zones' analyses disagree. Nothing here may
+# ever be derived from a per-zone rule count.
+_RL_MAX_ENTRIES = 4096
+
+
+def _emit_rl_maps(
+  program: ast.Program, names: MapNames, pinned_shared: bool = False
+) -> str:
+  """Emit the per-CPU hash map declaration for each rate_limit bucket.
+
+  ZONE-scoped buckets get one map per rule index, unpinned and named
+  for the emitting zone, so two zones can never land on one kernel
+  map.
+
+  GLOBAL-scoped buckets get one map per bundle-wide slot, pinned by
+  name (in a bundle) so every zone object that holds the rule resolves
+  to the SAME kernel map. Several rules in one zone may share a slot —
+  that is the point — so the declarations are de-duplicated here.
+  """
   blocks: list[str] = []
+  emitted: set[str] = set()
   for idx, rule in enumerate(program.rules):
     if rule.modifier is None:
       continue
-    blocks.append(f"""\
+    name = names.rate_limit(rule.modifier, idx)
+    if name in emitted:
+      continue
+    emitted.add(name)
+    decl = f"""\
 struct {{
   __uint(type, BPF_MAP_TYPE_PERCPU_HASH);
   __type(key, __u32);
   __type(value, struct fwl_rl_state);
-  __uint(max_entries, 4096);
-}} fwl_rl_map_{idx} SEC(".maps");
-""")
+  __uint(max_entries, {_RL_MAX_ENTRIES});
+}} {name} SEC(".maps");
+"""
+    if rule.modifier.scope is ast.RlScope.GLOBAL:
+      decl = _maybe_pin(decl, pinned_shared)
+    blocks.append(decl)
   return "\n".join(blocks)
 
 
@@ -1795,7 +2355,9 @@ def _collect_geoip_in_stmts(stmts) -> list[ast.GeoIp]:
   return out
 
 
-def _emit_geoip_maps_and_helpers(program: ast.Program) -> str:
+def _emit_geoip_maps_and_helpers(
+  program: ast.Program, names: MapNames
+) -> str:
   """Emit one BPF_MAP_TYPE_LPM_TRIE + lookup helper per geoip call site.
 
   Per FWL_V02_SPEC.md, each call site is bound to exactly one family
@@ -1803,6 +2365,13 @@ def _emit_geoip_maps_and_helpers(program: ast.Program) -> str:
   the trie at load time from `geoip.json`; the BPF program does the
   lookup. Helpers are `__always_inline` so the verifier sees a flat
   call site rather than a function-pointer indirection.
+
+  The trie is a PRIVATE map — its call indices are numbered within the
+  zone and userspace finds it by name — so its name (and the matching
+  key struct) carries the zone in a bundle. The lookup helper does
+  not: it is a static function with no linkage past this object, and
+  its call sites elsewhere in the emitter address it by call index
+  alone.
   """
   blocks: list[str] = []
   seen: set[int] = set()
@@ -1810,47 +2379,48 @@ def _emit_geoip_maps_and_helpers(program: ast.Program) -> str:
     if call.call_index in seen:
       continue
     seen.add(call.call_index)
+    trie = names.geoip(call.call_index)
     if call.family == "ipv4":
       blocks.append(f"""\
-struct fwl_geoip_{call.call_index}_key {{
+struct {trie}_key {{
   __u32 prefixlen;
   __u32 ip;
 }};
 
 struct {{
   __uint(type, BPF_MAP_TYPE_LPM_TRIE);
-  __type(key, struct fwl_geoip_{call.call_index}_key);
+  __type(key, struct {trie}_key);
   __type(value, __u8);
   __uint(max_entries, 65536);
   __uint(map_flags, BPF_F_NO_PREALLOC);
-}} fwl_geoip_{call.call_index} SEC(".maps");
+}} {trie} SEC(".maps");
 
 static __always_inline int fwl_geoip_{call.call_index}_v4(__u32 ip) {{
-  struct fwl_geoip_{call.call_index}_key key = {{
+  struct {trie}_key key = {{
     .prefixlen = 32,
     .ip = bpf_htonl(ip),
   }};
-  return bpf_map_lookup_elem(&fwl_geoip_{call.call_index}, &key) != 0;
+  return bpf_map_lookup_elem(&{trie}, &key) != 0;
 }}
 """)
     elif call.family == "ipv6":
       blocks.append(f"""\
-struct fwl_geoip_{call.call_index}_key {{
+struct {trie}_key {{
   __u32 prefixlen;
   __u8  ip[16];
 }};
 
 struct {{
   __uint(type, BPF_MAP_TYPE_LPM_TRIE);
-  __type(key, struct fwl_geoip_{call.call_index}_key);
+  __type(key, struct {trie}_key);
   __type(value, __u8);
   __uint(max_entries, 65536);
   __uint(map_flags, BPF_F_NO_PREALLOC);
-}} fwl_geoip_{call.call_index} SEC(".maps");
+}} {trie} SEC(".maps");
 
 static __always_inline int fwl_geoip_{call.call_index}_v6(
     __u64 hi, __u64 lo) {{
-  struct fwl_geoip_{call.call_index}_key key = {{ .prefixlen = 128 }};
+  struct {trie}_key key = {{ .prefixlen = 128 }};
   key.ip[0]  = (hi >> 56) & 0xff; key.ip[1]  = (hi >> 48) & 0xff;
   key.ip[2]  = (hi >> 40) & 0xff; key.ip[3]  = (hi >> 32) & 0xff;
   key.ip[4]  = (hi >> 24) & 0xff; key.ip[5]  = (hi >> 16) & 0xff;
@@ -1859,7 +2429,7 @@ static __always_inline int fwl_geoip_{call.call_index}_v6(
   key.ip[10] = (lo >> 40) & 0xff; key.ip[11] = (lo >> 32) & 0xff;
   key.ip[12] = (lo >> 24) & 0xff; key.ip[13] = (lo >> 16) & 0xff;
   key.ip[14] = (lo >>  8) & 0xff; key.ip[15] = (lo      ) & 0xff;
-  return bpf_map_lookup_elem(&fwl_geoip_{call.call_index}, &key) != 0;
+  return bpf_map_lookup_elem(&{trie}, &key) != 0;
 }}
 """)
     else:
@@ -1870,8 +2440,19 @@ static __always_inline int fwl_geoip_{call.call_index}_v6(
   return "\n".join(blocks)
 
 
-def _collect_redirect_zones(zp: ast.ZoneProgram) -> list[str]:
-  """Ordered, de-duplicated list of zones `zp` redirects to (v0.4 § 6.3)."""
+def _collect_redirect_zones(
+  zp: ast.ZoneProgram,
+  helpers: list[ast.FunctionDef] | None = None,
+) -> list[str]:
+  """Ordered, de-duplicated list of zones `zp` redirects to (v0.4 § 6.3).
+
+  `helpers` are the unit's top-level defs. A `redirect to <zone>` that
+  a helper performs emits a `fwl_devmap_<zone>` into this object just
+  the same, and the daemon fills that devmap from the manifest's
+  `redirects_to` — so a caller building the manifest must pass them,
+  or the map stays empty and every redirected packet is dropped with
+  nothing logged. `_emit_zone_source` scans the same closure.
+  """
   out: list[str] = []
   seen: set[str] = set()
 
@@ -1880,11 +2461,15 @@ def _collect_redirect_zones(zp: ast.ZoneProgram) -> list[str]:
       seen.add(z)
       out.append(z)
 
-  for rule in zp.rules:
-    if rule.action == ast.Action.REDIRECT:
-      _add(rule.redirect_zone)
-  if zp.function is not None:
-    _collect_redirect_zones_stmts(zp.function.body, _add)
+  units = [zp] + [
+    _synth_unit(zp, h) for h in _reachable_helpers(zp, helpers or [])
+  ]
+  for u in units:
+    for rule in u.rules:
+      if rule.action == ast.Action.REDIRECT:
+        _add(rule.redirect_zone)
+    if u.function is not None:
+      _collect_redirect_zones_stmts(u.function.body, _add)
   return out
 
 
@@ -1921,6 +2506,53 @@ def _stmts_use_nat(stmts) -> bool:
         if _stmts_use_nat(body):
           return True
       if s.else_body is not None and _stmts_use_nat(s.else_body):
+        return True
+  return False
+
+
+def _program_masquerades(
+  zp: ast.ZoneProgram,
+  helpers: list[ast.FunctionDef] | None = None,
+) -> bool:
+  """True iff `zp` uses the `masquerade` action.
+
+  Only `masquerade` derives its source from the runtime `fwl_nat_cfg`
+  map (the WAN address the daemon programs); `snat`/`dnat` bake fixed
+  addresses into the emitted C. The daemon reads this manifest flag to
+  decide which zone's fwl_nat_cfg to seed, so a non-masquerading zone
+  that merely carries the shared de-NAT machinery is not mistaken for a
+  masquerade source.
+
+  `helpers` are the unit's top-level defs (v0.4 § 6.5). A `masquerade`
+  reached only through a helper is still a masquerade, and the flag is
+  what makes the daemon program an address at all — miss it and the
+  action compiles, loads, and silently no-ops. Scanned over the same
+  reachable set `_emit_zone_source` emits into the object, so the
+  manifest cannot disagree with the code.
+  """
+  units = [zp] + [
+    _synth_unit(zp, h) for h in _reachable_helpers(zp, helpers or [])
+  ]
+  for u in units:
+    for rule in u.rules:
+      if rule.action == ast.Action.MASQUERADE:
+        return True
+    if u.function is not None and _stmts_masquerade(u.function.body):
+      return True
+  return False
+
+
+def _stmts_masquerade(stmts) -> bool:
+  for s in stmts:
+    if isinstance(s, ast.ActionStmt) and s.action == ast.Action.MASQUERADE:
+      return True
+    if isinstance(s, ast.IfStmt):
+      if _stmts_masquerade(s.body):
+        return True
+      for _, body in s.elif_branches:
+        if _stmts_masquerade(body):
+          return True
+      if s.else_body is not None and _stmts_masquerade(s.else_body):
         return True
   return False
 
@@ -2044,6 +2676,7 @@ def _allocate_counter_slots_units(
 
 
 def _emit_helper_function(
+  names: MapNames,
   func: ast.FunctionDef,
   counter_slots: dict[str, int],
   zp: ast.ZoneProgram,
@@ -2061,7 +2694,9 @@ def _emit_helper_function(
   """
   synth = _synth_unit(zp, func)
   prelude = _emit_parse_prelude(synth, early_out="FWL_CONTINUE")
-  body, _ = _emit_tier2_body(func, counter_slots, synth, ct_create, zone_name)
+  body, _ = _emit_tier2_body(
+    names, func, counter_slots, synth, ct_create, zone_name
+  )
   return (
     f"static __noinline int fwl_helper_{func.name}"
     f"(struct xdp_md *ctx) {{\n"
@@ -2083,6 +2718,7 @@ def emit(program: ast.Program, *, split: bool | None = None) -> str:
   harness emits the same program both ways and checks identical
   behavior.
   """
+  _check_zone_ids(program)
   return _emit_zone_source(
     program.programs[0], pinned_shared=False, helpers=program.helpers,
     split=split,
@@ -2097,9 +2733,15 @@ def _emit_zone_source(
   """Emit one zone's complete BPF C source.
 
   `zp` is a single @xdp block. `pinned_shared` controls whether the
-  shared maps (conntrack, counters, rate-limit, log, geoip, devmaps)
-  carry LIBBPF_PIN_BY_NAME so they resolve to one bpffs-pinned kernel
-  map across every zone program in a bundle (v0.4 § 6.2).
+  bpffs-backed maps carry LIBBPF_PIN_BY_NAME (v0.4 § 6.2), and is true
+  exactly for a bundle. Pinning alone does NOT make a map
+  bundle-shared: the NAME decides that, and the name comes from
+  `MapNames`, which gives every map classified PRIVATE in `_MAP_KINDS`
+  a per-zone name so it pins to its own kernel map. Only the maps
+  classified SHARED — bundle-global by construction — resolve to one
+  kernel map across every zone program. Before returning, the source
+  is checked against the registry (`_check_map_scopes`), so a map
+  nobody classified fails the compile instead of quietly sharing.
 
   `helpers` are the unit's top-level helper defs (v0.4 § 6.5); the ones
   this zone reaches via CallStmt are emitted into this object as
@@ -2116,6 +2758,10 @@ def _emit_zone_source(
   Tier 2: prelude + locals declaration + statement-by-statement body.
   """
   zone_name = zp.zone_name
+  # A PRIVATE map's name carries the zone only in a bundle; a
+  # single-object emission pins nothing, so base names are unambiguous
+  # there and the test runner's BPF oracle can address them.
+  names = MapNames(zone_name if pinned_shared else None)
   if split is False:
     plan = splitter.SplitPlan(
       split=False, stages=(), estimate=splitter.estimate(zp),
@@ -2130,11 +2776,9 @@ def _emit_zone_source(
   # body and its `static __noinline` helper functions.
   units = [zp] + [_synth_unit(zp, h) for h in reachable]
   prelude = _emit_parse_prelude(zp)
-  rl_maps = _emit_rl_maps(zp)
-  geoip_block = _emit_geoip_maps_and_helpers(zp)
+  rl_maps = _emit_rl_maps(zp, names, pinned_shared)
+  geoip_block = _emit_geoip_maps_and_helpers(zp, names)
   uses_ct = any(_program_uses_conntrack(u) for u in units)
-  conntrack_decl = _maybe_pin(_CONNTRACK_DECL, pinned_shared) if uses_ct else ""
-  ct_create = _emit_ct_create() if uses_ct else ""
   # Redirect targets from the zone body and any reachable helper (a
   # helper may `redirect to <zone>`), de-duplicated in first-seen order.
   redirect_zones: list[str] = []
@@ -2149,6 +2793,17 @@ def _emit_zone_source(
   # de-NATs on whichever zone it arrives). The de-NAT pass runs before
   # any rule.
   nat_active = any(_program_uses_nat(u) for u in units) or force_nat
+
+  # A source-NAT action tracks the flow (fwl_snat_egress inserts the
+  # post-NAT 5-tuple into conntrack so the reply reads `established`), so
+  # the conntrack map + structs must be present whenever NAT helpers are
+  # emitted — even in a program that never reads conntrack(pkt).state.
+  conntrack_decl = (
+    _maybe_pin(_CONNTRACK_DECL, pinned_shared)
+    if (uses_ct or nat_active) else ""
+  )
+  ct_create = _emit_ct_create() if uses_ct else ""
+
   nat_decl = _maybe_pin(_NAT_DECL, pinned_shared) if nat_active else ""
   nat_helpers = _NAT_HELPERS if nat_active else ""
   nat_denat = "  fwl_nat_denat(ctx);\n" if nat_active else ""
@@ -2165,17 +2820,16 @@ def _emit_zone_source(
   log_sample_decl = ""
   if sampled > 0:
     log_sample_decl = _maybe_pin(
-      "struct {\n"
-      "  __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);\n"
-      "  __type(key, __u32);\n"
-      "  __type(value, __u64);\n"
-      f"  __uint(max_entries, {len(zp.rules)});\n"
-      "} fwl_log_sample SEC(\".maps\");\n",
+      _LOG_SAMPLE_MAP_DECL_TEMPLATE.format(
+        n_rules=len(zp.rules), name=names.log_sample()
+      ),
       pinned_shared,
     )
   if counter_slots:
     counter_decl = _maybe_pin(
-      _COUNTER_MAP_DECL_TEMPLATE.format(n_slots=max(len(counter_slots), 1)),
+      _COUNTER_MAP_DECL_TEMPLATE.format(
+        n_slots=max(len(counter_slots), 1), name=names.counters()
+      ),
       pinned_shared,
     )
     counter_table = _emit_counter_table(counter_slots)
@@ -2192,7 +2846,9 @@ def _emit_zone_source(
     for h in reachable
   )
   helper_defs = "".join(
-    _emit_helper_function(h, counter_slots, zp, ct_create, zone_name)
+    _emit_helper_function(
+      names, h, counter_slots, zp, ct_create, zone_name
+    )
     + "\n"
     for h in reachable
   )
@@ -2205,39 +2861,48 @@ def _emit_zone_source(
   if plan.split:
     # v0.4 § 6.6: N-program tail-call pipeline in one object.
     programs = _emit_split_programs(
-      zp, plan, counter_slots, ct_create, zone_name, prelude, nat_denat,
+      names, zp, plan, counter_slots, ct_create, zone_name, prelude,
+      nat_denat,
     )
     scratch_struct = _emit_scratch_struct(zp)
     # The scratch + prog_array are object-private transients (per-packet
     # per-CPU metadata; this zone's own stage table). They must NOT pin
     # by name — pinning would collide two split zones onto one kernel
     # map in a bundle, cross-wiring their pipelines. Each zone object
-    # keeps its own unpinned copy.
-    scratch_map = _SCRATCH_MAP_DECL
-    prog_array = _PROG_ARRAY_DECL_TEMPLATE.format(n=plan.n_stages)
-    return f"""{_HEADER}
+    # keeps its own unpinned copy. `_MAP_KINDS` classifies both PRIVATE
+    # with no zone-qualified name, and `_check_map_scopes` fails the
+    # compile if either ever acquires LIBBPF_PIN_BY_NAME.
+    scratch_map = _SCRATCH_MAP_DECL_TEMPLATE.format(
+      name=names.qualified("fwl_scratch")
+    )
+    prog_array = _PROG_ARRAY_DECL_TEMPLATE.format(
+      n=plan.n_stages, name=names.qualified("fwl_stages")
+    )
+    src = f"""{_HEADER}
 {scratch_struct}
 {maps_block}{scratch_map}{prog_array}
 {nat_helpers}
 {helper_protos}{helper_defs}{programs}
 char _license[] SEC("license") = "GPL";
 {counter_table}"""
+    _check_map_scopes(src, names)
+    return src
 
   if zp.function is not None:
     body, _ = _emit_tier2_body(
-      zp.function, counter_slots, zp, ct_create, zone_name
+      names, zp.function, counter_slots, zp, ct_create, zone_name
     )
     # Tier 2 fall-through is an implicit XDP_PASS (no rule "allowed"
     # the packet), so it does not create conntrack state.
     final_stmt = "return XDP_PASS;"
   else:
     body = "".join(
-      _emit_rule(r, i, counter_slots, ct_create, zone_name)
+      _emit_rule(names, r, i, counter_slots, ct_create, zone_name)
       for i, r in enumerate(zp.rules)
     )
     final_stmt = _emit_final_stmt(zp, ct_create)
 
-  return f"""{_HEADER}
+  src = f"""{_HEADER}
 {maps_block}
 {nat_helpers}
 {helper_protos}{helper_defs}SEC("xdp")
@@ -2247,6 +2912,8 @@ int fwl_prog(struct xdp_md *ctx) {{
 
 char _license[] SEC("license") = "GPL";
 {counter_table}"""
+  _check_map_scopes(src, names)
+  return src
 
 
 def _emit_final_stmt(zp: ast.ZoneProgram, ct_create: str) -> str:
@@ -2265,13 +2932,13 @@ def _emit_final_stmt(zp: ast.ZoneProgram, ct_create: str) -> str:
 # every later stage reads — one entry per CPU keeps the tail-call chain
 # (which stays on one CPU) race-free. The prog_array wires the stages;
 # the daemon/runner populates it with each stage program's fd at load.
-_SCRATCH_MAP_DECL = """\
-struct {
+_SCRATCH_MAP_DECL_TEMPLATE = """\
+struct {{
   __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
   __type(key, __u32);
   __type(value, struct fwl_meta);
   __uint(max_entries, 1);
-} fwl_scratch SEC(".maps");
+}} {name} SEC(".maps");
 """
 
 _PROG_ARRAY_DECL_TEMPLATE = """\
@@ -2280,7 +2947,7 @@ struct {{
   __uint(key_size, sizeof(__u32));
   __uint(value_size, sizeof(__u32));
   __uint(max_entries, {n});
-}} fwl_stages SEC(".maps");
+}} {name} SEC(".maps");
 """
 
 
@@ -2371,11 +3038,12 @@ def _emit_scratch_struct(zp: ast.ZoneProgram) -> str:
   )
 
 
-def _emit_scratch_lookup() -> str:
+def _emit_scratch_lookup(scratch_map: str) -> str:
   """Emit the scratch-map lookup prologue shared by every stage."""
   return (
     "  __u32 _zero = 0;\n"
-    "  struct fwl_meta *_m = bpf_map_lookup_elem(&fwl_scratch, &_zero);\n"
+    f"  struct fwl_meta *_m = bpf_map_lookup_elem(&{scratch_map}, "
+    "&_zero);\n"
     "  if (!_m) return XDP_PASS;\n"
   )
 
@@ -2396,6 +3064,7 @@ def _emit_scratch_unpack(zp: ast.ZoneProgram) -> str:
 
 
 def _emit_split_programs(
+  names: MapNames,
   zp: ast.ZoneProgram,
   plan: "splitter.SplitPlan",
   counter_slots: dict[str, int],
@@ -2414,13 +3083,15 @@ def _emit_split_programs(
   fall-through of a single program; the loader always populates every
   slot so this is unreachable in practice.
   """
+  stages_map = names.qualified("fwl_stages")
+  scratch_map = names.qualified("fwl_scratch")
   out: list[str] = []
   # Stage 0: parse + de-NAT + pack scratch, then jump to stage 1.
   out.append(
     f'SEC("xdp")\nint fwl_stage_0(struct xdp_md *ctx) {{\n'
     f"{prelude}{nat_denat}"
-    f"{_emit_scratch_lookup()}{_emit_scratch_pack(zp)}"
-    f"  bpf_tail_call(ctx, &fwl_stages, 1);\n"
+    f"{_emit_scratch_lookup(scratch_map)}{_emit_scratch_pack(zp)}"
+    f"  bpf_tail_call(ctx, &{stages_map}, 1);\n"
     f"  return XDP_PASS;\n}}\n"
   )
   unpack = _emit_scratch_unpack(zp)
@@ -2429,25 +3100,27 @@ def _emit_split_programs(
       continue
     if stage.kind == "policy":
       body, _ = _emit_tier2_body(
-        zp.function, counter_slots, zp, ct_create, zone_name
+        names, zp.function, counter_slots, zp, ct_create, zone_name
       )
       tail = "  return XDP_PASS;\n"
     else:
       lo, hi = stage.rule_range
       body = "".join(
-        _emit_rule(zp.rules[i], i, counter_slots, ct_create, zone_name)
+        _emit_rule(
+          names, zp.rules[i], i, counter_slots, ct_create, zone_name
+        )
         for i in range(lo, hi)
       )
       if stage.is_last:
         tail = f"  {_emit_final_stmt(zp, ct_create)}\n"
       else:
         tail = (
-          f"  bpf_tail_call(ctx, &fwl_stages, {stage.index + 1});\n"
+          f"  bpf_tail_call(ctx, &{stages_map}, {stage.index + 1});\n"
           f"  return XDP_PASS;\n"
         )
     out.append(
       f'SEC("xdp")\nint fwl_stage_{stage.index}(struct xdp_md *ctx) {{\n'
-      f"{_emit_scratch_lookup()}{unpack}{body}{tail}}}\n"
+      f"{_emit_scratch_lookup(scratch_map)}{unpack}{body}{tail}}}\n"
     )
   return "\n".join(out) + "\n"
 
@@ -2481,8 +3154,14 @@ def emit_bundle(program: ast.Program) -> dict[str, str]:
 
   Returns a mapping of filename -> C source:
     - `<zone>.bpf.c` per zone program — its prelude, rules/function,
-      redirect devmaps, and the shared maps it uses (conntrack,
-      counters, rate-limit, log, geoip) carrying LIBBPF_PIN_BY_NAME.
+      redirect devmaps, the cross-zone shared maps it uses (conntrack,
+      fwl_nat, fwl_nat_cfg, fwl_log_events, a scope=global rate-limit
+      bucket) under their bundle-global names, and its zone-private
+      maps (counters, zone-scoped rate limits, geoip, log-sample)
+      under per-zone names. Both kinds may carry LIBBPF_PIN_BY_NAME;
+      the NAME is what decides sharing, and `_MAP_KINDS` is what
+      decides the name.
+
     - `fwl_shared.h` — a manifest header documenting the pinned maps
       every zone program shares via bpffs (the cross-zone state).
 
@@ -2491,7 +3170,21 @@ def emit_bundle(program: ast.Program) -> dict[str, str]:
   (above all, `conntrack`) to a single kernel map — established flows
   tracked on one zone are visible to every other zone. The single-zone
   degenerate case still goes through `emit()` (no pinning).
+
+  Three invariants run here, on every compile:
+    - per zone, `_check_map_scopes` — every map in the generated source
+      has a declared scope, and carries (or does not carry) the pinning
+      attribute and the zone qualifier that scope demands;
+    - across zones, `_check_bundle_pinned_maps` — a name pinned by more
+      than one object is declared identically in all of them;
+    - across zones, `_check_zone_ids` — no two zones share the
+      `zone_id` their log events are tagged with.
+  The first catches a map nobody classified; the second catches one
+  classified SHARED whose shape still comes from a per-zone analysis;
+  the third catches the shared ring buffer's records becoming
+  ambiguous again.
   """
+  _check_zone_ids(program)
   # When any zone uses NAT, every zone program emits the shared NAT map
   # + de-NAT pass so return traffic is un-translated on whichever zone
   # it lands (the egress zone installs the reply mapping; the ingress
@@ -2500,10 +3193,205 @@ def emit_bundle(program: ast.Program) -> dict[str, str]:
   files: dict[str, str] = {}
   for zp in program.programs:
     files[f"{zp.zone_name}.bpf.c"] = _emit_zone_source(
-      zp, pinned_shared=True, force_nat=bundle_nat, helpers=program.helpers
+      zp, pinned_shared=True, force_nat=bundle_nat,
+      helpers=program.helpers,
     )
+  _check_bundle_pinned_maps(files)
   files["fwl_shared.h"] = _emit_shared_header(program)
   return files
+
+
+def shared_pinned_map_names(files: dict[str, str]) -> list[str]:
+  """The bundle-global pinned names an emitted bundle actually declares.
+
+  Read back out of the generated sources rather than listed by hand:
+  the manifest used to state `["conntrack"]` unconditionally, which was
+  wrong in both directions — it omitted fwl_nat, the devmaps, the log
+  ring and the scope=global rate-limit buckets, and it claimed
+  conntrack for bundles whose policy never reads it.
+  """
+  names: list[str] = []
+  for fname, src in sorted(files.items()):
+    if not fname.endswith(".bpf.c"):
+      continue
+    for decl in _scan_map_decls(src):
+      kind = _map_kind(decl.name)
+      if (
+        decl.pinned
+        and kind is not None
+        and kind.scope is MapScope.SHARED
+        and decl.name not in names
+      ):
+        names.append(decl.name)
+  return sorted(names)
+
+
+# A `struct { ... } name SEC(".maps");` declaration in generated C.
+# Map bodies never nest braces, so `[^{}]*` keeps the match anchored to
+# one declaration.
+_MAP_DECL_RE = re.compile(
+  r"struct\s*\{(?P<body>[^{}]*)\}\s*(?P<name>\w+)\s*SEC\(\"\.maps\"\);"
+)
+
+# One `__uint(attr, value);` / `__type(attr, value);` line of a map body.
+_MAP_ATTR_RE = re.compile(r"__(?:uint|type)\(\s*(\w+)\s*,\s*(.+?)\s*\)\s*;")
+
+
+@dataclasses.dataclass(frozen=True)
+class _DeclaredMap:
+  """A map declaration found in generated source."""
+  name: str
+  # (attribute, value) pairs in declaration order, whitespace-normalized
+  # — the shape libbpf validates when it reuses a pin.
+  attrs: tuple[tuple[str, str], ...]
+  pinned: bool
+
+  def attr(self, key: str) -> str | None:
+    """The value declared for `key`, or None."""
+    for name, value in self.attrs:
+      if name == key:
+        return value
+    return None
+
+
+def _scan_map_decls(src: str) -> list[_DeclaredMap]:
+  """Every map declared in `src`.
+
+  The generated text is the ground truth for what the emitter produced:
+  a check driven by a list the author also has to update would fail in
+  exactly the case it exists for.
+  """
+  found: list[_DeclaredMap] = []
+  for m in _MAP_DECL_RE.finditer(src):
+    attrs = tuple(
+      (key, " ".join(value.split()))
+      for key, value in _MAP_ATTR_RE.findall(m.group("body"))
+    )
+    found.append(_DeclaredMap(
+      name=m.group("name"),
+      attrs=attrs,
+      pinned="LIBBPF_PIN_BY_NAME" in m.group("body"),
+    ))
+  return found
+
+
+def _check_map_scopes(src: str, names: MapNames) -> None:
+  """Fail the compile for any map whose sharing is not declared.
+
+  Runs on every emitted zone source, single-object and bundle alike.
+  Four things must hold for each map in the generated text:
+
+    1. it has a row in `_MAP_KINDS` — SHARED or PRIVATE, no default;
+    2. a PRIVATE map that qualifies by name is emitted under its
+       zone-qualified name in a bundle, not its base name;
+    3. a PRIVATE map that has no zone-qualified name (the object-local
+       transients) does not carry LIBBPF_PIN_BY_NAME, which would
+       collide two zones onto one kernel map;
+    4. a SHARED map in a bundle does carry LIBBPF_PIN_BY_NAME —
+       otherwise each object gets its own copy and the state that was
+       supposed to be bundle-wide silently is not.
+
+  (1) is the one that matters most: it is what makes forgetting fail
+  loudly instead of aliasing quietly.
+  """
+  bundle = names.zone is not None
+  for decl in _scan_map_decls(src):
+    kind = names.issued.get(decl.name) or _map_kind(decl.name)
+    if kind is None:
+      raise _unclassified_map_error(decl.name)
+    if (
+      bundle
+      and decl.name not in names.issued
+      and kind.scope is MapScope.PRIVATE
+      and kind.private_name is not None
+    ):
+      raise _codegen_error(
+        f"map '{decl.name}' is PRIVATE ({kind.why}) but zone "
+        f"'{names.zone}' emits it under its bundle-global name. Take "
+        f"the name from MapNames so it carries the zone: two zones "
+        f"pinning this name share one kernel map, and when their "
+        f"shapes happen to agree that sharing is silent."
+      )
+    if (
+      decl.pinned
+      and kind.scope is MapScope.PRIVATE
+      and kind.private_name is None
+    ):
+      raise _codegen_error(
+        f"map '{decl.name}' is object-private ({kind.why}) but is "
+        f"declared with LIBBPF_PIN_BY_NAME, so every zone object in a "
+        f"bundle would resolve it to one kernel map."
+      )
+    if bundle and kind.scope is MapScope.SHARED and not decl.pinned:
+      raise _codegen_error(
+        f"map '{decl.name}' is SHARED ({kind.why}) but zone "
+        f"'{names.zone}' declares it without LIBBPF_PIN_BY_NAME, so "
+        f"each zone object would get its own kernel map and the state "
+        f"would not be bundle-wide at all."
+      )
+
+
+def _check_bundle_pinned_maps(files: dict[str, str]) -> None:
+  """Every bundle-global pin must be one map, declared identically.
+
+  libbpf validates a map's definition when it reuses an existing pin.
+  Two zone objects that pin the same NAME with different type, key,
+  value or max_entries make the second load fail with -EINVAL
+  ("parameter mismatch"); two that agree only by accident load and
+  share one kernel map with no error and no symptom. Both are visible
+  in the artifact SET at compile time, so they are caught here rather
+  than on the wire.
+
+  This is the check that catches MISCLASSIFICATION — a map declared
+  SHARED whose shape is still derived from one zone's analysis.
+  `_check_map_scopes` catches the omission; this catches the
+  misjudgement.
+  """
+  # map name -> declared shape -> the zones declaring it that way.
+  seen: dict[str, dict[tuple[tuple[str, str], ...], list[str]]] = {}
+  for fname, src in files.items():
+    if not fname.endswith(".bpf.c"):
+      continue
+    zone = fname[: -len(".bpf.c")]
+    for decl in _scan_map_decls(src):
+      if not decl.pinned:
+        continue
+      seen.setdefault(decl.name, {}).setdefault(decl.attrs, []).append(zone)
+  for name, shapes in sorted(seen.items()):
+    if len(shapes) < 2:
+      continue
+    raise _codegen_error(_bundle_shape_message(name, shapes))
+
+
+def _bundle_shape_message(
+  name: str,
+  shapes: dict[tuple[tuple[str, str], ...], list[str]],
+) -> str:
+  """Name the map, the zones, and every attribute they disagree on."""
+  variants = [(dict(shape), zones) for shape, zones in shapes.items()]
+  keys = {k for shape, _ in variants for k in shape}
+  differing = sorted(
+    k for k in keys
+    if len({shape.get(k) for shape, _ in variants}) > 1
+  )
+  lines = []
+  for shape, zones in variants:
+    zone_list = ", ".join(f"'{z}'" for z in sorted(zones))
+    values = ", ".join(
+      f"{k}={shape.get(k, '(absent)')}" for k in differing
+    )
+    lines.append(f"  zone(s) {zone_list}: {values}")
+  detail = "\n".join(lines)
+  return (
+    f"map '{name}' is pinned under one bundle-global name but is not "
+    f"declared the same way by every zone:\n{detail}\n"
+    f"A pinned name is ONE kernel map. libbpf rejects the second "
+    f"object with -EINVAL when the definitions differ, and shares the "
+    f"map silently when they happen to agree. Either the shape must "
+    f"not come from a per-zone analysis (size it from a constant), or "
+    f"the map is not bundle-wide state at all and belongs in "
+    f"_MAP_KINDS as MapScope.PRIVATE so its name carries the zone."
+  )
 
 
 def _emit_shared_header(program: ast.Program) -> str:
@@ -2517,6 +3405,12 @@ def _emit_shared_header(program: ast.Program) -> str:
   zone_lines = "\n".join(
     f"//   zone {z.name} = [{', '.join(z.interfaces)}]"
     for z in program.zones
+  )
+  zone_id_lines = "\n".join(
+    f"//   0x{zid:08X}  {name}"
+    for name, zid in log_abi.zone_ids(
+      emitting_zone_names(program)
+    ).items()
   )
   redirect_lines = "\n".join(
     f"//   @xdp({zp.zone_name}) redirects to: "
@@ -2538,6 +3432,12 @@ def _emit_shared_header(program: ast.Program) -> str:
 //
 // Redirect topology (devmaps, daemon-populated with egress ifindexes):
 {redirect_lines}
+//
+// Log-event zone ids. `fwl_log_events` is ONE ring for the bundle and
+// `rule_index` is numbered per zone, so a record is read as
+// (zone_id, rule_index). The machine-readable copy of this table is
+// manifest.json's "zone_ids" — use that, not this comment.
+{zone_id_lines or '//   (none)'}
 """
 
 
@@ -2645,6 +3545,7 @@ _FIELD_LOCAL_TYPE = {
 
 
 def _emit_tier2_body(
+  names: MapNames,
   func: ast.FunctionDef,
   counter_slots: dict[str, int],
   program: ast.Program,
@@ -2667,7 +3568,7 @@ def _emit_tier2_body(
     decl_block += "\n"
   ctx = _Tier2EmitCtx(
     locals=locals_, counter_slots=counter_slots, ct_create=ct_create,
-    zone_name=zone_name,
+    zone_name=zone_name, names=names,
   )
   body_text = _emit_tier2_stmts(func.body, ctx, indent="  ")
   return decl_block + body_text, "XDP_PASS"
@@ -2675,12 +3576,15 @@ def _emit_tier2_body(
 
 class _Tier2EmitCtx:
   """Mutable context threaded through Tier 2 emission."""
-  def __init__(self, *, locals, counter_slots, ct_create="", zone_name=None):
+  def __init__(self, *, locals, counter_slots, names,
+               ct_create="", zone_name=None):
     self.locals = locals
     self.counter_slots = counter_slots
     self.ct_create = ct_create
     # The @xdp block's zone, for folding pkt.zone (v0.4 § 6.4).
     self.zone_name = zone_name
+    # The names this object's maps are emitted under (v0.4 § 6.2).
+    self.names = names
 
 
 def _emit_tier2_stmts(stmts, ctx: _Tier2EmitCtx, indent: str) -> str:
@@ -2701,14 +3605,16 @@ def _emit_tier2_stmt(stmt, ctx: _Tier2EmitCtx, indent: str) -> str:
     if stmt.action == ast.Action.LOG:
       return (
         f"{indent}{{\n{indent}  "
-        + _emit_log(0).replace("\n", f"\n{indent}  ")
+        + _emit_log(ctx.names, 0, ctx.zone_name).replace(
+          "\n", f"\n{indent}  "
+        )
         + f"\n{indent}}}\n"
       )
     if stmt.action == ast.Action.COUNT:
       slot = ctx.counter_slots[stmt.counter_name]
       return (
         f"{indent}{{\n{indent}  "
-        + _emit_count(slot).replace("\n", f"\n{indent}  ")
+        + _emit_count(ctx.names, slot).replace("\n", f"\n{indent}  ")
         + f"\n{indent}}}\n"
       )
     if stmt.action in ast.NAT_ACTIONS:

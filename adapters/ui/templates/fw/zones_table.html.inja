@@ -1,0 +1,28 @@
+{% if length(zones) > 0 %}
+<table class="data-table">
+  <thead>
+    <tr>
+      <th>zone</th>
+      <th>interfaces</th>
+      <th>attached</th>
+      <th>mode</th>
+      <th>redirects to</th>
+      <th>masq</th>
+    </tr>
+  </thead>
+  <tbody>
+{% for z in zones %}
+    <tr>
+      <td class="mono">{{ z.zone }}</td>
+      <td>{{ z.ifaces_str }}</td>
+      <td><span class="badge badge-{{ z.attach_semantic }}">{{ z.attached_str }}</span></td>
+      <td><span class="badge badge-{{ z.mode_semantic }}">{{ z.xdp_mode }}</span></td>
+      <td>{{ z.redirects_str }}</td>
+      <td><span class="badge badge-{{ z.masq_semantic }}">{{ z.masq_str }}</span></td>
+    </tr>
+{% endfor %}
+  </tbody>
+</table>
+{% else %}
+<div class="empty">{{ zones_empty }}</div>
+{% endif %}

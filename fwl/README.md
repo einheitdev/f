@@ -54,7 +54,9 @@ fwl test corpus/      # run a corpus of .pkt cases
   CIDR list.
 - Composition: `and`, `or`, `not`, parens (and binds tighter than or).
 - One stateful primitive: `rate_limit(N, per=<field>)` as a `limited by`
-  modifier on any rule.
+  modifier on any rule. v0.4 adds an optional `scope=zone|global`
+  (default `zone`) saying how far the bucket reaches across a
+  multi-zone bundle — FWL_V04_SPEC.md § 6.7.
 
 Anything else is deferred to v0.2+ (see the spec's "What Is Not in v0.1"
 section).

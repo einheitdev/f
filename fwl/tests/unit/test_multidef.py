@@ -138,15 +138,16 @@ def test_helper_emits_static_noinline_function():
 def test_helper_object_has_real_call_not_inlined():
   """The compiled object must contain a distinct helper symbol and a
   BPF-to-BPF pseudo-call — proof the helper is not inlined."""
-  r = bpf_runner.compile_c(emitter.emit(_analyze(_SRC)))
   import subprocess
-  syms = subprocess.run(
-    ["llvm-nm", str(r.obj_path)], capture_output=True, text=True
-  ).stdout
+  with bpf_runner.compile_c(emitter.emit(_analyze(_SRC))) as r:
+    syms = subprocess.run(
+      ["llvm-nm", str(r.obj_path)], capture_output=True, text=True
+    ).stdout
+    disasm = subprocess.run(
+      ["llvm-objdump", "-d", str(r.obj_path)],
+      capture_output=True, text=True,
+    ).stdout
   assert "fwl_helper_gate" in syms
-  disasm = subprocess.run(
-    ["llvm-objdump", "-d", str(r.obj_path)], capture_output=True, text=True
-  ).stdout
   # opcode 0x85 with src=1 renders as a `call` to a pc-relative target.
   assert "call" in disasm.lower()
 
@@ -162,7 +163,7 @@ def test_bundle_emits_helper_into_each_calling_zone():
   files = emitter.emit_bundle(prog)
   for zone in ("wan.bpf.c", "lan.bpf.c"):
     assert "fwl_helper_gate" in files[zone]
-    bpf_runner.compile_c(files[zone])  # both objects must compile
+    bpf_runner.check_compiles(files[zone])  # both must compile
 
 
 def test_uncalled_helper_not_emitted():

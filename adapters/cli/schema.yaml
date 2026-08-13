@@ -37,6 +37,22 @@ config:
         type: enum
         values: [trace, debug, info, warn, error]
         default: "info"
+  system:
+    type: object
+    fields:
+      config:
+        type: string
+        help: "System configuration: interfaces, zones, services"
+        default: "/etc/f/system.yaml"
+        example: "/etc/f/system.yaml"
+      generated_dir:
+        type: string
+        help: "Where derived daemon configs are installed"
+        default: "/etc/f/generated"
+      networkd_dir:
+        type: string
+        help: "Where derived systemd-networkd units are installed"
+        default: "/etc/systemd/network"
   editor:
     type: string
     help: "Preferred editor for configure firewall"

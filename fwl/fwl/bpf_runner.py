@@ -12,6 +12,7 @@ gracefully rather than failing the whole test suite.
 from __future__ import annotations
 import ctypes
 import os
+import platform
 import shutil
 import struct
 import subprocess
@@ -19,6 +20,7 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
+from . import log_abi
 from .interpreter import XdpAction
 
 
@@ -32,7 +34,15 @@ class BpfUnavailable(RuntimeError):
 
 @dataclass(frozen=True)
 class LogEvent:
-  """A log event read from the BPF ring buffer."""
+  """A log event read from the BPF ring buffer.
+
+  `zone_id` is the raw tag the datapath wrote (`log_abi.zone_id` of
+  the emitting zone's name). It is kept numeric here because this
+  module reads a ring, not a compilation: resolving it to a zone name
+  needs the id -> name table, which the caller has (the AST it emitted,
+  or a bundle's `manifest.json["zone_ids"]`) and this module does not.
+  """
+  zone_id: int
   rule_index: int
   proto: str
   src_ip: str
@@ -55,36 +65,38 @@ class RunResult:
   output_packet: bytes = b""
 
 
-@dataclass(frozen=True)
+@dataclass
 class CompileResult:
-  """Output of compiling BPF C with clang."""
+  """Output of compiling BPF C with clang.
+
+  Also a context manager. `compile_c` makes a temporary directory when
+  the caller does not supply one, and leaving the `with` block removes
+  it; a caller that passed its own `work_dir` owns that directory and
+  it is never touched. Callers that only want to know whether the
+  source compiles should use `check_compiles`, which cleans up for
+  them.
+
+  Not cleaning up is a real failure mode, not an untidiness: one
+  directory per compile filled a 2 GiB tmpfs with 84k of them and
+  killed a measurement run with ENOSPC.
+  """
   obj_path: Path
   source_path: Path
+  # The directory to remove on cleanup, or None when the caller
+  # supplied `work_dir` and therefore owns it.
+  owned_dir: Path | None = None
 
+  def __enter__(self) -> "CompileResult":
+    return self
 
-# Temp work dirs this process created and may still reclaim. Bounded,
-# because the alternative measured badly: `compile_c` used to mkdtemp
-# and never clean up, one long harness run left 84,000 directories,
-# and they filled a 2 GB /tmp and killed a corpus run mid-measurement.
-# A run that dies halfway through is worse than a slow one — it
-# reports a partial number that looks like a whole one.
-#
-# The bound rather than an atexit sweep: a soak process compiles tens
-# of thousands of programs before it exits, so deferring every removal
-# to exit only moves the same pile to the end of the run. Callers
-# consume `obj_path` immediately (load, or read stderr and discard),
-# and the only caller that keeps several objects alive at once is the
-# bundle loader, which holds one per zone. 256 is far above that and
-# far below anything that fills a disk.
-_TEMP_WORK_DIR_KEEP = 256
-_temp_work_dirs: list[Path] = []
+  def __exit__(self, *exc_info) -> None:
+    self.cleanup()
 
-
-def _track_temp_work_dir(path: Path) -> None:
-  """Remember a temp dir, reclaiming the oldest beyond the bound."""
-  _temp_work_dirs.append(path)
-  while len(_temp_work_dirs) > _TEMP_WORK_DIR_KEEP:
-    shutil.rmtree(_temp_work_dirs.pop(0), ignore_errors=True)
+  def cleanup(self) -> None:
+    """Remove the temporary directory this compile created, if any."""
+    if self.owned_dir is not None:
+      shutil.rmtree(self.owned_dir, ignore_errors=True)
+      self.owned_dir = None
 
 
 def compile_c(c_source: str, work_dir: Path | None = None) -> CompileResult:
@@ -95,10 +107,11 @@ def compile_c(c_source: str, work_dir: Path | None = None) -> CompileResult:
   even when full BPF_PROG_RUN is unavailable: structurally broken
   emitter output fails here.
 
-  When `work_dir` is None a temporary directory is created, and this
-  module reclaims it once `_TEMP_WORK_DIR_KEEP` newer ones exist. A
-  caller that needs its object to outlive that must pass `work_dir`
-  explicitly, as `fwl compile --bundle-dir` does.
+  The result owns a temporary directory unless `work_dir` is given, so
+  use it as a context manager (or call `cleanup()`) once the object
+  file has been consumed. A caller that needs its object to outlive
+  the call passes `work_dir` explicitly and owns it, as `fwl compile
+  --bundle-dir` does.
 
   Raises BpfUnavailable if clang is missing.
   Raises subprocess.CalledProcessError if compilation fails — the
@@ -107,9 +120,10 @@ def compile_c(c_source: str, work_dir: Path | None = None) -> CompileResult:
   if shutil.which("clang") is None:
     raise BpfUnavailable("clang not found on PATH")
 
+  owned_dir: Path | None = None
   if work_dir is None:
     work_dir = Path(tempfile.mkdtemp(prefix="fwl-bpf-"))
-    _track_temp_work_dir(work_dir)
+    owned_dir = work_dir
   work_dir.mkdir(parents=True, exist_ok=True)
 
   src_path = work_dir / "fwl_prog.bpf.c"
@@ -128,8 +142,28 @@ def compile_c(c_source: str, work_dir: Path | None = None) -> CompileResult:
     if path.exists():
       cmd.extend(["-I", str(path)])
 
-  subprocess.run(cmd, check=True, capture_output=True)
-  return CompileResult(obj_path=obj_path, source_path=src_path)
+  try:
+    subprocess.run(cmd, check=True, capture_output=True)
+  except BaseException:
+    # A failed compile has no artifacts worth keeping, and its caller
+    # gets an exception rather than a result it could clean up.
+    if owned_dir is not None:
+      shutil.rmtree(owned_dir, ignore_errors=True)
+    raise
+  return CompileResult(
+    obj_path=obj_path, source_path=src_path, owned_dir=owned_dir
+  )
+
+
+def check_compiles(c_source: str) -> None:
+  """Compile `c_source` and discard the object.
+
+  For callers that use clang purely as an oracle — the object is never
+  loaded, only the absence of an exception matters. Raises the same
+  exceptions as `compile_c`.
+  """
+  with compile_c(c_source):
+    pass
 
 
 # Debian/Ubuntu multiarch installs put asm/* under a triplet path
@@ -207,11 +241,13 @@ def run_full(
       "kernel BPF load unavailable: not root and "
       "unprivileged_bpf_disabled is set"
     )
-  result = compile_c(c_source)
-  return _load_and_run(
-    result.obj_path, packet, map_init or {},
-    counter_slots, has_log,
-  )
+  # The object is read by the loader inside the block; nothing needs
+  # the file afterwards, so the temp dir goes with it.
+  with compile_c(c_source) as result:
+    return _load_and_run(
+      result.obj_path, packet, map_init or {},
+      counter_slots, has_log,
+    )
 
 
 def run_sequence(
@@ -232,10 +268,10 @@ def run_sequence(
       "kernel BPF load unavailable: not root and "
       "unprivileged_bpf_disabled is set"
     )
-  result = compile_c(c_source)
-  return _load_and_run_seq(
-    result.obj_path, packets, map_init or {}, counter_slots, has_log,
-  )
+  with compile_c(c_source) as result:
+    return _load_and_run_seq(
+      result.obj_path, packets, map_init or {}, counter_slots, has_log,
+    )
 
 
 def num_possible_cpus() -> int:
@@ -372,12 +408,19 @@ def _load_and_run_seq(
     prev_totals: dict[int, int] = {}
     for packet in packets:
       log_events: list[LogEvent] = []
-      rb = _setup_ring_buffer(libbpf, obj, log_events) if has_log else None
+      abi_errors: list[str] = []
+      rb = _setup_ring_buffer(
+        libbpf, obj, log_events, abi_errors
+      ) if has_log else None
       action, out_packet = _bpf_prog_test_run_out(prog_fd, packet)
       if rb:
         libbpf.ring_buffer__consume(rb)
         libbpf.ring_buffer__free(rb)
         rb = None
+      if abi_errors:
+        raise RuntimeError(
+          "fwl_log_events record rejected: " + abi_errors[0]
+        )
 
       counter_deltas: dict[int, int] = {}
       if counter_slots > 0:
@@ -481,11 +524,16 @@ _RING_BUFFER_SAMPLE_FN = ctypes.CFUNCTYPE(
   ctypes.c_size_t,
 )
 
-_LOG_EVENT_STRUCT = struct.Struct("<Q II HH BB xx I")
 
+def _setup_ring_buffer(libbpf, obj, log_events, abi_errors):
+  """Set up a ring buffer consumer for fwl_log_events.
 
-def _setup_ring_buffer(libbpf, obj, log_events):
-  """Set up a ring buffer consumer for fwl_log_events."""
+  `abi_errors` collects records the shared `log_abi` decoder rejects.
+  A ctypes callback cannot usefully raise — the exception would be
+  swallowed inside libbpf's poll loop — so the failure is carried out
+  and raised by the caller, which is what turns a layout mismatch into
+  a test error instead of a silently short event list.
+  """
   bpf_map = libbpf.bpf_object__find_map_by_name(
     obj, b"fwl_log_events"
   )
@@ -495,20 +543,22 @@ def _setup_ring_buffer(libbpf, obj, log_events):
 
   @_RING_BUFFER_SAMPLE_FN
   def callback(ctx, data, size):
-    if size < _LOG_EVENT_STRUCT.size:
+    raw = ctypes.string_at(data, min(size, log_abi.SIZE))
+    try:
+      ev = log_abi.decode(raw)
+    except log_abi.LogAbiError as exc:
+      abi_errors.append(str(exc))
       return 0
-    raw = ctypes.string_at(data, _LOG_EVENT_STRUCT.size)
-    (ts, src_ip, dst_ip, src_port, dst_port,
-     proto, flags, rule_index) = _LOG_EVENT_STRUCT.unpack(raw)
     log_events.append(LogEvent(
-      rule_index=rule_index,
-      proto=_PROTO_NUM_TO_STR.get(proto, str(proto)),
-      src_ip=_u32_to_ip(src_ip),
-      dst_ip=_u32_to_ip(dst_ip),
-      src_port=src_port,
-      dst_port=dst_port,
-      syn=bool(flags & 0x01),
-      ack=bool(flags & 0x02),
+      zone_id=ev["zone_id"],
+      rule_index=ev["rule_index"],
+      proto=_PROTO_NUM_TO_STR.get(ev["proto"], str(ev["proto"])),
+      src_ip=_u32_to_ip(ev["src_ip"]),
+      dst_ip=_u32_to_ip(ev["dst_ip"]),
+      src_port=ev["src_port"],
+      dst_port=ev["dst_port"],
+      syn=bool(ev["flags"] & 0x01),
+      ack=bool(ev["flags"] & 0x02),
     ))
     return 0
 
@@ -594,7 +644,16 @@ class _BpfAttrTestRun(ctypes.Structure):
 
 
 _BPF_PROG_TEST_RUN = 10
-_NR_BPF = 321  # x86_64 syscall number
+# The bpf(2) syscall number is per-architecture. Hardcoding the
+# x86_64 value made every BPF_PROG_TEST_RUN fail with ENOSYS on the
+# aarch64 rig — the loader (libbpf) worked, so the failure only
+# surfaced when the oracle actually executed a program.
+_NR_BPF_BY_MACHINE = {
+  "x86_64": 321,
+  "aarch64": 280,
+  "riscv64": 280,
+}
+_NR_BPF = _NR_BPF_BY_MACHINE.get(platform.machine(), 321)
 
 
 def _bpf_prog_test_run(prog_fd: int, packet: bytes) -> XdpAction:

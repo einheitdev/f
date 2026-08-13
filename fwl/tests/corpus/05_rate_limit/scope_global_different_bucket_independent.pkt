@@ -1,0 +1,21 @@
+name: "scope=global still buckets by per= (a different src_ip is untouched)"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.proto == tcp and pkt.dst_port == 22
+       limited by rate_limit(3, per=src_ip, scope=global)
+  default allow
+
+state:
+  rate_limit:
+    0:
+      "1.2.3.4": 100
+
+test_packet:
+  builder: tcp(src_ip="5.6.7.8", dst_port=22)
+
+expected:
+  compiles: true
+  # scope says how far a bucket reaches; per= says how traffic is cut
+  # into buckets. Sharing the map across zones must not merge the keys
+  # inside it.
+  bpf_action: allow

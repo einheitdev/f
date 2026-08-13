@@ -1,0 +1,6 @@
+<section class="card">
+  <h2 class="card-title">conntrack</h2>
+  <div class="card-body" id="conntrack-table">
+    {% include "fw/conntrack_table" %}
+  </div>
+</section>

@@ -1,0 +1,73 @@
+# f appliance system configuration.
+#
+#     physical port  ->  interface  ->  zone  ->  services bind here
+#
+# Read it in that order. Each arrow is a place where a name is
+# assigned, and each name is checked against the one before it.
+#
+# The zone list lives here, not in the firewall policy. A zone is
+# "these ports", which is a fact about the box rather than about the
+# policy — so interfaces, DHCP and DNS come up before any policy
+# exists, which is how a box is actually commissioned.
+#
+# Validate with:   f-sysconf -c /etc/f/system.yaml check
+# See the result:  f-sysconf -c /etc/f/system.yaml show
+# Apply it with:   f-sysconf -c /etc/f/system.yaml apply
+
+zones:
+  # The office-facing port. Nothing is bound here, and that is the
+  # point.
+  wan:
+
+  # The test benches. This is where the services live.
+  testnet:
+    # off | ra. Default off. The office is flat L2 and may have router
+    # advertisements flying around; a testnet device that
+    # autoconfigures v6 from an office RA routes around the v4 policy
+    # entirely while appearing to work perfectly.
+    ipv6: off
+
+interfaces:
+  # A name is pinned to a hardware identity, assigned once, and never
+  # derived from probe order. `f-sysconf show` prints what the box
+  # currently has; `ip -o link` gives you the MACs.
+  #
+  # This is not tidiness. udev renumbering a port repoints the policy
+  # underneath itself, and a firewall pointing at the wrong port is a
+  # bypass, not an outage.
+  wan0:
+    mac: "52:54:00:aa:bb:01"
+    # static CIDR | dhcp | omitted for link-up-no-address
+    address: dhcp
+    zone: wan
+
+  lan0:
+    # `path:` is the alternative when a card has no stable MAC:
+    #   path: "pci-0000:01:00.0"
+    mac: "52:54:00:aa:bb:02"
+    address: 10.10.0.1/24
+    zone: testnet
+
+services:
+  # Services bind to a zone. There is no key here that names an
+  # interface, in any service, deliberately: the set of ports a service
+  # answers on is derived from zone membership every time the config is
+  # generated, so it cannot drift from the zone it claims to serve.
+  #
+  # Which is what makes the dangerous case structural rather than
+  # remembered: DHCP is bound to `testnet`, the uplink is in `wan`, and
+  # there is no configuration you can write in which DHCP answers on
+  # the uplink.
+  dhcp:
+    - zone: testnet
+      range: 10.10.0.100-10.10.0.200
+      lease: 12h
+      # Stable addresses for the boards that want them.
+      reservations:
+        - mac: "aa:bb:cc:dd:ee:01"
+          address: 10.10.0.50
+          hostname: bench1
+
+  dns:
+    - zone: testnet
+      upstream: [9.9.9.9, 1.1.1.1]

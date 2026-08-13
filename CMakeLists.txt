@@ -112,13 +112,42 @@ include("cmake/bpf.cmake")
 add_bpf_object(fw bpf/fw.bpf.c)
 
 # ============================================================================
-# Engine library (BPF + ZMQ, no HTTP)
+# yaml-cpp (system, for config file parsing)
 # ============================================================================
-# yaml-cpp (system, for fd config file parsing)
 if(NOT TARGET yaml-cpp::yaml-cpp)
   find_package(yaml-cpp REQUIRED)
 endif()
 
+# ============================================================================
+# System configuration model (interfaces -> zones -> services)
+#
+# No BPF, no ZMQ, no HTTP: the model, its validation and its backends.
+# Kept separate so the CLI can reason about the appliance's network
+# configuration without linking the datapath.
+# ============================================================================
+add_library(libf-sysconfig STATIC
+  src/sysconfig/artifact.cc
+  src/sysconfig/dnsmasq.cc
+  src/sysconfig/edit.cc
+  src/sysconfig/model.cc
+  src/sysconfig/net.cc
+  src/sysconfig/networkd.cc
+  src/sysconfig/parse.cc
+  src/sysconfig/service_status.cc
+  src/sysconfig/validate.cc
+)
+
+target_include_directories(libf-sysconfig PUBLIC
+  ${PROJECT_SOURCE_DIR}/include
+)
+
+target_link_libraries(libf-sysconfig PUBLIC
+  yaml-cpp::yaml-cpp
+)
+
+# ============================================================================
+# Engine library (BPF + ZMQ, no HTTP)
+# ============================================================================
 add_library(libf-engine STATIC
   src/bpf_loader.cc
   src/config.cc
@@ -192,11 +221,45 @@ add_subdirectory(
 )
 
 # ============================================================================
+# System config plane (confd backend)
+#
+# The system configuration as a confd ConfigBackend, so `apply system`
+# gets candidate/commit/rollback and — the reason it exists — the
+# server-side commit-confirmed revert timer.
+# ============================================================================
+add_library(libf-confd STATIC
+  src/confd/system_backend.cc
+)
+
+target_include_directories(libf-confd PUBLIC
+  ${PROJECT_SOURCE_DIR}/include
+)
+
+target_link_libraries(libf-confd PUBLIC
+  libf-sysconfig
+  einheit_cli
+)
+
+# ============================================================================
+# f-confd — configuration daemon (owns the anti-lockout revert timer)
+# ============================================================================
+add_executable(f-confd cmd/f_confd.cc)
+target_link_libraries(f-confd PRIVATE
+  libf-confd CLI11::CLI11 spdlog::spdlog)
+
+# ============================================================================
 # fd — BPF engine daemon
 # ============================================================================
 add_executable(fd cmd/fd.cc)
 target_link_libraries(fd PRIVATE
   libf-engine CLI11::CLI11 yaml-cpp::yaml-cpp)
+
+# ============================================================================
+# f-sysconf — system configuration model tool
+# ============================================================================
+add_executable(f-sysconf cmd/f_sysconf.cc)
+target_link_libraries(f-sysconf PRIVATE
+  libf-sysconfig CLI11::CLI11)
 
 # ============================================================================
 # fctl — engine control CLI
@@ -245,7 +308,7 @@ target_compile_definitions(einheit-f-ui PRIVATE
 # ============================================================================
 # Install rules
 # ============================================================================
-install(TARGETS fd fctl einheit-f einheit-f-ui f-api
+install(TARGETS fd fctl f-sysconf f-confd einheit-f einheit-f-ui f-api
   RUNTIME DESTINATION bin
 )
 install(FILES deploy/fd.yaml
@@ -255,7 +318,12 @@ install(FILES
   deploy/systemd/fd.service
   deploy/systemd/einheit-f-ui.service
   deploy/systemd/f-firstboot.service
+  deploy/systemd/f-dnsmasq.service
+  deploy/systemd/f-confd.service
   DESTINATION lib/systemd/system
+)
+install(FILES deploy/system.yaml.example
+  DESTINATION share/f
 )
 install(FILES
   deploy/networkd/10-eth0.network

@@ -1,0 +1,23 @@
+name: "scope=global bucket at threshold fires (seed reaches the global slot)"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.proto == tcp and pkt.dst_port == 22
+       limited by rate_limit(10, per=src_ip, scope=global)
+  default allow
+
+state:
+  rate_limit:
+    0:
+      "1.2.3.4": 10
+
+test_packet:
+  builder: tcp(src_ip="1.2.3.4", dst_port=22, syn=true)
+
+expected:
+  compiles: true
+  # A .pkt names a rule index; under scope=global the rule reads its
+  # bundle slot instead. Both oracles must move the seed there — the
+  # interpreter by re-keying it, the BPF runner by writing it into
+  # fwl_rl_g0 rather than fwl_rl_map_0. If either did not, this case
+  # would allow on one oracle and drop on the other.
+  bpf_action: drop

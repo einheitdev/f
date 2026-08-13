@@ -388,12 +388,40 @@ class _ToAst(Transformer):
     )
 
   def modifier(self, children) -> ast.RateLimit:
-    threshold_tok, field_tok = children
+    threshold_tok, field_tok = children[0], children[1]
+    scope = ast.RlScope.ZONE
+    explicit = False
+    if len(children) > 2:
+      scope = children[2]
+      explicit = True
     return ast.RateLimit(
       threshold=_parse_int(str(threshold_tok)),
       per_field=str(field_tok),
       span=_span(threshold_tok),
+      scope=scope,
+      scope_explicit=explicit,
     )
+
+  def rl_scope(self, children) -> "ast.RlScope":
+    """`, scope=<zone|global>` (v0.4 § 6.7).
+
+    The grammar admits any IDENTIFIER here (plus the ZONE keyword
+    token) so that `global` need not become a reserved word; the
+    spec's two values are enforced here, with a message that names
+    them, rather than as a bare "expected one of" syntax error.
+    """
+    (tok,) = children
+    text = str(tok)
+    try:
+      return ast.RlScope(text)
+    except ValueError:
+      raise FwlException(FwlError(
+        category="semantic",
+        message=(
+          f"rate_limit scope= must be zone or global, not '{text}'"
+        ),
+        span=_span(tok),
+      )) from None
 
   def RL_FIELD(self, tok):
     return tok

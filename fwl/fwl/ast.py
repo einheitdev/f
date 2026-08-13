@@ -368,17 +368,48 @@ Condition = Union[
 ]
 
 
-@dataclass(frozen=True)
+class RlScope(Enum):
+  """Zone scope of a `rate_limit` bucket (FWL_V04_SPEC.md § 6.7).
+
+  ZONE — the bucket is private to the zone program that holds the rule.
+    N zones carrying the rule each get their own budget.
+  GLOBAL — one bucket for the rule across the whole bundle: every zone
+    program that holds that rule shares it, so the budget is spent
+    once no matter which zone the traffic arrives on.
+  """
+  ZONE = "zone"
+  GLOBAL = "global"
+
+
+# RateLimit is mutable so the analyzer can fill `global_slot` post-parse,
+# mirroring the GeoIp / RateLimitCall call_index convention.
+@dataclass
 class RateLimit:
-  """`rate_limit(<N>, per=<field>)` modifier (FWL_V01_SPEC.md:266).
+  """`rate_limit(<N>, per=<field>[, scope=...])` modifier.
+
+  FWL_V01_SPEC.md:266 for the base form, FWL_V04_SPEC.md § 6.7 for
+  `scope=`.
 
   per_field is the bare bucket key name: src_ip, dst_ip, src_port,
   dst_port. The grammar restricts it to those four; the analyzer
   enforces threshold > 0.
+
+  `scope` defaults to ZONE, which is what every pre-v0.4-§6.7 policy
+  meant, so adding the field changes no deployed policy.
+  `scope_explicit` records whether the author wrote `scope=` — it drives
+  the multi-zone aggregate warning and nothing else, so an author who
+  has stated intent is not nagged.
+  `global_slot` is the bundle-wide bucket number the analyzer assigns to
+  a GLOBAL-scoped rule; -1 for ZONE-scoped ones. Rules that are
+  structurally identical share a slot, which is what makes one rule
+  written into several zones one bucket.
   """
   threshold: int
   per_field: str
   span: Span
+  scope: RlScope = RlScope.ZONE
+  scope_explicit: bool = False
+  global_slot: int = -1
 
 
 @dataclass(frozen=True)
@@ -659,6 +690,10 @@ class Program:
   # Each compiles to a `static __noinline` BPF function; zone bodies
   # invoke them via CallStmt. Empty in the v0.1-v0.3 shape.
   helpers: list[FunctionDef] = field(default_factory=list)
+  # Non-fatal diagnostics collected by the analyzer (errors.FwlWarning).
+  # Rebuilt from scratch on every analyze() call, so re-analyzing a
+  # program does not accumulate duplicates.
+  warnings: list = field(default_factory=list)
 
   @property
   def hook(self) -> Hook:

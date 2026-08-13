@@ -66,4 +66,32 @@
       </table>
     </div>
   </section>
+
+  <section class="card">
+    <h2 class="card-title">zones &amp; NAT</h2>
+    <div class="card-body">
+      <table class="data-table">
+        <tbody>
+          <tr>
+            <td>zones</td>
+            <td>{{ zone_count }}</td>
+          </tr>
+          <tr>
+            <td>NAT translations</td>
+            <td>{{ nat_count }}</td>
+          </tr>
+{% if has_masq %}
+          <tr>
+            <td>masquerade source</td>
+            <td class="mono">{{ masq_source }}</td>
+          </tr>
+{% endif %}
+          <tr>
+            <td>tracked connections</td>
+            <td>{{ conntrack_count }}</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
 </div>

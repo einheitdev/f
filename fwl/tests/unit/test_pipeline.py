@@ -123,7 +123,7 @@ def test_parse_stage_packs_policy_stage_unpacks():
 ])
 def test_split_forms_compile(src, split):
   c = emitter.emit(analyzer.analyze(parser.parse(src)), split=split)
-  bpf_runner.compile_c(c)  # raises on clang failure
+  bpf_runner.check_compiles(c)  # raises on clang failure
 
 
 def test_tier2_split_is_parse_plus_policy():

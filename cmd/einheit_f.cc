@@ -46,6 +46,10 @@ auto main(int argc, char** argv) -> int {
   std::string pin_path = "/sys/fs/bpf/f";
   std::string fd_socket = "ipc:///run/f/control.sock";
   std::string fw_source = "/etc/f/rules.fw";
+  std::string system_config = "/etc/f/system.yaml";
+  std::string dnsmasq_conf = "/etc/f/generated/dnsmasq.conf";
+  std::string confd_socket = "ipc:///run/f/confd.sock";
+  std::string networkd_dir = "/etc/systemd/network";
   bool locked = false;
 
   app.add_option("--color", color, "always|never|auto");
@@ -58,6 +62,16 @@ auto main(int argc, char** argv) -> int {
                  "fd control socket endpoint");
   app.add_option("--source", fw_source,
                  "FWL source file path");
+  app.add_option("--system-config", system_config,
+                 "System configuration: interfaces, zones, "
+                 "services");
+  app.add_option("--dnsmasq-conf", dnsmasq_conf,
+                 "Where the generated dnsmasq config lives");
+  app.add_option("--networkd-dir", networkd_dir,
+                 "Where generated networkd units are installed");
+  app.add_option("--confd-socket", confd_socket,
+                 "f-confd control socket (owns the commit-confirm "
+                 "revert timer)");
   app.add_flag("--locked", locked,
                "Restricted mode — no shell escapes");
 
@@ -84,6 +98,10 @@ auto main(int argc, char** argv) -> int {
   tcfg.pin_path = pin_path;
   tcfg.fd_socket = fd_socket;
   tcfg.fw_source = fw_source;
+  tcfg.system_config = system_config;
+  tcfg.dnsmasq_conf = dnsmasq_conf;
+  tcfg.networkd_dir = networkd_dir;
+  tcfg.confd_socket = confd_socket;
   auto tx_result = adapters::fw::NewFLocalTransport(tcfg);
   if (!tx_result) {
     std::cerr << std::format("transport: {}\n",

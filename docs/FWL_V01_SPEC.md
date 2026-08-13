@@ -283,6 +283,8 @@ v0.1 has exactly one stateful primitive: `rate_limit`. It applies to a rule via 
 - `<N>` — positive integer, the rate limit threshold (events per second).
 - `<field>` — one of `src_ip`, `dst_ip`, `src_port`, `dst_port`. The dimension to bucket by.
 
+v0.4 adds an optional third field, `scope=zone|global`, which says how far a bucket reaches when one policy compiles to several per-zone programs. The default is `zone` — the behaviour described in this section. See FWL_V04_SPEC.md § 6.7.
+
 ### Semantics
 
 The rule's action takes effect only when the rate of matching packets, bucketed by the `per` field's current value, has exceeded `<N>` per second within the current one-second window. Every matching packet increments the bucket counter; the action fires once the bucket already holds `<N>` or more matches before this packet.

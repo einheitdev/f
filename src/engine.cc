@@ -2,12 +2,16 @@
 /// @brief BPF engine: load, attach, pin, ZMQ control loop.
 
 #include "f/engine.h"
+#include "f/reload.h"
 
 #include <arpa/inet.h>
 #include <net/if.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/un.h>
 #include <unistd.h>
 
+#include <cstddef>
 #include <chrono>
 #include <cstring>
 #include <filesystem>
@@ -16,6 +20,7 @@
 
 #include <bpf/bpf.h>
 #include <bpf/libbpf.h>
+#include <linux/if_link.h>
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
 
@@ -66,6 +71,56 @@ auto FlushMap(int map_fd) -> void {
              map_fd, nullptr, next_key) == 0) {
     std::memcpy(key, next_key, sizeof(key));
     bpf_map_delete_elem(map_fd, key);
+  }
+}
+
+auto ProtoName(uint8_t proto) -> std::string {
+  switch (proto) {
+    case 1: return "icmp";
+    case 6: return "tcp";
+    case 17: return "udp";
+    case 0: return "any";
+    default: return std::to_string(proto);
+  }
+}
+
+auto CtStateName(uint8_t state) -> std::string {
+  switch (state) {
+    case 0: return "new";
+    case 1: return "established";
+    case 2: return "related";
+    case 3: return "invalid";
+    default: return std::to_string(state);
+  }
+}
+
+auto Ipv4Str(uint32_t netorder) -> std::string {
+  char buf[INET_ADDRSTRLEN] = {};
+  inet_ntop(AF_INET, &netorder, buf, sizeof(buf));
+  return buf;
+}
+
+// Cap on entries serialized per map dump — an unbounded map (up to 64k
+// conntrack/NAT entries) would block the single-threaded control loop
+// while it builds the JSON. Beyond this the reply is marked truncated.
+constexpr size_t kMaxDumpEntries = 4096;
+
+// Which XDP mode a program is attached in on `ifindex`: native (driver)
+// is line-rate, generic (SKB) is the software fallback for NICs without
+// native XDP. Operators need this to know if they are on the slow path.
+auto XdpMode(int ifindex) -> std::string {
+  LIBBPF_OPTS(bpf_xdp_query_opts, opts);
+  if (bpf_xdp_query(ifindex, 0, &opts) != 0) return "unknown";
+  switch (opts.attach_mode) {
+    case XDP_ATTACHED_DRV:
+    case XDP_ATTACHED_HW:
+      return "native";
+    case XDP_ATTACHED_SKB:
+      return "generic";
+    case XDP_ATTACHED_NONE:
+      return "none";
+    default:
+      return "multi";
   }
 }
 
@@ -242,6 +297,140 @@ auto HandleRequest(Engine& e, const std::string& req_str)
       }
       return json({{"cleared", cleared}}).dump();
     }
+    case Cmd::kReloadProg: {
+      // Recompile the configured source and hot-swap it. On any
+      // failure (compile error, invalid bundle) ReloadFromSource
+      // leaves the running program untouched — the reload path never
+      // installs a broken program.
+      auto r = ReloadFromSource(e);
+      if (!r) {
+        return json({{"error", r.error().message}}).dump();
+      }
+      return json({
+          {"status", "reloaded"},
+          {"version", r->version},
+          {"rules_installed", r->rules_installed},
+          {"program_updated", r->program_updated},
+      }).dump();
+    }
+    case Cmd::kGetZones: {
+      // v0.4 multi-zone bundle topology. Empty on the single-program
+      // path (no zones declared).
+      json arr = json::array();
+      for (const auto& p : e.zone_bundle.programs) {
+        json attached = json::array();
+        // Aggregate the XDP attach mode across the zone's interfaces:
+        // a single value if they agree, "mixed" otherwise.
+        std::string mode;
+        for (int idx : p.ifindexes) {
+          char nm[IF_NAMESIZE] = {};
+          if (if_indextoname(static_cast<unsigned int>(idx), nm)) {
+            attached.push_back(std::string(nm));
+          }
+          auto m = XdpMode(idx);
+          if (mode.empty()) {
+            mode = m;
+          } else if (mode != m) {
+            mode = "mixed";
+          }
+        }
+        arr.push_back({
+            {"zone", p.zone},
+            {"interfaces", p.interfaces},
+            {"redirects_to", p.redirects_to},
+            {"masquerades", p.masquerades},
+            {"attached", attached},
+            {"attached_count", p.ifindexes.size()},
+            {"xdp_mode", mode.empty() ? "none" : mode},
+        });
+      }
+      return arr.dump();
+    }
+    case Cmd::kGetNat: {
+      json j;
+      json arr = json::array();
+      int fd = e.zone_bundle.nat_fd;
+      if (fd >= 0) {
+        FwlNatKey key{}, next{};
+        FwlNatValue val{};
+        bool has =
+            bpf_map_get_next_key(fd, nullptr, &next) == 0;
+        while (has) {
+          if (bpf_map_lookup_elem(fd, &next, &val) == 0) {
+            // fwl_nat holds reply mappings, so nat_type is what the
+            // RETURN packet rewrites — the inverse of the original
+            // action. Report the original direction operators expect:
+            // a reply that restores the destination (DNAT) came from an
+            // outbound snat/masquerade; one that restores the source
+            // (SNAT) came from an inbound dnat/port-forward.
+            const char* dir = val.nat_type == 2 ? "snat" : "dnat";
+            arr.push_back({
+                {"proto", ProtoName(next.proto)},
+                {"orig_src", Ipv4Str(next.src_addr)},
+                {"orig_dst", Ipv4Str(next.dst_addr)},
+                {"orig_src_port", next.src_port},
+                {"orig_dst_port", next.dst_port},
+                {"new_addr", Ipv4Str(val.new_addr)},
+                {"new_port", val.new_port},
+                {"type", dir},
+            });
+          }
+          key = next;
+          has = bpf_map_get_next_key(fd, &key, &next) == 0;
+          if (arr.size() >= kMaxDumpEntries) {
+            j["truncated"] = true;
+            break;
+          }
+        }
+      }
+      j["translations"] = arr;
+      // Report the masquerade source address the daemon programmed.
+      if (e.zone_bundle.nat_cfg_fd >= 0) {
+        uint32_t k = 0, masq = 0;
+        if (bpf_map_lookup_elem(
+                e.zone_bundle.nat_cfg_fd, &k, &masq) == 0 &&
+            masq != 0) {
+          j["masq_source"] = Ipv4Str(masq);
+        }
+      }
+      return j.dump();
+    }
+    case Cmd::kGetConntrack: {
+      json arr = json::array();
+      int fd = e.conntrack.map_fd;
+      if (fd >= 0) {
+        ConnKey key{}, next{};
+        ConnValue val{};
+        bool has =
+            bpf_map_get_next_key(fd, nullptr, &next) == 0;
+        while (has) {
+          if (bpf_map_lookup_elem(fd, &next, &val) == 0) {
+            arr.push_back({
+                {"proto", ProtoName(next.proto)},
+                {"src", Ipv4Str(next.src_addr)},
+                {"dst", Ipv4Str(next.dst_addr)},
+                {"src_port", next.src_port},
+                {"dst_port", next.dst_port},
+                {"state", CtStateName(val.state)},
+                {"packets", val.packets},
+                {"last_seen_ns", val.last_seen_ns},
+            });
+          }
+          key = next;
+          has = bpf_map_get_next_key(fd, &key, &next) == 0;
+          // The response is a bare array (the CLI/UI consume it as one),
+          // so cap it and log rather than reshape to add a flag — the
+          // point is to not block the control loop serializing 64k
+          // entries.
+          if (arr.size() >= kMaxDumpEntries) {
+            spdlog::warn("conntrack dump truncated at {} entries",
+                         kMaxDumpEntries);
+            break;
+          }
+        }
+      }
+      return arr.dump();
+    }
     default:
       return R"({"error":"unknown command"})";
   }
@@ -277,6 +466,38 @@ auto EngineInit(Engine& e,
   if (multi_zone) {
     spdlog::info("Cold-boot: loading multi-zone bundle from {}...",
                  current_dir);
+    // A pin outlives the process that made it. bpffs holds a reference,
+    // so every map a previous `fd` pinned is still there — with the
+    // previous POLICY's shape and the previous policy's numbering. The
+    // reload path has always reconciled that; cold boot did not, and
+    // the result was a daemon that could not start at all: libbpf
+    // refuses to reuse a pin whose definition differs (-EINVAL), the
+    // load fails, and systemd's Restart= turns it into a loop with no
+    // XDP attached anywhere. A reboot cleared it (bpffs is a fresh
+    // mount) and a restart did not, so the fault presented as "works
+    // after a reboot, fails after a restart" — measured on the rig,
+    // tests/system/hw/l8_09_stale_pins_cold_boot.sh.
+    //
+    // kColdBoot: there is no running policy to fall back on, so an
+    // unusable pin is discarded rather than deferred to the loader.
+    // Losing state hurts; not coming up at all is worse.
+    auto pins = ReconcilePinnedMaps(current_dir, e.pin_path,
+                                    PinPolicy::kColdBoot,
+                                    e.conntrack.timeout_s);
+    for (const auto& name : pins.discarded) {
+      spdlog::info("Cold-boot: discarded stale pin '{}' "
+                   "(left by a previous policy).", name);
+    }
+    for (const auto& name : pins.adopted) {
+      spdlog::info("Cold-boot: adopted pinned '{}' (flow-keyed state, "
+                   "definition matches this bundle).", name);
+    }
+    if (pins.conntrack_swept > 0) {
+      spdlog::info(
+          "Cold-boot: swept {} conntrack entries older than {}s from "
+          "the adopted table.",
+          pins.conntrack_swept, e.conntrack.timeout_s);
+    }
     auto zb = LoadZoneBundle(current_dir, e.pin_path);
     if (!zb) {
       return MakeError(EngineError::kBpfLoadFailed,
@@ -284,6 +505,26 @@ auto EngineInit(Engine& e,
     }
     e.zone_bundle = *zb;
     e.conntrack.map_fd = e.zone_bundle.conntrack_fd;
+    // Garbage collection is gated on `enabled`, which was only ever
+    // set by ApplyConfig — the single-program rule path. A bundle
+    // deployment (i.e. every v0.4 deployment) therefore never
+    // collected: entries accumulated until the map hit its 65536
+    // cap, after which new flows stopped being tracked and every
+    // established-state rule silently began mismatching, with
+    // nothing logged. Measured on hardware —
+    // tests/system/hw/l8_02_conntrack_gc.sh saw entries only grow
+    // with enabled=false and total_evicted stuck at 0.
+    //
+    // Enable it whenever the bundle actually carries a conntrack map
+    // (a policy that never reads conntrack(pkt).state has none, and
+    // there is nothing to collect). The struct defaults — 300 s
+    // idle timeout, 30 s sweep — are the documented ones.
+    if (e.zone_bundle.conntrack_fd >= 0) {
+      e.conntrack.enabled = true;
+      spdlog::info(
+          "Conntrack GC enabled (timeout {}s, sweep every {}s).",
+          e.conntrack.timeout_s, e.conntrack.gc_interval_s);
+    }
     // Record the attached interfaces for status reporting.
     for (const auto& prog : e.zone_bundle.programs) {
       for (int idx : prog.ifindexes) {
@@ -391,11 +632,83 @@ auto EngineInit(Engine& e,
   return {};
 }
 
+
+namespace {
+
+/// Minimal sd_notify(3): report readiness to the service manager.
+///
+/// Implemented directly rather than by linking libsystemd — the
+/// protocol is one datagram to the socket named in $NOTIFY_SOCKET,
+/// and a firewall daemon does not need another shared library on its
+/// critical path for it. A leading '@' denotes an abstract socket,
+/// encoded as a leading NUL. Silently does nothing when the variable
+/// is unset, so running fd by hand is unaffected.
+auto NotifySystemd(const std::string& message) -> void {
+  const char* path = ::getenv("NOTIFY_SOCKET");
+  if (path == nullptr || *path == '\0') {
+    return;
+  }
+  int fd = ::socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+  if (fd < 0) {
+    return;
+  }
+  struct sockaddr_un addr{};
+  addr.sun_family = AF_UNIX;
+  std::string p(path);
+  if (p.size() >= sizeof(addr.sun_path)) {
+    ::close(fd);
+    return;
+  }
+  std::memcpy(addr.sun_path, p.data(), p.size());
+  if (addr.sun_path[0] == '@') {
+    addr.sun_path[0] = '\0';  // abstract namespace
+  }
+  ::sendto(fd, message.data(), message.size(), MSG_NOSIGNAL,
+           reinterpret_cast<struct sockaddr*>(&addr),
+           static_cast<socklen_t>(offsetof(struct sockaddr_un, sun_path)
+                                  + p.size()));
+  ::close(fd);
+}
+
+}  // namespace
+
 auto EngineRun(Engine& e, std::stop_token stop)
     -> std::expected<void, Error<EngineError>> {
   e.state.store(EngineState::kRunning);
   spdlog::info("Engine running. {} interfaces.",
                e.ifaces.count);
+
+  // Readiness means "the datapath is armed", not "the process
+  // started". With Type=simple, systemd considers the unit started
+  // the moment exec() succeeds, so `Before=network.target` ordered
+  // the spawn and nothing more: on the rig, network.target was
+  // reached 17 ms BEFORE fd logged its first line, and the only
+  // reason no traffic passed unfiltered is that PHY autonegotiation
+  // happens to take ~1.4 s longer than loading a BPF program. That
+  // margin is physics, not a guarantee — a larger bundle or a faster
+  // link could invert it silently.
+  //
+  // With Type=notify, systemd holds network.target until this
+  // datagram arrives, so the ordering is enforced rather than
+  // observed.
+  if (e.ifaces.count == 0) {
+    // Nothing is attached, so nothing is being filtered. Staying
+    // silent here makes systemd fail the unit on TimeoutStartSec
+    // instead of reporting a healthy firewall that filters nothing
+    // — the failure mode is otherwise invisible: active, green, and
+    // forwarding everything.
+    spdlog::error(
+        "No interfaces attached — the datapath is NOT armed. "
+        "Refusing to report readiness; check the bundle's zone "
+        "interfaces exist and that XDP attach succeeded.");
+    NotifySystemd(
+        "STATUS=datapath NOT armed: 0 interfaces attached\n");
+  } else {
+    NotifySystemd(
+        std::format("READY=1\nSTATUS=datapath armed on {} "
+                    "interface(s)\n",
+                    e.ifaces.count));
+  }
 
   // Start slow path thread if ring buffer available.
   if (e.bpf.events_fd >= 0) {
@@ -440,6 +753,18 @@ auto EngineRun(Engine& e, std::stop_token stop)
       }
     }
 
+    // Hot reload: the watcher thread flags a source change; the
+    // compile + apply runs here on the main thread so it can touch
+    // engine state without locking.
+    if (WatcherConsumeReload(e.watcher)) {
+      auto reloaded = ReloadFromSource(e);
+      if (!reloaded) {
+        spdlog::error("reload failed ({}); previous policy stays "
+                      "active",
+                      reloaded.error().message);
+      }
+    }
+
     auto now_ns = static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now()
@@ -458,6 +783,7 @@ auto EngineRun(Engine& e, std::stop_token stop)
 }
 
 auto EngineStop(Engine& e) -> void {
+  WatcherStop(e.watcher);
   // Stop slow path.
   if (e.slow_path_thread.joinable()) {
     e.slow_path_thread.request_stop();
@@ -466,8 +792,21 @@ auto EngineStop(Engine& e) -> void {
   SlowPathStop(e.slow_path);
 
   spdlog::info("Detaching XDP.");
-  for (uint32_t i = 0; i < e.ifaces.count; i++) {
-    DetachXdp(e.ifaces.interfaces[i].ifindex);
+  // Detach what is actually attached, not what was attached at
+  // startup. `e.ifaces` is populated once in EngineInit; a reload
+  // that changes zone membership replaces `e.zone_bundle` without
+  // touching it. Walking the stale list left every interface a
+  // reload had ADDED still running an XDP program after a clean
+  // `systemctl stop` — a firewall with no daemon behind it,
+  // surviving until reboot or a manual detach, and liable to
+  // collide with the next start. Measured on hardware:
+  // tests/system/hw/l8_05_stale_ifaces.sh.
+  if (!e.zone_bundle.programs.empty()) {
+    DetachZoneBundle(e.zone_bundle);
+  } else {
+    for (uint32_t i = 0; i < e.ifaces.count; i++) {
+      DetachXdp(e.ifaces.interfaces[i].ifindex);
+    }
   }
   e.ctrl_socket.reset();
   e.zmq_ctx.reset();

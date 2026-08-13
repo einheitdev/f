@@ -16,7 +16,8 @@ from pathlib import Path
 import click
 
 from . import (
-  __version__, analyzer, ast, emitter, interpreter, parser, pkt, runner
+  __version__, analyzer, ast, emitter, interpreter, log_abi, parser,
+  pkt, runner
 )
 from .errors import FwlException
 
@@ -55,9 +56,12 @@ def _format_program(p: ast.Program) -> str:
       if rule.condition is not None:
         parts.append(f"if {_format_condition(rule.condition)}")
       if rule.modifier is not None:
+        scope = ""
+        if rule.modifier.scope is not ast.RlScope.ZONE:
+          scope = f", scope={rule.modifier.scope.value}"
         parts.append(
           f"limited by rate_limit({rule.modifier.threshold}, "
-          f"per={rule.modifier.per_field})"
+          f"per={rule.modifier.per_field}{scope})"
         )
       lines.append(f"  [{i}] {' '.join(parts)}")
     if zp.default is not None:
@@ -117,11 +121,22 @@ def check(source: Path) -> None:
   """Parse + semantic check of SOURCE without code generation."""
   text = source.read_text(encoding="utf-8")
   try:
-    analyzer.analyze(parser.parse(text))
+    program = analyzer.analyze(parser.parse(text))
   except FwlException as exc:
     click.echo(exc.error.format(), err=True)
     sys.exit(1)
+  _echo_warnings(program)
   click.echo("ok")
+
+
+def _echo_warnings(program: ast.Program) -> None:
+  """Print the analyzer's non-fatal diagnostics to stderr.
+
+  stderr, not stdout, so a warning never contaminates a compile whose
+  output is being piped — `fwl compile` writes C to stdout.
+  """
+  for warning in program.warnings:
+    click.echo(warning.format(), err=True)
 
 
 @main.command()
@@ -137,7 +152,18 @@ def check(source: Path) -> None:
     "block, a shared header, and manifest.json) into this directory."
   ),
 )
-def compile(source: Path, output: Path | None, bundle_dir: Path | None) -> None:
+@click.option(
+  "--geoip", "geoip_file", type=click.Path(exists=True, path_type=Path),
+  default=None,
+  help=(
+    "Country -> CIDR-prefix data (JSON object, e.g. "
+    '{"DE": ["1.2.0.0/16"]}). Required when the program uses '
+    "geoip(); the bundle gains a geoip.json the daemon loads into "
+    "the LPM tries at attach time."
+  ),
+)
+def compile(source: Path, output: Path | None, bundle_dir: Path | None,
+            geoip_file: Path | None) -> None:
   """Compile SOURCE to BPF C (single object) or a multi-zone bundle."""
   text = source.read_text(encoding="utf-8")
   try:
@@ -145,9 +171,15 @@ def compile(source: Path, output: Path | None, bundle_dir: Path | None) -> None:
   except FwlException as exc:
     click.echo(exc.error.format(), err=True)
     sys.exit(1)
+  _echo_warnings(program)
+
+  geoip_data = None
+  if geoip_file is not None:
+    import json
+    geoip_data = json.loads(geoip_file.read_text(encoding="utf-8"))
 
   if bundle_dir is not None:
-    _emit_bundle_dir(program, bundle_dir)
+    _emit_bundle_dir(program, bundle_dir, geoip_data)
     return
 
   # A multi-zone unit has more than one program; a single C file cannot
@@ -167,18 +199,94 @@ def compile(source: Path, output: Path | None, bundle_dir: Path | None) -> None:
     output.write_text(c_source, encoding="utf-8")
 
 
-def _emit_bundle_dir(program: ast.Program, bundle_dir: Path) -> None:
+def _collect_bundle_geoip(
+  program: ast.Program,
+) -> list[tuple[str, ast.GeoIp]]:
+  """(zone, call) for every geoip() site across every @xdp block."""
+  calls: list[tuple[str, ast.GeoIp]] = []
+  for zp in program.programs:
+    for rule in zp.rules:
+      for n in emitter._walk(rule.condition):
+        if (isinstance(n, ast.Comparison)
+            and isinstance(n.operand, ast.GeoIp)):
+          calls.append((zp.zone_name, n.operand))
+    if zp.function is not None:
+      calls.extend(
+        (zp.zone_name, c)
+        for c in emitter._collect_geoip_in_stmts(zp.function.body)
+      )
+  return calls
+
+
+def _build_geoip_bundle_file(
+  program: ast.Program, geoip_data: dict | None
+) -> dict | None:
+  """Resolve geoip() call sites against the data file.
+
+  Returns the geoip.json payload ({"tries": [...]}), or None when the
+  program has no geoip() calls. Errors out (exit 1) when calls exist
+  but no data was provided, or when a referenced country has no
+  prefixes of the call's family (a silently empty trie would make the
+  rule a no-op). Trie names are zone-qualified to match the emitter's
+  per-zone private-map naming.
+  """
+  calls = _collect_bundle_geoip(program)
+  if not calls:
+    return None
+  if geoip_data is None:
+    click.echo(
+      "error: this program uses geoip() but no --geoip data file "
+      "was provided; the tries would load empty and never match",
+      err=True,
+    )
+    sys.exit(1)
+  import ipaddress
+  tries: dict[str, dict] = {}
+  for zone, call in calls:
+    # The name comes from the emitter's own map registry rather than
+    # being spelled out again here: a trie is zone-private state, and a
+    # second copy of the naming rule is a second thing to forget.
+    name = emitter.MapNames(zone).geoip(call.call_index)
+    prefixes: list[str] = []
+    for code in call.codes:
+      family_hits = 0
+      for cidr in geoip_data.get(code, ()):
+        net = ipaddress.ip_network(cidr, strict=False)
+        is_v4 = isinstance(net, ipaddress.IPv4Network)
+        if (call.family == "ipv4") == is_v4:
+          prefixes.append(str(net))
+          family_hits += 1
+      if family_hits == 0:
+        click.echo(
+          f"error: geoip data has no {call.family} prefixes for "
+          f"country '{code}'",
+          err=True,
+        )
+        sys.exit(1)
+    tries[name] = {
+      "map": name, "family": call.family,
+      "prefixes": sorted(prefixes),
+    }
+  return {"tries": [tries[k] for k in sorted(tries)]}
+
+
+def _emit_bundle_dir(program: ast.Program, bundle_dir: Path,
+                     geoip_data: dict | None = None) -> None:
   """Write a multi-zone bundle to `bundle_dir`.
 
   Emits each zone's `<zone>.bpf.c` and the shared header, compiles each
   C file to `<zone>.bpf.o` when clang is available, and writes a
   `manifest.json` describing the zones, per-zone objects, redirect
   topology, and the bpffs-pinned shared maps the daemon must wire up.
+  With geoip() in the program, also writes `geoip.json` (resolved
+  prefix lists per trie) for the daemon to load.
   """
   import json
   import subprocess
 
   from . import bpf_runner
+
+  geoip_payload = _build_geoip_bundle_file(program, geoip_data)
 
   bundle_dir.mkdir(parents=True, exist_ok=True)
   files = emitter.emit_bundle(program)
@@ -202,7 +310,15 @@ def _emit_bundle_dir(program: ast.Program, bundle_dir: Path) -> None:
       "zone": zp.zone_name,
       "source": c_name,
       "object": o_name if compiled else None,
-      "redirects_to": emitter._collect_redirect_zones(zp),
+      # Helpers included: the daemon fills each `fwl_devmap_<zone>`
+      # from this list, and a redirect performed inside a helper emits
+      # the devmap all the same.
+      "redirects_to": emitter._collect_redirect_zones(
+        zp, program.helpers),
+      # The daemon seeds fwl_nat_cfg (the masquerade source address)
+      # only for zones that actually masquerade; a zone that merely
+      # carries the shared de-NAT pass must not be treated as one.
+      "masquerades": emitter._program_masquerades(zp, program.helpers),
     })
 
   manifest = {
@@ -212,11 +328,27 @@ def _emit_bundle_dir(program: ast.Program, bundle_dir: Path) -> None:
       for z in program.zones
     ],
     "programs": programs_meta,
-    "shared_pinned_maps": ["conntrack"],
+    # zone name -> the id its log events carry. The lookup table for
+    # `fwl_log_events`, which is one ring for the whole bundle: a
+    # record is (zone_id, rule_index), and a numeric id a consumer
+    # cannot resolve to a name is no better than no id at all. It
+    # ships with the bundle so the resolution needs nothing but the
+    # artifact the events came from.
+    "zone_ids": log_abi.zone_ids(emitter.emitting_zone_names(program)),
+    "shared_pinned_maps": emitter.shared_pinned_map_names(files),
+    # The pins fd may carry across a policy change; everything else
+    # under its pin root is left over from a previous compilation and
+    # is removed before the load. Taken from _MAP_KINDS so the decision
+    # lives in one place and reaches the daemon without being restated.
+    "persistent_maps": list(emitter.persistent_map_names()),
   }
   (bundle_dir / "manifest.json").write_text(
     json.dumps(manifest, indent=2), encoding="utf-8"
   )
+  if geoip_payload is not None:
+    (bundle_dir / "geoip.json").write_text(
+      json.dumps(geoip_payload, indent=2), encoding="utf-8"
+    )
   # Drop the scratch source compile_c leaves behind in the bundle dir.
   stray = bundle_dir / "fwl_prog.bpf.c"
   if stray.exists():
@@ -255,7 +387,7 @@ def _which_rule_fired(
   interpreter doesn't carry diagnostic responsibilities into its
   oracle role.
   """
-  state = state or {}
+  state = interpreter.resolve_bucket_state(program, state)
   for idx, rule in enumerate(program.rules):
     if (rule.condition is not None
         and not interpreter._eval(rule.condition, packet)):
