@@ -235,6 +235,43 @@ auto RenderShowStatus(const Response& resp,
       row("interfaces", jstr(ifaces["count"]));
     }
   }
+  if (j.contains("conntrack")) {
+    auto& ct = j["conntrack"];
+    if (ct.value("enabled", false) && ct.contains("entries")) {
+      row("conntrack", std::format("{} flows (timeout {}s)",
+                                   jstr(ct["entries"]),
+                                   jstr(ct["timeout_s"])));
+    }
+  }
+  // NAT was the one table with no collector behind it AND no line
+  // here, which is why "new connections hang, old ones are fine" was
+  // undiagnosable from the CLI. Occupancy is coloured, because the
+  // number only means something against the cap, and any refusal is
+  // Bad — a refusal is a dropped packet.
+  if (j.contains("nat") && j["nat"].value("enabled", false)) {
+    auto& n = j["nat"];
+    auto pct = n.value("occupancy_pct", 0U);
+    auto sem = pct >= 90   ? Semantic::Bad
+               : pct >= 80 ? Semantic::Warn
+                           : Semantic::Good;
+    row("nat_mappings",
+        std::format("{} / {} ({}%, peak {})", jstr(n["entries"]),
+                    jstr(n["max_entries"]), pct,
+                    jstr(n["high_water"])),
+        sem);
+    row("nat_reclaimed", jstr(n["total_reclaimed"]));
+    auto refused = n.value("refused", uint64_t{0});
+    if (refused > 0) {
+      row("nat_refused",
+          std::format("{} (packets DROPPED; {} were the table full)",
+                      refused, jstr(n["table_full"])),
+          Semantic::Bad);
+    }
+    auto realloc = n.value("port_reallocated", uint64_t{0});
+    if (realloc > 0) {
+      row("nat_port_moved", std::to_string(realloc), Semantic::Info);
+    }
+  }
   if (j.contains("slow_path")) {
     auto& sp = j["slow_path"];
     if (sp.contains("events")) {

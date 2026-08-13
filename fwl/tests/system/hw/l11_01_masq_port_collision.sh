@@ -1,29 +1,35 @@
 #!/usr/bin/env bash
-# CEILING PROBE: where does masquerade stop being able to multiplex
-# several hosts behind one address, and what does it do at that point?
+# Two hosts behind one masquerade address pick the same ephemeral port
+# toward the same destination. Whose reply is it?
 #
-# The office deployment is several testnets behind one masquerade
-# address, all browsing. The intuitive ceiling is "65535 ephemeral
-# ports". It is not. v0.4 masquerade is PORT-PRESERVING (spec § NAT:
-# "the translated source port equals the original ... ephemeral-port
-# reallocation on collision is Phase 5.3"), so the reply mapping is
-# keyed on the tuple the packet already had:
+# This was a ceiling probe and its answer was the worst kind. v0.4
+# masquerade was port-preserving with no fallback, so the reply mapping
+# was keyed on the tuple the packet already had:
 #
 #   key   = (peer_addr, masq_addr, peer_port, ORIGINAL src_port, proto)
-#   value = (original src_addr, original src_port)
 #
-# Two hosts that happen to pick the same ephemeral source port toward
-# the same destination produce the SAME key with DIFFERENT values, and
-# the install is BPF_ANY — an overwrite. The ceiling is therefore not
-# a pool running out, it is the FIRST source-port collision between
-# any two hosts talking to the same destination. This test drives that
-# collision deliberately and records what happens to the first host's
-# return traffic.
+# Two hosts sharing an ephemeral port to one destination produced the
+# SAME key with DIFFERENT values, and the install was BPF_ANY — an
+# overwrite. Measured here on the wire: the identical reply frame went
+# to host A 20/20 before the collision and to host B 20/20 after. Not a
+# refusal and not a drop — MISDELIVERY of one tenant's inbound TCP
+# payload to another, with nothing logged and no counter moving. At the
+# ~28k-port Linux ephemeral range that is a coin flip at 200 concurrent
+# flows to one destination: normal browsing, not an attack.
 #
-# Deliberately structured so nothing can pass vacuously: the same
-# reply frame, byte for byte, is sent twice — once before the
-# collision and once after — and the assertion is on which host it is
-# delivered to each time.
+# The install is now BPF_NOEXIST, so a collision is DETECTED. The port
+# is preserved when the key is free — that preference was never the
+# defect — and when it is not, the mapping is moved to a port in the
+# NAT-owned range 49152-65535 and the source port is rewritten with it.
+# The two flows end up with two keys, so the two replies are no longer
+# the same frame at all.
+#
+# The test keeps its original shape, because that shape is what made
+# the defect visible: the same reply frame, byte for byte, sent before
+# and after the collision, with the assertion on which host receives
+# it. What changed is that the second round now also asserts the
+# SECOND host's own reply arrives — and, above all, that host A's
+# mapping is untouched.
 source "$(dirname "$0")/hwlib.sh"
 hw::require_root
 
@@ -104,6 +110,7 @@ mapping is keyed on a port the guest chose, not one the NAT owns."
 # Nothing exotic: two hosts picking the same ephemeral port toward the
 # same destination. On a testnet browsing the same CDN this is a
 # birthday problem over the ~28k-port Linux ephemeral range.
+REALLOC_BEFORE=$(hw::nat port_reallocated)
 hw::sniff_start 8 --detail --srcport
 egress "$HOST_B"
 sleep 1
@@ -111,48 +118,87 @@ reply
 sleep 1
 hw::sniff_wait
 
-B_OUT=$(hw::sniff_get "tcp:$MASQ_ADDR:$SPORT>$PEER:443:ok")
+B_OUT_SAME=$(hw::sniff_get "tcp:$MASQ_ADDR:$SPORT>$PEER:443:ok")
 A_BACK2=$(hw::sniff_get "tcp:$PEER:443>$HOST_A:$SPORT:ok")
 B_BACK2=$(hw::sniff_get "tcp:$PEER:443>$HOST_B:$SPORT:ok")
 NAT_ENTRIES_2=$(hw::map_entries fwl_nat)
+REALLOC_AFTER=$(hw::nat port_reallocated)
 
 assert_eq "counter egress_b" "$(hw::counter egress_b)" 20
-assert_eq "wire: host B also left as $MASQ_ADDR:$SPORT (no port \
-reallocation on collision)" "$B_OUT" 20
-assert_eq "the colliding flow did NOT get its own mapping" \
-  "$NAT_ENTRIES_2" 1
 
-# The measurement. The same reply frame now resolves to a different
-# host. Assert the observed behaviour rather than a hoped-for one:
-# this test exists to RECORD the ceiling, so it fails only if the
-# evidence is unreadable, not because the ceiling is where it is.
-log "=== behaviour at the ceiling ==="
+# The port host B actually left on. Read it off the wire rather than
+# recomputing the emitter's hash here: a test that derives the expected
+# port from the same function it is testing asserts nothing about it.
+# Keys are "<proto>:<src_ip>:<src_port>><dst_ip>:<dst_port>:ok".
+B_PORT=$($PY -c "
+import json
+with open('$SNIFF_OUT') as fh:
+  seen = json.load(fh)
+best, port = 0, 0
+for key, n in seen.items():
+  if not key.startswith('tcp:$MASQ_ADDR:'):
+    continue
+  sport = int(key.split(':')[2])
+  if key.split('>', 1)[1].startswith('$PEER:443') and n > best:
+    best, port = n, sport
+print(port if best >= 20 else 0)
+")
+log "host B left as $MASQ_ADDR:$B_PORT, host A holds $MASQ_ADDR:$SPORT"
+
+# --- the assertions that replaced the ceiling ------------------------
+assert_eq "wire: host B did NOT reuse host A's translated port" \
+  "$B_OUT_SAME" 0
+assert_range "wire: host B's port came from the NAT-owned range" \
+  "$B_PORT" 49152 65535
+assert_eq "the colliding flow got its OWN mapping" "$NAT_ENTRIES_2" 2
+if [ "$REALLOC_AFTER" -gt "$REALLOC_BEFORE" ]; then
+  pass "the reallocation is COUNTED and readable from fctl status \
+($REALLOC_BEFORE -> $REALLOC_AFTER)"
+else
+  fail "a port was reallocated on the wire but fctl status counted \
+none ($REALLOC_BEFORE -> $REALLOC_AFTER): the datapath and the \
+reporting disagree"
+fi
+
+# The measurement that used to record the defect. The identical reply
+# frame is sent again; it must still belong to host A, because host A
+# is the only flow holding that key.
+log "=== the same reply frame, after the collision ==="
 log "identical reply frame ($PEER:443 -> $MASQ_ADDR:$SPORT): \
 round 1 delivered to A x$A_BACK / B x$B_BACK; \
 round 2 delivered to A x$A_BACK2 / B x$B_BACK2"
+assert_eq "wire: A's reply STILL reaches host A after the collision" \
+  "$A_BACK2" 20
+assert_eq "wire: A's reply never reaches host B" "$B_BACK2" 0
 
-if [ "$B_BACK2" -gt 0 ] && [ "$A_BACK2" -eq 0 ]; then
-  pass "CEILING MEASURED — host B's egress packet silently \
-overwrote host A's reply mapping. Host A's return traffic is now \
-delivered to host B ($B_BACK2/20), and host A receives none ($A_BACK2/20). \
-The failure is not a refusal and not a drop: it is MISDELIVERY of one \
-tenant's inbound TCP payload to another tenant behind the same \
-masquerade address. Nothing is logged, no counter moves, and host A \
-sees a connection that simply stops."
-elif [ "$A_BACK2" -gt 0 ] && [ "$B_BACK2" -eq 0 ]; then
-  fail "unexpected: the mapping survived the collision. Either the \
-build allocates ports after all (spec says it does not) or the \
-collision did not happen — re-check the test before believing it."
-else
-  fail "the reply reached neither host (A=$A_BACK2 B=$B_BACK2): the \
-evidence is unreadable, so nothing is measured here"
-fi
+# ...and host B's own reply, addressed to the port it was given, has
+# to arrive too. Without this the test would pass on a build that
+# simply dropped every colliding flow.
+hw::sniff_start 8 --detail --srcport
+hw::send 20 "tcp(src_ip=\"$PEER\", dst_ip=\"$MASQ_ADDR\", \
+src_port=443, dst_port=$B_PORT, ack=true)"
+sleep 1
+hw::sniff_wait
+B_HOME=$(hw::sniff_get "tcp:$PEER:443>$HOST_B:$SPORT:ok")
+A_STEAL=$(hw::sniff_get "tcp:$PEER:443>$HOST_A:$SPORT:ok")
+assert_eq "wire: B's reply de-NATs to host B on its ORIGINAL port" \
+  "$B_HOME" 20
+assert_eq "wire: B's reply does not leak to host A" "$A_STEAL" 0
 
-# --- what the ceiling is worth in numbers ---------------------------
+pass "NO MISDELIVERY — two hosts, one ephemeral port, one \
+destination, and each reply reaches the host that opened the \
+connection. The old build delivered the identical frame to A 20/20 \
+before the collision and to B 20/20 after; the mapping is now claimed \
+with BPF_NOEXIST, so the second flow is moved to its own key instead \
+of taking over the first's."
+
+# --- what the collision rate is, now that it is handled -------------
 # Linux picks ephemeral ports from 32768-60999 (28232 values). For N
 # concurrent flows from distinct hosts to the SAME destination
 # address+port, the chance that some pair collides is the birthday
-# bound 1 - prod(1 - i/28232).
+# bound 1 - prod(1 - i/28232). These are no longer misdeliveries —
+# they are reallocations, and the fctl counter above is where an
+# operator sees how many.
 $PY - <<'EOF'
 POOL = 60999 - 32768 + 1
 print(f"[l11_01] ephemeral pool per (dst_ip, dst_port): {POOL}")
@@ -165,5 +211,5 @@ for n in (50, 100, 200, 400, 800):
 EOF
 log "Read that against the deployment: several testnets browsing means \
 hundreds of concurrent flows to a handful of popular destination \
-addresses on port 443. The ceiling is reached in normal use, not \
-under attack."
+addresses on port 443. Collisions happen in normal use — they are now \
+resolved and counted rather than silently misdelivered."

@@ -1,0 +1,25 @@
+name: "alloc exhausted drops 10.1.2.3 to 93.184.216.34 8080"
+source_fw: |
+  @xdp(lan)
+  masquerade if pkt.src_ip in [10.0.0.0/8]
+  allow if pkt.proto == tcp and pkt.tcp.syn
+  allow if conntrack(pkt).state == established
+  default drop
+state:
+  nat:
+    masq_ip: "198.51.100.9"
+    mappings:
+      - { proto: tcp, src_ip: "93.184.216.34", dst_ip: "198.51.100.9", src_port: 8080, dst_port: 40000, new_ip: "10.0.0.97", new_port: 40000, nat_type: dnat }
+      - { proto: tcp, src_ip: "93.184.216.34", dst_ip: "198.51.100.9", src_port: 8080, dst_port: 50700, new_ip: "10.0.0.97", new_port: 30000, nat_type: dnat }
+      - { proto: tcp, src_ip: "93.184.216.34", dst_ip: "198.51.100.9", src_port: 8080, dst_port: 65469, new_ip: "10.0.0.97", new_port: 30001, nat_type: dnat }
+      - { proto: tcp, src_ip: "93.184.216.34", dst_ip: "198.51.100.9", src_port: 8080, dst_port: 63854, new_ip: "10.0.0.97", new_port: 30002, nat_type: dnat }
+      - { proto: tcp, src_ip: "93.184.216.34", dst_ip: "198.51.100.9", src_port: 8080, dst_port: 62239, new_ip: "10.0.0.97", new_port: 30003, nat_type: dnat }
+      - { proto: tcp, src_ip: "93.184.216.34", dst_ip: "198.51.100.9", src_port: 8080, dst_port: 60624, new_ip: "10.0.0.97", new_port: 30004, nat_type: dnat }
+      - { proto: tcp, src_ip: "93.184.216.34", dst_ip: "198.51.100.9", src_port: 8080, dst_port: 59009, new_ip: "10.0.0.97", new_port: 30005, nat_type: dnat }
+      - { proto: tcp, src_ip: "93.184.216.34", dst_ip: "198.51.100.9", src_port: 8080, dst_port: 57394, new_ip: "10.0.0.97", new_port: 30006, nat_type: dnat }
+      - { proto: tcp, src_ip: "93.184.216.34", dst_ip: "198.51.100.9", src_port: 8080, dst_port: 55779, new_ip: "10.0.0.97", new_port: 30007, nat_type: dnat }
+test_packet:
+  builder: tcp(src_ip="10.1.2.3", dst_ip="93.184.216.34", src_port=40000, dst_port=8080, syn=true)
+expected:
+  compiles: true
+  bpf_action: drop

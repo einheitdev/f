@@ -482,6 +482,11 @@ The four states:
   second probe on the reverse key (src/dst addresses and ports swapped).
   A hit in **either** direction is `established` — this is what lets a
   reply match the entry its initiating packet created.
+- **Refresh.** A hit stamps the entry's `last_seen_ns` and bumps its
+  packet count. This is what makes the daemon's `timeout_s` an *idle*
+  timeout rather than a lifetime cap: without it an entry was collected
+  `timeout_s` after the flow's FIRST packet, so a busy connection lost
+  its state mid-flight and a stateful policy began dropping it.
 - **Classification.** Forward-or-reverse hit → `established`. Otherwise a
   TCP segment with no SYN flag → `invalid` (data/ACK/RST for a flow whose
   handshake was never seen). Everything else → `new`. `established` takes
@@ -498,6 +503,14 @@ The four states:
      so a stateful gateway can redirect return traffic back in. Without
      it the canonical `masquerade` + `redirect to wan` / `redirect to lan
      if established` gateway would be outbound-only.
+  3. A **destination-NAT** action (`dnat`) that actually rewrites the
+     destination — likewise the post-NAT 5-tuple, so the internal
+     server's reply reads `established` on its way back out. Same
+     argument as (2), same failure without it: a port forward that
+     admits the client and drops every reply.
+
+  These post-NAT entries are also what gives each `fwl_nat` mapping an
+  anchor the daemon can age it against (see § NAT, mapping lifetime).
 
   A `drop` on a `new` packet creates **nothing**, the implicit
   fall-through `XDP_PASS` (no matching rule and no `default`) does
@@ -1093,13 +1106,29 @@ outside that range is a compile error.
   `masquerade` — to the address the daemon wrote into the per-zone
   `fwl_nat_cfg` map), fixes the IPv4 header checksum and the TCP/UDP
   checksum, and installs a **reply mapping** in the shared `fwl_nat`
-  map so the return packet is de-NAT'd. v0.4 is **port-preserving**:
-  the translated source port equals the original, so two oracles agree
-  deterministically and the only L4-checksum delta is the address
-  change. (Ephemeral-port reallocation on collision is Phase 5.3.)
+  map so the return packet is de-NAT'd.
+- **Port allocation.** Source NAT **prefers to preserve** the source
+  port: when the mapping key that port names is free, the translated
+  port equals the original. When a **different flow already holds that
+  key** — two guests picking the same ephemeral port toward the same
+  destination — the mapping is moved to a port in the NAT-owned range
+  `49152`–`65535`, chosen by a hash of the flow with a bounded probe
+  (8 attempts), and the source port is rewritten to match. The claim is
+  a `BPF_NOEXIST` insert, so a collision is always *detected*: a
+  mapping is never overwritten.
+- **Refusal is terminal.** If no mapping can be claimed — every probe
+  taken, no port to move (a frame with no L4 ports), or `fwl_nat` at
+  its `max_entries` cap — the packet is **dropped**, the frame is left
+  untouched, and the event is counted in `fwl_nat_stats`. This is the
+  one case where a NAT action, normally non-terminal, terminates
+  evaluation. A translated packet without a mapping has nowhere for its
+  reply to go: it is delivered either to the firewall's own address or
+  into another guest's socket, and both used to happen silently.
 - **Destination NAT (`dnat`).** Rewrites the destination address **and**
   port, fixes both checksums, and installs the reply mapping that
-  restores the original (public) destination on return traffic.
+  restores the original (public) destination on return traffic. A
+  `dnat` port is the operator's choice, so a `dnat` mapping is **never
+  reallocated** — a collision is refused.
 - **Return traffic (automatic de-NAT).** Before any rule evaluates,
   each NAT-carrying program probes `fwl_nat` with the packet's forward
   5-tuple; on a hit it rewrites the recorded side (destination for an
@@ -1107,6 +1136,25 @@ outside that range is a compile error.
   endpoint, fixing checksums. In a bundle, **every** zone program emits
   this de-NAT pass and the shared `fwl_nat` map, so the egress zone
   installs the mapping and the ingress zone consumes it.
+- **Mapping lifetime.** A mapping lives exactly as long as its flow.
+  Every translated flow gets a conntrack entry carrying its **post-NAT**
+  5-tuple (see § Conntrack, entry creation), and that entry is the
+  mapping's own key with both endpoints swapped — so the daemon can ask
+  conntrack, one lookup per mapping, whether the flow is still there.
+  `fd` sweeps `fwl_nat` immediately after each conntrack sweep and frees
+  every mapping whose entry is gone **and** which has itself carried no
+  traffic for a grace window (default 30 s). The second condition exists
+  because the anchor can be missing without the flow being over — a
+  conntrack table at its own cap refuses the insert silently — and a
+  mapping that is carrying traffic is never freed whatever conntrack
+  says. Nothing evicts a live mapping to make room: at the cap, new
+  allocations are refused and logged.
+- **Occupancy is observable.** `fctl status` carries a `nat` section:
+  live mappings, the cap, occupancy percentage, high-water mark, total
+  reclaimed, and the datapath's own tally (`installed`,
+  `port_reallocated`, `refused`, `table_full`, `denat`). `fd` logs a
+  warning as the table crosses 80 % and an error naming the count
+  whenever refusals move.
 - **Checksums.** XDP has no `bpf_l3/l4_csum_replace` (skb-only), so the
   IPv4 header checksum is recomputed with `bpf_csum_diff` and the L4
   checksum is updated incrementally (RFC 1624) in native byte order.
@@ -1130,7 +1178,20 @@ outside that range is a compile error.
 - *IPv6 frame.* No rewrite, no mapping (NAT is IPv4-only).
 - *UDP with checksum 0.* Left as 0 ("no checksum"); a computed checksum
   that folds to 0 is stored as `0xffff`.
-- *ICMP.* v0.4 NAT does not rewrite ICMP (ICMP-error NAT is Phase 5.3).
+- *Same flow, later packet.* Finds its own mapping, not a collision:
+  the port does not move and the mapping's lifetime stamp is refreshed.
+- *ICMP.* A source NAT translates an ICMP frame's address and installs a
+  mapping keyed on **ports 0**, and de-NAT consumes it, so a masqueraded
+  host's echo replies come home. Because the key has no port field to
+  move, two hosts pinging the same peer collide, and the second is
+  **refused and dropped** rather than silently taking over the first's
+  mapping. `dnat` does not touch ICMP at all (there is no port to
+  rewrite). ICMP **error** translation — reading the embedded datagram
+  per RFC 5508, which is what path-MTU discovery needs — is **not** in
+  v0.4; see § What Is Not in v0.4.
+- *Table at its cap.* Refused and dropped, never evicted. Freeing is
+  driven by flow end, so reaching the cap means flows are genuinely
+  live, not that the table failed to drain.
 
 ### Compile errors
 
@@ -1244,3 +1305,15 @@ behaviour on every packet is unchanged.
   fragment carries the L4 header that the 5-tuple needs.
 - **Configurable UDP/TCP conntrack timeouts in the language** — timeouts
   live in the daemon (`fd.yaml`) and its GC, not the `.fw` surface.
+- **ICMP-error NAT (RFC 5508)** — an ICMP error carries the flow it is
+  about in its *payload* (the embedded IP header plus 8 bytes), not in
+  its own header, so translating it means reading one header deeper.
+  v0.4 de-NATs an ICMP error's outer addresses only if the error itself
+  happens to match a ports-0 mapping, which a frag-needed from a router
+  never does. The cost is measured, not assumed: `l11_05` shows a
+  genuine RFC 1191 frag-needed reaching the datapath and never reaching
+  the guest behind masquerade, so **path-MTU discovery is structurally
+  broken for a masqueraded flow**. Fixing it needs both halves — the
+  translation above *and* `related` (the previous item), because an
+  ICMP error has no ports, reads `new`, and a realistic stateful policy
+  drops it before translation is even reached.

@@ -924,6 +924,7 @@ auto CloseZoneBundle(ZoneBundleHandles& handles) -> void {
   handles.programs.clear();
   handles.conntrack_fd = -1;
   handles.nat_fd = -1;
+  handles.nat_stats_fd = -1;
   handles.nat_cfg_fd = -1;
 }
 
@@ -1098,10 +1099,20 @@ auto LoadZoneBundle(std::string_view bundle_dir,
     }
 
     // Capture the shared NAT reply-mapping fd; `show nat` reads the
-    // live translations out of it.
+    // live translations out of it, and NatMgr sweeps it.
     if (handles.nat_fd < 0) {
       int nf = FindMap(obj, "fwl_nat");
       if (nf >= 0) handles.nat_fd = nf;
+    }
+
+    // ...and the datapath's own tally of what happened to it. A
+    // refusal counted here is a packet the program DROPPED rather than
+    // translate into a mapping it could not claim; without the fd the
+    // daemon cannot report it, and an unreportable failure is the
+    // exact shape of every defect l11_01/l11_02 found.
+    if (handles.nat_stats_fd < 0) {
+      int ns = FindMap(obj, "fwl_nat_stats");
+      if (ns >= 0) handles.nat_stats_fd = ns;
     }
 
     // masquerade (v0.4 § NAT): the program translates sources to "the

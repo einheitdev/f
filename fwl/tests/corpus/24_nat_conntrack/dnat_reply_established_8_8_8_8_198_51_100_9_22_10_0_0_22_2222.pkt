@@ -1,0 +1,26 @@
+name: "dnat reply established 8.8.8.8 to 198.51.100.9 22 forwarded to 10.0.0.22 2222"
+source_fw: |
+  @xdp(wan)
+  dnat to 10.0.0.22:2222 if pkt.proto == tcp and pkt.dst_port == 22
+  allow if pkt.proto == tcp and pkt.tcp.syn
+  allow if conntrack(pkt).state == established
+  default drop
+sequence:
+  - name: the client's SYN is forwarded to the internal server
+    builder: tcp(src_ip="8.8.8.8", dst_ip="198.51.100.9", src_port=51000, dst_port=22, syn=true)
+    expected:
+      bpf_action: allow
+      output_packet:
+        dst_ip: "10.0.0.22"
+        dst_port: 2222
+  - name: the server's reply reads ESTABLISHED against the POST-NAT tuple the forward packet tracked, and de-NATs back to the public endpoint
+    builder: tcp(src_ip="10.0.0.22", dst_ip="8.8.8.8", src_port=2222, dst_port=51000, ack=true)
+    expected:
+      bpf_action: allow
+      output_packet:
+        src_ip: "198.51.100.9"
+        src_port: 22
+  - name: an unrelated reply from the same server on another port has nothing tracking it
+    builder: tcp(src_ip="10.0.0.22", dst_ip="8.8.8.8", src_port=2223, dst_port=51000, ack=true)
+    expected:
+      bpf_action: drop

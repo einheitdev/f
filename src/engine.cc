@@ -438,6 +438,34 @@ auto HandleRequest(Engine& e, const std::string& req_str)
 
 }  // namespace
 
+auto AttachNatMgr(Engine& e) -> void {
+  e.nat.map_fd = e.zone_bundle.nat_fd;
+  e.nat.stats_fd = e.zone_bundle.nat_stats_fd;
+  // One conntrack fd, held in two places, taken from one source: a
+  // mapping is reclaimed on the say-so of the conntrack entry behind
+  // it, so the two managers must be looking at the same table.
+  e.nat.conntrack_fd = e.conntrack.map_fd;
+  e.nat.enabled = e.nat.map_fd >= 0;
+  if (!e.nat.enabled) {
+    e.nat.max_entries = 0;
+    return;
+  }
+  // Read the cap from the map rather than assume 65536: occupancy is
+  // only meaningful as a fraction of the real limit, and a hard-coded
+  // one silently reports the wrong percentage the day the emitter
+  // changes it.
+  struct bpf_map_info info = {};
+  uint32_t len = sizeof(info);
+  if (bpf_obj_get_info_by_fd(e.nat.map_fd, &info, &len) == 0) {
+    e.nat.max_entries = info.max_entries;
+  }
+  spdlog::info(
+      "NAT mapping GC enabled: {} entries max, reclaimed when the "
+      "flow's conntrack entry is gone and the mapping has been idle "
+      "{}s; swept every {}s with conntrack.",
+      e.nat.max_entries, e.nat.grace_s, e.conntrack.gc_interval_s);
+}
+
 auto EngineInit(Engine& e,
                 std::string_view sock_addr,
                 std::span<const std::string> ifaces,
@@ -525,6 +553,7 @@ auto EngineInit(Engine& e,
           "Conntrack GC enabled (timeout {}s, sweep every {}s).",
           e.conntrack.timeout_s, e.conntrack.gc_interval_s);
     }
+    AttachNatMgr(e);
     // Record the attached interfaces for status reporting.
     for (const auto& prog : e.zone_bundle.programs) {
       for (int idx : prog.ifindexes) {
@@ -775,6 +804,12 @@ auto EngineRun(Engine& e, std::stop_token stop)
       spdlog::debug("conntrack gc: evicted {} entries",
                     evicted);
     }
+    // NAT mappings are reclaimed AFTER conntrack, never before: a
+    // mapping is freed when its flow is over, and the conntrack entry
+    // behind it is what says so. Sweeping the other way round would
+    // read anchors this tick was about to delete and keep every dead
+    // mapping for one extra interval.
+    e.nat.MaybeRunGc(now_ns, e.conntrack.gc_interval_s);
   }
 
   spdlog::info("Engine stopping.");
@@ -943,6 +978,12 @@ auto GetFullState(const Engine& e) -> nlohmann::json {
   j["rules"] = e.rules.GetState();
   j["interfaces"] = e.ifaces.GetState();
   j["conntrack"] = e.conntrack.GetState();
+  // The NAT table had no section here at all, which is why a map with
+  // no collector behind it was also the one an operator could not
+  // watch. l11_02 measured the consequence: 65536 mappings, "new
+  // connections hang, old ones are fine", and nothing in the CLI to
+  // see it in.
+  j["nat"] = e.nat.GetState();
 
   // Slow path stats.
   j["slow_path"] = {

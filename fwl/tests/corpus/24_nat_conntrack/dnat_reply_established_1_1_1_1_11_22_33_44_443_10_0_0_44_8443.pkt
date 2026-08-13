@@ -1,0 +1,26 @@
+name: "dnat reply established 1.1.1.1 to 11.22.33.44 443 forwarded to 10.0.0.44 8443"
+source_fw: |
+  @xdp(wan)
+  dnat to 10.0.0.44:8443 if pkt.proto == tcp and pkt.dst_port == 443
+  allow if pkt.proto == tcp and pkt.tcp.syn
+  allow if conntrack(pkt).state == established
+  default drop
+sequence:
+  - name: the client's SYN is forwarded to the internal server
+    builder: tcp(src_ip="1.1.1.1", dst_ip="11.22.33.44", src_port=52000, dst_port=443, syn=true)
+    expected:
+      bpf_action: allow
+      output_packet:
+        dst_ip: "10.0.0.44"
+        dst_port: 8443
+  - name: the server's reply reads ESTABLISHED against the POST-NAT tuple the forward packet tracked, and de-NATs back to the public endpoint
+    builder: tcp(src_ip="10.0.0.44", dst_ip="1.1.1.1", src_port=8443, dst_port=52000, ack=true)
+    expected:
+      bpf_action: allow
+      output_packet:
+        src_ip: "11.22.33.44"
+        src_port: 443
+  - name: an unrelated reply from the same server on another port has nothing tracking it
+    builder: tcp(src_ip="10.0.0.44", dst_ip="1.1.1.1", src_port=8444, dst_port=52000, ack=true)
+    expected:
+      bpf_action: drop

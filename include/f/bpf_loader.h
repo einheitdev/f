@@ -120,6 +120,12 @@ struct ZoneBundleHandles {
   /// -1 when no zone program uses NAT. Read to report active
   /// translations (`show nat`).
   int nat_fd = -1;
+  /// The shared `fwl_nat_stats` per-CPU tally fd, or -1. Counts what
+  /// the datapath did with the table: mappings claimed, source ports
+  /// reallocated around a collision, and allocations REFUSED (a
+  /// refusal means the packet was dropped). Read by NatMgr for
+  /// `fctl status` and for the log line that fires when refusals move.
+  int nat_stats_fd = -1;
   /// The shared masquerade config map fd (`fwl_nat_cfg`), or -1 when no
   /// zone program masquerades. The loader seeds slot 0 with the
   /// masquerade source address so the XDP `masquerade` action rewrites

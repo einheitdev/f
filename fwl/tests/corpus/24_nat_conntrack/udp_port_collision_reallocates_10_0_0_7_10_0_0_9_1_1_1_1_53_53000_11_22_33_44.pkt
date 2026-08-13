@@ -1,0 +1,32 @@
+name: "udp port collision reallocates 10.0.0.9 behind 10.0.0.7 to 1.1.1.1 53"
+source_fw: |
+  @xdp(lan)
+  masquerade if pkt.src_ip in [10.0.0.0/8]
+  allow if pkt.proto == udp
+  allow if conntrack(pkt).state == established
+  default drop
+state:
+  nat:
+    masq_ip: "11.22.33.44"
+sequence:
+  - name: first datagram keeps its source port
+    builder: udp(src_ip="10.0.0.7", dst_ip="1.1.1.1", src_port=53000, dst_port=53)
+    expected:
+      bpf_action: allow
+      output_packet:
+        src_ip: "11.22.33.44"
+        src_port: 53000
+  - name: the colliding datagram is moved, and its UDP checksum is fixed for the new port
+    builder: udp(src_ip="10.0.0.9", dst_ip="1.1.1.1", src_port=53000, dst_port=53)
+    expected:
+      bpf_action: allow
+      output_packet:
+        src_ip: "11.22.33.44"
+        src_port: 53549
+  - name: the response to the moved port de-NATs to the second host and its ORIGINAL port
+    builder: udp(src_ip="1.1.1.1", dst_ip="11.22.33.44", src_port=53, dst_port=53549)
+    expected:
+      bpf_action: allow
+      output_packet:
+        dst_ip: "10.0.0.9"
+        dst_port: 53000

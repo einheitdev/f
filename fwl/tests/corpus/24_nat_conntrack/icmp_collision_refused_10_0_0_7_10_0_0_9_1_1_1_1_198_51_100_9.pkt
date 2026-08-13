@@ -1,0 +1,27 @@
+name: "icmp collision refused 10.0.0.9 behind 10.0.0.7 to 1.1.1.1"
+source_fw: |
+  @xdp(lan)
+  masquerade if pkt.src_ip in [10.0.0.0/8]
+  allow if pkt.proto == icmp
+  default drop
+state:
+  nat:
+    masq_ip: "198.51.100.9"
+sequence:
+  - name: the first host's echo is translated and claims the ports-0 mapping
+    builder: icmp(src_ip="10.0.0.7", dst_ip="1.1.1.1", type=8, code=0)
+    expected:
+      bpf_action: allow
+      output_packet:
+        src_ip: "198.51.100.9"
+        dst_ip: "1.1.1.1"
+  - name: the second host collides on the same key and there is no port to move it to — refused and dropped, never silently overwritten
+    builder: icmp(src_ip="10.0.0.9", dst_ip="1.1.1.1", type=8, code=0)
+    expected:
+      bpf_action: drop
+  - name: the first host's mapping is intact, so its echo reply still comes home
+    builder: icmp(src_ip="1.1.1.1", dst_ip="198.51.100.9", type=0, code=0)
+    expected:
+      bpf_action: allow
+      output_packet:
+        dst_ip: "10.0.0.7"

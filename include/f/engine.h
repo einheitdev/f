@@ -21,6 +21,7 @@
 #include "f/conntrack_mgr.h"
 #include "f/error.h"
 #include "f/iface_mgr.h"
+#include "f/nat_mgr.h"
 #include "f/protocol.h"
 #include "f/rule_table.h"
 #include "f/slow_path.h"
@@ -71,6 +72,7 @@ struct Engine {
   RuleTable rules;
   IfaceMgr ifaces;
   ConntrackMgr conntrack;
+  NatMgr nat;
 
   // Current firewall config.
   FwConfig current_config{};
@@ -140,6 +142,14 @@ auto GetStatus(const Engine& e)
 /// Aggregate state from all components.
 auto GetFullState(const Engine& e)
     -> nlohmann::json;
+
+/// Point the NAT manager at the currently loaded bundle's maps.
+///
+/// Called from both places a bundle becomes live — cold boot and hot
+/// reload — because they are the two places `e.zone_bundle` changes and
+/// a manager left holding the previous bundle's fds reports plausible
+/// numbers about a table nothing is using.
+auto AttachNatMgr(Engine& e) -> void;
 
 /// Open pinned BPF maps (for f-api read access).
 auto OpenPinnedMaps(std::string_view pin_path)

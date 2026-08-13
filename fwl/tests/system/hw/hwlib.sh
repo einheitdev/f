@@ -244,6 +244,33 @@ with open('$SNIFF_OUT') as fh:
 "
 }
 
+# hw::nat <field> — one field of `fctl status`'s "nat" section, or -1
+# when the section (or the field) is absent. Reading the table through
+# the CLI rather than through bpftool is the point: the l11_02 finding
+# was not only that fwl_nat never drained but that an operator had no
+# way to see it, so a test that reaches around fctl to bpftool would
+# pass over the half of the defect that mattered.
+hw::nat() {
+  fctl status 2>/dev/null | $PY -c "
+import json, sys
+try:
+  print(json.load(sys.stdin)['nat']['$1'])
+except Exception:
+  print(-1)
+"
+}
+
+# hw::ct <field> — the same, for the "conntrack" section.
+hw::ct() {
+  fctl status 2>/dev/null | $PY -c "
+import json, sys
+try:
+  print(json.load(sys.stdin)['conntrack']['$1'])
+except Exception:
+  print(-1)
+"
+}
+
 # hw::map_entries <pin-name> — number of entries in a pinned map, or
 # -1 when the pin does not exist (so a missing map fails an assertion
 # instead of reading as an empty one).

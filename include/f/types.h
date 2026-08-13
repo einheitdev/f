@@ -122,10 +122,29 @@ struct FwlNatKey {
   uint8_t pad[3];
 };
 struct FwlNatValue {
+  /// Monotonic (bpf_ktime_get_ns) stamp of the last datapath touch:
+  /// the egress rewrite that keeps using the mapping, or the de-NAT of
+  /// one of its replies. This is what the daemon ages the table on —
+  /// without it `fwl_nat` is monotone and its 65536 entries are a
+  /// lifetime budget of translated flows rather than a concurrency
+  /// budget (measured on the rig: 3613 entries/h at ~1 new flow/s).
+  uint64_t last_seen_ns;
   uint32_t new_addr;
   uint16_t new_port;
   uint8_t nat_type;
   uint8_t pad;
+};
+
+/// Slots in the shared `fwl_nat_stats` per-CPU array. Numbered by the
+/// FWL emitter's NAT header, not by any policy, so slot i means the
+/// same event under every compilation.
+enum FwlNatStat : uint32_t {
+  kFwlNatStatInstalled = 0,   ///< reply mappings claimed
+  kFwlNatStatRealloc = 1,     ///< source port moved to avoid a collision
+  kFwlNatStatRefused = 2,     ///< no mapping could be claimed; packet dropped
+  kFwlNatStatTableFull = 3,   ///< the refusal was the table hitting its cap
+  kFwlNatStatDenat = 4,       ///< return packets translated back
+  kFwlNatStatSlots = 5,
 };
 
 // Per-zone masquerade config (`fwl_nat_cfg`, slot 0). `masq_addr` is the

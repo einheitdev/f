@@ -264,6 +264,12 @@ auto ApplyBundle(Engine& e, std::string_view bundle_dir)
       // (see the note there — it never ran in bundle mode at all).
       e.conntrack.enabled = true;
     }
+    // Same reason, same defect class: the NAT table's fds belong to the
+    // bundle that was just swapped in. Left pointing at the old
+    // bundle's maps, the sweep would collect a table nothing is using
+    // and the status section would report it — the map is FLOW-lifetime
+    // and its pin is adopted, so the numbers would look plausible.
+    AttachNatMgr(e);
     // Re-derive the tracked interface list from the bundle that is
     // now attached. Leaving it stale made `fctl status` describe the
     // boot-time topology forever, and gave EngineStop the wrong set

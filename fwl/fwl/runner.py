@@ -769,6 +769,7 @@ def _build_nat_state(case: pkt.PktCase):
 def _build_nat_map_init(case: pkt.PktCase) -> dict[str, dict[bytes, bytes]]:
   """Seed `fwl_nat` (reply mappings) and `fwl_nat_cfg` (masquerade IP)
   from the .pkt's state.nat block, byte-matching the emitted structs."""
+  import time
   out: dict[str, dict[bytes, bytes]] = {}
   if case.nat_masq_ip is not None:
     out["fwl_nat_cfg"] = {
@@ -782,7 +783,11 @@ def _build_nat_map_init(case: pkt.PktCase) -> dict[str, dict[bytes, bytes]]:
       key = (struct.pack(">I", src) + struct.pack(">I", dst)
              + struct.pack("<H", sport) + struct.pack("<H", dport)
              + struct.pack("<B", proto_num) + b"\x00\x00\x00")
-      value = (struct.pack(">I", new) + struct.pack("<H", new_port)
+      # struct fwl_nat_value: __u64 last_seen_ns, then the rewrite. A
+      # seeded mapping is stamped "now" so it reads as a live flow —
+      # the daemon's sweep is what ages it, and no oracle runs one.
+      value = (struct.pack("<Q", time.monotonic_ns())
+               + struct.pack(">I", new) + struct.pack("<H", new_port)
                + struct.pack("<B", _NAT_TYPE_NUM[kind]) + b"\x00")
       entries[key] = value
     out["fwl_nat"] = entries
