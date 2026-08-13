@@ -1,0 +1,27 @@
+name: "masq established 10.1.2.3 via 198.51.100.255 to 208.67.222.222 80"
+source_fw: |
+  @xdp(lan)
+  masquerade if pkt.src_ip in [10.0.0.0/8]
+  allow if pkt.proto == tcp and pkt.tcp.syn
+  allow if conntrack(pkt).state == established
+  default drop
+state:
+  nat:
+    masq_ip: "198.51.100.255"
+sequence:
+  - name: outbound SYN — translated, and the POST-NAT tuple tracked
+    builder: tcp(src_ip="10.1.2.3", dst_ip="208.67.222.222", src_port=12345, dst_port=80, syn=true)
+    expected:
+      bpf_action: allow
+      output_packet:
+        src_ip: "198.51.100.255"
+        dst_ip: "208.67.222.222"
+        src_port: 12345
+  - name: reply as the wire delivers it — reads ESTABLISHED under the post-NAT key, and is delivered de-NAT'd
+    builder: tcp(src_ip="208.67.222.222", dst_ip="198.51.100.255", src_port=80, dst_port=12345, ack=true)
+    expected:
+      bpf_action: allow
+      output_packet:
+        src_ip: "208.67.222.222"
+        dst_ip: "10.1.2.3"
+        dst_port: 12345

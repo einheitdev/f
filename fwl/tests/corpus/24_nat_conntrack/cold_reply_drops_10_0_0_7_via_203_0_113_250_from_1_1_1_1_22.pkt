@@ -1,0 +1,15 @@
+name: "cold reply drops 10.0.0.7 via 203.0.113.250 from 1.1.1.1 22"
+source_fw: |
+  @xdp(lan)
+  masquerade if pkt.src_ip in [10.0.0.0/8]
+  allow if pkt.proto == tcp and pkt.tcp.syn
+  allow if conntrack(pkt).state == established
+  default drop
+state:
+  nat:
+    masq_ip: "203.0.113.250"
+sequence:
+  - name: a reply with no flow behind it — nothing tracked it, so ESTABLISHED cannot match and default drop takes it
+    builder: tcp(src_ip="1.1.1.1", dst_ip="203.0.113.250", src_port=22, dst_port=1024, ack=true)
+    expected:
+      bpf_action: drop

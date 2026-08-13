@@ -1,0 +1,27 @@
+name: "udp masq established 192.168.4.20 via 203.0.113.250 to 151.101.0.1 5353"
+source_fw: |
+  @xdp(lan)
+  masquerade if pkt.src_ip in [192.168.0.0/16]
+  allow if pkt.proto == udp and pkt.src_ip in [192.168.0.0/16]
+  allow if conntrack(pkt).state == established
+  default drop
+state:
+  nat:
+    masq_ip: "203.0.113.250"
+sequence:
+  - name: outbound — translated, and the POST-NAT tuple tracked
+    builder: udp(src_ip="192.168.4.20", dst_ip="151.101.0.1", src_port=65535, dst_port=5353)
+    expected:
+      bpf_action: allow
+      output_packet:
+        src_ip: "203.0.113.250"
+        dst_ip: "151.101.0.1"
+        src_port: 65535
+  - name: reply — ESTABLISHED under the post-NAT key, de-NAT'd home
+    builder: udp(src_ip="151.101.0.1", dst_ip="203.0.113.250", src_port=5353, dst_port=65535)
+    expected:
+      bpf_action: allow
+      output_packet:
+        src_ip: "151.101.0.1"
+        dst_ip: "192.168.4.20"
+        dst_port: 65535

@@ -1,0 +1,24 @@
+name: "snat established 10.44.0.3 via 203.0.113.250 to 140.82.112.3 53"
+source_fw: |
+  @xdp(lan)
+  snat to 203.0.113.250 if pkt.src_ip in [10.0.0.0/8]
+  allow if pkt.proto == tcp and pkt.tcp.syn
+  allow if conntrack(pkt).state == established
+  default drop
+sequence:
+  - name: outbound SYN — translated, and the POST-NAT tuple tracked
+    builder: tcp(src_ip="10.44.0.3", dst_ip="140.82.112.3", src_port=12345, dst_port=53, syn=true)
+    expected:
+      bpf_action: allow
+      output_packet:
+        src_ip: "203.0.113.250"
+        dst_ip: "140.82.112.3"
+        src_port: 12345
+  - name: reply — ESTABLISHED under the post-NAT key, de-NAT'd home
+    builder: tcp(src_ip="140.82.112.3", dst_ip="203.0.113.250", src_port=53, dst_port=12345, ack=true)
+    expected:
+      bpf_action: allow
+      output_packet:
+        src_ip: "140.82.112.3"
+        dst_ip: "10.44.0.3"
+        dst_port: 12345
