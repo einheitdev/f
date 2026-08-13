@@ -349,6 +349,13 @@ auto HandleRequest(Engine& e, const std::string& req_str)
     case Cmd::kGetNat: {
       json j;
       json arr = json::array();
+      // The same clock the datapath stamps with (bpf_ktime_get_ns is
+      // CLOCK_MONOTONIC), so the difference is a real age and not two
+      // unrelated numbers subtracted.
+      auto now_ns = static_cast<uint64_t>(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(
+              std::chrono::steady_clock::now().time_since_epoch())
+              .count());
       int fd = e.zone_bundle.nat_fd;
       if (fd >= 0) {
         FwlNatKey key{}, next{};
@@ -364,6 +371,14 @@ auto HandleRequest(Engine& e, const std::string& req_str)
             // outbound snat/masquerade; one that restores the source
             // (SNAT) came from an inbound dnat/port-forward.
             const char* dir = val.nat_type == 2 ? "snat" : "dnat";
+            // How long since the datapath last touched this mapping.
+            // A list of translations with no ages cannot answer the
+            // question an operator is actually asking — "is any of
+            // this still real" — and the reclamation rule is stated in
+            // exactly these terms.
+            uint64_t idle_ns = now_ns > val.last_seen_ns
+                                   ? now_ns - val.last_seen_ns
+                                   : 0;
             arr.push_back({
                 {"proto", ProtoName(next.proto)},
                 {"orig_src", Ipv4Str(next.src_addr)},
@@ -373,6 +388,7 @@ auto HandleRequest(Engine& e, const std::string& req_str)
                 {"new_addr", Ipv4Str(val.new_addr)},
                 {"new_port", val.new_port},
                 {"type", dir},
+                {"idle_s", idle_ns / 1'000'000'000ULL},
             });
           }
           key = next;
