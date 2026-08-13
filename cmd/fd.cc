@@ -43,13 +43,20 @@ auto ParseInterfaces(const std::string& s)
   return out;
 }
 
+/// File-watcher settings from the `watch:` config block.
+struct WatchConfig {
+  bool enabled = false;
+  std::string source;
+  std::string compiled_dir;
+  std::string fwl = "fwl";
+  int interval_s = 5;
+};
+
 auto RunEngine(const std::string& sock_addr,
                const std::vector<std::string>& ifaces,
                const std::string& pin_path,
                const std::string& bundle_dir,
-               const std::string& source_path,
-               const std::string& compiled_dir,
-               const std::string& fwl_path) -> int {
+               const WatchConfig& watch) -> int {
   f::Engine engine;
   auto res = f::EngineInit(
       engine, sock_addr, ifaces, pin_path, bundle_dir);
@@ -60,12 +67,38 @@ auto RunEngine(const std::string& sock_addr,
   }
 
   // Configure the reload pipeline (kReloadProg → ReloadFromSource).
-  // The compiled-bundle root defaults to bundle_dir so an on-demand
-  // reload updates the same `current` symlink the cold-boot path reads.
-  engine.watcher.source_path = source_path;
-  engine.watcher.compiled_dir =
-      compiled_dir.empty() ? bundle_dir : compiled_dir;
-  if (!fwl_path.empty()) engine.watcher.fwl_path = fwl_path;
+  // This is unconditional, and separate from `watch.enabled`: the
+  // control command is how the CLI's `commit` makes a policy live, and
+  // it needs the source path and a place to put the bundle whether or
+  // not anything is polling the file. Configured only by the watcher
+  // thread, an operator with `watch.enabled: false` got "watcher not
+  // configured" back from a commit that had nothing to do with the
+  // watcher. The compiled-bundle root defaults to bundle_dir so an
+  // on-demand reload updates the same `current` symlink the cold-boot
+  // path reads.
+  std::string compiled_dir =
+      watch.compiled_dir.empty() ? bundle_dir : watch.compiled_dir;
+  engine.watcher.source_path = watch.source;
+  engine.watcher.compiled_dir = compiled_dir;
+  if (!watch.fwl.empty()) engine.watcher.fwl_path = watch.fwl;
+
+  // The polling thread on top of it: recompile and reload when the
+  // source file's contents change.
+  if (watch.enabled) {
+    auto wres = f::WatcherInit(
+        engine.watcher, watch.source, compiled_dir,
+        std::chrono::seconds(watch.interval_s));
+    if (!wres) {
+      spdlog::warn("Watcher disabled: {}",
+                   wres.error().message);
+    } else {
+      engine.watcher.fwl_path = watch.fwl;
+      f::WatcherStart(engine.watcher);
+      spdlog::info(
+          "Watching {} every {}s (compile via {}).",
+          watch.source, watch.interval_s, watch.fwl);
+    }
+  }
 
   struct sigaction sa{};
   sa.sa_handler = SignalHandler;
@@ -96,18 +129,9 @@ auto LoadConfig(const std::string& path,
                 std::string& socket_addr,
                 std::string& pin_path,
                 std::string& log_level,
-                std::string& source_path,
-                std::string& compiled_dir,
-                std::string& fwl_path) -> bool {
+                WatchConfig& watch) -> bool {
   try {
     auto cfg = YAML::LoadFile(path);
-    if (auto w = cfg["watch"]; w && w.IsMap()) {
-      if (w["source"]) source_path = w["source"].as<std::string>();
-      if (w["compiled_dir"]) {
-        compiled_dir = w["compiled_dir"].as<std::string>();
-      }
-      if (w["fwl"]) fwl_path = w["fwl"].as<std::string>();
-    }
     if (cfg["interfaces"]) {
       std::string ifaces;
       for (const auto& n : cfg["interfaces"]) {
@@ -124,6 +148,27 @@ auto LoadConfig(const std::string& path,
     }
     if (cfg["log_level"]) {
       log_level = cfg["log_level"].as<std::string>();
+    }
+    if (cfg["watch"]) {
+      auto w = cfg["watch"];
+      watch.enabled = w["enabled"] && w["enabled"].as<bool>();
+      if (w["source"]) {
+        watch.source = w["source"].as<std::string>();
+      }
+      if (w["compiled_dir"]) {
+        watch.compiled_dir = w["compiled_dir"].as<std::string>();
+      }
+      if (w["fwl"]) {
+        watch.fwl = w["fwl"].as<std::string>();
+      }
+      if (w["interval"]) {
+        // "5s" or a bare integer of seconds.
+        auto text = w["interval"].as<std::string>();
+        if (!text.empty() && text.back() == 's') {
+          text.pop_back();
+        }
+        watch.interval_s = std::max(1, std::stoi(text));
+      }
     }
     return true;
   } catch (const std::exception& e) {
@@ -148,47 +193,57 @@ int main(int argc, char** argv) {
   std::string pin_path = "/sys/fs/bpf/f";
   std::string bundle_dir = "/usr/share/f/compiled";
   std::string log_level = "info";
-  std::string source_path;
-  std::string compiled_dir;
-  std::string fwl_path;
 
-  app.add_option("-c,--config", config_file,
-                 "YAML config file");
-  auto* opt_iface = app.add_option(
-      "-i,--interfaces", interfaces, "Comma-separated NIC list");
-  auto* opt_socket = app.add_option(
-      "-s,--socket", socket_addr, "ZMQ IPC control address");
-  auto* opt_pin = app.add_option(
-      "--pin-path", pin_path, "BPF map pin directory");
+  auto* opt_config = app.add_option("-c,--config", config_file,
+                                    "YAML config file");
+  auto* opt_ifaces = app.add_option("-i,--interfaces", interfaces,
+                                    "Comma-separated NIC list");
+  auto* opt_socket = app.add_option("-s,--socket", socket_addr,
+                                    "ZMQ IPC control address");
+  auto* opt_pin = app.add_option("--pin-path", pin_path,
+                                 "BPF map pin directory");
   app.add_option("--bundle-dir", bundle_dir,
                  "Compiled-bundle root; <dir>/current/main.bpf.o "
                  "is loaded at startup when present");
-  auto* opt_log = app.add_option(
-      "-l,--log-level", log_level, "Log level")
-      ->check(CLI::IsMember(
-          {"trace", "debug", "info", "warn", "error"}));
+  auto* opt_log = app.add_option("-l,--log-level", log_level,
+                                 "Log level")
+                      ->check(CLI::IsMember({"trace", "debug",
+                                             "info", "warn",
+                                             "error"}));
+  (void)opt_config;
 
   app.add_subcommand("run", "Run in foreground");
   app.add_subcommand("start", "Daemonize and run");
 
   CLI11_PARSE(app, argc, argv);
 
-  // Load the config file, then re-apply anything given on the command
-  // line so a genuine CLI flag wins over the config (the flags are the
-  // more specific, one-off intent). Snapshot the CLI values first.
-  std::string cli_if = interfaces, cli_sk = socket_addr,
-              cli_pin = pin_path, cli_lg = log_level;
-  if (!config_file.empty()) {
-    LoadConfig(config_file, interfaces, socket_addr, pin_path,
-               log_level, source_path, compiled_dir, fwl_path);
-  } else if (std::ifstream("/etc/f/fd.yaml").good()) {
-    LoadConfig("/etc/f/fd.yaml", interfaces, socket_addr, pin_path,
-               log_level, source_path, compiled_dir, fwl_path);
+  // Load config file. CLI flags override config values: the config
+  // is read into separate variables and applied only where the
+  // corresponding flag was not given. (It used to overwrite CLI
+  // values unconditionally — a standalone `fd -s ipc://... run`
+  // silently bound the config file's socket instead; found by the
+  // netns system tests running against a rig with /etc/f/fd.yaml.)
+  WatchConfig watch;
+  {
+    std::string cfg_ifaces = interfaces;
+    std::string cfg_socket = socket_addr;
+    std::string cfg_pin = pin_path;
+    std::string cfg_log = log_level;
+    bool loaded = false;
+    if (!config_file.empty()) {
+      loaded = LoadConfig(config_file, cfg_ifaces, cfg_socket,
+                          cfg_pin, cfg_log, watch);
+    } else if (std::ifstream("/etc/f/fd.yaml").good()) {
+      loaded = LoadConfig("/etc/f/fd.yaml", cfg_ifaces, cfg_socket,
+                          cfg_pin, cfg_log, watch);
+    }
+    if (loaded) {
+      if (opt_ifaces->count() == 0) interfaces = cfg_ifaces;
+      if (opt_socket->count() == 0) socket_addr = cfg_socket;
+      if (opt_pin->count() == 0) pin_path = cfg_pin;
+      if (opt_log->count() == 0) log_level = cfg_log;
+    }
   }
-  if (opt_iface->count() > 0) interfaces = cli_if;
-  if (opt_socket->count() > 0) socket_addr = cli_sk;
-  if (opt_pin->count() > 0) pin_path = cli_pin;
-  if (opt_log->count() > 0) log_level = cli_lg;
 
   if (log_level == "trace")
     spdlog::set_level(spdlog::level::trace);
@@ -217,7 +272,7 @@ int main(int argc, char** argv) {
     f::WritePidFile(f::kEnginePidPath);
     chmod(f::kEnginePidPath, 0644);
     int rc = RunEngine(socket_addr, ifaces, pin_path, bundle_dir,
-                       source_path, compiled_dir, fwl_path);
+                       watch);
     f::RemovePidFile(f::kEnginePidPath);
     return rc;
   }
@@ -225,7 +280,7 @@ int main(int argc, char** argv) {
   // "run" — foreground.
   f::WritePidFile(f::kEnginePidPath);
   int rc = RunEngine(socket_addr, ifaces, pin_path, bundle_dir,
-                       source_path, compiled_dir, fwl_path);
+                     watch);
   f::RemovePidFile(f::kEnginePidPath);
   return rc;
 }

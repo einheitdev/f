@@ -1,0 +1,19 @@
+name: "helper drops ssh"
+source_fw: |
+  def gate(pkt):
+    if pkt.proto == tcp and pkt.dst_port == 22:
+      drop
+    if pkt.src_ip == 10.0.0.9:
+      allow
+  
+  @xdp(eth0)
+  def m(pkt):
+    gate(pkt)
+    drop
+
+test_packet:
+  builder: tcp(src_ip="1.2.3.4", dst_ip="9.9.9.9", dst_port=22)
+
+expected:
+  compiles: true
+  bpf_action: drop

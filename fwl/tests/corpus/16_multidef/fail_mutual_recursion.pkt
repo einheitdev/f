@@ -1,0 +1,19 @@
+name: "fail mutual recursion"
+source_fw: |
+  def a(pkt):
+    b(pkt)
+    drop
+  
+  def b(pkt):
+    a(pkt)
+    drop
+  
+  @xdp(eth0)
+  def m(pkt):
+    a(pkt)
+
+test_packet:
+  builder: tcp()
+
+expected:
+  compiles: false

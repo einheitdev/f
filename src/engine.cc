@@ -6,9 +6,12 @@
 
 #include <arpa/inet.h>
 #include <net/if.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/un.h>
 #include <unistd.h>
 
+#include <cstddef>
 #include <chrono>
 #include <cstring>
 #include <filesystem>
@@ -463,6 +466,38 @@ auto EngineInit(Engine& e,
   if (multi_zone) {
     spdlog::info("Cold-boot: loading multi-zone bundle from {}...",
                  current_dir);
+    // A pin outlives the process that made it. bpffs holds a reference,
+    // so every map a previous `fd` pinned is still there — with the
+    // previous POLICY's shape and the previous policy's numbering. The
+    // reload path has always reconciled that; cold boot did not, and
+    // the result was a daemon that could not start at all: libbpf
+    // refuses to reuse a pin whose definition differs (-EINVAL), the
+    // load fails, and systemd's Restart= turns it into a loop with no
+    // XDP attached anywhere. A reboot cleared it (bpffs is a fresh
+    // mount) and a restart did not, so the fault presented as "works
+    // after a reboot, fails after a restart" — measured on the rig,
+    // tests/system/hw/l8_09_stale_pins_cold_boot.sh.
+    //
+    // kColdBoot: there is no running policy to fall back on, so an
+    // unusable pin is discarded rather than deferred to the loader.
+    // Losing state hurts; not coming up at all is worse.
+    auto pins = ReconcilePinnedMaps(current_dir, e.pin_path,
+                                    PinPolicy::kColdBoot,
+                                    e.conntrack.timeout_s);
+    for (const auto& name : pins.discarded) {
+      spdlog::info("Cold-boot: discarded stale pin '{}' "
+                   "(left by a previous policy).", name);
+    }
+    for (const auto& name : pins.adopted) {
+      spdlog::info("Cold-boot: adopted pinned '{}' (flow-keyed state, "
+                   "definition matches this bundle).", name);
+    }
+    if (pins.conntrack_swept > 0) {
+      spdlog::info(
+          "Cold-boot: swept {} conntrack entries older than {}s from "
+          "the adopted table.",
+          pins.conntrack_swept, e.conntrack.timeout_s);
+    }
     auto zb = LoadZoneBundle(current_dir, e.pin_path);
     if (!zb) {
       return MakeError(EngineError::kBpfLoadFailed,
@@ -470,6 +505,26 @@ auto EngineInit(Engine& e,
     }
     e.zone_bundle = *zb;
     e.conntrack.map_fd = e.zone_bundle.conntrack_fd;
+    // Garbage collection is gated on `enabled`, which was only ever
+    // set by ApplyConfig — the single-program rule path. A bundle
+    // deployment (i.e. every v0.4 deployment) therefore never
+    // collected: entries accumulated until the map hit its 65536
+    // cap, after which new flows stopped being tracked and every
+    // established-state rule silently began mismatching, with
+    // nothing logged. Measured on hardware —
+    // tests/system/hw/l8_02_conntrack_gc.sh saw entries only grow
+    // with enabled=false and total_evicted stuck at 0.
+    //
+    // Enable it whenever the bundle actually carries a conntrack map
+    // (a policy that never reads conntrack(pkt).state has none, and
+    // there is nothing to collect). The struct defaults — 300 s
+    // idle timeout, 30 s sweep — are the documented ones.
+    if (e.zone_bundle.conntrack_fd >= 0) {
+      e.conntrack.enabled = true;
+      spdlog::info(
+          "Conntrack GC enabled (timeout {}s, sweep every {}s).",
+          e.conntrack.timeout_s, e.conntrack.gc_interval_s);
+    }
     // Record the attached interfaces for status reporting.
     for (const auto& prog : e.zone_bundle.programs) {
       for (int idx : prog.ifindexes) {
@@ -577,11 +632,83 @@ auto EngineInit(Engine& e,
   return {};
 }
 
+
+namespace {
+
+/// Minimal sd_notify(3): report readiness to the service manager.
+///
+/// Implemented directly rather than by linking libsystemd — the
+/// protocol is one datagram to the socket named in $NOTIFY_SOCKET,
+/// and a firewall daemon does not need another shared library on its
+/// critical path for it. A leading '@' denotes an abstract socket,
+/// encoded as a leading NUL. Silently does nothing when the variable
+/// is unset, so running fd by hand is unaffected.
+auto NotifySystemd(const std::string& message) -> void {
+  const char* path = ::getenv("NOTIFY_SOCKET");
+  if (path == nullptr || *path == '\0') {
+    return;
+  }
+  int fd = ::socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+  if (fd < 0) {
+    return;
+  }
+  struct sockaddr_un addr{};
+  addr.sun_family = AF_UNIX;
+  std::string p(path);
+  if (p.size() >= sizeof(addr.sun_path)) {
+    ::close(fd);
+    return;
+  }
+  std::memcpy(addr.sun_path, p.data(), p.size());
+  if (addr.sun_path[0] == '@') {
+    addr.sun_path[0] = '\0';  // abstract namespace
+  }
+  ::sendto(fd, message.data(), message.size(), MSG_NOSIGNAL,
+           reinterpret_cast<struct sockaddr*>(&addr),
+           static_cast<socklen_t>(offsetof(struct sockaddr_un, sun_path)
+                                  + p.size()));
+  ::close(fd);
+}
+
+}  // namespace
+
 auto EngineRun(Engine& e, std::stop_token stop)
     -> std::expected<void, Error<EngineError>> {
   e.state.store(EngineState::kRunning);
   spdlog::info("Engine running. {} interfaces.",
                e.ifaces.count);
+
+  // Readiness means "the datapath is armed", not "the process
+  // started". With Type=simple, systemd considers the unit started
+  // the moment exec() succeeds, so `Before=network.target` ordered
+  // the spawn and nothing more: on the rig, network.target was
+  // reached 17 ms BEFORE fd logged its first line, and the only
+  // reason no traffic passed unfiltered is that PHY autonegotiation
+  // happens to take ~1.4 s longer than loading a BPF program. That
+  // margin is physics, not a guarantee — a larger bundle or a faster
+  // link could invert it silently.
+  //
+  // With Type=notify, systemd holds network.target until this
+  // datagram arrives, so the ordering is enforced rather than
+  // observed.
+  if (e.ifaces.count == 0) {
+    // Nothing is attached, so nothing is being filtered. Staying
+    // silent here makes systemd fail the unit on TimeoutStartSec
+    // instead of reporting a healthy firewall that filters nothing
+    // — the failure mode is otherwise invisible: active, green, and
+    // forwarding everything.
+    spdlog::error(
+        "No interfaces attached — the datapath is NOT armed. "
+        "Refusing to report readiness; check the bundle's zone "
+        "interfaces exist and that XDP attach succeeded.");
+    NotifySystemd(
+        "STATUS=datapath NOT armed: 0 interfaces attached\n");
+  } else {
+    NotifySystemd(
+        std::format("READY=1\nSTATUS=datapath armed on {} "
+                    "interface(s)\n",
+                    e.ifaces.count));
+  }
 
   // Start slow path thread if ring buffer available.
   if (e.bpf.events_fd >= 0) {
@@ -626,6 +753,18 @@ auto EngineRun(Engine& e, std::stop_token stop)
       }
     }
 
+    // Hot reload: the watcher thread flags a source change; the
+    // compile + apply runs here on the main thread so it can touch
+    // engine state without locking.
+    if (WatcherConsumeReload(e.watcher)) {
+      auto reloaded = ReloadFromSource(e);
+      if (!reloaded) {
+        spdlog::error("reload failed ({}); previous policy stays "
+                      "active",
+                      reloaded.error().message);
+      }
+    }
+
     auto now_ns = static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now()
@@ -644,6 +783,7 @@ auto EngineRun(Engine& e, std::stop_token stop)
 }
 
 auto EngineStop(Engine& e) -> void {
+  WatcherStop(e.watcher);
   // Stop slow path.
   if (e.slow_path_thread.joinable()) {
     e.slow_path_thread.request_stop();
@@ -652,8 +792,21 @@ auto EngineStop(Engine& e) -> void {
   SlowPathStop(e.slow_path);
 
   spdlog::info("Detaching XDP.");
-  for (uint32_t i = 0; i < e.ifaces.count; i++) {
-    DetachXdp(e.ifaces.interfaces[i].ifindex);
+  // Detach what is actually attached, not what was attached at
+  // startup. `e.ifaces` is populated once in EngineInit; a reload
+  // that changes zone membership replaces `e.zone_bundle` without
+  // touching it. Walking the stale list left every interface a
+  // reload had ADDED still running an XDP program after a clean
+  // `systemctl stop` — a firewall with no daemon behind it,
+  // surviving until reboot or a manual detach, and liable to
+  // collide with the next start. Measured on hardware:
+  // tests/system/hw/l8_05_stale_ifaces.sh.
+  if (!e.zone_bundle.programs.empty()) {
+    DetachZoneBundle(e.zone_bundle);
+  } else {
+    for (uint32_t i = 0; i < e.ifaces.count; i++) {
+      DetachXdp(e.ifaces.interfaces[i].ifindex);
+    }
   }
   e.ctrl_socket.reset();
   e.zmq_ctx.reset();

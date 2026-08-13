@@ -94,11 +94,12 @@ static auto LatestBundle(const fs::path& compiled) -> fs::path {
 }
 
 TEST_F(ReloadIntegrationTest, Tier1SourceProducesBundle) {
-  // Under unified compilation, Tier 1 sources also produce a
-  // BPF program (synthesized `policy` wrapper). Bundle exists
-  // regardless of whether the kernel load step succeeds.
+  // v0.4 unified compilation: every source produces per-zone
+  // BPF objects (`<zone>.bpf.o`) plus a bundle manifest. Bundle
+  // exists regardless of whether the kernel load step succeeds.
   WriteFile(source_, R"(
-allow dst_port 80, 443 proto tcp
+@xdp(eth0)
+allow if pkt.proto == tcp and (pkt.dst_port == 80 or pkt.dst_port == 443)
 default drop
 )");
 
@@ -107,15 +108,16 @@ default drop
   auto bundle = LatestBundle(compiled_);
   ASSERT_FALSE(bundle.empty());
   EXPECT_TRUE(fs::exists(bundle / "manifest.json"));
-  EXPECT_TRUE(fs::exists(bundle / "rules.json"));
-  EXPECT_TRUE(fs::exists(bundle / "maps.json"));
-  EXPECT_TRUE(fs::exists(bundle / "main.bpf.o"));
+  EXPECT_TRUE(fs::exists(bundle / "eth0.bpf.c"));
+  EXPECT_TRUE(fs::exists(bundle / "eth0.bpf.o"));
 
   json m = json::parse(
       std::ifstream(bundle / "manifest.json"));
-  EXPECT_TRUE(m["has_program"].get<bool>());
-  EXPECT_EQ(m["program"]["entry"].get<std::string>(),
-            "policy");
+  ASSERT_EQ(m["programs"].size(), 1u);
+  EXPECT_EQ(m["programs"][0]["zone"].get<std::string>(),
+            "eth0");
+  EXPECT_EQ(m["programs"][0]["object"].get<std::string>(),
+            "eth0.bpf.o");
 
   if (res) {
     // Privileged run: full success path.
@@ -147,14 +149,14 @@ def block_port(pkt):
   auto latest = LatestBundle(compiled_);
   ASSERT_FALSE(latest.empty());
   EXPECT_TRUE(fs::exists(latest / "manifest.json"));
-  EXPECT_TRUE(fs::exists(latest / "main.bpf.c"));
-  EXPECT_TRUE(fs::exists(latest / "main.bpf.o"));
+  EXPECT_TRUE(fs::exists(latest / "eth0.bpf.c"));
+  EXPECT_TRUE(fs::exists(latest / "eth0.bpf.o"));
 
   json m = json::parse(
       std::ifstream(latest / "manifest.json"));
-  EXPECT_TRUE(m["has_program"].get<bool>());
-  EXPECT_EQ(m["program"]["entry"].get<std::string>(),
-            "block_port");
+  ASSERT_EQ(m["programs"].size(), 1u);
+  EXPECT_EQ(m["programs"][0]["zone"].get<std::string>(),
+            "eth0");
 
   if (!res) {
     // No CAP_BPF: apply failed, current NOT updated.
@@ -172,7 +174,7 @@ TEST_F(ReloadIntegrationTest,
   // Both reloads now produce BPF programs (Tier 1 synthesizes
   // a wrapper). Verify two distinct bundle dirs land on disk
   // regardless of whether the kernel load step succeeds.
-  WriteFile(source_, "default drop\n");
+  WriteFile(source_, "@xdp(eth0)\ndefault drop\n");
   ReloadFromSource(*engine_);
 
   // Snapshot directory list, sleep so timestamps differ, then
@@ -182,9 +184,11 @@ TEST_F(ReloadIntegrationTest,
     if (e.is_directory()) before.push_back(e.path());
   }
   ASSERT_FALSE(before.empty());
+  EXPECT_TRUE(fs::exists(LatestBundle(compiled_)
+                         / "manifest.json"));
 
   std::this_thread::sleep_for(std::chrono::seconds(1));
-  WriteFile(source_, "default allow\n");
+  WriteFile(source_, "@xdp(eth0)\ndefault allow\n");
   ReloadFromSource(*engine_);
 
   std::vector<fs::path> after;
@@ -196,11 +200,13 @@ TEST_F(ReloadIntegrationTest,
 
 TEST_F(ReloadIntegrationTest,
        CompileFailureLeavesNoCurrent) {
-  // Source with a semantic error: tcp field outside TCP guard.
+  // Source with a semantic error: unknown packet field. (Unguarded
+  // pkt.tcp access is legal since v0.4 — the compiler synthesizes
+  // the protocol guard — so it no longer serves as a bad fixture.)
   WriteFile(source_, R"(
 @xdp(eth0)
 def bad(pkt):
-  if pkt.tcp.syn:
+  if pkt.nonsense == 1:
     drop
   allow
 )");
@@ -219,7 +225,7 @@ TEST_F(ReloadIntegrationTest,
   // not be clobbered by the failure. (Skips the post-success
   // assertion when running without CAP_BPF — the first reload
   // will fail at apply, leaving no current to preserve.)
-  WriteFile(source_, "default drop\n");
+  WriteFile(source_, "@xdp(eth0)\ndefault drop\n");
   auto good = ReloadFromSource(*engine_);
   if (!good) {
     GTEST_SKIP() << "no CAP_BPF: cannot establish prior state";
@@ -229,7 +235,7 @@ TEST_F(ReloadIntegrationTest,
 
   std::this_thread::sleep_for(std::chrono::seconds(1));
   WriteFile(source_, "@xdp(eth0)\ndef bad(pkt):\n"
-                     "  if pkt.tcp.syn:\n    drop\n  allow\n");
+                     "  if pkt.nonsense == 1:\n    drop\n  allow\n");
   EXPECT_FALSE(ReloadFromSource(*engine_));
 
   // Symlink unchanged — last good version still active.
@@ -242,7 +248,7 @@ TEST_F(ReloadIntegrationTest,
   // Tie the watcher thread to the reload pipeline. Touch the
   // source after the watcher starts; verify that we observe a
   // reload-requested signal and the bundle artifacts land.
-  WriteFile(source_, "default drop\n");
+  WriteFile(source_, "@xdp(eth0)\ndefault drop\n");
 
   ASSERT_TRUE(WatcherInit(
       engine_->watcher, source_.string(), compiled_.string(),

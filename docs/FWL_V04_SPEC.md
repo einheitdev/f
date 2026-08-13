@@ -39,12 +39,16 @@ the connection-tracking entry a later packet reads as `established`.
 | `pkt.proto` enum values | `tcp`, `udp`, `icmp`, `icmp6` | unchanged |
 | Operators | `==`, `!=`, `<`, `<=`, `>`, `>=`, `in` | unchanged |
 | Program shape | Tier 1 rule sequence **xor** one Tier 2 `def` | unchanged |
+| `rate_limit` | `rate_limit(N, per=<field>)` | adds optional `scope=zone\|global` (§ 6.7), default `zone` |
 
 No v0.4 reservation breaks v0.2 backward compatibility: the new field
 spellings (`fin`, `rst`, `psh`, `urg`, `ece`, `cwr`, `type`, `code`)
 are recognized only as field segments after `pkt.tcp.` / `pkt.icmp.` /
 `pkt.icmp6.`, not as globally reserved words. A Tier 2 local named
-`type` or a counter named `code` remains permitted.
+`type` or a counter named `code` remains permitted. `global` is
+likewise not a reserved word — it is recognized only as the value of a
+`rate_limit` `scope=` field, so an interface, zone, or counter named
+`global` keeps working.
 
 ## TCP Flags (all 8)
 
@@ -740,6 +744,285 @@ are a compile error.
 - `pkt.zone` compared against an undeclared zone.
 - `pkt.zone` with an ordered operator.
 - `pkt.zone` in a file that declares no zones.
+
+### 6.7 `rate_limit` zone scope — `scope=`
+
+v0.1 defined `rate_limit(N, per=<field>)` for a world with one program.
+v0.4 compiles one program per zone, which raises a question v0.1 could
+not ask: when a policy carries that rule in more than one zone, is `N`
+a budget per zone or a budget for the bundle? Through v0.4 the answer
+was per zone, by implementation and not by statement. `scope=` states
+it.
+
+#### Construct
+
+```
+<rule> limited by rate_limit(<N>, per=<field>[, scope=<zone|global>])
+```
+
+`scope` is optional and its **default is `zone`** — the behaviour every
+policy written before this section already had, so adding the field
+changes no deployed policy's meaning.
+
+#### Semantics
+
+- **`scope=zone`** (default) — the bucket belongs to the zone program
+  that holds the rule. A rule written into three zones is three
+  independent budgets: each zone admits `N` per second per bucket key,
+  so the bundle admits up to `3N`.
+- **`scope=global`** — one bucket for the rule across the whole
+  bundle. Every zone program that holds the rule spends the same
+  budget, so the bundle admits `N` per second per bucket key no matter
+  which zone the traffic arrives on.
+
+Everything else about the primitive is unchanged: the one-second
+window, the pre-increment comparison, and the "fires once the bucket
+already holds `N`" reading of v0.1 § *The rate_limit Modifier* all
+apply identically under both scopes.
+
+**`scope` does not change the per-CPU nature of the count.** v0.1 chose
+a per-CPU map for `rate_limit`, and that is still the map a global
+bucket shares: `scope=global` makes two zones read the same *map*, and
+each CPU still keeps its own counter within it. So a global budget is
+`N` per second per bucket key **per CPU** — the same multiplier
+`scope=zone` has always carried, and the same one a single-zone v0.1
+policy has. Two zones' traffic therefore shares a budget when it is
+processed on the same CPU, which for one flow (one RSS bucket) it
+normally is, and does not when the kernel spreads it. Removing that
+multiplier is a change to `rate_limit` itself, not to `scope`, and is
+not in v0.4.
+
+**Which rules share a global bucket.** A `scope=global` bucket is one
+bucket *per rule*, and "the same rule" means structurally the same
+rule: same action, same condition, same threshold, same `per=` field,
+same scope. That is what makes the common multi-zone shape work — one
+rule written once per `@xdp` block is one rule, so it gets one bucket.
+Two rules that differ anywhere in that list are two rules and get two
+buckets, even when both say `scope=global`. Source position is not part
+of the identity; a rule's line number and its index within its zone are
+not.
+
+#### Composition with `per=`
+
+`scope` and `per=` are independent and orthogonal, and both are needed
+to describe a bucket: `per=` chooses **how the traffic is divided into
+buckets**, `scope` chooses **how far each bucket reaches**.
+
+| | `scope=zone` (default) | `scope=global` |
+|---|---|---|
+| `per=src_ip` | each source IP gets `N`/s **in each zone** | each source IP gets `N`/s **across the bundle** |
+| `per=dst_port` | each destination port gets `N`/s in each zone | each destination port gets `N`/s across the bundle |
+
+`per=src_ip, scope=global` is the meaningful combination for a DoS
+control: one attacking source cannot get a fresh budget by moving to
+another zone's interface. `per=src_ip, scope=zone` is the meaningful
+combination for a fairness control within a zone.
+
+#### Composition with the v0.2 dominator rule
+
+Unchanged. `scope` does not alter what `rate_limit` reads, only where
+the resulting count is kept, so the implicit `pkt.<field>` read at the
+call site is exactly the read v0.2 already governs: `per=src_port` /
+`per=dst_port` still require a `pkt.proto == tcp`/`udp` dominator,
+`per=src_ip` / `per=dst_ip` still require an IPv4-establishing
+dominator, and the same
+`error: rate_limit(per=<field>) call site does not dominate the
+implicit read of pkt.<field>` applies. Dominance is a property of the
+control-flow path to the call site within one program; a scope is a
+property of the state behind the call. Adding `scope=global` neither
+satisfies nor weakens a guard, and a rule shared across zones must
+still be individually dominated **in every zone that holds it** — each
+zone program is analysed on its own.
+
+#### Compilation model
+
+- A `scope=zone` bucket compiles to a map private to the zone object,
+  named for the zone and the rule's index within it
+  (`fwl_rl_<zone>_<idx>`), and is **not** pinned. Two zones cannot
+  reach each other's buckets even when their rate-limit rules sit at
+  the same index.
+- A `scope=global` bucket compiles to a map named for its **bundle**
+  slot (`fwl_rl_g<slot>`) and pinned `LIBBPF_PIN_BY_NAME`, so every
+  zone object that declares it resolves to one kernel map under the
+  bundle's common pin root.
+- The slot number is allocated over the whole compilation unit from the
+  rule's structure, never from its index inside a zone, and
+  `max_entries` is a constant. Both are required, not incidental: a map
+  wearing a bundle-global name whose shape or index meaning came from
+  one zone's own analysis fails to load with `-EINVAL` when two zones
+  disagree, and silently aliases their slots when they agree. A global
+  bucket is on the shared side of that line precisely because the
+  author declared the state bundle-wide; per-zone counters, geoip
+  tries, log-sample accumulators and `scope=zone` buckets are not.
+
+#### Diagnostic
+
+When a `rate_limit` rule appears in **more than one zone** and the
+author did **not** write `scope=`, the compiler warns and names the
+effective aggregate:
+
+```
+warning: 6:58: rate_limit(1000, per=src_ip) appears in 3 zones
+(wan, dmz, lan) with no scope=; scope defaults to zone, so each zone
+keeps its own bucket and the bundle-wide aggregate is 3000/s. Write
+scope=global for one shared bucket, or scope=zone to say per-zone is
+what you meant
+```
+
+The warning is not a deprecation of the default — per-zone stays the
+default and stays correct. It exists because per-zone is *more
+permissive* than the naive reading of a single `rate_limit(N)`, and for
+a rule used as a DoS control that gap is security-relevant. It fires
+only for the implicit default: once any copy of the rule states a
+scope, the author has declared intent and is not warned again.
+
+#### Compile errors
+
+- `scope=` with any value other than `zone` or `global`:
+  `error: rate_limit scope= must be zone or global, not '<value>'`
+
+#### Examples
+
+```
+# One SSH-flood budget for the whole appliance. A source that exhausts
+# its 10/s on the WAN gets nothing more by arriving on the DMZ.
+zone wan = [wan0]
+zone dmz = [dmz0]
+
+@xdp(wan)
+drop if pkt.proto == tcp and pkt.dst_port == 22
+       limited by rate_limit(10, per=src_ip, scope=global)
+allow
+
+@xdp(dmz)
+drop if pkt.proto == tcp and pkt.dst_port == 22
+       limited by rate_limit(10, per=src_ip, scope=global)
+allow
+```
+
+```
+# Per-zone fairness, stated rather than inherited: each zone admits
+# 1000/s per source independently. Identical in behaviour to omitting
+# scope, but it silences the multi-zone aggregate warning because the
+# author has said the 2000/s bundle total is intended.
+@xdp(wan)
+drop limited by rate_limit(1000, per=src_ip, scope=zone)
+allow
+
+@xdp(lan)
+drop limited by rate_limit(1000, per=src_ip, scope=zone)
+allow
+```
+
+### 6.8 Log-event record ABI
+
+`log` submits one record to `fwl_log_events`, a `BPF_MAP_TYPE_RINGBUF`
+that is **bundle-wide**: every zone object in a unit pins it by name
+and writes into one kernel ring. That is deliberate — the ring is fixed
+size and genuinely unit-wide, and splitting it per zone would push
+multiplexing onto every consumer for no gain.
+
+It does mean a record is only meaningful *with* its zone. `rule_index`
+is numbered within a zone, so zone `wan`'s rule 2 and zone `lan`'s rule
+2 write the same number into the same ring. **A logged rule is
+identified by the pair `(zone_id, rule_index)`, never by `rule_index`
+alone.**
+
+#### Record layout (v1)
+
+```c
+#define FWL_LOG_EVENT_MAGIC 0x464C4745u   /* "FLGE" */
+#define FWL_LOG_EVENT_VERSION 1u
+
+struct fwl_log_event {
+  __u32 magic;          /* offset  0 */
+  __u16 version;        /*         4 */
+  __u16 event_size;     /*         6 — sizeof(struct fwl_log_event) */
+  __u64 timestamp_ns;   /*         8 */
+  __u32 zone_id;        /*        16 */
+  __u32 rule_index;     /*        20 */
+  __u32 src_ip;         /*        24 */
+  __u32 dst_ip;         /*        28 */
+  __u16 src_port;       /*        32 */
+  __u16 dst_port;       /*        34 */
+  __u8  proto;          /*        36 */
+  __u8  flags;          /*        37 — bit 0 SYN, bit 1 ACK */
+  __u8  pad[2];         /*        38 */
+};                      /* 40 bytes */
+```
+
+The layout is defined once, in `fwl/log_abi.py`: both the C the
+emitter stamps into every object and the `struct` format its consumers
+unpack come from that module, and a unit test compiles the struct and
+asserts each offset against the format. Two copies of a record layout
+is how a reader and a datapath drift apart without either reporting an
+error.
+
+#### Header fields
+
+A consumer **must** validate `magic`, `version` and `event_size`
+before reading any other field, and **must** treat a mismatch as an
+error rather than skipping the record. The failure this guards against
+is not a crash: a changed layout unpacks into values that all look
+legal — a rule index that names a real rule, a port in range — so
+without the header a mismatch produces plausible wrong data and no
+diagnostic anywhere.
+
+#### `zone_id`
+
+`zone_id` is FNV-1a 32 over the UTF-8 zone name (offset basis
+`0x811C9DC5`, prime `0x01000193`).
+
+It is a hash of the name and not an ordinal assigned at emit time,
+because an ordinal is a property of a zone's *position* in the unit:
+inserting a zone renumbers every zone after it, and a table read back
+against a previous compilation then names the wrong zone — silently.
+The name is what every other artifact already keys on
+(`fwl_counters_<zone>`, the manifest, `pkt.zone`), so the id follows
+the name.
+
+A hash's one failure mode is a collision, and a collision restores
+exactly the ambiguity this field removes. It is therefore a **compile
+error**, checked across the whole unit's zone set:
+
+```
+error: zones 'wan' and 'lan' share log-event zone id 0x0BADC0DE. Log
+events identify their zone by a hash of its name, so a collision makes
+the two zones' events indistinguishable — the ambiguity the zone tag
+removes. Rename one of them.
+```
+
+`zone_id == 0` is reserved to mean "unattributed" and no zone may
+compile to it.
+
+#### The lookup table
+
+A numeric id a consumer cannot resolve to a name is no improvement on
+no id at all, so the table ships **with the bundle**. Every bundle's
+`manifest.json` carries a `zone_ids` object mapping name to id, over
+every zone the unit can emit an event from (including the degenerate
+`@xdp(eth0)` case, which declares no zones and still tags its records
+`eth0`):
+
+```json
+"zone_ids": {
+  "lan": 1449164816,
+  "wan": 736289537
+}
+```
+
+`fwl_shared.h` repeats the table as a comment for a human reading the
+bundle; `manifest.json` is the machine-readable copy.
+
+#### Rejected alternatives
+
+- **Bundle-global rule numbering.** Would couple every zone object to
+  whole-unit knowledge at emit time — the same coupling that made the
+  shared-counter-map defect possible.
+- **Packing the zone into the high bits of `rule_index`.** Saves four
+  bytes, costs clarity, and caps the rule count.
+- **One ring buffer per zone.** The shared ring is correct; splitting
+  it moves multiplexing into every consumer and buys nothing.
 
 ### Examples
 

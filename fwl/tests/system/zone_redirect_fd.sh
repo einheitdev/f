@@ -80,7 +80,7 @@ drop
 EOF
 
 cd "$WS"
-PYTHONPATH="$WS" "$FWL" compile "$WORK/gw.fw" \
+PYTHONPATH="$WS${PYTHONPATH:+:$PYTHONPATH}" "$FWL" compile "$WORK/gw.fw" \
   --bundle "$BUNDLE/current" || { fail "fwl compile --bundle"; exit 1; }
 
 # The bundle must carry real compiled objects (clang available) or fd
@@ -164,12 +164,12 @@ ip netns exec wandst timeout 6 tcpdump -i wan0p -c 1 -nn \
 CAPPID=$!
 sleep 1
 
-ip netns exec lansrc env PYTHONPATH="$WS" "$PYBIN" "$HERE/send_frame.py" \
+ip netns exec lansrc env PYTHONPATH="$WS${PYTHONPATH:+:$PYTHONPATH}" "$PYBIN" "$HERE/send_frame.py" \
   lan0p 'tcp(src_ip="10.0.0.5", dst_ip="93.184.216.34", dst_port=80, syn=true)' \
   || fail "send frame"
 
 # A non-matching UDP frame must NOT cross.
-ip netns exec lansrc env PYTHONPATH="$WS" "$PYBIN" "$HERE/send_frame.py" \
+ip netns exec lansrc env PYTHONPATH="$WS${PYTHONPATH:+:$PYTHONPATH}" "$PYBIN" "$HERE/send_frame.py" \
   lan0p 'udp(src_ip="10.0.0.5", dst_ip="93.184.216.34", dst_port=53)' \
   2>/dev/null
 

@@ -1,0 +1,14 @@
+name: "chain masquerade"
+source_fw: |
+  @xdp(eth0)
+  masquerade if pkt.src_ip == 10.0.0.5
+  chain o
+  allow if pkt.proto == tcp and pkt.dst_port == 443
+  default drop
+
+test_packet:
+  builder: tcp(src_ip="10.0.0.5", dst_ip="9.9.9.9", dst_port=443)
+
+expected:
+  compiles: true
+  bpf_action: allow

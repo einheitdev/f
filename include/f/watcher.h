@@ -43,8 +43,9 @@ struct Watcher {
   /// thread atomically exchanges this for false to consume.
   std::atomic<bool> reload_requested{false};
 
-  /// Last observed mtime in nanoseconds since epoch.
-  int64_t last_mtime_ns = 0;
+  /// Last observed content fingerprint (mtime, size, inode and a
+  /// hash of the contents). 0 means the file was missing.
+  int64_t last_fingerprint = 0;
 
   /// True once WatcherStart has launched the thread.
   std::atomic<bool> running{false};
@@ -66,8 +67,9 @@ auto WatcherStart(Watcher& w) -> void;
 /// Stop and join the background thread.
 auto WatcherStop(Watcher& w) -> void;
 
-/// Check the source file mtime once. If changed, set
-/// `reload_requested` and update `last_mtime_ns`. Returns true
+/// Check the source file fingerprint once (mtime, size, inode and
+/// content hash). If changed, set
+/// `reload_requested` and update `last_fingerprint`. Returns true
 /// if a change was detected. Public for testing.
 auto WatcherCheckOnce(Watcher& w) -> bool;
 

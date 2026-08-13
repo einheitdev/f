@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# Test-plan L2 row 5: storm_shield.fw — the dogfood policy on copper.
+#
+# Deploys the real example (interface names adapted): wan zone on the
+# receive port eats the broadcast-domain firehose; lan zone sits on
+# the second data port (idle here — its masquerade+redirect path is
+# covered by l2_01/l2_03).
+#
+# KNOWN v0.4 GAP, demonstrated (not hidden) by the last assertion:
+# storm_shield promises "admit only replies to flows the testnet
+# initiated", but in v0.4 bundle mode the lan program (masquerade +
+# redirect) creates NO conntrack entry — entry creation happens only
+# on explicit `allow`, and NAT-driven flow creation is Phase 5. So
+# `allow if conntrack(pkt).state == established` on the wan side can
+# never match: replies are de-NATed, then dropped. The test pins that
+# behavior so the fix (Phase 5) has a wire-level regression witness.
+source "$(dirname "$0")/hwlib.sh"
+hw::require_root
+trap hw::finish EXIT
+
+LAN_IF="${LAN_IF:-enp1s0f2}"
+FW=$(mktemp --suffix=.fw)
+sed -e "s/\bwan0\b/$RECV_IF/g" -e "s/\blan0\b/$LAN_IF/g" \
+  /opt/fwl/examples/storm_shield.fw > "$FW"
+hw::deploy l2-06 "$FW"
+
+hw::sniff_start 8
+# The plant-floor firehose, as unicast MACs through the switch:
+hw::send 100 'udp(src_ip="10.99.40.1", dst_ip="239.255.255.250", dst_port=1900)'
+hw::send 100 'udp(src_ip="10.99.40.1", dst_ip="255.255.255.255", dst_port=7437)'
+hw::send 100 'udp(src_ip="10.99.40.2", dst_ip="10.99.40.9", dst_port=137)'
+# A DHCP offer (broadcast reply from a server) must survive:
+hw::send 20 'udp(src_ip="10.99.40.3", dst_ip="255.255.255.255", src_port=67, dst_port=68)'
+# An unsolicited "reply" — no testnet flow initiated it:
+hw::send 50 'tcp(src_ip="10.99.40.9", dst_ip="10.99.40.2", src_port=443, dst_port=52000, syn=true, ack=true)'
+sleep 1
+hw::sniff_wait
+
+# The multicast/broadcast counters legitimately catch ambient VLAN
+# noise (IGMP, mDNS) on top of the test frames — small headroom.
+assert_range "counter noise_multicast" \
+  "$(hw::counter noise_multicast)" 100 115
+assert_range "counter noise_broadcast" \
+  "$(hw::counter noise_broadcast)" 120 135
+assert_eq "counter noise_netbios" "$(hw::counter noise_netbios)" 100
+assert_range "counter wan_total (all of the above)" \
+  "$(hw::counter wan_total)" 370 400
+assert_eq "wire: SSDP dead" \
+  "$(hw::sniff_get udp:10.99.40.1:1900)" 0
+assert_eq "wire: broadcast dead" \
+  "$(hw::sniff_get udp:10.99.40.1:7437)" 0
+assert_eq "wire: NetBIOS dead" \
+  "$(hw::sniff_get udp:10.99.40.2:137)" 0
+assert_eq "wire: DHCP offer survives" \
+  "$(hw::sniff_get udp:10.99.40.3:68)" 20
+# The documented gap: replies cannot become established in v0.4.
+assert_eq "wire: unsolicited reply dropped (v0.4 gap: NO flow can \
+be established — see header)" \
+  "$(hw::sniff_get tcp:10.99.40.9:52000)" 0

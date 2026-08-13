@@ -1,0 +1,15 @@
+name: "fail recursive helper"
+source_fw: |
+  def a(pkt):
+    a(pkt)
+    drop
+  
+  @xdp(eth0)
+  def m(pkt):
+    a(pkt)
+
+test_packet:
+  builder: tcp()
+
+expected:
+  compiles: false

@@ -5,6 +5,11 @@
 
 #include <sys/stat.h>
 
+#include <fstream>
+#include <functional>
+#include <iterator>
+#include <string>
+
 #include <filesystem>
 #include <format>
 
@@ -13,16 +18,46 @@
 namespace f {
 namespace {
 
-/// Read the mtime of `path` as nanoseconds since epoch. Returns
-/// 0 if the file doesn't exist or cannot be stat'd.
-auto StatMtimeNs(std::string_view path) -> int64_t {
+/// A fingerprint of the policy file: mtime, size, inode, and a hash
+/// of the contents.
+///
+/// mtime alone is not enough. Every mtime-preserving deployment tool
+/// — `cp -p`, `rsync -a`, `tar x`, `install -p`, restoring a backup —
+/// installs new content under the old timestamp, and the watcher
+/// simply never noticed: new policy on disk, old policy in the
+/// kernel, nothing logged. Confirmed on hardware
+/// (tests/system/hw/l8_04_watcher_mtime.sh): the superseded policy
+/// was still dropping traffic while the file on disk said otherwise.
+///
+/// Hashing the contents also makes the check *narrower* in the right
+/// way: a touch that does not change the policy no longer triggers a
+/// recompile-and-swap. The file is a few KB and this runs on a 5 s
+/// poll, so the read costs nothing worth measuring. Returns 0 when
+/// the file is missing or unreadable.
+auto FingerprintFile(std::string_view path) -> int64_t {
+  std::string p(path);
   struct stat st{};
-  if (::stat(std::string(path).c_str(), &st) != 0) {
+  if (::stat(p.c_str(), &st) != 0) {
     return 0;
   }
-  return static_cast<int64_t>(st.st_mtim.tv_sec)
-       * 1'000'000'000
-       + static_cast<int64_t>(st.st_mtim.tv_nsec);
+  int64_t fp = static_cast<int64_t>(st.st_mtim.tv_sec)
+             * 1'000'000'000
+             + static_cast<int64_t>(st.st_mtim.tv_nsec);
+  fp ^= static_cast<int64_t>(st.st_size) << 1;
+  fp ^= static_cast<int64_t>(st.st_ino) << 3;
+
+  std::ifstream in(p, std::ios::in | std::ios::binary);
+  if (!in) {
+    // Unreadable but present: fall back to the stat fingerprint so a
+    // later permission fix still registers as a change.
+    return fp ? fp : 1;
+  }
+  std::string content((std::istreambuf_iterator<char>(in)),
+                      std::istreambuf_iterator<char>());
+  auto h = static_cast<int64_t>(std::hash<std::string>{}(content));
+  // Keep it non-zero: 0 is the "missing file" sentinel.
+  int64_t combined = fp ^ h;
+  return combined ? combined : 1;
 }
 
 }  // namespace
@@ -45,10 +80,10 @@ auto WatcherInit(Watcher& w,
   w.compiled_dir = std::string(compiled_dir);
   w.interval = interval;
 
-  // Pre-record the current mtime so the first tick doesn't
+  // Pre-record the current fingerprint so the first tick doesn't
   // fire a spurious reload against unchanged content.
-  w.last_mtime_ns = StatMtimeNs(w.source_path);
-  if (w.last_mtime_ns == 0) {
+  w.last_fingerprint = FingerprintFile(w.source_path);
+  if (w.last_fingerprint == 0) {
     return MakeError(
         WatcherError::kSourceNotFound,
         std::format("source not found: {}", w.source_path));
@@ -67,15 +102,15 @@ auto WatcherInit(Watcher& w,
 }
 
 auto WatcherCheckOnce(Watcher& w) -> bool {
-  int64_t now = StatMtimeNs(w.source_path);
+  int64_t now = FingerprintFile(w.source_path);
   if (now == 0) {
     // File may have been removed; wait for it to come back.
     return false;
   }
-  if (now == w.last_mtime_ns) {
+  if (now == w.last_fingerprint) {
     return false;
   }
-  w.last_mtime_ns = now;
+  w.last_fingerprint = now;
   w.reload_requested.store(true, std::memory_order_release);
   spdlog::info("watcher: change detected on {}", w.source_path);
   return true;

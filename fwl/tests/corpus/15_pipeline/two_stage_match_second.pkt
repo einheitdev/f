@@ -1,0 +1,14 @@
+name: "two stage match second"
+source_fw: |
+  @xdp(eth0)
+  allow if pkt.src_ip == 1.1.1.1
+  chain b
+  drop if pkt.src_ip == 2.2.2.2
+  default allow
+
+test_packet:
+  builder: tcp(src_ip="2.2.2.2", dst_ip="9.9.9.9", dst_port=80)
+
+expected:
+  compiles: true
+  bpf_action: drop

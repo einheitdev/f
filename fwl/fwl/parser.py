@@ -388,12 +388,40 @@ class _ToAst(Transformer):
     )
 
   def modifier(self, children) -> ast.RateLimit:
-    threshold_tok, field_tok = children
+    threshold_tok, field_tok = children[0], children[1]
+    scope = ast.RlScope.ZONE
+    explicit = False
+    if len(children) > 2:
+      scope = children[2]
+      explicit = True
     return ast.RateLimit(
       threshold=_parse_int(str(threshold_tok)),
       per_field=str(field_tok),
       span=_span(threshold_tok),
+      scope=scope,
+      scope_explicit=explicit,
     )
+
+  def rl_scope(self, children) -> "ast.RlScope":
+    """`, scope=<zone|global>` (v0.4 § 6.7).
+
+    The grammar admits any IDENTIFIER here (plus the ZONE keyword
+    token) so that `global` need not become a reserved word; the
+    spec's two values are enforced here, with a message that names
+    them, rather than as a bare "expected one of" syntax error.
+    """
+    (tok,) = children
+    text = str(tok)
+    try:
+      return ast.RlScope(text)
+    except ValueError:
+      raise FwlException(FwlError(
+        category="semantic",
+        message=(
+          f"rate_limit scope= must be zone or global, not '{text}'"
+        ),
+        span=_span(tok),
+      )) from None
 
   def RL_FIELD(self, tok):
     return tok
@@ -413,13 +441,26 @@ class _ToAst(Transformer):
       span=_span(zone_tok),
     )
 
+  def chain_decl(self, children) -> ast.ChainMarker:
+    """`chain <name>` — a v0.4 § 6.6 manual stage boundary."""
+    chain_tok, name_tok = children
+    return ast.ChainMarker(name=str(name_tok), span=_span(chain_tok))
+
   def xdp_block(self, children) -> ast.ZoneProgram:
     """One @xdp(<zone>) block — a single zone's policy (v0.4 § 6.2)."""
     hook = children[0]
     default: ast.DefaultRule | None = None
     function: ast.FunctionDef | None = None
     rules: list[ast.Rule] = []
+    # v0.4 § 6.6: record each `chain` marker's position as the rule
+    # index that begins a new stage (the count of rules seen so far).
+    chain_boundaries: list[int] = []
     for child in children[1:]:
+      if isinstance(child, ast.ChainMarker):
+        boundary = len(rules)
+        if boundary not in chain_boundaries:
+          chain_boundaries.append(boundary)
+        continue
       if isinstance(child, ast.DefaultRule):
         if default is not None:
           raise FwlException(FwlError(
@@ -439,18 +480,25 @@ class _ToAst(Transformer):
           ))
         rules.append(child)
     return ast.ZoneProgram(
-      hook=hook, rules=rules, default=default, function=function
+      hook=hook, rules=rules, default=default, function=function,
+      chain_boundaries=tuple(chain_boundaries),
     )
 
   def program(self, children) -> ast.Program:
     zones: list[ast.ZoneDecl] = []
     programs: list[ast.ZoneProgram] = []
+    # v0.4 § 6.5: FunctionDef children appearing at the top level (before
+    # any @xdp block) are shared helper defs; those inside an xdp_block
+    # arrive folded into their ZoneProgram.function by `xdp_block`.
+    helpers: list[ast.FunctionDef] = []
     for child in children:
       if isinstance(child, ast.ZoneDecl):
         zones.append(child)
       elif isinstance(child, ast.ZoneProgram):
         programs.append(child)
-    return ast.Program(programs=programs, zones=zones)
+      elif isinstance(child, ast.FunctionDef):
+        helpers.append(child)
+    return ast.Program(programs=programs, zones=zones, helpers=helpers)
 
   # --- conditions ---
 
@@ -763,6 +811,11 @@ class _ToAst(Transformer):
   def statement(self, children) -> ast.Stmt:
     (stmt,) = children
     return stmt
+
+  def call_stmt(self, children) -> ast.CallStmt:
+    """`helper(pkt)` — a v0.4 § 6.5 multi-def call statement."""
+    (name_tok,) = children
+    return ast.CallStmt(name=str(name_tok), span=_span(name_tok))
 
   def elif_clause(self, children) -> tuple[ast.Condition, list[ast.Stmt]]:
     cond, body_block = children

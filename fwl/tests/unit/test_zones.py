@@ -4,6 +4,8 @@ Covers the parser/analyzer/emitter/interpreter surfaces added for zone
 declarations, per-zone @xdp blocks, the `redirect to <zone>` action,
 and the `pkt.zone` compile-time constant.
 """
+import re
+
 import pytest
 
 from fwl import analyzer, ast, bpf_runner, emitter, interpreter, parser, pkt
@@ -189,7 +191,7 @@ class TestEmitter:
       WL + "@xdp(lan)\ndef f(pkt):\n  if pkt.zone == lan:\n"
       "    redirect to wan\n  drop\n",
     ):
-      bpf_runner.compile_c(_emit(src))  # raises on failure
+      bpf_runner.check_compiles(_emit(src))  # raises on failure
 
   def test_bundle_one_file_per_zone(self):
     prog = _analyze(WL + "@xdp(wan)\ndrop\n@xdp(lan)\nredirect to wan\n")
@@ -206,6 +208,91 @@ class TestEmitter:
     # The pinned map is the shared conntrack state.
     assert "} conntrack SEC" in files["wan.bpf.c"]
 
+  def test_bundle_zone_private_maps_are_zone_qualified(self):
+    # Two zones with DIFFERENT counter sets: a bundle-global pinned
+    # `fwl_counters` would fail to load (parameter mismatch reusing
+    # the pin) or cross-wire slots. Private maps carry the zone name.
+    prog = _analyze(
+      WL + "@xdp(wan)\ncount wan_a\ncount wan_b\ndrop\n"
+      "@xdp(lan)\ncount lan_only\nredirect to wan\n"
+    )
+    files = emitter.emit_bundle(prog)
+    assert "fwl_counters_wan" in files["wan.bpf.c"]
+    assert "fwl_counters_lan" in files["lan.bpf.c"]
+    assert "fwl_counters SEC" not in files["wan.bpf.c"]
+    assert "fwl_counters SEC" not in files["lan.bpf.c"]
+
+  def test_bundle_log_sample_map_is_zone_qualified(self):
+    # `fwl_log_sample` is sized len(zone.rules) and indexed by the
+    # zone's own rule index. Sharing it bundle-wide breaks both ways:
+    # unequal rule counts fail to load, equal rule counts silently
+    # cross-advance each other's sampling phase.
+    prog = _analyze(
+      WL + "@xdp(wan)\nlog(sample=4) if pkt.proto == udp\n"
+      "log(sample=4) if pkt.proto == tcp\ndrop\n"
+      "@xdp(lan)\nlog(sample=4) if pkt.proto == udp\nallow\n"
+    )
+    files = emitter.emit_bundle(prog)
+    assert "fwl_log_sample_wan" in files["wan.bpf.c"]
+    assert "fwl_log_sample_lan" in files["lan.bpf.c"]
+    assert "fwl_log_sample SEC" not in files["wan.bpf.c"]
+    assert "fwl_log_sample SEC" not in files["lan.bpf.c"]
+
+  def test_bundle_pinned_maps_agree_on_max_entries(self):
+    # The invariant behind every zone-qualified name, stated once and
+    # checked structurally so a NEW map cannot reintroduce the bug:
+    # any map pinned under a name shared by two zone objects must be
+    # declared identically in both. libbpf validates the definition
+    # when reusing a pin, so a divergence is either -EINVAL at load
+    # (unequal sizes) or silent cross-zone aliasing (equal sizes).
+    # Every construct that emits a map appears in at least one zone.
+    #
+    # This logic now also lives in the emitter
+    # (`_check_bundle_pinned_maps`), so it runs on every compile and
+    # not only here. The test stays as the readable statement of the
+    # property, and as a check on a real multi-construct policy —
+    # tests/unit/test_map_scope.py holds the invariant itself down.
+    prog = _analyze(
+      "zone wan = [wan0]\nzone lan = [lan0]\n"
+      "@xdp(wan)\n"
+      "count wan_a\ncount wan_b\n"
+      "log(sample=4) if pkt.proto == udp\n"
+      "drop if pkt.src_ip in geoip(RU)\n"
+      "drop limited by rate_limit(10, per=src_ip)\n"
+      "drop limited by rate_limit(7, per=src_ip, scope=global)\n"
+      "allow if conntrack(pkt).state == established\n"
+      "masquerade\ndrop\n"
+      "@xdp(lan)\n"
+      "count lan_only\n"
+      "log(sample=8) if pkt.proto == tcp\n"
+      "drop if pkt.src_ip in geoip(CN)\n"
+      "drop limited by rate_limit(7, per=src_ip, scope=global)\n"
+      "redirect to wan\n"
+    )
+    files = emitter.emit_bundle(prog)
+    # map name -> set of the distinct declaration bodies seen for it
+    pinned: dict[str, set[str]] = {}
+    for name, src in files.items():
+      if not name.endswith(".bpf.c"):
+        continue
+      for m in re.finditer(
+          r"struct \{(.*?)\}\s*(\w+) SEC\(\"\.maps\"\);", src, re.S):
+        body, map_name = m.group(1), m.group(2)
+        if "LIBBPF_PIN_BY_NAME" in body:
+          pinned.setdefault(map_name, set()).add(body)
+    # Sanity: the policy really did emit shared pinned maps to check.
+    # The two zones differ in rule count, counter count and geoip call
+    # count, so a map whose shape came from a zone's own analysis WOULD
+    # diverge here. `fwl_rl_g0` is the v0.4 § 6.7 global bucket: named
+    # bundle-wide on purpose, and therefore held to this invariant.
+    assert "conntrack" in pinned
+    assert "fwl_rl_g0" in pinned
+    divergent = {k: v for k, v in pinned.items() if len(v) > 1}
+    assert not divergent, (
+      f"pinned maps declared differently across zones: "
+      f"{sorted(divergent)}"
+    )
+
   def test_bundle_zone_files_compile(self):
     prog = _analyze(
       WL + "@xdp(wan)\nallow if conntrack(pkt).state == established\ndrop\n"
@@ -214,7 +301,7 @@ class TestEmitter:
     files = emitter.emit_bundle(prog)
     for name, src in files.items():
       if name.endswith(".bpf.c"):
-        bpf_runner.compile_c(src)
+        bpf_runner.check_compiles(src)
 
 
 # --------------------------------------------------------------------
@@ -266,4 +353,4 @@ class TestBackwardCompat:
     assert prog.hook.interface == "eth0"
     assert len(prog.rules) == 1
     c = emitter.emit(prog)
-    bpf_runner.compile_c(c)
+    bpf_runner.check_compiles(c)

@@ -15,8 +15,11 @@ any guard requirement.
 """
 from __future__ import annotations
 
+import dataclasses
+from enum import Enum
+
 from . import ast
-from .errors import FwlError, FwlException
+from .errors import FwlError, FwlException, FwlWarning
 from .iso3166 import ALPHA2_CODES
 
 
@@ -90,12 +93,298 @@ def analyze(program: ast.Program) -> ast.Program:
   `family` written during this pass; RateLimitCall nodes have
   `call_index` written. Every other AST node stays immutable.
   """
+  program.warnings.clear()
   declared = _collect_declared_zones(program)
   _check_xdp_zone_bindings(program, declared)
+  # v0.4 § 6.5 multi-def: validate + type-check the shared helper defs
+  # once, returning the set of callable names for the per-zone passes.
+  helper_names = _analyze_helpers(program, declared)
   for zp in program.programs:
     _check_zone_references(zp, declared)
-    _analyze_program(zp)
+    _analyze_program(zp, helper_names)
+  # v0.4 § 6.7 rate-limit scope. Both passes are bundle-wide by
+  # construction — a global bucket's slot number and the "how many
+  # zones does this rule reach" question are properties of the unit,
+  # not of any one zone — so they run after the per-zone analysis.
+  _assign_global_rate_limit_slots(program)
+  _warn_implicit_multizone_rate_limit(program)
   return program
+
+
+def _analyze_helpers(
+  program: ast.Program, declared: dict[str, ast.ZoneDecl]
+) -> frozenset[str]:
+  """Validate the unit's top-level helper defs (v0.4 § 6.5 multi-def).
+
+  Each helper is a self-contained Tier 2 function: it type-checks and
+  guard-checks independently (the verifier analyzes each BPF function
+  once), so a helper that reads pkt.dst_port must guard on the protocol
+  inside its own body. Rejects duplicate helper names, calls to
+  undefined helpers, recursion (helpers may not form a call cycle — BPF
+  forbids recursion), and helper-only unsupported constructs
+  (geoip/rate_limit/pkt.zone, whose per-zone lowering does not compose
+  with a shared, per-zone-duplicated function body in v0.4).
+  """
+  names: set[str] = set()
+  for h in program.helpers:
+    if h.name in names:
+      raise FwlException(FwlError(
+        category="semantic",
+        message=f"duplicate helper def '{h.name}'",
+        span=h.span,
+      ))
+    names.add(h.name)
+  helper_names = frozenset(names)
+  _check_helper_cycles(program.helpers, helper_names)
+  for h in program.helpers:
+    _reject_helper_unsupported(h)
+    _check_zone_refs_stmts(h.body, declared)
+    ctx = _Tier2Ctx(helper_names=helper_names)
+    _check_stmts(h.body, ctx, established_guards=frozenset())
+    _check_stack_budget(h, ctx)
+  return helper_names
+
+
+def _calls_in_stmts(stmts):
+  """Yield every CallStmt reachable in a statement block (all branches)."""
+  for s in stmts:
+    if isinstance(s, ast.CallStmt):
+      yield s
+    elif isinstance(s, ast.IfStmt):
+      yield from _calls_in_stmts(s.body)
+      for _cond, body in s.elif_branches:
+        yield from _calls_in_stmts(body)
+      if s.else_body is not None:
+        yield from _calls_in_stmts(s.else_body)
+
+
+def _check_helper_cycles(
+  helpers: list[ast.FunctionDef], helper_names: frozenset[str]
+) -> None:
+  """Reject recursion / mutual recursion among helper defs.
+
+  BPF-to-BPF calls may not recurse; a call cycle would also make the
+  emitter's per-function lowering non-terminating. Any call to a name
+  that is not a declared helper is left for the per-body pass to report
+  as "call to undefined helper".
+  """
+  graph: dict[str, list[str]] = {}
+  by_name = {h.name: h for h in helpers}
+  for h in helpers:
+    graph[h.name] = [
+      c.name for c in _calls_in_stmts(h.body) if c.name in by_name
+    ]
+  # Iterative DFS with a recursion stack for cycle detection.
+  WHITE, GREY, BLACK = 0, 1, 2
+  color = {n: WHITE for n in graph}
+
+  def visit(node: str, path: list[str]) -> None:
+    color[node] = GREY
+    path.append(node)
+    for nxt in graph[node]:
+      if color[nxt] == GREY:
+        cycle = " -> ".join(path[path.index(nxt):] + [nxt])
+        raise FwlException(FwlError(
+          category="semantic",
+          message=f"recursive helper call cycle: {cycle}",
+          span=by_name[node].span,
+        ))
+      if color[nxt] == WHITE:
+        visit(nxt, path)
+    path.pop()
+    color[node] = BLACK
+
+  for n in graph:
+    if color[n] == WHITE:
+      visit(n, [])
+
+
+def _reject_helper_unsupported(func: ast.FunctionDef) -> None:
+  """Reject constructs a shared helper may not use in v0.4 § 6.5."""
+  for op in _walk_geoip_in_stmts(func.body):
+    raise FwlException(FwlError(
+      category="semantic",
+      message=(
+        f"geoip() is not supported inside a helper def '{func.name}' "
+        f"(v0.4 § 6.5); use it in the @xdp body"
+      ),
+      span=op.span,
+    ))
+  for call in _walk_rate_limit_in_stmts(func.body):
+    raise FwlException(FwlError(
+      category="semantic",
+      message=(
+        f"rate_limit() is not supported inside a helper def "
+        f"'{func.name}' (v0.4 § 6.5)"
+      ),
+      span=call.span,
+    ))
+  _reject_zone_field_stmts(func.name, func.body)
+
+
+def _reject_zone_field_stmts(fname: str, stmts) -> None:
+  """Reject pkt.zone anywhere in a helper body (its value is per-caller)."""
+  for s in stmts:
+    if isinstance(s, ast.AssignStmt):
+      _reject_zone_field_expr(fname, s.rhs)
+    elif isinstance(s, ast.IfStmt):
+      _reject_zone_field_expr(fname, s.cond)
+      _reject_zone_field_stmts(fname, s.body)
+      for cond, body in s.elif_branches:
+        _reject_zone_field_expr(fname, cond)
+        _reject_zone_field_stmts(fname, body)
+      if s.else_body is not None:
+        _reject_zone_field_stmts(fname, s.else_body)
+
+
+def _reject_zone_field_expr(fname: str, expr) -> None:
+  if isinstance(expr, ast.ZoneCompare):
+    raise FwlException(FwlError(
+      category="semantic",
+      message=(
+        f"pkt.zone is not supported inside a helper def '{fname}' "
+        f"(v0.4 § 6.5): a shared helper has no single ingress zone"
+      ),
+      span=expr.span,
+    ))
+  if isinstance(expr, ast.NotOp):
+    _reject_zone_field_expr(fname, expr.inner)
+  elif isinstance(expr, (ast.AndOp, ast.OrOp)):
+    for c in expr.operands:
+      _reject_zone_field_expr(fname, c)
+
+
+# --------------------------------------------------------------------
+# v0.4 § 6.7 — rate_limit zone scope.
+#
+# A `scope=global` bucket is bundle-SHARED state: the emitter pins its
+# map under one bundle-global name, so every zone object declaring it
+# resolves to the same kernel map. The audit in commit 4a944e6 fixed
+# the line such a name has to sit on — a map may only wear a
+# bundle-global name when its size and the meaning of its indices are
+# bundle-global too, never derived from one zone's own analysis. Both
+# halves are held here and in the emitter:
+#
+#   max_entries — a constant in the emitted declaration (not
+#     len(zone.rules)), so every object declares the map identically
+#     and libbpf's pin-reuse check cannot fail with -EINVAL.
+#   slot number — allocated over the WHOLE unit and from the rule's
+#     STRUCTURE, never from its index inside a zone. Two zones holding
+#     the same rule get the same slot, which is the sharing the author
+#     asked for; two different rules never collide, whatever their
+#     per-zone rule indices happen to be.
+#
+# Zone-scoped buckets are untouched: still one map per rule index, still
+# zone-suffixed, still unpinned.
+
+_SIGNATURE_SKIP_FIELDS = frozenset({
+  # Source position: two zones' copies of one rule sit on different
+  # lines and are still the same rule.
+  "span",
+  # Analyzer-assigned numbering — per-zone (geoip call_index) or the
+  # very thing being allocated (global_slot).
+  "call_index", "global_slot",
+  # Whether the author WROTE `scope=`. `scope` itself is in the key, so
+  # an explicit `scope=zone` and an omitted one are the same rule.
+  "scope_explicit",
+})
+
+
+def _structural_key(node):
+  """A hashable, source-position-free digest of an AST subtree.
+
+  Two rules with the same key are the same rule written twice — same
+  action, same condition, same rate-limit arguments — which is what
+  "one bucket per rule across the bundle" has to mean for a rule that
+  a multi-zone policy repeats once per zone.
+  """
+  if isinstance(node, Enum):
+    return (type(node).__name__, node.value)
+  if dataclasses.is_dataclass(node) and not isinstance(node, type):
+    return (type(node).__name__,) + tuple(
+      (f.name, _structural_key(getattr(node, f.name)))
+      for f in dataclasses.fields(node)
+      if f.name not in _SIGNATURE_SKIP_FIELDS
+    )
+  if isinstance(node, (list, tuple)):
+    return tuple(_structural_key(x) for x in node)
+  if isinstance(node, (set, frozenset)):
+    return tuple(sorted(repr(_structural_key(x)) for x in node))
+  if isinstance(node, dict):
+    return tuple(
+      (k, _structural_key(v)) for k, v in sorted(node.items())
+    )
+  return node
+
+
+def _rate_limit_rules(program: ast.Program):
+  """(zone_name, rule) for every Tier 1 rate_limit rule in the unit."""
+  for zp in program.programs:
+    for rule in zp.rules:
+      if rule.modifier is not None:
+        yield zp.zone_name, rule
+
+
+def _assign_global_rate_limit_slots(program: ast.Program) -> None:
+  """Number every `scope=global` bucket, bundle-wide, by rule identity.
+
+  Runs over the whole unit in source order so the numbering is a
+  property of the bundle and is therefore identical in every zone
+  object the emitter writes — the requirement that makes one pinned
+  name safe to share. ZONE-scoped modifiers keep slot -1; they are
+  addressed by their per-zone rule index as before.
+  """
+  slots: dict[tuple, int] = {}
+  for _zone, rule in _rate_limit_rules(program):
+    mod = rule.modifier
+    if mod.scope is not ast.RlScope.GLOBAL:
+      mod.global_slot = -1
+      continue
+    key = _structural_key(rule)
+    if key not in slots:
+      slots[key] = len(slots)
+    mod.global_slot = slots[key]
+
+
+def _warn_implicit_multizone_rate_limit(program: ast.Program) -> None:
+  """Warn when an unscoped rate_limit rule sits in more than one zone.
+
+  Per-zone is the default and the safe-for-existing-policy choice, but
+  it is more permissive than the naive reading: the same
+  `rate_limit(N)` written into three zones permits 3N packets per
+  second in total, and for a rule used as a DoS control that gap is
+  security-relevant. The warning names the effective aggregate.
+
+  It fires only for the IMPLICIT default. Once any copy of the rule
+  says `scope=`, the author has stated intent and is not nagged again.
+  """
+  groups: dict[tuple, list[tuple[str, ast.Rule]]] = {}
+  for zone, rule in _rate_limit_rules(program):
+    if rule.modifier.scope is not ast.RlScope.ZONE:
+      continue
+    groups.setdefault(_structural_key(rule), []).append((zone, rule))
+  for members in groups.values():
+    zones: list[str] = []
+    for zone, _rule in members:
+      if zone not in zones:
+        zones.append(zone)
+    if len(zones) < 2:
+      continue
+    if any(r.modifier.scope_explicit for _z, r in members):
+      continue
+    mod = members[0][1].modifier
+    aggregate = mod.threshold * len(members)
+    program.warnings.append(FwlWarning(
+      message=(
+        f"rate_limit({mod.threshold}, per={mod.per_field}) appears in "
+        f"{len(zones)} zones ({', '.join(zones)}) with no scope=; "
+        f"scope defaults to zone, so each zone keeps its own bucket "
+        f"and the bundle-wide aggregate is {aggregate}/s. Write "
+        f"scope=global for one shared bucket, or scope=zone to say "
+        f"per-zone is what you meant"
+      ),
+      span=mod.span,
+    ))
 
 
 def _collect_declared_zones(
@@ -266,7 +555,9 @@ def _check_zone_refs_stmts(
         _check_zone_refs_stmts(s.else_body, declared)
 
 
-def _analyze_program(program) -> object:
+def _analyze_program(
+  program, helper_names: frozenset[str] = frozenset()
+) -> object:
   """Per-@xdp-block analysis (Tier 1/Tier 2 dispatch).
 
   `program` is a ZoneProgram (or, in the single-block degenerate case,
@@ -278,6 +569,14 @@ def _analyze_program(program) -> object:
   # Mutual exclusion: per FWL_V02_SPEC.md § Tier 2 / Edge cases.
   has_tier1 = bool(program.rules) or program.default is not None
   has_tier2 = program.function is not None
+  # v0.4 § 6.6: `chain` separates Tier 1 rules; a Tier 2 body is split
+  # (if at all) at the parse/policy seam, not by a manual marker.
+  if has_tier2 and getattr(program, "chain_boundaries", ()):
+    raise FwlException(FwlError(
+      category="semantic",
+      message="'chain' is a Tier 1 stage boundary; not valid in a def body",
+      span=program.function.span if program.function else None,
+    ))
   if has_tier1 and has_tier2:
     raise FwlException(FwlError(
       category="semantic",
@@ -288,8 +587,11 @@ def _analyze_program(program) -> object:
       span=program.function.span if program.function else None,
     ))
 
+  # A Tier 1 rule sequence cannot host a CallStmt (calls are Tier 2
+  # statements), so a file with helpers but a rule-based @xdp body still
+  # works — the helpers just go uncalled from that zone.
   if has_tier2:
-    return _analyze_tier2(program)
+    return _analyze_tier2(program, helper_names)
   return _analyze_tier1(program)
 
 
@@ -341,7 +643,9 @@ def _analyze_tier1(program) -> object:
   return program
 
 
-def _analyze_tier2(program: ast.Program) -> ast.Program:
+def _analyze_tier2(
+  program: ast.Program, helper_names: frozenset[str] = frozenset()
+) -> ast.Program:
   """Tier 2 analyzer pass — type infer locals + dominator + reachability.
 
   Implementation detail per FWL_V02_SPEC.md § Tier 2:
@@ -357,7 +661,7 @@ def _analyze_tier2(program: ast.Program) -> ast.Program:
   assert func is not None
   _assign_geoip_call_indices_tier2(program)
   _assign_rate_limit_call_indices_tier2(program)
-  ctx = _Tier2Ctx()
+  ctx = _Tier2Ctx(helper_names=helper_names)
   _check_stmts(func.body, ctx, established_guards=frozenset())
   _check_stack_budget(func, ctx)
   if len(ctx.counter_names) > _MAX_COUNTERS:
@@ -374,10 +678,12 @@ def _analyze_tier2(program: ast.Program) -> ast.Program:
 
 class _Tier2Ctx:
   """Mutable state threaded through the Tier 2 walk."""
-  def __init__(self):
+  def __init__(self, helper_names: frozenset[str] = frozenset()):
     self.locals: dict[str, ast.LocalType] = {}
     self.counter_names: set[str] = set()
     self.next_rate_limit_index = 0
+    # v0.4 § 6.5: names of top-level helper defs a CallStmt may target.
+    self.helper_names = helper_names
 
 
 def _check_stmts(
@@ -412,6 +718,17 @@ def _check_stmts(
         terminated = True
     elif isinstance(stmt, ast.AssignStmt):
       _check_assign(stmt, ctx, guards)
+    elif isinstance(stmt, ast.CallStmt):
+      # v0.4 § 6.5: the target must be a declared helper. A call is
+      # non-terminal for reachability (the helper *may* terminate, but
+      # we cannot prove it does on every path) and establishes no
+      # guards in the caller.
+      if stmt.name not in ctx.helper_names:
+        raise FwlException(FwlError(
+          category="semantic",
+          message=f"call to undefined helper '{stmt.name}'",
+          span=stmt.span,
+        ))
     elif isinstance(stmt, ast.IfStmt):
       branch_terms = []
       branch_cond_guards = _established_by(stmt.cond)

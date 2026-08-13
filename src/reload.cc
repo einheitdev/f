@@ -5,6 +5,7 @@
 
 #include <spawn.h>
 #include <sys/wait.h>
+#include <net/if.h>
 #include <unistd.h>
 
 #include <chrono>
@@ -12,9 +13,8 @@
 #include <filesystem>
 #include <format>
 #include <fstream>
+#include <set>
 #include <sstream>
-#include <unordered_map>
-#include <unordered_set>
 #include <vector>
 
 #include <nlohmann/json.hpp>
@@ -80,19 +80,28 @@ auto RunCompiler(std::string_view fwl_path,
                  std::string_view output_dir)
     -> std::expected<std::string, Error<ReloadError>> {
   // Build argv: fwl compile <source> --bundle <output_dir>
+  // [--geoip /etc/f/geoip.json]. The geoip data file is passed
+  // whenever the conventional path exists — the compiler ignores it
+  // for programs without geoip(), and a geoip() program without it
+  // is a hard compile error (silently empty tries never match).
   std::string fwl(fwl_path);
   std::string src(source_path);
   std::string out(output_dir);
+  static const std::string kGeoipData = "/etc/f/geoip.json";
   std::vector<char*> argv{
       fwl.data(),
       const_cast<char*>("compile"),
       src.data(),
       const_cast<char*>("--bundle"),
       out.data(),
-      nullptr,
   };
+  if (std::filesystem::exists(kGeoipData)) {
+    argv.push_back(const_cast<char*>("--geoip"));
+    argv.push_back(const_cast<char*>(kGeoipData.c_str()));
+  }
+  argv.push_back(nullptr);
 
-  // Pipe for capturing the JSON envelope from stdout.
+  // Pipe for capturing stdout (error context on failure).
   int stdout_pipe[2] = {-1, -1};
   if (pipe(stdout_pipe) != 0) {
     return MakeError(ReloadError::kSpawnFailed,
@@ -202,82 +211,82 @@ auto ApplyBundle(Engine& e, std::string_view bundle_dir)
   // apply. Route it to the zone loader instead of the single-program
   // rule-application path below.
   if (IsMultiZoneBundle(dir.string())) {
-    // Hitless hot-reload: keep the old programs attached while the new
-    // bundle loads, then atomically ReplaceXdp per interface, so no
-    // interface is ever left without an XDP program mid-reload.
-    ZoneBundleHandles old_bundle = e.zone_bundle;
-
-    // Per-zone devmaps can't be reused across a reload (libbpf refuses a
-    // pinned DEVMAP: "parameter mismatch"), so unpin them and let the
-    // new bundle create fresh ones. The still-attached old programs keep
-    // running via their held fds. Shared state maps (conntrack, fwl_nat)
-    // stay pinned and are reused, so flows survive the reload.
-    {
-      std::error_code uec;
-      for (const auto& entry :
-           std::filesystem::directory_iterator(e.pin_path, uec)) {
-        auto name = entry.path().filename().string();
-        if (name.rfind("fwl_devmap_", 0) == 0) {
-          std::filesystem::remove(entry.path(), uec);
-        }
-      }
-    }
-
-    // Load the new bundle but do not attach yet.
-    auto loaded =
-        LoadZoneBundle(dir.string(), e.pin_path, /*attach=*/false);
+    // Hot reload: swap each already-attached interface to the new
+    // bundle's program atomically (XDP_FLAGS_REPLACE). Detaching
+    // first would reset the NIC (igb drops the link for seconds) and
+    // leave a policy-off window — measured on the i350 rig.
+    //
+    // The new objects need fresh policy-scoped maps (their shape and
+    // their slot meanings follow the new policy); the flow-keyed pins
+    // — conntrack, fwl_nat — stay, so established connections survive
+    // the policy change. That preservation is the point of the
+    // distinction and must not be traded away: a firewall that drops
+    // every established connection when a rule is edited is not
+    // reloadable in production.
+    //
+    // kReload: a pin whose definition the new bundle disagrees with is
+    // NOT removed here. The currently attached policy is still running
+    // and is a real fallback, so the load is allowed to fail and say
+    // which map and which numbers — see PinPolicy for why cold boot
+    // decides that trade the other way.
+    auto pins = ReconcilePinnedMaps(dir.string(), e.pin_path,
+                                    PinPolicy::kReload,
+                                    e.conntrack.timeout_s);
+    spdlog::info("reload: pins adopted={} discarded={}",
+                 pins.adopted.size(), pins.discarded.size());
+    const ZoneBundleHandles* old =
+        e.zone_bundle.programs.empty() ? nullptr : &e.zone_bundle;
+    auto loaded = LoadZoneBundle(dir.string(), e.pin_path, old);
     if (!loaded) {
+      // The old bundle is still attached and intact.
       return MakeError(ReloadError::kApplyFailed,
                        std::format("LoadZoneBundle: {}",
                                    loaded.error().message));
     }
-
-    // ifindex -> currently-attached (old) program fd, for the swap.
-    std::unordered_map<int, int> old_fd;
-    for (const auto& p : old_bundle.programs) {
-      for (int idx : p.ifindexes) old_fd[idx] = p.prog_fd;
+    // Interfaces the old bundle covered but the new one does not:
+    // nothing replaced them, detach explicitly.
+    std::set<int> covered;
+    for (const auto& np : loaded->programs) {
+      covered.insert(np.ifindexes.begin(), np.ifindexes.end());
     }
-    std::unordered_set<int> new_ifs;
-    for (const auto& p : loaded->programs) {
-      for (int idx : p.ifindexes) {
-        new_ifs.insert(idx);
-        auto it = old_fd.find(idx);
-        int prev = it != old_fd.end() ? it->second : -1;
-        auto sw = ReplaceXdp(idx, p.prog_fd, prev);
-        if (!sw) {
-          // An atomic native replace is not possible on a generic-XDP
-          // NIC (e.g. RTL8125); fall back to detach + attach for this
-          // interface (a brief gap on it only). AttachXdp carries the
-          // native->generic fallback.
-          (void)DetachXdp(idx);
-          BpfHandles h{};
-          h.prog_fd = p.prog_fd;
-          auto at = AttachXdp(h, idx);
-          if (!at) {
-            return MakeError(ReloadError::kApplyFailed,
-                std::format("swap zone '{}' ifindex {}: {}",
-                            p.zone, idx, at.error().message));
-          }
+    for (const auto& op : e.zone_bundle.programs) {
+      for (int idx : op.ifindexes) {
+        if (!covered.contains(idx)) {
+          DetachXdp(idx);
         }
       }
     }
-    // Detach any interface the old bundle used that the new one drops.
-    for (const auto& p : old_bundle.programs) {
-      for (int idx : p.ifindexes) {
-        if (!new_ifs.count(idx)) (void)DetachXdp(idx);
-      }
-    }
-
+    CloseZoneBundle(e.zone_bundle);
     e.zone_bundle = *loaded;
     if (e.zone_bundle.conntrack_fd >= 0) {
       e.conntrack.map_fd = e.zone_bundle.conntrack_fd;
+      // Mirror EngineInit: a reload must not leave GC switched off
+      // (see the note there — it never ran in bundle mode at all).
+      e.conntrack.enabled = true;
+    }
+    // Re-derive the tracked interface list from the bundle that is
+    // now attached. Leaving it stale made `fctl status` describe the
+    // boot-time topology forever, and gave EngineStop the wrong set
+    // to detach.
+    e.ifaces.count = 0;
+    for (const auto& prog : e.zone_bundle.programs) {
+      for (int idx : prog.ifindexes) {
+        if (e.ifaces.count >= sizeof(e.ifaces.interfaces) /
+                                  sizeof(e.ifaces.interfaces[0])) {
+          break;
+        }
+        auto& entry = e.ifaces.interfaces[e.ifaces.count];
+        entry.ifindex = idx;
+        if_indextoname(static_cast<unsigned int>(idx), entry.name);
+        e.ifaces.count++;
+      }
     }
     ReloadResult out{};
     out.version = manifest["version"].get<std::string>();
     out.rules_installed = 0;
     out.program_updated = true;
     spdlog::info("reload: multi-zone bundle hot-swapped, "
-                 "{} zone program(s)",
+                 "{} zone program(s), atomic swap",
                  e.zone_bundle.programs.size());
     return out;
   }
@@ -402,37 +411,15 @@ auto ReloadFromSource(Engine& e)
   spdlog::info("reload: compiling {} -> {}",
                e.watcher.source_path, bundle_dir.string());
 
-  auto envelope = RunCompiler(
+  // v0.4: `fwl compile --bundle` signals success via exit status
+  // and the bundle's manifest.json (validated in ApplyBundle) —
+  // there is no JSON envelope on stdout anymore.
+  auto compiled = RunCompiler(
       e.watcher.fwl_path,
       e.watcher.source_path,
       bundle_dir.string());
-  if (!envelope) {
-    return std::unexpected(envelope.error());
-  }
-
-  // A zero-exit compile succeeded (RunCompiler already turns a non-zero
-  // exit into kCompileFailed). Some compile modes emit a JSON status
-  // envelope on stdout; the `--bundle` mode instead prints a human
-  // summary. So only treat stdout as a failure signal when it actually
-  // parses as a JSON envelope reporting a non-ok status — otherwise the
-  // exit code is authoritative and the bundle's manifest.json (checked
-  // by ApplyBundle below) is the source of truth.
-  try {
-    json env = json::parse(*envelope);
-    if (env.is_object() && env.contains("status") &&
-        env.value("status", std::string()) != "ok") {
-      std::string errs;
-      if (env.contains("errors")) {
-        for (const auto& e : env["errors"]) {
-          if (!errs.empty()) errs += "; ";
-          errs += e.get<std::string>();
-        }
-      }
-      return MakeError(ReloadError::kCompileFailed,
-                       errs.empty() ? "compile failed" : errs);
-    }
-  } catch (const std::exception&) {
-    // Non-JSON stdout (e.g. the --bundle human summary) is fine.
+  if (!compiled) {
+    return std::unexpected(compiled.error());
   }
 
   auto applied = ApplyBundle(e, bundle_dir.string());

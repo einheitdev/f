@@ -1,0 +1,10 @@
+name: "rate_limit scope= must be zone or global"
+source_fw: |
+  @xdp(eth0)
+  drop limited by rate_limit(10, per=src_ip, scope=bundle)
+
+test_packet:
+  builder: tcp()
+
+expected:
+  compiles: false

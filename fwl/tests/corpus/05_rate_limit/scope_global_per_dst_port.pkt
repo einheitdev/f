@@ -1,0 +1,18 @@
+name: "scope=global composes with per=dst_port"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.proto == udp and pkt.dst_port == 53
+       limited by rate_limit(4, per=dst_port, scope=global)
+  default allow
+
+state:
+  rate_limit:
+    0:
+      53: 4
+
+test_packet:
+  builder: udp(src_ip="10.0.0.9", dst_port=53)
+
+expected:
+  compiles: true
+  bpf_action: drop

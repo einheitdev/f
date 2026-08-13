@@ -1,0 +1,31 @@
+name: log event carries its emitting zone (lan)
+# Pairs with log_zone_tag_wan.pkt: same unit, same rule index, same
+# packet shape, different ingress zone. The two expectations differ in
+# one field, `zone`, which is the whole reason it exists — rule_index
+# alone cannot separate these two records in the bundle-wide ring.
+source_fw: |
+  zone lan = [lan0]
+  zone wan = [wan0]
+
+  @xdp(lan)
+  count lan_seen if pkt.proto == udp
+  log if pkt.proto == udp and pkt.dst_port == 7801
+  default allow
+
+  @xdp(wan)
+  count wan_seen if pkt.proto == udp
+  log if pkt.proto == udp and pkt.dst_port == 7801
+  default allow
+
+ingress_zone: lan
+test_packet:
+  builder: udp(src_ip="10.99.11.2", dst_ip="10.99.11.9", dst_port=7801)
+
+expected:
+  compiles: true
+  bpf_action: allow
+  log_events:
+    - zone: lan
+      rule_index: 1
+      proto: udp
+      dst_port: 7801

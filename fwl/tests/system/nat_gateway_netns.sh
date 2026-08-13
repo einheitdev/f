@@ -58,7 +58,7 @@ redirect to wan
 @xdp(wan)
 redirect to lan
 EOF
-PYTHONPATH="$WS" "$FWL" compile "$WORK/gw.fw" --bundle "$BUNDLE/current" \
+PYTHONPATH="$WS${PYTHONPATH:+:$PYTHONPATH}" "$FWL" compile "$WORK/gw.fw" --bundle "$BUNDLE/current" \
   || { fail "fwl compile"; exit 1; }
 [ -f "$BUNDLE/current/lan.bpf.o" ] && [ -f "$BUNDLE/current/wan.bpf.o" ] \
   || { fail "objects missing"; ls -la "$BUNDLE/current"; exit 1; }
@@ -106,7 +106,7 @@ FCAP="$WORK/fwd.pcap"
 ip netns exec wandst timeout 6 tcpdump -i wan0p -c1 -w "$FCAP" \
   'tcp and dst port 80' 2>/dev/null &
 fpid=$!; sleep 1
-ip netns exec lansrc env PYTHONPATH="$WS" "$PYBIN" "$HERE/send_scapy.py" \
+ip netns exec lansrc env PYTHONPATH="$WS${PYTHONPATH:+:$PYTHONPATH}" "$PYBIN" "$HERE/send_scapy.py" \
   lan0p "$LANIP" "$EXT" 40000 80 S || fail "send forward frame"
 wait $fpid 2>/dev/null
 
@@ -115,7 +115,7 @@ RCAP="$WORK/ret.pcap"
 ip netns exec lansrc timeout 6 tcpdump -i lan0p -c1 -w "$RCAP" \
   'tcp and src port 80' 2>/dev/null &
 rpid=$!; sleep 1
-ip netns exec wandst env PYTHONPATH="$WS" "$PYBIN" "$HERE/send_scapy.py" \
+ip netns exec wandst env PYTHONPATH="$WS${PYTHONPATH:+:$PYTHONPATH}" "$PYBIN" "$HERE/send_scapy.py" \
   wan0p "$EXT" "$WANIP" 80 40000 SA || fail "send reply frame"
 wait $rpid 2>/dev/null
 

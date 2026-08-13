@@ -368,17 +368,48 @@ Condition = Union[
 ]
 
 
-@dataclass(frozen=True)
+class RlScope(Enum):
+  """Zone scope of a `rate_limit` bucket (FWL_V04_SPEC.md § 6.7).
+
+  ZONE — the bucket is private to the zone program that holds the rule.
+    N zones carrying the rule each get their own budget.
+  GLOBAL — one bucket for the rule across the whole bundle: every zone
+    program that holds that rule shares it, so the budget is spent
+    once no matter which zone the traffic arrives on.
+  """
+  ZONE = "zone"
+  GLOBAL = "global"
+
+
+# RateLimit is mutable so the analyzer can fill `global_slot` post-parse,
+# mirroring the GeoIp / RateLimitCall call_index convention.
+@dataclass
 class RateLimit:
-  """`rate_limit(<N>, per=<field>)` modifier (FWL_V01_SPEC.md:266).
+  """`rate_limit(<N>, per=<field>[, scope=...])` modifier.
+
+  FWL_V01_SPEC.md:266 for the base form, FWL_V04_SPEC.md § 6.7 for
+  `scope=`.
 
   per_field is the bare bucket key name: src_ip, dst_ip, src_port,
   dst_port. The grammar restricts it to those four; the analyzer
   enforces threshold > 0.
+
+  `scope` defaults to ZONE, which is what every pre-v0.4-§6.7 policy
+  meant, so adding the field changes no deployed policy.
+  `scope_explicit` records whether the author wrote `scope=` — it drives
+  the multi-zone aggregate warning and nothing else, so an author who
+  has stated intent is not nagged.
+  `global_slot` is the bundle-wide bucket number the analyzer assigns to
+  a GLOBAL-scoped rule; -1 for ZONE-scoped ones. Rules that are
+  structurally identical share a slot, which is what makes one rule
+  written into several zones one bucket.
   """
   threshold: int
   per_field: str
   span: Span
+  scope: RlScope = RlScope.ZONE
+  scope_explicit: bool = False
+  global_slot: int = -1
 
 
 @dataclass(frozen=True)
@@ -424,6 +455,21 @@ class CountCompare:
   call: CountCall
   op: str
   operand: "Operand"
+  span: Span
+
+
+@dataclass(frozen=True)
+class ChainMarker:
+  """A `chain <name>` manual pipeline-split boundary (v0.4 § 6.6).
+
+  Placed between Tier 1 rules, it forces the emitter to start a new
+  tail-call stage at the following rule. `name` is a human label for
+  the stage (surfaced in the emitted stage filename / manifest). The
+  parser records the marker's position as a rule-index boundary on
+  ZoneProgram.chain_boundaries; the node itself is not retained in the
+  rule list.
+  """
+  name: str
   span: Span
 
 
@@ -527,6 +573,21 @@ class ActionStmt:
 
 
 @dataclass(frozen=True)
+class CallStmt:
+  """A Tier 2 `helper(pkt)` call statement (v0.4 § 6.5 multi-def).
+
+  Invokes a top-level helper `def` (resolved by `name` against
+  Program.helpers). The helper compiles to a `static __noinline` BPF
+  function; the call site checks its return value and propagates a
+  terminal verdict (allow/drop/redirect) while falling through on the
+  helper's non-terminal fall-out. Non-terminal side effects (count,
+  log, NAT rewrite, conntrack create) happen inside the helper.
+  """
+  name: str
+  span: Span
+
+
+@dataclass(frozen=True)
 class IfStmt:
   """A Tier 2 `if` / `elif` / `else` chain (FWL_V02_SPEC.md grammar).
 
@@ -541,8 +602,8 @@ class IfStmt:
   span: Span
 
 
-# A Tier 2 statement is one of these four shapes.
-Stmt = Union[IfStmt, AssignStmt, ActionStmt]
+# A Tier 2 statement is one of these shapes.
+Stmt = Union[IfStmt, AssignStmt, ActionStmt, CallStmt]
 
 
 # A `scalar_expr` is the RHS of an `AssignStmt`, narrowed at analysis
@@ -600,6 +661,10 @@ class ZoneProgram:
   rules: list[Rule] = field(default_factory=list)
   default: DefaultRule | None = None
   function: FunctionDef | None = None
+  # v0.4 § 6.6: rule indices at which a manual `chain` forces a new
+  # pipeline stage. Each value b means rules[b:] start a fresh stage.
+  # Empty when the source has no `chain` markers.
+  chain_boundaries: tuple[int, ...] = ()
 
   @property
   def zone_name(self) -> str:
@@ -621,6 +686,14 @@ class Program:
   """
   programs: list[ZoneProgram] = field(default_factory=list)
   zones: list[ZoneDecl] = field(default_factory=list)
+  # v0.4 § 6.5 multi-def: top-level helper `def`s shared across zones.
+  # Each compiles to a `static __noinline` BPF function; zone bodies
+  # invoke them via CallStmt. Empty in the v0.1-v0.3 shape.
+  helpers: list[FunctionDef] = field(default_factory=list)
+  # Non-fatal diagnostics collected by the analyzer (errors.FwlWarning).
+  # Rebuilt from scratch on every analyze() call, so re-analyzing a
+  # program does not accumulate duplicates.
+  warnings: list = field(default_factory=list)
 
   @property
   def hook(self) -> Hook:

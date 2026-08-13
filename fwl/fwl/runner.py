@@ -16,7 +16,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from . import analyzer, ast, bpf_runner, emitter, interpreter, parser, pkt
+from . import (
+  analyzer, ast, bpf_runner, emitter, interpreter, log_abi, parser, pkt
+)
 from .errors import FwlException
 
 
@@ -43,7 +45,12 @@ def _zone_program(program: ast.Program, ingress_zone: str | None):
     return program
   for zp in program.programs:
     if zp.zone_name == ingress_zone:
-      return ast.Program(programs=[zp], zones=program.zones)
+      # Carry the unit's helper defs (v0.4 § 6.5): a per-zone body may
+      # call a shared helper, so the emitter and interpreter both need
+      # them even when we isolate one @xdp block.
+      return ast.Program(
+        programs=[zp], zones=program.zones, helpers=program.helpers
+      )
   raise ValueError(
     f"ingress_zone {ingress_zone!r} matches no @xdp block"
   )
@@ -213,7 +220,7 @@ def _bpf_oracle(
     )
   except bpf_runner.BpfUnavailable as exc:
     try:
-      bpf_runner.compile_c(c_source)
+      bpf_runner.check_compiles(c_source)
     except subprocess.CalledProcessError as cexc:
       stderr = cexc.stderr.decode("utf-8", "replace")
       return OracleResult(
@@ -274,10 +281,33 @@ def _bpf_oracle(
     if counter_diff:
       return OracleResult("bpf", "fail", counter_diff)
 
+  # Every record's zone tag must resolve, through the compilation's own
+  # id -> name table, to the zone this object was emitted for. Checked
+  # on every logging case rather than only where a .pkt asserts `zone`:
+  # the tag is a constant that travels source -> clang -> ring, and the
+  # failure it guards against (a struct-layout slip putting the right
+  # bytes at the wrong offset) is invisible to a field-by-field
+  # comparison that never looks at it.
+  zone_by_id = {
+    zid: name for name, zid in
+    log_abi.zone_ids(emitter.emitting_zone_names(program)).items()
+  }
+  emitted_zone = program.hook.interface
+  for i, e in enumerate(result.log_events):
+    got = zone_by_id.get(e.zone_id)
+    if got != emitted_zone:
+      return OracleResult(
+        "bpf", "fail",
+        f"log_events[{i}].zone_id 0x{e.zone_id:08X} resolves to "
+        f"{got!r}, but this object was emitted for zone "
+        f"{emitted_zone!r}",
+      )
+
   expected_le = case.expected.get("log_events", [])
   if expected_le:
     bpf_log = [
       interpreter.LogEvent(
+        zone=zone_by_id[e.zone_id],
         rule_index=e.rule_index, proto=e.proto,
         src_ip=e.src_ip, dst_ip=e.dst_ip,
         src_port=e.src_port, dst_port=e.dst_port,
@@ -290,6 +320,94 @@ def _bpf_oracle(
       return OracleResult("bpf", "fail", log_diff)
 
   return OracleResult("bpf", "pass", "")
+
+
+def _bpf_map_init(program, case, c_source):
+  """Build the (map_init, n_counter_slots, has_log) triple for a run.
+
+  Shared by the standard BPF oracle and the pipeline_equivalence check
+  so both seed identical map state before BPF_PROG_TEST_RUN.
+  """
+  map_init = _build_map_init(program, case.state)
+  for name, entries in _build_geoip_map_init(
+    program, case.geoip_data or {}
+  ).items():
+    map_init[name] = entries
+  ct_seed = _build_conntrack_map_init(case.conntrack_seed)
+  if ct_seed:
+    map_init["conntrack"] = ct_seed
+  for name, entries in _build_nat_map_init(case).items():
+    map_init[name] = entries
+  n_slots = len(_parse_counter_table(c_source))
+  has_log = any(r.action == ast.Action.LOG for r in program.rules)
+  return map_init, n_slots, has_log
+
+
+def pipeline_equivalence(case: pkt.PktCase) -> OracleResult:
+  """Run a program single-stage AND split, require identical results.
+
+  The core anti-regression for the v0.4 § 6.6 pipeline splitter: the
+  SAME program, forced single (`split=False`) and forced into a
+  tail-call pipeline (`split=True`), must yield byte-identical verdicts,
+  packet rewrites, and counter deltas on the packet — the semantic
+  preservation a stub cannot fake. Returns:
+
+    - pass: both forms ran on the kernel and agreed.
+    - fail: the forms diverged (action / output_packet / counters).
+    - skip: kernel BPF unavailable — both forms still compiled clean, so
+      the split emitter is structurally sound even where it can't run
+      (the divergence run happens on the real-kernel VM).
+  """
+  try:
+    program = analyzer.analyze(parser.parse(case.source_fw))
+  except FwlException:
+    return OracleResult("pipeline", "skip", "compile failed (see interpreter)")
+  program = _zone_program(program, case.ingress_zone)
+  c_single = emitter.emit(program, split=False)
+  c_split = emitter.emit(program, split=True)
+
+  try:
+    single = bpf_runner.run_full(*_run_args(program, case, c_single))
+    split = bpf_runner.run_full(*_run_args(program, case, c_split))
+  except bpf_runner.BpfUnavailable as exc:
+    try:
+      bpf_runner.check_compiles(c_single)
+      bpf_runner.check_compiles(c_split)
+    except subprocess.CalledProcessError as cexc:
+      stderr = cexc.stderr.decode("utf-8", "replace")
+      return OracleResult("pipeline", "fail", f"clang failed:\n{stderr}")
+    return OracleResult(
+      "pipeline", "skip",
+      f"both forms compiled; kernel run unavailable ({exc})",
+    )
+  except subprocess.CalledProcessError as exc:
+    stderr = exc.stderr.decode("utf-8", "replace")
+    return OracleResult("pipeline", "fail", f"clang failed:\n{stderr}")
+
+  if single.action != split.action:
+    return OracleResult(
+      "pipeline", "fail",
+      f"action diverged: single={single.action.value} "
+      f"split={split.action.value}",
+    )
+  if single.output_packet != split.output_packet:
+    return OracleResult(
+      "pipeline", "fail",
+      "output_packet diverged between single and split forms",
+    )
+  if single.counter_deltas != split.counter_deltas:
+    return OracleResult(
+      "pipeline", "fail",
+      f"counter deltas diverged: single={single.counter_deltas} "
+      f"split={split.counter_deltas}",
+    )
+  return OracleResult("pipeline", "pass", "")
+
+
+def _run_args(program, case, c_source):
+  """Positional args for bpf_runner.run_full for one compiled form."""
+  map_init, n_slots, has_log = _bpf_map_init(program, case, c_source)
+  return (c_source, case.packet.raw, map_init, n_slots, has_log)
 
 
 def _seq_spec_oracle(case: pkt.PktCase) -> OracleResult:
@@ -354,7 +472,7 @@ def _seq_bpf_oracle(case: pkt.PktCase) -> OracleResult:
     )
   except bpf_runner.BpfUnavailable as exc:
     try:
-      bpf_runner.compile_c(c_source)
+      bpf_runner.check_compiles(c_source)
     except subprocess.CalledProcessError as cexc:
       stderr = cexc.stderr.decode("utf-8", "replace")
       return OracleResult(
@@ -426,10 +544,15 @@ def _build_map_init(
 ) -> dict[str, dict[bytes, bytes]]:
   """Translate .pkt state into the {map_name: {key: value}} layout.
 
-  The emitter names rate_limit maps fwl_rl_map_<rule_idx>; the value
-  is `struct fwl_rl_state { __u64 ts; __u32 count; }` packed to 16
-  bytes by the C compiler. For per-CPU maps the kernel expects the
-  value buffer to be nr_possible_cpus * sizeof(struct).
+  The map a rule's bucket lives in depends on its zone scope, so the
+  name comes from the emitter's own `rl_map_name` rather than being
+  spelled out here — a seed that went to `fwl_rl_map_<idx>` for a
+  `scope=global` rule would land in a map the program never reads, and
+  the BPF oracle would silently diverge from the interpreter.
+
+  The value is `struct fwl_rl_state { __u64 ts; __u32 count; }` packed
+  to 16 bytes by the C compiler. For per-CPU maps the kernel expects
+  the value buffer to be nr_possible_cpus * sizeof(struct).
   """
   if not state:
     return {}
@@ -439,12 +562,12 @@ def _build_map_init(
   except OSError:
     nr_cpus = 1
   for rule_idx, buckets in state.items():
-    if rule_idx >= len(program.rules):
+    if not isinstance(rule_idx, int) or rule_idx >= len(program.rules):
       continue
     rule = program.rules[rule_idx]
     if rule.modifier is None:
       continue
-    map_name = f"fwl_rl_map_{rule_idx}"
+    map_name = emitter.rl_map_name(rule.modifier, rule_idx)
     entries: dict[bytes, bytes] = {}
     for raw_key, count in buckets.items():
       key_bytes = _encode_rl_key(rule.modifier.per_field, raw_key)
@@ -678,6 +801,7 @@ def _check_log_events(
 
 
 _LOG_FIELD_GETTERS = {
+  "zone": lambda e: e.zone,
   "rule_index": lambda e: e.rule_index,
   "proto": lambda e: e.proto,
   "src_ip": lambda e: e.src_ip,
@@ -698,7 +822,13 @@ def _compare_log_event(
   for field_name, value in expected.items():
     getter = _LOG_FIELD_GETTERS.get(field_name)
     if getter is None:
-      continue
+      # An unknown field used to be skipped, which made a typo'd
+      # assertion pass — the same shape of silence as an untagged
+      # event. Name it instead.
+      return (
+        f"log_events[{idx}]: no such field {field_name!r} "
+        f"(known: {', '.join(sorted(_LOG_FIELD_GETTERS))})"
+      )
     actual_val = getter(actual)
     if actual_val != value:
       return (

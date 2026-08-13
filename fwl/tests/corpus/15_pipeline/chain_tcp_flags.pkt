@@ -1,0 +1,14 @@
+name: "chain tcp flags"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.proto == tcp and pkt.tcp.syn
+  chain b
+  allow if pkt.proto == tcp and pkt.tcp.ack
+  default drop
+
+test_packet:
+  builder: tcp(src_ip="1.1.1.1", dst_ip="9.9.9.9", dst_port=80, ack=1)
+
+expected:
+  compiles: true
+  bpf_action: allow
