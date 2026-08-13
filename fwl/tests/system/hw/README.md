@@ -57,14 +57,22 @@ on exit, so the rig is always left in the walk-up state.
 - `run_l1.sh` — runs every `l1_*` script, prints a summary table.
 - `natsoak_*` — the NAT/masquerade soak (policy, traffic generator,
   per-sample wire probe, sampler, report). See below.
-- `run_l11.sh` — the ceiling probes; several FAIL by design.
+- `run_l11.sh` — the ceiling probes; one still FAILs by design.
 
 ### Ceiling probes (`l10_*`, `l11_*`) — read the evidence, not the code
 
 These do not ask "does the feature work". They ask "where does it stop
-working", and they are written to RECORD the answer rather than to
-assert a hoped-for one. `l11_04` and `l11_05` end in FAIL because the
-ceilings they found are real; the failure text is the finding.
+working", and they were written to RECORD the answer rather than to
+assert a hoped-for one. When a ceiling closes, the probe is tightened
+to the behaviour that replaced it — the exact value, not a looser
+bound — and taken off the by-design-FAIL list, so a failure there is a
+regression. `l11_01`, `l11_02` and `l11_04` have been through that.
+`l11_05` still ends in FAIL: an ICMP error names its flow in its
+payload, which nothing reads, so path-MTU discovery is structurally
+broken for a masqueraded flow. `l11_06` (occupancy curve) was added
+with the collector and asserts the SHAPE of the curve, because a cap
+that is far away and a cap that is merely not yet reached look
+identical in a single sample.
 
 They all share one property that keeps them out of the `.pkt` corpus:
 each is about the system over TIME or over the SET of loaded state — a

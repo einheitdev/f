@@ -169,9 +169,10 @@ auto NatMgr::MaybeRunGc(uint64_t now_ns, uint32_t gc_interval_s)
     spdlog::error(
         "NAT: refused {} mapping(s) since the last sweep — those "
         "packets were DROPPED. {} of {} total refusals were the "
-        "{}-entry fwl_nat table being FULL; the rest were source-port "
-        "collisions no free port in 49152-65535 could resolve. New "
-        "connections through the NAT are failing.",
+        "{}-entry fwl_nat table being FULL; the rest were collisions "
+        "no free port in 49152-65535 could resolve, or a frame with "
+        "no L4 port to move (ICMP). New connections through the NAT "
+        "are failing.",
         refused - reported_refusals, full, refused, max_entries);
     reported_refusals = refused;
   }
