@@ -1175,14 +1175,19 @@ auto LoadZoneBundle(std::string_view bundle_dir,
     for (int ifindex : zone_ifindexes[zone]) {
       auto old_it = old_prog_by_ifindex.find(ifindex);
       if (old_it != old_prog_by_ifindex.end()) {
+        // Recorded BEFORE the swap is attempted, not after it
+        // succeeds: the fallback below detaches this interface, so a
+        // failure between the detach and the re-attach leaves it bare.
+        // Rolling back an interface that was never touched re-attaches
+        // the program already on it, which the kernel rejects and the
+        // rollback ignores; leaving one bare is a hole in the firewall.
+        flipped.emplace_back(ifindex, old_it->second);
         auto r = ReplaceXdp(ifindex, zh.prog_fd, old_it->second);
         if (!r) {
           // No atomic replace on this interface. Rather than fail the
           // reload, detach and re-attach this one interface: a gap of
           // microseconds on it alone, against a policy that does not
-          // land at all. `flipped` still records the OLD fd, so the
-          // rollback path below restores the previous program here
-          // exactly as it does for a swapped interface.
+          // land at all.
           bool generic = false;
           bpf_xdp_detach(ifindex, 0, nullptr);
           int aerr = AttachXdpFallback(ifindex, zh.prog_fd, &generic);
@@ -1196,7 +1201,6 @@ auto LoadZoneBundle(std::string_view bundle_dir,
               "re-attached ({} mode)",
               zone, ifindex, generic ? "generic" : "native");
         }
-        flipped.emplace_back(ifindex, old_it->second);
       } else {
         // Native (driver) XDP where the NIC has it, generic (SKB)
         // where it does not — the RTL8125 (`r8169`) has no native XDP
