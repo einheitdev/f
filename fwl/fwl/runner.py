@@ -430,6 +430,13 @@ def _seq_interpreter_oracle(case: pkt.PktCase) -> OracleResult:
       "interpreter", "error",
       f"unexpected compile error: {exc.error.format()}",
     )
+  # Both single-packet oracles have always done this and neither
+  # sequence oracle did, so a multi-zone `sequence:` case ran against
+  # whichever @xdp block came first and ignored its `ingress_zone`
+  # entirely. Both oracles ignored it the same way, which is why no
+  # differential run could notice: the case simply measured a
+  # different program than it named.
+  program = _zone_program(program, case.ingress_zone)
   ct = interpreter.ConntrackTable(case.conntrack_seed)
   # NAT state is carried across the sequence for the same reason the
   # conntrack table is: the BPF oracle loads the program once, so its
@@ -499,6 +506,9 @@ def _seq_bpf_oracle(case: pkt.PktCase) -> OracleResult:
     return OracleResult(
       "bpf", "skip", "skipped because compile failed (see interpreter)"
     )
+  # See _seq_interpreter_oracle: without this the emitted object is
+  # the first zone's, whatever the case declared.
+  program = _zone_program(program, case.ingress_zone)
   c_source = emitter.emit(program)
   map_init = _build_map_init(program, case.state)
   for name, entries in _build_geoip_map_init(

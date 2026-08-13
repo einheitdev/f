@@ -1,0 +1,49 @@
+name: a sequence step's log_events resolve their zone tag
+# The single-packet oracle has always resolved a record's numeric zone
+# tag through the compilation's own id -> name table. The SEQUENCE
+# oracle did not, and no corpus case had ever asserted `log_events` on
+# a sequence step, so the path was reached for the first time by this
+# case. It has to be a sequence: the tag travels source -> clang ->
+# ring, and only a case that reads a record off the ring on step N>0
+# proves the resolution survives a second BPF_PROG_RUN against one
+# loaded object.
+#
+# Two steps on the same 5-tuple so the second record is genuinely the
+# second one written to the ring, not a replay of the first.
+source_fw: |
+  zone lan = [lan0]
+  zone wan = [wan0]
+
+  @xdp(lan)
+  log if pkt.proto == udp and pkt.dst_port == 7801
+  default allow
+
+  @xdp(wan)
+  log if pkt.proto == udp and pkt.dst_port == 7801
+  default allow
+
+ingress_zone: wan
+sequence:
+  - name: first packet — one record, tagged with the emitting zone
+    builder: udp(src_ip="10.99.11.2", dst_ip="10.99.11.9", src_port=41000, dst_port=7801)
+    expected:
+      bpf_action: allow
+      log_events:
+        - zone: wan
+          rule_index: 0
+          proto: udp
+          src_ip: "10.99.11.2"
+          dst_ip: "10.99.11.9"
+          dst_port: 7801
+  - name: second packet — the tag resolves the same way on a later run
+    builder: udp(src_ip="10.99.11.2", dst_ip="10.99.11.9", src_port=41001, dst_port=7801)
+    expected:
+      bpf_action: allow
+      log_events:
+        - zone: wan
+          rule_index: 0
+          proto: udp
+          src_ip: "10.99.11.2"
+          dst_ip: "10.99.11.9"
+          src_port: 41001
+          dst_port: 7801

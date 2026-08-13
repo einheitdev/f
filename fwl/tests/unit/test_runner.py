@@ -78,3 +78,64 @@ class TestCheckLogEvents:
 
   def test_empty_expected_passes(self):
     assert runner._check_log_events([], [self._ev()]) == ""
+
+
+class TestSequenceOraclesHonourIngressZone:
+  """A `sequence:` case must run against the zone it names.
+
+  Both single-packet oracles resolved `ingress_zone` through
+  `_zone_program` and neither sequence oracle did, so a multi-zone
+  sequence silently ran against whichever @xdp block came first. Both
+  oracles ignored it identically, so the differential comparison
+  agreed perfectly while measuring a program the case never named —
+  the failure mode this harness exists to prevent, one level up from
+  the case that finds it.
+
+  Asserted on the shared selector rather than by running BPF, so it
+  holds unprivileged too.
+  """
+
+  SOURCE = (
+    "zone lan = [lan0]\n"
+    "zone wan = [wan0]\n"
+    "\n"
+    "@xdp(lan)\n"
+    "drop if pkt.proto == udp\n"
+    "default allow\n"
+    "\n"
+    "@xdp(wan)\n"
+    "allow if pkt.proto == udp\n"
+    "default drop\n"
+  )
+
+  def _program(self):
+    from fwl import analyzer, parser
+    return analyzer.analyze(parser.parse(self.SOURCE))
+
+  def test_selector_picks_the_named_block(self):
+    picked = runner._zone_program(self._program(), "wan")
+    assert [zp.zone_name for zp in picked.programs] == ["wan"]
+
+  def test_selector_defaults_to_the_whole_program(self):
+    whole = runner._zone_program(self._program(), None)
+    assert [zp.zone_name for zp in whole.programs] == ["lan", "wan"]
+
+  def test_both_sequence_oracles_call_the_selector(self):
+    """The regression guard: the call sites, not just the selector.
+
+    A source-level check because the defect was an ABSENT call, and
+    nothing about the oracles' output distinguished it — they agreed
+    with each other on the wrong program.
+    """
+    import inspect
+    for fn in (runner._seq_interpreter_oracle, runner._seq_bpf_oracle):
+      src = inspect.getsource(fn)
+      assert "_zone_program(program, case.ingress_zone)" in src, (
+        f"{fn.__name__} does not resolve ingress_zone; a multi-zone "
+        "sequence case will run against the wrong @xdp block"
+      )
+
+  def test_an_unknown_zone_is_named_not_ignored(self):
+    import pytest
+    with pytest.raises(ValueError, match="matches no @xdp block"):
+      runner._zone_program(self._program(), "dmz")
