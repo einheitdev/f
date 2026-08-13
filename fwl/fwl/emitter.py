@@ -817,6 +817,21 @@ static __always_inline int fwl_nat_claim(
         fwl_nat_stat(FWL_NAT_STAT_REFUSED);
         return -1;
       }
+      // The candidate may be OUR OWN earlier reallocation. Without this
+      // check every subsequent packet of a moved flow walks one probe
+      // further and claims another port, so a single collision costs a
+      // port per packet and the flow is dropped after
+      // FWL_NAT_ALLOC_TRIES of them. Measured on the rig: 20 identical
+      // SYNs from the colliding host produced 8 mappings and 8
+      // reallocations where one of each was correct.
+      struct fwl_nat_value *cx = bpf_map_lookup_elem(&fwl_nat, rk);
+      if (cx && cx->new_addr == rv->new_addr
+          && cx->new_port == rv->new_port
+          && cx->nat_type == rv->nat_type) {
+        cx->last_seen_ns = rv->last_seen_ns;
+        *got = cand;
+        return 0;
+      }
     }
   }
   rk->dst_port = want;

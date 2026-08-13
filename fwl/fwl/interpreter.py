@@ -224,8 +224,14 @@ class NatState:
         (h + i * 2654435761) % 0x100000000 & _NAT_PORT_MASK
       )
       cand_key = (proto, k_src, k_dst, k_sport, cand)
-      if cand_key not in self._reply:
+      cand_held = self._reply.get(cand_key)
+      if cand_held is None:
         self._reply[cand_key] = value
+        return cand
+      # Our own earlier reallocation: a later packet of a moved flow
+      # must land back on the port it was given, or one collision costs
+      # a port per packet and the flow dies after the probe budget.
+      if cand_held == value:
         return cand
     return None
 

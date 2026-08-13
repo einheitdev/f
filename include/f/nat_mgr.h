@@ -57,6 +57,21 @@ namespace f {
 /// reclaimed whatever conntrack says. Freeing is driven by flow end;
 /// the stamp only guarantees we never break a live flow to do it.
 ///
+/// (3) is not hypothetical, and the rig shows exactly when it bites. A
+/// masquerading policy that also reads `conntrack(pkt).state` creates
+/// TWO conntrack entries per flow — the pre-NAT tuple from an `allow`
+/// of a NEW packet, and the post-NAT tuple from the NAT helper — while
+/// creating one NAT mapping. Both tables cap at 65536, so conntrack is
+/// the binding constraint and fills at twice the rate: measured under
+/// an 80k-flow flood, `fwl_nat` reached 65536 with exactly half of its
+/// mappings unanchored, because conntrack had been full since flow
+/// 32768. Those mappings then age on `grace_s` instead of conntrack's
+/// timeout. That is the right degradation — under pressure, mappings
+/// nothing is using are recycled sooner, and a mapping carrying
+/// traffic still never is — but it means NAT lifetime silently
+/// shortens once conntrack saturates, which is worth knowing before
+/// reading a `total_reclaimed` that looks too eager.
+///
 /// ## At the cap
 ///
 /// Refuse and say so. The datapath claims mappings with BPF_NOEXIST and

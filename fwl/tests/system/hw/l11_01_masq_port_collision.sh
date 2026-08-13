@@ -138,7 +138,7 @@ best, port = 0, 0
 for key, n in seen.items():
   if not key.startswith('tcp:$MASQ_ADDR:'):
     continue
-  sport = int(key.split(':')[2])
+  sport = int(key.split(':')[2].split('>')[0])
   if key.split('>', 1)[1].startswith('$PEER:443') and n > best:
     best, port = n, sport
 print(port if best >= 20 else 0)

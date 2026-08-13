@@ -446,6 +446,15 @@ auto AttachNatMgr(Engine& e) -> void {
   // it, so the two managers must be looking at the same table.
   e.nat.conntrack_fd = e.conntrack.map_fd;
   e.nat.enabled = e.nat.map_fd >= 0;
+  // `fwl_nat_stats` is POLICY-lifetime: its pin is discarded on a
+  // reload and the new bundle starts counting from zero. The mirror of
+  // "refusals already reported" has to reset with it, or after a
+  // reload the first refusals sit below the old high mark and are
+  // never logged — the daemon would go quiet about exactly the event
+  // it exists to shout about. The table's own numbers (high_water,
+  // total_reclaimed) are the daemon's observations of a FLOW-lifetime
+  // map that survives the reload, so they carry over.
+  e.nat.reported_refusals = 0;
   if (!e.nat.enabled) {
     e.nat.max_entries = 0;
     return;
