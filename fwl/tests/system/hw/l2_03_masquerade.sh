@@ -29,9 +29,11 @@ zone wanz = [$WAN_IF]
 @xdp(t)
 
 count outbound if pkt.src_ip == 10.99.21.5
+count pings if pkt.proto == icmp
 masquerade if pkt.src_ip == 10.99.21.5
 redirect to wanz if pkt.proto == udp and pkt.dst_port == 1
 allow if pkt.proto == tcp
+allow if pkt.proto == icmp
 default drop
 EOF
 hw::deploy l2-03 "$FW"
@@ -51,3 +53,38 @@ assert_eq "wire: src is the daemon-resolved wan address" \
   "$(hw::sniff_get "tcp:$MASQ_ADDR>10.99.21.9:443:ok")" 100
 assert_eq "wire: no un-translated leak" \
   "$(hw::sniff_get 'tcp:10.99.21.5>10.99.21.9:443:ok')" 0
+
+# --- ICMP through the same masquerade -------------------------------
+# A source NAT installs a mapping for a frame with no L4 ports too,
+# keyed on ports 0 — and de-NAT used to return early for anything that
+# was not TCP or UDP, so the mapping was written and never read. The
+# egress half worked and the return half did not: a masqueraded host
+# could ping out and never hear back, with the two oracles disagreeing
+# about it and no corpus case going through that door. Both halves are
+# asserted here, in that order, so the reply assertion cannot pass
+# without the request having been translated first.
+hw::sniff_start 6 --detail
+hw::send 30 'icmp(src_ip="10.99.21.5", dst_ip="10.99.21.9", type=8, code=0)'
+sleep 1
+hw::send 30 "icmp(src_ip=\"10.99.21.9\", dst_ip=\"$MASQ_ADDR\", \
+type=0, code=0)"
+sleep 1
+hw::sniff_wait
+
+assert_eq "counter pings (request + reply seen by the datapath)" \
+  "$(hw::counter pings)" 60
+assert_eq "wire: the echo request's source is the masquerade address" \
+  "$(hw::sniff_get "icmp:$MASQ_ADDR>10.99.21.9:8.0")" 30
+assert_eq "wire: no un-translated echo request leaked" \
+  "$(hw::sniff_get 'icmp:10.99.21.5>10.99.21.9:8.0')" 0
+assert_eq "wire: the echo REPLY is de-NATed back to the host" \
+  "$(hw::sniff_get "icmp:10.99.21.9>10.99.21.5:0.0")" 30
+assert_eq "wire: no echo reply stranded at the masquerade address" \
+  "$(hw::sniff_get "icmp:10.99.21.9>$MASQ_ADDR:0.0")" 0
+
+# What is still NOT translated, so nobody reads the above as more than
+# it is: an ICMP ERROR names its flow in its payload (the embedded IP
+# header + 8 bytes), which nothing reads. See l11_05 — path-MTU
+# discovery remains structurally broken for a masqueraded flow.
+log "NOTE: echo/echo-reply de-NAT works; ICMP ERROR translation (RFC \
+5508, the embedded datagram) does not — see l11_05_icmp_pmtu."

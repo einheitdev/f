@@ -199,8 +199,20 @@ if [ "$FILLED" -ge 65000 ]; then
   # Only assert the refusal when the flood really reached the cap; a
   # partially-filled table legitimately has room for the new flow.
   assert_eq "wire: a flow with no room is NOT translated" "$OUT" 0
-  assert_eq "wire: nothing is stranded at the masquerade address" \
-    "$STRANDED" 0
+  assert_eq "wire: the reply is not delivered to a host that was \
+never given a mapping" "$HOME_OK" 0
+  # $STRANDED is this test's own injected reply frame crossing under
+  # the policy's blanket `allow if pkt.proto == tcp`. It is NOT
+  # evidence of a defect and must not be asserted to zero — that would
+  # be asserting the firewall drops a packet its policy admits. What
+  # made the old behaviour a defect was the guest's packet being
+  # translated anyway ($OUT above): the firewall promised a return
+  # path it had not recorded, and the reply then arrived at its own
+  # address with nothing counted. With the allocation refused, no such
+  # promise is made.
+  log "($STRANDED/20 of the injected reply frames crossed to the \
+masquerade address, admitted by this policy's blanket TCP allow — no \
+translation was promised, so none is missing)"
   if [ "$REFUSED_AFTER" -gt "$REFUSED_BEFORE" ]; then
     pass "REFUSED AND COUNTED — the packet was dropped rather than \
 translated into a mapping that could not be installed, and \
@@ -213,10 +225,31 @@ to the firewall's own address with nothing logged."
 ($REFUSED_BEFORE -> $REFUSED_AFTER): the datapath is either still \
 translating without a mapping, or the stats map is not being read"
   fi
-  journalctl -u fd --since "-3 min" --no-pager | grep -q "NAT: refused" \
-    && pass "fd LOGGED the refusal (journalctl -u fd)" \
-    || fail "refusals were counted but nothing was logged — an \
-operator watching the journal still sees nothing"
+  # The daemon reports refusals from its sweep, so the line appears at
+  # the next sweep boundary, not the instant the counter moves. Wait
+  # for one — checking immediately passed the first time this test ran
+  # only because a PREVIOUS run's line was still inside the window,
+  # which is a test that agrees with itself rather than with fd.
+  SWEEP=$(hw::ct gc_interval_s)
+  LOGGED=0
+  for _ in $(seq 1 $(( (SWEEP + 15) * 2 )) ); do
+    if journalctl -u fd --since "-2 min" --no-pager \
+        | grep -q "NAT: refused"; then
+      LOGGED=1
+      break
+    fi
+    sleep 1
+  done
+  if [ "$LOGGED" -eq 1 ]; then
+    pass "fd LOGGED the refusal within one ${SWEEP}s sweep \
+(journalctl -u fd)"
+    journalctl -u fd --since "-2 min" --no-pager \
+      | grep -E "NAT: (refused|fwl_nat is)" | tail -2 \
+      | while read -r l; do log "  journal: ${l#*] }"; done
+  else
+    fail "refusals were counted but nothing was logged within \
+$((SWEEP + 15))s — an operator watching the journal still sees nothing"
+  fi
 else
   log "the flood stopped at $FILLED of $NAT_CAP, so the cap was not \
 reached and the refusal path is not exercised by this run"
