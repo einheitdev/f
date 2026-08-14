@@ -23,6 +23,22 @@ pass() { log "PASS: $*"; EVIDENCE+=("PASS: $*"); }
 
 fail() { log "FAIL: $*"; EVIDENCE+=("FAIL: $*"); FAILURES=$((FAILURES+1)); }
 
+# record <text> — an OBSERVATION, kept in the evidence, that is not a
+# verdict.
+#
+# Some measurements record what the bench did rather than judge it: the
+# i350 accepts oversized frames or it does not, RSS spread this run's
+# traffic over several CPUs or it did not, dnsmasq's upstream socket
+# carries a peer or it does not. Written as `pass` in both branches —
+# which is how several of them were written — the line renders green
+# whatever happened, and a check with one possible colour carries no
+# information while looking exactly like one that does.
+#
+# vacuity_sweep.py's static lint flags any conditional that cannot fail
+# yet emits a PASS. Use `record` there; keep `pass`/`fail` for claims
+# that can be wrong.
+record() { log "NOTE: $*"; EVIDENCE+=("NOTE: $*"); }
+
 # assert_eq <label> <actual> <expected>
 assert_eq() {
   if [ "$2" -eq "$3" ] 2>/dev/null; then
@@ -64,6 +80,45 @@ hw::require_root() {
   fi
 }
 
+# --- vacuity sweep hooks ---------------------------------------------
+#
+# When HW_SABOTAGE names a scenario, vacuity_sweep.py has planted the
+# defect that scenario exists to catch and expects the scenario to go
+# red. Nothing below does anything unless that variable is set.
+#
+# The compiler is wrapped rather than hw::deploy alone because not every
+# scenario deploys through hw::deploy — l1_09 compiles by hand to pass
+# --geoip, and a plant in the geoip data is the only way to break the
+# trie-load path. The wrapper only ever rewrites a compile into a
+# `v-hw-<tag>-<pid>` bundle: hw::restore_smoke recompiles the operator's
+# own /etc/f/rules.fw from the EXIT trap of every scenario, and a plant
+# that reached it would leave the rig running a deliberately broken
+# policy for whoever walks up next.
+fwl() {
+  if [ -n "${HW_SABOTAGE:-}" ]; then
+    local -a rewritten=()
+    if mapfile -d '' -t rewritten < <($PY "$HERE/sweep_lib.py" rewrite-argv \
+          --scenario "$HW_SABOTAGE" \
+          --plant "${HW_SABOTAGE_PLANT:-}" \
+          --receipt "${HW_SABOTAGE_RECEIPT:-}" -- "$@" 2>/dev/null) \
+       && [ "${#rewritten[@]}" -gt 0 ]; then
+      set -- "${rewritten[@]}"
+    fi
+  fi
+  command fwl "$@"
+}
+
+# hw::sabotage_hook <pre|post> <tag> — runtime plants that are not a
+# text edit: clearing the pin root before a restart, detaching a
+# program after the attach. A no-op outside the sweep.
+hw::sabotage_hook() {
+  [ -n "${HW_SABOTAGE:-}" ] || return 0
+  $PY "$HERE/sweep_lib.py" deploy-hook \
+    --scenario "$HW_SABOTAGE" --plant "${HW_SABOTAGE_PLANT:-}" \
+    --tag "$2" --phase "$1" --receipt "${HW_SABOTAGE_RECEIPT:-}" \
+    >/dev/null 2>&1 || true
+}
+
 # Abort the test as FAILED (deploy/setup error). Never exit 0 from a
 # setup failure — a test that could not run has not passed.
 hw::abort() {
@@ -86,6 +141,7 @@ hw::deploy() {
     hw::abort "bundle has uncompiled zone objects"
   fi
   systemctl stop fd
+  hw::sabotage_hook pre "$tag"
   # Pinned maps persist across an fd restart (bpffs holds a reference;
   # only a reboot clears it). Clearing them here used to be this
   # function's job, and that workaround is exactly why no test could
@@ -115,6 +171,7 @@ hw::deploy() {
   $PY "$HERE/sendmany.py" --probe "$SEND_IF" "$RECV_IF" 45 \
     || hw::abort "wire never came back after attach"
   hw::teach_fdb
+  hw::sabotage_hook post "$tag"
   log "deployed $ver"
 }
 

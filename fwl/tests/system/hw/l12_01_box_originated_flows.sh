@@ -264,7 +264,7 @@ except Exception:
   TOTAL=$(ss -unap 2>/dev/null | grep -c dnsmasq)
   log "dnsmasq udp sockets: $TOTAL, of which unconnected: $UNCONN"
   if [ "$TOTAL" -gt 0 ] && [ "$UNCONN" -eq "$TOTAL" ]; then
-    pass "MEASURED: dnsmasq's upstream sockets carry NO peer, so \
+    record "MEASURED: dnsmasq's upstream sockets carry NO peer, so \
 sk_lookup cannot tell its replies from unsolicited packets to the same \
 port — candidate 2 is refuted for the case that matters most"
   else

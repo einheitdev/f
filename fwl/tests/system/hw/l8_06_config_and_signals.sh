@@ -90,12 +90,12 @@ STATE=$(systemctl is-active fd || true)
 log "SIGHUP: pid $PID_BEFORE -> $PID_AFTER, unit=$STATE"
 
 if [ "$PID_AFTER" != "$PID_BEFORE" ]; then
-  pass "SIGHUP killed the daemon (pid changed $PID_BEFORE -> \
+  record "SIGHUP killed the daemon (pid changed $PID_BEFORE -> \
 $PID_AFTER); systemd restarted it. Worth knowing: HUP is the reflex \
 for 'reload config' on most daemons, and here it is not handled — \
 edit the policy file instead, or use systemctl reload-or-restart."
 else
-  pass "SIGHUP was ignored, daemon survived (pid $PID_AFTER)"
+  record "SIGHUP was ignored, daemon survived (pid $PID_AFTER)"
 fi
 assert_eq "after SIGHUP the firewall is attached and running" \
   "$(ip -d link show "$RECV_IF" | grep -c ' xdp' || true)" 1

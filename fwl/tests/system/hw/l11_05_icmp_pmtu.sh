@@ -516,13 +516,13 @@ log "NIC oversize/length errors +$((OVER2 - OVER1)); bulk counter \
 
 log "=== ICMP/PMTU: what was measured ==="
 if [ "$BIG" -ge 20 ] && [ "$BIG" -lt 40 ]; then
-  pass "the receiving link DOES swallow oversized frames silently: \
+  record "the receiving link DOES swallow oversized frames silently: \
 only the 20 legal frames arrived, the 20 at 1514 B did not \
 ($BIG/40 total). A hop whose MTU the sender does not know about is a \
 black hole, and nothing on the wire says so — which is the whole \
 reason ICMP frag-needed exists"
 elif [ "$BIG" -ge 40 ]; then
-  pass "BENCH LIMIT RECORDED — the receiving link accepted the \
+  record "BENCH LIMIT RECORDED — the receiving link accepted the \
 oversized frames as readily as the legal ones ($BIG/40, NIC \
 oversize/length errors +$((OVER1 - OVER0))). igb allocates 2 KB \
 receive buffers and does not police frame size against the MTU, so a \
@@ -537,7 +537,7 @@ did not make it either, so this sub-measurement is unreadable"
 fi
 
 if [ "$XRC" -ne 0 ] || [ "${RX2:-0}" -lt "$WANT" ]; then
-  pass "PMTU BLACK HOLE REPRODUCED — the transfer stalled with \
+  record "PMTU BLACK HOLE REPRODUCED — the transfer stalled with \
 ${RX2:-0} of $WANT bytes delivered and no error surfaced anywhere. \
 This is the shape of the office failure: ping works, DNS works, small \
 requests work, and a large transfer hangs. The thing that rescues it \
@@ -545,7 +545,7 @@ is the router's ICMP frag-needed — which, measured above, this \
 firewall now admits under a stateful policy and delivers to the host \
 behind masquerade, both headers translated."
 else
-  pass "the transfer completed (${RX2} bytes) with the link MTU cut \
+  record "the transfer completed (${RX2} bytes) with the link MTU cut \
 to 1400 under an open connection — consistent with the frame-size \
 measurement above: the receiver takes oversized frames anyway, so \
 there was no black hole to fall into. What this DOES establish is \

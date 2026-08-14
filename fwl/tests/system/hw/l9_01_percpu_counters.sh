@@ -72,7 +72,7 @@ log "counter delta $DELTA (expected $EXPECTED), non-zero CPUs: $CPUS"
 assert_eq "per-CPU counter sum is exact across $SOURCES sources" \
   "$DELTA" "$EXPECTED"
 if [ "$CPUS" -gt 1 ]; then
-  pass "traffic genuinely spread across $CPUS CPUs — the sum is a \
+  record "traffic genuinely spread across $CPUS CPUs — the sum is a \
 real multi-CPU aggregation, not a single-queue artifact"
 else
   log "NOTE: only $CPUS CPU carried traffic, so this run did not \

@@ -230,7 +230,7 @@ hw::in fguest timeout 2 $PY "$HERE/realsock.py" client "$SERVER" \
   "$PORT" 1 1 >/dev/null 2>&1 || true
 NN_1=$(hw::route no_neigh)
 if [ "$NN_1" -gt "$NN_0" ]; then
-  pass "an unresolved next hop is counted (no_neigh $NN_0 -> $NN_1), \
+  record "an unresolved next hop is counted (no_neigh $NN_0 -> $NN_1), \
 not silently dropped"
 else
   log "NOTE: no_neigh did not move ($NN_0 -> $NN_1) — the stack \
