@@ -49,6 +49,38 @@ auto ClearInterfaceAddress(std::string_view document,
                            const std::string& iface)
     -> std::expected<std::string, std::string>;
 
+/// Add or update the DHCP reservation for `mac` on the server bound to
+/// `zone`.
+///
+/// A reservation is the operator saying "this board keeps this
+/// address", so it belongs in the same document as the range it comes
+/// out of — not in a dnsmasq file that the next `apply system` would
+/// overwrite. An existing reservation for the same MAC is edited in
+/// place so any comment beside it survives.
+///
+/// Refuses when the document declares no DHCP server on `zone`:
+/// inventing a server (and a range for it) from a reservation command
+/// would be guessing at the shape of the network.
+/// @param document The system configuration text.
+/// @param zone The zone whose DHCP server holds the reservation.
+/// @param mac Client hardware address.
+/// @param address The address to pin it to.
+/// @param hostname Optional name; empty leaves it unset.
+/// @returns the edited document, or why the edit was refused.
+auto SetDhcpReservation(std::string_view document,
+                        const std::string& zone,
+                        const std::string& mac,
+                        const std::string& address,
+                        const std::string& hostname = "")
+    -> std::expected<std::string, std::string>;
+
+/// Remove the reservation for `mac` wherever it is declared. Removing
+/// one that is not there is an error, not a no-op: an operator typing
+/// a MAC by hand wants to know the deletion did not match.
+auto ClearDhcpReservation(std::string_view document,
+                          const std::string& mac)
+    -> std::expected<std::string, std::string>;
+
 }  // namespace f::sysconfig
 
 #endif  // INCLUDE_F_SYSCONFIG_EDIT_H_

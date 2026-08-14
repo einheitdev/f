@@ -19,6 +19,7 @@
 #include <utility>
 #include <vector>
 
+#include "f/lease/lease.h"
 #include "f/sysconfig/artifact.h"
 #include "f/sysconfig/net.h"
 #include "f/sysconfig/validate.h"
@@ -165,7 +166,9 @@ auto PlanDnsmasq(const SystemConfig& cfg) -> DnsmasqPlan {
     o << "# no dhcp server is bound to any zone\n";
   } else {
     o << "dhcp-authoritative\n";
-    o << "dhcp-leasefile=/var/lib/f/dnsmasq.leases\n";
+    // The reader of this file is `show leases`; both sides name the
+    // path from the same constant so they cannot drift apart.
+    o << "dhcp-leasefile=" << lease::kLeaseFilePath << "\n";
     for (const auto& d : cfg.dhcp) {
       const auto& zone = d.bind.zone;
       auto names = cfg.InterfaceNamesInZone(zone);

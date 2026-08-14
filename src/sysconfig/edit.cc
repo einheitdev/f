@@ -4,9 +4,12 @@
 #include "f/sysconfig/edit.h"
 
 #include <algorithm>
+#include <cstddef>
 #include <format>
+#include <optional>
 #include <sstream>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "f/sysconfig/net.h"
@@ -96,6 +99,93 @@ auto FindChildKey(const Lines& lines, std::size_t from,
     if (key == name) return i;
   }
   return std::string::npos;
+}
+
+/// Where a YAML sequence item begins and ends, half-open.
+struct ItemRange {
+  std::size_t begin = 0;
+  std::size_t end = 0;
+  /// Column of the `-`.
+  std::size_t dash_indent = 0;
+};
+
+/// The sequence items nested in [from, to). An item starts at a line
+/// whose first non-space character is `-` and runs to the next such
+/// line at the same indent.
+auto SequenceItems(const Lines& lines, std::size_t from,
+                   std::size_t to) -> std::vector<ItemRange> {
+  std::vector<ItemRange> items;
+  std::size_t dash_indent = std::string::npos;
+  for (std::size_t i = from; i < to; ++i) {
+    if (IsBlankOrComment(lines[i])) continue;
+    auto n = Indent(lines[i]);
+    if (n >= lines[i].size() || lines[i][n] != '-') continue;
+    if (dash_indent == std::string::npos) dash_indent = n;
+    if (n != dash_indent) continue;
+    if (!items.empty()) items.back().end = i;
+    items.push_back({i, to, n});
+  }
+  if (!items.empty()) items.back().end = to;
+  return items;
+}
+
+/// The value of `key` inside a sequence item, or nullopt.
+///
+/// The first key of an item shares the `- ` line, so the item's key
+/// indent is the dash column plus two — not the indent of the first
+/// line, which would be the dash itself.
+auto ItemKeyLine(const Lines& lines, const ItemRange& item,
+                 const std::string& key) -> std::size_t {
+  const auto key_indent = item.dash_indent + 2;
+  for (std::size_t i = item.begin; i < item.end; ++i) {
+    if (IsBlankOrComment(lines[i])) continue;
+    std::string body = lines[i];
+    std::size_t start = Indent(body);
+    if (i == item.begin) {
+      // "  - zone: lan" -> the key starts after the dash and a space.
+      if (start < body.size() && body[start] == '-') {
+        start = start + 1;
+        while (start < body.size() && body[start] == ' ') ++start;
+      }
+    } else if (start != key_indent) {
+      continue;
+    }
+    auto colon = body.find(':', start);
+    if (colon == std::string::npos) continue;
+    if (body.substr(start, colon - start) == key) return i;
+  }
+  return std::string::npos;
+}
+
+auto ValueAfterColon(const std::string& line) -> std::string {
+  auto colon = line.find(':');
+  if (colon == std::string::npos) return "";
+  auto v = line.substr(colon + 1);
+  auto b = v.find_first_not_of(" \t");
+  if (b == std::string::npos) return "";
+  auto e = v.find_last_not_of(" \t\r");
+  auto out = v.substr(b, e - b + 1);
+  if (out.size() >= 2 && (out.front() == '"' || out.front() == '\'') &&
+      out.back() == out.front()) {
+    out = out.substr(1, out.size() - 2);
+  }
+  return out;
+}
+
+/// The line range of the block nested under a key line inside an item.
+/// `base` is the key's own column, passed in rather than measured: a
+/// key that shares the `- ` line is indented to the dash, and measuring
+/// would swallow every sibling key of the item.
+auto KeyBlockRange(const Lines& lines, std::size_t key_line,
+                   std::size_t base, std::size_t limit)
+    -> std::pair<std::size_t, std::size_t> {
+  std::size_t end = key_line + 1;
+  for (std::size_t i = key_line + 1; i < limit; ++i) {
+    if (IsBlankOrComment(lines[i])) continue;
+    if (Indent(lines[i]) <= base) break;
+    end = i + 1;
+  }
+  return {key_line + 1, end};
 }
 
 /// Re-parse the edited document. An edit that does not parse, or that
@@ -234,6 +324,259 @@ auto ClearInterfaceAddress(std::string_view document,
     lines.erase(lines.begin() + static_cast<long>(addr_line));
   }
   return Verify(Join(lines), iface, "none");
+}
+
+namespace {
+
+/// Re-parse, and hand back the model's view of the reservation for
+/// `mac`. Same rule as the interface edits: nothing goes back to a
+/// caller who is about to install it until it has been read again.
+auto ReparseReservation(const std::string& text,
+                        const std::string& mac,
+                        std::optional<std::string>* found)
+    -> std::expected<void, std::string> {
+  auto parsed = ParseSystemConfigString(text);
+  if (!parsed) {
+    std::string why;
+    for (const auto& d : parsed.error().diagnostics) {
+      if (!why.empty()) why += "; ";
+      why += d.Format();
+    }
+    return std::unexpected(std::format(
+        "the edit would not parse ({}) — nothing was changed", why));
+  }
+  for (const auto& d : parsed->dhcp) {
+    for (const auto& r : d.reservations) {
+      if (r.mac == mac) {
+        *found = r.address;
+        return {};
+      }
+    }
+  }
+  *found = std::nullopt;
+  return {};
+}
+
+/// The reservation must exist, at exactly this address.
+auto VerifyReservationPresent(const std::string& text,
+                              const std::string& mac,
+                              const std::string& address)
+    -> std::expected<std::string, std::string> {
+  std::optional<std::string> found;
+  if (auto r = ReparseReservation(text, mac, &found); !r) {
+    return std::unexpected(r.error());
+  }
+  if (!found || *found != address) {
+    return std::unexpected(
+        "the edit did not take — nothing was changed");
+  }
+  return text;
+}
+
+/// The reservation must be gone.
+auto VerifyReservationAbsent(const std::string& text,
+                             const std::string& mac)
+    -> std::expected<std::string, std::string> {
+  std::optional<std::string> found;
+  if (auto r = ReparseReservation(text, mac, &found); !r) {
+    return std::unexpected(r.error());
+  }
+  if (found) {
+    return std::unexpected(
+        "the reservation is still there — nothing was changed");
+  }
+  return text;
+}
+
+/// Locate the `services: dhcp:` sequence, or say why it is not there.
+struct DhcpSequence {
+  std::size_t begin = 0;
+  std::size_t end = 0;
+};
+
+auto FindDhcpSequence(const Lines& lines)
+    -> std::expected<DhcpSequence, std::string> {
+  auto services = FindTopLevelKey(lines, "services");
+  if (services == std::string::npos) {
+    return std::unexpected(
+        "the system configuration declares no services");
+  }
+  auto [sbegin, send] = BlockRange(lines, services);
+  auto dhcp = FindChildKey(lines, sbegin, send, "dhcp");
+  if (dhcp == std::string::npos) {
+    return std::unexpected(
+        "no DHCP server is declared in the system configuration");
+  }
+  auto [dbegin, dend] = KeyBlockRange(lines, dhcp, Indent(lines[dhcp]),
+                                      send);
+  return DhcpSequence{dbegin, dend};
+}
+
+}  // namespace
+
+auto SetDhcpReservation(std::string_view document,
+                        const std::string& zone,
+                        const std::string& mac,
+                        const std::string& address,
+                        const std::string& hostname)
+    -> std::expected<std::string, std::string> {
+  if (!IsMacAddress(mac)) {
+    return std::unexpected(std::format(
+        "'{}' is not a MAC address — a reservation is keyed by the "
+        "client's hardware address",
+        mac));
+  }
+  const auto norm = NormalizeMac(mac);
+  if (!ParseIpv4(address)) {
+    return std::unexpected(std::format(
+        "'{}' is not an IPv4 address", address));
+  }
+
+  auto lines = SplitLines(document);
+  auto seq = FindDhcpSequence(lines);
+  if (!seq) return std::unexpected(seq.error());
+
+  auto items = SequenceItems(lines, seq->begin, seq->end);
+  const ItemRange* target = nullptr;
+  std::vector<std::string> zones_seen;
+  for (const auto& it : items) {
+    auto zl = ItemKeyLine(lines, it, "zone");
+    if (zl == std::string::npos) continue;
+    auto name = ValueAfterColon(lines[zl]);
+    zones_seen.push_back(name);
+    if (name == zone) target = &it;
+  }
+  if (target == nullptr) {
+    std::string list;
+    for (const auto& z : zones_seen) {
+      if (!list.empty()) list += ", ";
+      list += z;
+    }
+    return std::unexpected(std::format(
+        "no DHCP server is bound to zone '{}'{}", zone,
+        list.empty() ? "" : std::format(" (declared: {})", list)));
+  }
+
+  const auto key_indent = target->dash_indent + 2;
+  const std::string key_pad(key_indent, ' ');
+  auto res_line = ItemKeyLine(lines, *target, "reservations");
+
+  if (res_line == std::string::npos) {
+    // No reservations block yet: open one at the end of this server's
+    // body, leaving every other key where it was.
+    Lines block = {
+        std::format("{}reservations:", key_pad),
+        std::format("{}  - mac: \"{}\"", key_pad, norm),
+        std::format("{}    address: {}", key_pad, address),
+    };
+    if (!hostname.empty()) {
+      block.push_back(
+          std::format("{}    hostname: {}", key_pad, hostname));
+    }
+    // Skip trailing blank lines so the block lands inside the item and
+    // not after the blank line that separates it from the next.
+    auto at = target->end;
+    while (at > target->begin && IsBlankOrComment(lines[at - 1]) &&
+           Indent(lines[at - 1]) >= lines[at - 1].size()) {
+      --at;
+    }
+    lines.insert(lines.begin() + static_cast<long>(at), block.begin(),
+                 block.end());
+    return VerifyReservationPresent(Join(lines), norm, address);
+  }
+
+  auto [rbegin, rend] =
+      KeyBlockRange(lines, res_line, key_indent, target->end);
+  auto entries = SequenceItems(lines, rbegin, rend);
+  for (const auto& e : entries) {
+    auto ml = ItemKeyLine(lines, e, "mac");
+    if (ml == std::string::npos) continue;
+    if (NormalizeMac(ValueAfterColon(lines[ml])) != norm) continue;
+    // Editing in place keeps whatever the operator wrote beside it.
+    // Every line index is resolved before anything moves, and the
+    // edits are then applied from the bottom up so the earlier indices
+    // stay valid.
+    const std::string epad(e.dash_indent + 2, ' ');
+    auto al = ItemKeyLine(lines, e, "address");
+    auto hl = hostname.empty() ? std::string::npos
+                               : ItemKeyLine(lines, e, "hostname");
+    struct Insert {
+      std::size_t at;
+      std::string text;
+    };
+    std::vector<Insert> inserts;
+    if (al != std::string::npos) {
+      lines[al] = std::format("{}address: {}", epad, address);
+    } else {
+      inserts.push_back({e.end, std::format("{}address: {}", epad,
+                                            address)});
+    }
+    if (!hostname.empty()) {
+      if (hl != std::string::npos) {
+        lines[hl] = std::format("{}hostname: {}", epad, hostname);
+      } else {
+        inserts.push_back({e.end, std::format("{}hostname: {}", epad,
+                                              hostname)});
+      }
+    }
+    for (auto it = inserts.rbegin(); it != inserts.rend(); ++it) {
+      lines.insert(lines.begin() + static_cast<long>(it->at),
+                   it->text);
+    }
+    return VerifyReservationPresent(Join(lines), norm, address);
+  }
+
+  // A reservations block that does not mention this MAC: append.
+  std::size_t entry_indent = key_indent + 2;
+  if (!entries.empty()) entry_indent = entries.front().dash_indent;
+  const std::string epad(entry_indent, ' ');
+  Lines block = {
+      std::format("{}- mac: \"{}\"", epad, norm),
+      std::format("{}  address: {}", epad, address),
+  };
+  if (!hostname.empty()) {
+    block.push_back(std::format("{}  hostname: {}", epad, hostname));
+  }
+  lines.insert(lines.begin() + static_cast<long>(rend), block.begin(),
+               block.end());
+  return VerifyReservationPresent(Join(lines), norm, address);
+}
+
+auto ClearDhcpReservation(std::string_view document,
+                          const std::string& mac)
+    -> std::expected<std::string, std::string> {
+  if (!IsMacAddress(mac)) {
+    return std::unexpected(
+        std::format("'{}' is not a MAC address", mac));
+  }
+  const auto norm = NormalizeMac(mac);
+  auto lines = SplitLines(document);
+  auto seq = FindDhcpSequence(lines);
+  if (!seq) return std::unexpected(seq.error());
+
+  for (const auto& item : SequenceItems(lines, seq->begin, seq->end)) {
+    auto res_line = ItemKeyLine(lines, item, "reservations");
+    if (res_line == std::string::npos) continue;
+    auto [rbegin, rend] = KeyBlockRange(
+        lines, res_line, item.dash_indent + 2, item.end);
+    auto entries = SequenceItems(lines, rbegin, rend);
+    for (const auto& e : entries) {
+      auto ml = ItemKeyLine(lines, e, "mac");
+      if (ml == std::string::npos) continue;
+      if (NormalizeMac(ValueAfterColon(lines[ml])) != norm) continue;
+      lines.erase(lines.begin() + static_cast<long>(e.begin),
+                  lines.begin() + static_cast<long>(e.end));
+      // An empty `reservations:` key parses as null, which the model
+      // reads as no reservations — but it reads as an unfinished edit
+      // to a human, so take the key with the last entry.
+      if (entries.size() == 1) {
+        lines.erase(lines.begin() + static_cast<long>(res_line));
+      }
+      return VerifyReservationAbsent(Join(lines), norm);
+    }
+  }
+  return std::unexpected(std::format(
+      "no reservation for {} in the system configuration", norm));
 }
 
 }  // namespace f::sysconfig

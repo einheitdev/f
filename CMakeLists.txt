@@ -146,6 +146,29 @@ target_link_libraries(libf-sysconfig PUBLIC
 )
 
 # ============================================================================
+# Lease / device visibility
+#
+# Observed state, not configuration: what dnsmasq handed out, when each
+# device first appeared, and the join of the two with the model. Kept
+# apart from libf-sysconfig because the model is what we declare and
+# this is what actually turned up.
+# ============================================================================
+add_library(libf-lease STATIC
+  src/lease/journal.cc
+  src/lease/lease.cc
+  src/lease/view.cc
+)
+
+target_include_directories(libf-lease PUBLIC
+  ${PROJECT_SOURCE_DIR}/include
+)
+
+target_link_libraries(libf-lease PUBLIC
+  libf-sysconfig
+  nlohmann_json::nlohmann_json
+)
+
+# ============================================================================
 # Engine library (BPF + ZMQ, no HTTP)
 # ============================================================================
 add_library(libf-engine STATIC

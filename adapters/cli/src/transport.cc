@@ -14,14 +14,22 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cerrno>
+#include <chrono>
+#include <condition_variable>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <filesystem>
 #include <format>
 #include <fstream>
+#include <mutex>
 #include <sstream>
 #include <string>
+#include <string_view>
+#include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include <nlohmann/json.hpp>
@@ -29,10 +37,14 @@
 
 #include "einheit/cli/transport/zmq_local.h"
 #include "f/confd/system_backend.h"
+#include "f/lease/journal.h"
+#include "f/lease/lease.h"
+#include "f/lease/view.h"
 #include "f/sysconfig/artifact.h"
 #include "f/sysconfig/dnsmasq.h"
 #include "f/sysconfig/edit.h"
 #include "f/sysconfig/model.h"
+#include "f/sysconfig/net.h"
 #include "f/sysconfig/networkd.h"
 #include "f/sysconfig/parse.h"
 #include "f/sysconfig/service_status.h"
@@ -62,6 +74,73 @@ using json_t = nlohmann::json;
 using Error_t = cli::Error<cli::transport::TransportError>;
 namespace proto = cli::protocol;
 namespace sc = ::f::sysconfig;
+namespace lease = ::f::lease;
+
+/// Unix seconds. The lease file and the journal are both stamped in
+/// wall-clock time, because a lease expiry is a wall-clock fact.
+auto NowSeconds() -> std::int64_t {
+  return std::chrono::duration_cast<std::chrono::seconds>(
+             std::chrono::system_clock::now().time_since_epoch())
+      .count();
+}
+
+/// The daemon stamps conntrack with bpf_ktime_get_ns(), which is
+/// CLOCK_MONOTONIC — so an idle time is computed against the same
+/// clock, not against the wall.
+auto MonotonicNs() -> std::uint64_t {
+  return static_cast<std::uint64_t>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now().time_since_epoch())
+          .count());
+}
+
+/// Render a device report as the wire body `show leases` renders.
+///
+/// Note what travels next to the list: `leases` and `journal` carry
+/// *why* the list looks the way it does. The renderer is not allowed
+/// to infer that from the list being empty, so it is sent whether or
+/// not anything went wrong.
+auto DeviceReportToJson(const lease::DeviceReport& r,
+                        std::int64_t now) -> json {
+  json devices = json::array();
+  for (const auto& d : r.devices) {
+    devices.push_back({
+        {"mac", d.mac},
+        {"address", d.address},
+        {"hostname", d.hostname},
+        {"zone", d.zone},
+        {"first_seen", d.first_seen},
+        {"first_seen_age", now - d.first_seen},
+        {"first_seen_exact",
+         d.precision == lease::FirstSeenPrecision::kObserved},
+        {"last_seen", d.last_seen},
+        {"last_seen_age", now - d.last_seen},
+        {"last_arrival", d.last_arrival},
+        {"expiry", d.expiry},
+        {"expires_in", d.expiry > 0 ? d.expiry - now : 0},
+        {"active", d.active},
+        {"new", d.IsNew(now, lease::kNewWindowSeconds)},
+        {"reserved", d.reserved},
+        {"reserved_address", d.reserved_address},
+        {"address_changes", d.address_changes},
+    });
+  }
+  return {
+      {"devices", devices},
+      {"active", r.ActiveCount()},
+      {"leases", lease::LeaseAvailabilityName(r.leases)},
+      {"journal", lease::JournalAvailabilityName(r.journal)},
+      {"detail", r.detail},
+      {"lease_path", r.lease_path},
+      {"journal_path", r.journal_path},
+      {"unparsable", r.unparsable},
+      {"ipv6_skipped", r.ipv6_skipped},
+      {"arrived", r.changes.arrived},
+      {"departed", r.changes.departed},
+      {"readdressed", r.changes.readdressed},
+      {"now", now},
+  };
+}
 
 auto MakeOk(const std::string& id, json data)
     -> proto::Response {
@@ -371,23 +450,21 @@ class FLocalTransport final
   explicit FLocalTransport(FLocalConfig cfg)
       : cfg_(std::move(cfg)) {}
 
+  /// A joinable poller thread at destruction would call terminate, so
+  /// the watch is always stopped here as well as on Disconnect.
+  ~FLocalTransport() override { StopWatch(); }
+
   auto Connect()
       -> std::expected<void, Error_t> override {
-    try {
-      zmq_ctx_ = std::make_unique<zmq::context_t>(1);
-      zmq_sock_ = std::make_unique<zmq::socket_t>(
-          *zmq_ctx_, zmq::socket_type::req);
-      zmq_sock_->set(zmq::sockopt::linger, 0);
-      zmq_sock_->set(zmq::sockopt::rcvtimeo, 3000);
-      zmq_sock_->set(zmq::sockopt::sndtimeo, 3000);
-      zmq_sock_->connect(cfg_.fd_socket);
-      fd_connected_ = true;
-    } catch (const zmq::error_t&) {
-    }
+    // Connecting to a dead ipc:// path succeeds, so this proves
+    // nothing about fd being up; every command finds that out for
+    // itself and says so.
+    (void)OpenFdSocket();
     return {};
   }
 
   auto Disconnect() -> void override {
+    StopWatch();
     zmq_sock_.reset();
     zmq_ctx_.reset();
     fd_connected_ = false;
@@ -416,6 +493,18 @@ class FLocalTransport final
     }
     if (req.command == "show_counters") {
       return HandleShowCounters(req);
+    }
+    if (req.command == "show_leases") {
+      return HandleShowLeases(req);
+    }
+    if (req.command == "show_device") {
+      return HandleShowDevice(req);
+    }
+    if (req.command == "set_reservation") {
+      return HandleSetReservation(req);
+    }
+    if (req.command == "no_reservation") {
+      return HandleNoReservation(req);
     }
     if (req.command == "show_zones") {
       return FdQuery(req.id, fd_cmd::kGetZones);
@@ -511,18 +600,53 @@ class FLocalTransport final
                    "Unknown command: " + req.command);
   }
 
-  auto Subscribe(const std::string& /*topic_prefix*/,
-                 cli::transport::EventCallback /*cb*/)
+  /// Subscribe to an event topic.
+  ///
+  /// This used to return success for anything and then deliver
+  /// nothing, which made `watch` sit there looking like a quiet
+  /// network. A topic with no source behind it is now refused by name.
+  auto Subscribe(const std::string& topic_prefix,
+                 cli::transport::EventCallback cb)
       -> std::expected<void, Error_t> override {
+    if (topic_prefix != kLeaseTopic) {
+      return std::unexpected(Error_t{
+          cli::transport::TransportError::InvalidState,
+          std::format(
+              "nothing on this box publishes '{}'; the only live "
+              "topic is '{}'",
+              topic_prefix, kLeaseTopic)});
+    }
+    {
+      std::lock_guard<std::mutex> lk(watch_mu_);
+      if (watch_thread_.joinable()) {
+        return std::unexpected(Error_t{
+            cli::transport::TransportError::InvalidState,
+            "already watching leases"});
+      }
+      watch_stop_ = false;
+    }
+    watch_thread_ = std::thread([this, cb = std::move(cb)] {
+      PollLeases(cb);
+    });
     return {};
   }
 
-  auto Unsubscribe(const std::string& /*topic_prefix*/)
+  auto Unsubscribe(const std::string& topic_prefix)
       -> std::expected<void, Error_t> override {
+    if (topic_prefix != kLeaseTopic) {
+      return std::unexpected(Error_t{
+          cli::transport::TransportError::InvalidState,
+          std::format("not subscribed to '{}'", topic_prefix)});
+    }
+    StopWatch();
     return {};
   }
 
  private:
+  /// The one topic this transport can actually publish. Named here so
+  /// the adapter and the transport agree on the spelling.
+  static constexpr const char* kLeaseTopic = "leases";
+
   FLocalConfig cfg_;
   std::unique_ptr<zmq::context_t> zmq_ctx_;
   std::unique_ptr<zmq::socket_t> zmq_sock_;
@@ -534,6 +658,85 @@ class FLocalTransport final
   std::unique_ptr<cli::transport::Transport> confd_;
   bool confd_probed_ = false;
   bool confd_up_ = false;
+
+  // The lease poller behind `watch show leases`.
+  std::thread watch_thread_;
+  std::mutex watch_mu_;
+  std::condition_variable watch_cv_;
+  bool watch_stop_ = false;
+
+  auto StopWatch() -> void {
+    {
+      std::lock_guard<std::mutex> lk(watch_mu_);
+      watch_stop_ = true;
+    }
+    watch_cv_.notify_all();
+    if (watch_thread_.joinable()) watch_thread_.join();
+  }
+
+  /// Re-read the lease file until told to stop, publishing an event on
+  /// the first pass and thereafter only when something changed.
+  ///
+  /// Repainting a still screen every two seconds would bury the one
+  /// line the operator is waiting for, so a quiet segment stays quiet
+  /// — but the first paint is immediate, because a watch that shows
+  /// nothing until something happens is indistinguishable from a watch
+  /// that is broken.
+  auto PollLeases(const cli::transport::EventCallback& cb) -> void {
+    bool first = true;
+    for (;;) {
+      auto now = NowSeconds();
+      auto parsed = sc::ParseSystemConfigFile(SystemConfigPath());
+      json body;
+      if (!parsed) {
+        // The watch keeps running: a system config being edited
+        // underneath it is exactly when an operator is watching.
+        body = {
+            {"devices", json::array()},
+            {"leases", "no-dhcp-configured"},
+            {"journal", "unknown"},
+            {"detail",
+             std::format("{} does not parse", SystemConfigPath())},
+            {"now", now},
+        };
+      } else {
+        auto report =
+            lease::CollectDevices(*parsed, ViewOptions(), now);
+        const bool quiet = report.changes.Quiet();
+        if (!first && quiet) {
+          if (WaitOrStop()) return;
+          continue;
+        }
+        body = DeviceReportToJson(report, now);
+      }
+      proto::Event ev;
+      ev.topic = kLeaseTopic;
+      ev.timestamp = Rfc3339(now);
+      auto s = body.dump();
+      ev.data.assign(s.begin(), s.end());
+      cb(ev);
+      first = false;
+      if (WaitOrStop()) return;
+    }
+  }
+
+  /// Sleep for the poll interval. Returns true when asked to stop, so
+  /// Ctrl-C does not have to wait out the interval.
+  auto WaitOrStop() -> bool {
+    std::unique_lock<std::mutex> lk(watch_mu_);
+    watch_cv_.wait_for(lk, cfg_.lease_poll,
+                       [this] { return watch_stop_; });
+    return watch_stop_;
+  }
+
+  static auto Rfc3339(std::int64_t epoch) -> std::string {
+    auto t = static_cast<std::time_t>(epoch);
+    std::tm tm{};
+    ::gmtime_r(&t, &tm);
+    char buf[32] = {};
+    std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%S.000Z", &tm);
+    return buf;
+  }
 
   /// Connect to f-confd and prove it answers. The connection alone
   /// proves nothing — a ZMQ connect to a dead ipc:// path succeeds.
@@ -581,12 +784,37 @@ class FLocalTransport final
     return *resp;
   }
 
+  /// Whether fd's control socket exists on disk.
+  ///
+  /// A ZMQ connect to a missing `ipc://` path succeeds and then times
+  /// out three seconds later with "recv timeout", which reads as a
+  /// slow daemon rather than an absent one. The socket file is a
+  /// cheap, exact answer to "is fd there at all", so ask it first and
+  /// keep the timeout for the case it is meant for: fd running and
+  /// not answering.
+  auto FdSocketPresent() const -> bool {
+    constexpr std::string_view kIpc = "ipc://";
+    if (!cfg_.fd_socket.starts_with(kIpc)) return true;
+    auto path = cfg_.fd_socket.substr(kIpc.size());
+    std::error_code ec;
+    return std::filesystem::exists(path, ec);
+  }
+
   auto RequireFd(const std::string& id)
       -> std::optional<proto::Response> {
-    if (!fd_connected_) {
+    if (!FdSocketPresent()) {
+      fd_connected_ = false;
       return MakeErr(id, "no_daemon",
-          "fd is not running",
+          std::format("fd is not running (no socket at {})",
+                      cfg_.fd_socket),
           "Start fd: sudo systemctl start fd");
+    }
+    // The socket is there; fd may have been restarted since our last
+    // exchange failed, so rebuild the client side if we dropped it.
+    if ((!fd_connected_ || !zmq_sock_) && !OpenFdSocket()) {
+      return MakeErr(id, "no_daemon",
+          "fd's control socket exists but could not be opened",
+          "Check permissions on " + cfg_.fd_socket);
     }
     return std::nullopt;
   }
@@ -606,15 +834,61 @@ class FLocalTransport final
 
   /// Send `cmd` (with optional payload) and classify the answer.
   /// The single place that decides whether fd succeeded.
+  /// Build the REQ socket onto fd's control endpoint.
+  ///
+  /// A ZMQ REQ socket enforces strict send/recv alternation: once a
+  /// send has gone out and the reply has not come back, the next send
+  /// throws. A connect to a dead `ipc://` path still succeeds, so the
+  /// *first* command against a stopped fd times out — and every
+  /// command after it in the same session used to die with
+  /// "Operation cannot be accomplished in current state", which names
+  /// nothing an operator can act on. So a failed exchange throws the
+  /// socket away and makes a new one: one timeout, one honest message,
+  /// and the session recovers by itself the moment fd comes back.
+  auto OpenFdSocket() -> bool {
+    try {
+      if (!zmq_ctx_) zmq_ctx_ = std::make_unique<zmq::context_t>(1);
+      zmq_sock_ = std::make_unique<zmq::socket_t>(
+          *zmq_ctx_, zmq::socket_type::req);
+      zmq_sock_->set(zmq::sockopt::linger, 0);
+      zmq_sock_->set(zmq::sockopt::rcvtimeo, 3000);
+      zmq_sock_->set(zmq::sockopt::sndtimeo, 3000);
+      zmq_sock_->connect(cfg_.fd_socket);
+      fd_connected_ = true;
+      return true;
+    } catch (const zmq::error_t&) {
+      zmq_sock_.reset();
+      fd_connected_ = false;
+      return false;
+    }
+  }
+
   auto AskFd(uint8_t cmd, const std::string& payload = "")
       -> FdReply {
     FdReply out;
-    if (!fd_connected_ || !zmq_sock_) {
-      out.error = "fd is not running";
+    if (!FdSocketPresent()) {
+      fd_connected_ = false;
+      out.error = std::format("fd is not running (no socket at {})",
+                              cfg_.fd_socket);
       return out;
     }
-    auto resp = SendRawToFd(*zmq_sock_, cmd, payload);
+    if ((!fd_connected_ || !zmq_sock_) && !OpenFdSocket()) {
+      // A previous exchange failed and dropped the socket; fd may
+      // have been restarted since, so this is a retry, not a state.
+      out.error = "fd's control socket could not be opened";
+      return out;
+    }
+    std::expected<std::string, std::string> resp;
+    try {
+      resp = SendRawToFd(*zmq_sock_, cmd, payload);
+    } catch (const zmq::error_t& e) {
+      resp = std::unexpected(e.what());
+    }
     if (!resp) {
+      // The socket is now mid-transaction and unusable; replace it so
+      // the next command starts clean.
+      zmq_sock_.reset();
+      fd_connected_ = false;
       out.error = std::format("fd did not answer: {}",
                               resp.error());
       return out;
@@ -1495,6 +1769,380 @@ class FLocalTransport final
         {"artifact", cfg_.dnsmasq_conf},
         {"drift", sc::DriftKindName(drift)},
     });
+  }
+
+  // -- device visibility ----------------------------------------------
+  //
+  // Plug something in; find out what it is and what it is talking to.
+  //
+  // The lease view is assembled from three sources that fail
+  // independently — the system configuration, dnsmasq's lease file and
+  // the device journal — plus fd for the flow half. Each one's
+  // availability travels with the answer, because an empty table has
+  // to be able to say which kind of empty it is.
+
+  auto ViewOptions() const -> lease::ViewOptions {
+    lease::ViewOptions o;
+    o.lease_path = cfg_.lease_file;
+    o.journal_path = cfg_.device_journal;
+    return o;
+  }
+
+  /// The device report, or the response that explains why there is
+  /// none. A system configuration that will not parse is not a lease
+  /// view with no devices in it.
+  auto CollectReport(const proto::Request& req,
+                     lease::DeviceReport* out,
+                     std::optional<proto::Response>* fail,
+                     std::int64_t now) -> bool {
+    sc::SystemConfig cfg;
+    if (!LoadSystem(req, &cfg, fail)) return false;
+    *out = lease::CollectDevices(cfg, ViewOptions(), now);
+    return true;
+  }
+
+  auto HandleShowLeases(const proto::Request& req)
+      -> proto::Response {
+    const auto now = NowSeconds();
+    lease::DeviceReport report;
+    std::optional<proto::Response> fail;
+    if (!CollectReport(req, &report, &fail, now)) return *fail;
+
+    bool only_new = false;
+    bool include_gone = false;
+    for (const auto& a : req.args) {
+      if (a == "new") only_new = true;
+      if (a == "all") include_gone = true;
+    }
+    if (only_new || !include_gone) {
+      std::vector<lease::Device> kept;
+      for (const auto& d : report.devices) {
+        if (only_new && !d.IsNew(now, lease::kNewWindowSeconds)) {
+          continue;
+        }
+        if (!include_gone && !only_new && !d.active) continue;
+        kept.push_back(d);
+      }
+      // How many rows were left out is part of the answer: "3 devices"
+      // next to a table of one is a question the operator should not
+      // have to ask.
+      auto hidden = report.devices.size() - kept.size();
+      auto j = DeviceReportToJson(report, now);
+      report.devices = std::move(kept);
+      auto shown = DeviceReportToJson(report, now);
+      shown["hidden"] = hidden;
+      shown["filter"] = only_new ? "new" : "active";
+      shown["active"] = j["active"];
+      return MakeOk(req.id, shown);
+    }
+    auto j = DeviceReportToJson(report, now);
+    j["hidden"] = 0;
+    j["filter"] = "all";
+    return MakeOk(req.id, j);
+  }
+
+  auto HandleShowDevice(const proto::Request& req)
+      -> proto::Response {
+    if (req.args.empty()) {
+      return MakeErr(req.id, "missing_args",
+          "Usage: show device <mac|address|hostname>");
+    }
+    const auto& query = req.args[0];
+    const auto now = NowSeconds();
+    lease::DeviceReport report;
+    std::optional<proto::Response> fail;
+    if (!CollectReport(req, &report, &fail, now)) return *fail;
+
+    auto hits = lease::MatchDevices(report, query);
+    if (hits.empty()) {
+      // Not knowing the device and not being able to read the leases
+      // are different answers, and the hint says which one happened.
+      std::string hint =
+          report.leases == lease::LeaseAvailability::kOk
+              ? "`show leases all` lists every device seen"
+              : std::format("the lease view is unavailable: {}",
+                            lease::LeaseAvailabilityName(
+                                report.leases));
+      return MakeErr(req.id, "no_such_device",
+                     std::format("no device matches '{}'", query),
+                     hint);
+    }
+    if (hits.size() > 1) {
+      std::string names;
+      for (const auto* d : hits) {
+        if (!names.empty()) names += ", ";
+        names += std::format("{} ({})", d->mac, d->address);
+      }
+      return MakeErr(req.id, "ambiguous_device",
+          std::format("'{}' matches {} devices", query, hits.size()),
+          names);
+    }
+    const auto& d = *hits[0];
+
+    json j = {
+        {"mac", d.mac},
+        {"address", d.address},
+        {"hostname", d.hostname},
+        {"zone", d.zone},
+        {"first_seen", d.first_seen},
+        {"first_seen_age", now - d.first_seen},
+        {"first_seen_exact",
+         d.precision == lease::FirstSeenPrecision::kObserved},
+        {"last_seen_age", now - d.last_seen},
+        {"expires_in", d.expiry > 0 ? d.expiry - now : 0},
+        {"active", d.active},
+        {"new", d.IsNew(now, lease::kNewWindowSeconds)},
+        {"reserved", d.reserved},
+        {"reserved_address", d.reserved_address},
+        {"address_changes", d.address_changes},
+        {"leases", lease::LeaseAvailabilityName(report.leases)},
+        {"journal", lease::JournalAvailabilityName(report.journal)},
+    };
+
+    // NAT first, because the flow half needs it.
+    //
+    // Conntrack is keyed on the addresses that are *on the wire*, and
+    // behind a masquerade those are the gateway's, not the device's.
+    // Filtering conntrack by the device's own address therefore finds
+    // nothing on exactly the topology this appliance exists to run,
+    // and reports "tracking no connections" about a device with two.
+    // The NAT table is what makes the two views joinable: it maps
+    // each translated endpoint back to the host that owns it.
+    auto nat = AskFd(fd_cmd::kGetNat);
+    // Endpoints seen on the wire that really belong to this device.
+    struct WireAlias {
+      std::string addr;
+      int port = 0;
+      int local_port = 0;
+    };
+    std::vector<WireAlias> aliases;
+    if (nat.ok) {
+      j["nat_available"] = true;
+      json translations = json::array();
+      for (const auto& t : nat.body.value("translations",
+                                          json::array())) {
+        // `type` is the *original* direction. For an outbound
+        // masquerade the device is behind `new_addr`, and the wire
+        // carries `orig_dst`; for an inbound port-forward it is the
+        // other way round.
+        const auto type = t.value("type", "");
+        std::string device_side;
+        WireAlias alias;
+        if (type == "snat") {
+          device_side = t.value("new_addr", "");
+          alias.addr = t.value("orig_dst", "");
+          alias.port = t.value("orig_dst_port", 0);
+          alias.local_port = t.value("new_port", 0);
+        } else {
+          device_side = t.value("orig_src", "");
+          alias.addr = t.value("new_addr", "");
+          alias.port = t.value("new_port", 0);
+          alias.local_port = t.value("orig_src_port", 0);
+        }
+        if (device_side != d.address) continue;
+        translations.push_back(t);
+        if (!alias.addr.empty()) aliases.push_back(alias);
+      }
+      j["nat"] = translations;
+    } else {
+      j["nat_available"] = false;
+      j["nat_detail"] = nat.error;
+    }
+    j["translated"] = !aliases.empty();
+
+    // The flow half. fd being down is reported as such; it is not the
+    // same picture as a device that is talking to nobody.
+    auto ct = AskFd(fd_cmd::kGetConntrack);
+    if (!ct.ok) {
+      j["flows_available"] = false;
+      j["flows_detail"] = ct.error;
+    } else {
+      j["flows_available"] = true;
+      json flows = json::array();
+      const auto now_ns = MonotonicNs();
+      std::uint64_t packets_total = 0;
+      std::unordered_map<std::string, std::uint64_t> peers;
+      for (const auto& c : ct.body) {
+        auto src = c.value("src", "");
+        auto dst = c.value("dst", "");
+        auto sport = c.value("src_port", 0);
+        auto dport = c.value("dst_port", 0);
+        bool outbound = src == d.address;
+        bool mine = outbound || dst == d.address;
+        bool translated = false;
+        int local_port = outbound ? sport : dport;
+        if (!mine) {
+          for (const auto& a : aliases) {
+            if (src == a.addr && sport == a.port) {
+              mine = true;
+              outbound = true;
+              translated = true;
+              local_port = a.local_port;
+              break;
+            }
+            if (dst == a.addr && dport == a.port) {
+              mine = true;
+              outbound = false;
+              translated = true;
+              local_port = a.local_port;
+              break;
+            }
+          }
+        }
+        if (!mine) continue;
+        auto seen = c.value("last_seen_ns", std::uint64_t{0});
+        std::int64_t idle = -1;
+        if (seen > 0 && now_ns > seen) {
+          idle = static_cast<std::int64_t>((now_ns - seen) /
+                                           1'000'000'000ULL);
+        }
+        auto pkts = c.value("packets", std::uint64_t{0});
+        packets_total += pkts;
+        auto peer = outbound ? dst : src;
+        peers[peer] += pkts;
+        flows.push_back({
+            {"proto", c.value("proto", "any")},
+            {"direction", outbound ? "out" : "in"},
+            {"peer", peer},
+            {"peer_port", outbound ? dport : sport},
+            {"local_port", local_port},
+            // True when this row was found through the NAT table
+            // rather than by the device's own address — worth saying,
+            // because the address conntrack shows is not the
+            // device's.
+            {"translated", translated},
+            {"state", c.value("state", "")},
+            {"packets", pkts},
+            {"idle", idle},
+        });
+      }
+      j["flows"] = flows;
+      j["packets"] = packets_total;
+      json top = json::array();
+      std::vector<std::pair<std::string, std::uint64_t>> ranked(
+          peers.begin(), peers.end());
+      std::sort(ranked.begin(), ranked.end(),
+                [](const auto& a, const auto& b) {
+                  return a.second > b.second;
+                });
+      for (std::size_t i = 0; i < ranked.size() && i < 5; ++i) {
+        top.push_back({{"peer", ranked[i].first},
+                       {"packets", ranked[i].second}});
+      }
+      j["top_peers"] = top;
+    }
+
+    return MakeOk(req.id, j);
+  }
+
+  auto HandleSetReservation(const proto::Request& req)
+      -> proto::Response {
+    if (req.args.size() < 2) {
+      return MakeErr(req.id, "missing_args",
+          "Usage: set reservation <mac> <address> [hostname]");
+    }
+    const auto& mac = req.args[0];
+    const auto& address = req.args[1];
+    const std::string hostname =
+        req.args.size() > 2 ? req.args[2] : std::string();
+
+    sc::SystemConfig cfg;
+    std::optional<proto::Response> fail;
+    if (!LoadSystem(req, &cfg, &fail)) return *fail;
+
+    // Which DHCP server owns this address is a question the model can
+    // answer, so the operator is not made to repeat it. When it cannot
+    // be answered without guessing, say so rather than pick.
+    std::vector<std::string> candidates;
+    auto want = sc::ParseIpv4(address);
+    if (!want) {
+      return MakeErr(req.id, "invalid_address",
+          std::format("'{}' is not an IPv4 address", address));
+    }
+    for (const auto& d : cfg.dhcp) {
+      for (const auto* i : cfg.InterfacesInZone(d.bind.zone)) {
+        if (i->mode != sc::AddressMode::kStatic) continue;
+        auto p = sc::ParseCidr4(i->address);
+        if (p && p->Contains(*want)) {
+          candidates.push_back(d.bind.zone);
+          break;
+        }
+      }
+    }
+    if (candidates.empty()) {
+      std::string zones;
+      for (const auto& d : cfg.dhcp) {
+        if (!zones.empty()) zones += ", ";
+        zones += d.bind.zone;
+      }
+      return MakeErr(req.id, "no_zone_for_address",
+          std::format("{} is not in the subnet of any zone that "
+                      "serves DHCP", address),
+          zones.empty()
+              ? "no DHCP server is configured"
+              : std::format("zones serving DHCP: {}", zones));
+    }
+    if (candidates.size() > 1) {
+      std::string zones;
+      for (const auto& z : candidates) {
+        if (!zones.empty()) zones += ", ";
+        zones += z;
+      }
+      return MakeErr(req.id, "ambiguous_zone",
+          std::format("{} falls in more than one DHCP zone",
+                      address),
+          zones);
+    }
+    const auto& zone = candidates.front();
+
+    auto edited = sc::SetDhcpReservation(
+        ReadFile(SystemConfigPath()), zone, mac, address, hostname);
+    if (!edited) {
+      return MakeErr(req.id, "invalid_edit", edited.error());
+    }
+
+    json j = {
+        {"action", "set reservation"},
+        {"mac", sc::NormalizeMac(mac)},
+        {"address", address},
+        {"hostname", hostname},
+        {"zone", zone},
+        {"config", SystemConfigPath()},
+        {"live", false},
+    };
+    if (auto f = InstallSystemDocument(req, *edited, &j)) return *f;
+    j["applied"] = true;
+    j["persisted"] = true;
+    // A reservation only takes effect on the client's next DHCP
+    // request. Saying so here is the difference between an operator
+    // who waits and one who reboots a board for no reason.
+    j["note"] =
+        "the client keeps its current address until its lease is "
+        "renewed";
+    return MakeOk(req.id, j);
+  }
+
+  auto HandleNoReservation(const proto::Request& req)
+      -> proto::Response {
+    if (req.args.empty()) {
+      return MakeErr(req.id, "missing_args",
+                     "Usage: no reservation <mac>");
+    }
+    auto edited = sc::ClearDhcpReservation(
+        ReadFile(SystemConfigPath()), req.args[0]);
+    if (!edited) {
+      return MakeErr(req.id, "invalid_edit", edited.error());
+    }
+    json j = {
+        {"action", "remove reservation"},
+        {"mac", req.args[0]},
+        {"config", SystemConfigPath()},
+        {"live", false},
+    };
+    if (auto f = InstallSystemDocument(req, *edited, &j)) return *f;
+    j["applied"] = true;
+    j["persisted"] = true;
+    return MakeOk(req.id, j);
   }
 
   auto HandleCheckSystem(const proto::Request& req)
