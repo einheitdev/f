@@ -444,6 +444,31 @@ class Validator {
                           u));
         }
       }
+      // Rebind protection with nothing exempted is the configuration
+      // that makes every internal name in the building fail. It is a
+      // legitimate thing to ask for on a zone that resolves only
+      // public names, so it is a warning rather than a refusal — but
+      // it is never allowed to be silent, because the symptom is an
+      // empty answer with no error and one journal line.
+      if (d.stop_dns_rebind && d.rebind_ok.empty()) {
+        Warn("SC045", d.bind.span,
+             std::format(
+                 "zone '{}' discards upstream answers that point into "
+                 "private address space, and exempts no domain",
+                 zone),
+             "an office's internal names are private-addressed by "
+             "definition, so they will resolve to an empty answer "
+             "with no error. List the internal domains under "
+             "`rebind_ok:`, or drop `stop_dns_rebind`");
+      }
+      if (!d.stop_dns_rebind && !d.rebind_ok.empty()) {
+        Warn("SC046", d.bind.span,
+             std::format("zone '{}' lists `rebind_ok` domains but "
+                         "rebind protection is off, so they exempt "
+                         "nothing",
+                         zone),
+             "remove `rebind_ok`, or set `stop_dns_rebind: true`");
+      }
     }
   }
 

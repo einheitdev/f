@@ -50,6 +50,17 @@ auto WrapWithDigest(const std::string& body) -> std::string;
 auto CheckArtifactDrift(const std::string& path,
                         const std::string& expected) -> DriftKind;
 
+/// True when the file at `path` carries our digest header at all —
+/// that is, when we wrote it, whatever model it came from.
+///
+/// Distinct from drift, which asks whether the *current* model would
+/// produce it. This asks the ownership question, and ownership is what
+/// decides whether a file left over from an older model may be
+/// removed. Deleting a file a person wrote is never acceptable;
+/// leaving one we wrote is how two `.link` units end up pinning the
+/// same MAC to different names.
+auto ArtifactIsGenerated(const std::string& path) -> bool;
+
 /// Write `content` to `path` atomically, creating parent directories.
 /// @returns true when the file's contents changed, or an error string.
 auto InstallArtifact(const std::string& path,

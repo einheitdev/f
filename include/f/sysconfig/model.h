@@ -167,9 +167,26 @@ struct DnsForwarder {
   /// Upstream resolvers. Empty means inherit the system resolver,
   /// which on a DHCP uplink is whatever the upstream handed us.
   std::vector<std::string> upstreams;
-  /// Reject answers that point into RFC1918 space (dnsmasq
-  /// `stop-dns-rebind`).
-  bool stop_dns_rebind = true;
+  /// Discard upstream answers that point into private address space
+  /// (dnsmasq `stop-dns-rebind`).
+  ///
+  /// **Off by default, deliberately.** This appliance sits inside an
+  /// office or a plant, and inside an office every internal name — the
+  /// file server, the git server, the printer — is private-addressed
+  /// *by definition*. Turning this on makes every one of them resolve
+  /// to an empty answer with no error code, visible only as
+  /// `possible DNS-rebind attack detected` in a journal the operator
+  /// has no reason to be reading. The protection is real, but it
+  /// defends a browser against a hostile *public* zone, and it cannot
+  /// tell that zone apart from the company intranet.
+  ///
+  /// Turn it on together with `rebind_ok`, which names the internal
+  /// domains that are allowed to answer privately.
+  bool stop_dns_rebind = false;
+  /// Domains exempt from rebind protection (dnsmasq
+  /// `rebind-domain-ok=/<d>/`). Meaningless unless
+  /// `stop_dns_rebind` is set, and validated as such.
+  std::vector<std::string> rebind_ok;
 };
 
 /// NTP: a client on the uplink, and optionally a server for a zone.

@@ -38,6 +38,8 @@
 /// | SC042 | NTP server in a zone that also holds a DHCP client    |
 /// | SC043 | NTP zone has no statically addressed interface        |
 /// | SC044 | (warning) nothing is configured to set the clock      |
+/// | SC045 | (warning) DNS rebind protection exempts no domain     |
+/// | SC046 | (warning) `rebind_ok` listed while protection is off  |
 
 #ifndef INCLUDE_F_SYSCONFIG_VALIDATE_H_
 #define INCLUDE_F_SYSCONFIG_VALIDATE_H_

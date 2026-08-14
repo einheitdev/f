@@ -313,7 +313,9 @@ class Parser {
             "each services.dns entry must be a map");
         continue;
       }
-      RequireMapKeys(item, {"zone", "upstream", "stop_dns_rebind"},
+      RequireMapKeys(item,
+                     {"zone", "upstream", "stop_dns_rebind",
+                      "rebind_ok"},
                      "services.dns entry");
       d.bind.zone = Str(item, "zone");
       if (item["zone"]) d.bind.span = SpanOf(item["zone"]);
@@ -322,7 +324,10 @@ class Parser {
       }
       if (item["stop_dns_rebind"]) {
         d.stop_dns_rebind =
-            item["stop_dns_rebind"].as<bool>(true);
+            item["stop_dns_rebind"].as<bool>(false);
+      }
+      for (const auto& r : item["rebind_ok"]) {
+        d.rebind_ok.push_back(r.as<std::string>(""));
       }
       cfg->dns.push_back(d);
     }

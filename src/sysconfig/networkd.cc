@@ -3,13 +3,41 @@
 
 #include "f/sysconfig/networkd.h"
 
+#include <algorithm>
+#include <cctype>
+#include <filesystem>
 #include <format>
+#include <fstream>
+#include <set>
 #include <sstream>
 #include <string>
 #include <vector>
 
 namespace f::sysconfig {
 namespace {
+
+namespace fs = std::filesystem;
+
+auto Lower(std::string s) -> std::string {
+  for (auto& c : s) {
+    c = static_cast<char>(
+        std::tolower(static_cast<unsigned char>(c)));
+  }
+  return s;
+}
+
+auto Trim(std::string s) -> std::string {
+  while (!s.empty() && (std::isspace(static_cast<unsigned char>(
+                            s.back())) != 0)) {
+    s.pop_back();
+  }
+  std::size_t start = 0;
+  while (start < s.size() &&
+         (std::isspace(static_cast<unsigned char>(s[start])) != 0)) {
+    start++;
+  }
+  return s.substr(start);
+}
 
 constexpr const char* kBanner =
     "# GENERATED FROM THE f SYSTEM CONFIGURATION MODEL.\n"
@@ -127,6 +155,36 @@ auto PlanNetworkd(const SystemConfig& cfg,
   return units;
 }
 
+auto ScanLinkUnits(const std::string& dir) -> std::vector<LinkClaim> {
+  std::vector<LinkClaim> out;
+  std::error_code ec;
+  fs::directory_iterator it(dir, ec);
+  if (ec) return out;
+  for (const auto& entry : it) {
+    if (entry.path().extension() != ".link") continue;
+    std::ifstream in(entry.path());
+    if (!in) continue;
+    LinkClaim claim;
+    claim.path = entry.path().string();
+    claim.generated = ArtifactIsGenerated(claim.path);
+    std::string line;
+    while (std::getline(in, line)) {
+      auto trimmed = Trim(line);
+      if (trimmed.rfind("MACAddress=", 0) == 0) {
+        claim.mac = Lower(Trim(trimmed.substr(11)));
+      } else if (trimmed.rfind("Name=", 0) == 0) {
+        claim.name = Trim(trimmed.substr(5));
+      }
+    }
+    out.push_back(std::move(claim));
+  }
+  std::sort(out.begin(), out.end(),
+            [](const LinkClaim& a, const LinkClaim& b) {
+              return a.path < b.path;
+            });
+  return out;
+}
+
 auto CheckNetworkdDrift(const std::vector<NetworkdUnit>& units)
     -> std::vector<DriftKind> {
   std::vector<DriftKind> out;
@@ -166,6 +224,77 @@ auto ApplyNetworkd(const SystemConfig& cfg,
     if (!installed) return std::unexpected(installed.error());
     if (*installed) report.changed.push_back(u.path);
   }
+
+  // Sweep. An interface that left the model leaves its units behind,
+  // and a leftover `.link` does not merely sit there: udev applies
+  // `.link` files in lexical filename order, so a stale one whose name
+  // sorts first silently wins the rename for a MAC the current model
+  // pins somewhere else. The port then never gets its configured name,
+  // every generated file that names it matches no device, and nothing
+  // logs an error.
+  std::set<std::string> planned;
+  for (const auto& u : units) planned.insert(u.path);
+  {
+    std::error_code ec;
+    fs::directory_iterator it(opts.dir, ec);
+    if (!ec) {
+      std::vector<std::string> ours;
+      for (const auto& entry : it) {
+        auto name = entry.path().filename().string();
+        if (name.rfind("10-f-", 0) != 0) continue;
+        auto ext = entry.path().extension().string();
+        if (ext != ".link" && ext != ".network") continue;
+        auto path = entry.path().string();
+        if (planned.count(path) != 0) continue;
+        // Only files carrying our digest header are ours to delete.
+        // Anything else with the same name prefix was written by a
+        // person, and a person's file is reported, never removed.
+        if (!ArtifactIsGenerated(path)) {
+          report.conflicts.push_back(path);
+          continue;
+        }
+        ours.push_back(path);
+      }
+      std::sort(ours.begin(), ours.end());
+      for (const auto& path : ours) {
+        std::error_code rm;
+        if (fs::remove(path, rm)) report.removed.push_back(path);
+      }
+    }
+  }
+
+  // Anything left in the directory that pins one of our MACs to a
+  // different name still decides the rename, and it is not ours to
+  // delete. Refuse instead: a policy aimed at the wrong port is a
+  // bypass, and a warning at the bottom of a screen is not a defence.
+  std::string clash;
+  for (const auto& claim : ScanLinkUnits(opts.dir)) {
+    if (planned.count(claim.path) != 0) continue;
+    if (claim.mac.empty()) continue;
+    for (const auto& iface : cfg.interfaces) {
+      if (iface.match.kind != MatchKind::kMac) continue;
+      if (Lower(iface.match.value) != claim.mac) continue;
+      if (claim.name == iface.name) continue;
+      report.conflicts.push_back(claim.path);
+      clash += std::format(
+          "\n  {} pins {} to '{}', but the system configuration pins "
+          "it to '{}'",
+          claim.path, claim.mac, claim.name, iface.name);
+    }
+  }
+  if (!clash.empty() && opts.refuse_on_drift) {
+    return std::unexpected(std::format(
+        "another .link unit claims a port this configuration also "
+        "claims:{}\nudev applies .link files in filename order, so "
+        "whichever name sorts first wins and the loser is silent. "
+        "Remove the other unit, or re-apply with force to proceed "
+        "anyway.",
+        clash));
+  }
+  std::sort(report.conflicts.begin(), report.conflicts.end());
+  report.conflicts.erase(
+      std::unique(report.conflicts.begin(), report.conflicts.end()),
+      report.conflicts.end());
   return report;
 }
 

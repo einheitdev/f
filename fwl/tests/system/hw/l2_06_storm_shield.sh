@@ -6,6 +6,15 @@
 # the second data port (idle here — its masquerade+redirect path is
 # covered by l2_01/l2_03).
 #
+# NOTE: the lan block of storm_shield.fw now carries the appliance's
+# own testnet address (10.99.82.1) and that segment's directed
+# broadcast, because without them a client's DHCP DISCOVER was
+# masqueraded and broadcast onto the uplink (A3). This test only sends
+# on the wan side, so the sed below does not rewrite those; a rig run
+# that exercises the lan side must set them to the rig's own segment.
+# The interpreter/BPF coverage of that ordering is
+# tests/corpus/25_local_delivery and tests/unit/test_examples.py.
+#
 # KNOWN v0.4 GAP, demonstrated (not hidden) by the last assertion:
 # storm_shield promises "admit only replies to flows the testnet
 # initiated", but in v0.4 bundle mode the lan program (masquerade +

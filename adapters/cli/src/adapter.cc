@@ -1302,7 +1302,20 @@ auto RenderShowSystem(const Response& resp, Renderer& renderer)
     auto match = i.value("match", "");
     auto mode = i.value("mode", "none");
     auto addr = mode == "static" ? i.value("address", "") : mode;
-    bool present = i.value("present", false);
+    // PRESENT answers "is the port in the PINNED TO column here",
+    // which is the only question the column can honestly ask. It used
+    // to compare names, and so read `no` for a port that was present,
+    // powered and correctly identified one column to the left — wrong
+    // at exactly the moment it matters, before the rename.
+    auto presence = i.value("presence", "?");
+    auto current = i.value("current_name", "");
+    auto shown = presence == "pending rename" && !current.empty()
+                     ? std::format("pending rename (now {})", current)
+                     : presence;
+    auto sem = presence == "yes"          ? Semantic::Good
+               : presence == "?"          ? Semantic::Dim
+               : presence == "WRONG PORT" ? Semantic::Bad
+                                          : Semantic::Warn;
     AddRow(it, {
         Cell{i.value("name", ""), Semantic::Emphasis},
         Cell{match.empty() ? "(unpinned)" : match,
@@ -1311,11 +1324,18 @@ auto RenderShowSystem(const Response& resp, Renderer& renderer)
                                   : Semantic::Default},
         Cell{i.value("zone", "").empty() ? "(none)"
                                          : i.value("zone", "")},
-        Cell{present ? "yes" : "no",
-             present ? Semantic::Good : Semantic::Warn},
+        Cell{shown, sem},
     });
   }
   RenderFormatted(it, renderer);
+  if (!j.value("ports_read", true)) {
+    out << "the port table could not be read ("
+        << j.value("ports_detail", "no reason given")
+        << "), so PRESENT is unknown rather than no\n";
+  }
+  for (const auto& p : j.value("pending", json::array())) {
+    out << "\n" << p.value("detail", "") << "\n";
+  }
   out << "\n";
 
   // The derived placement is the answer to "where will a service
@@ -1341,6 +1361,15 @@ auto RenderShowSystem(const Response& resp, Renderer& renderer)
   }
 }
 
+/// What a service is doing, as distinct from what it was told to do.
+///
+/// `BOUND TO` is intent, re-derived from the model. `ANSWERS ON` is
+/// read out of the kernel's socket table. They are separate columns
+/// because the whole failure this view exists to catch is the case
+/// where they disagree — and while both were computed from the same
+/// model, this table printed byte-identical output whether dnsmasq was
+/// bound to lan0 or to nothing at all. A column that cannot disagree
+/// with the config it reports on is not evidence.
 auto RenderShowServices(const Response& resp, Renderer& renderer)
     -> void {
   auto j = ParseData(resp);
@@ -1348,22 +1377,45 @@ auto RenderShowServices(const Response& resp, Renderer& renderer)
   AddColumn(t, "SERVICE", Align::Left, Priority::High);
   AddColumn(t, "STATE", Align::Left, Priority::High);
   AddColumn(t, "ZONES", Align::Left, Priority::High);
+  AddColumn(t, "BOUND TO", Align::Left, Priority::Medium);
   AddColumn(t, "ANSWERS ON", Align::Left, Priority::High);
   AddColumn(t, "UNIT", Align::Left, Priority::Low);
   for (const auto& s : j.value("services", json::array())) {
     auto state = s.value("state", "unknown");
+    bool mismatch = s.value("mismatch", false);
     auto sem = s.value("healthy", false) ? Semantic::Good
                : state == "not configured" ? Semantic::Dim
                                            : Semantic::Bad;
     auto zones = JoinStrings(s.value("zones", json::array()));
-    auto ifaces =
-        JoinStrings(s.value("interfaces", json::array()));
+    auto want = JoinStrings(s.value("bound_to", json::array()));
+    auto have = JoinStrings(s.value("answers_on", json::array()));
+    std::string answers;
+    Semantic answers_sem = Semantic::Default;
+    if (!s.value("answers_known", false)) {
+      // Never a blank and never a zero: an unanswerable question is
+      // not the same answer as "nowhere".
+      answers = "? (" + s.value("observed", "not observed") + ")";
+      answers_sem = Semantic::Dim;
+    } else if (!have.empty()) {
+      answers = have;
+      answers_sem = mismatch ? Semantic::Warn : Semantic::Good;
+    } else if (s.value("loopback_only", false)) {
+      answers = "LOOPBACK ONLY";
+      answers_sem = Semantic::Bad;
+    } else if (s.value("wildcard", false)) {
+      answers = "every port (wildcard socket)";
+      answers_sem = Semantic::Warn;
+    } else {
+      answers = "nothing";
+      answers_sem = s.value("expected", false) ? Semantic::Bad
+                                               : Semantic::Dim;
+    }
     AddRow(t, {
         Cell{s.value("name", ""), Semantic::Emphasis},
         Cell{state, sem},
         Cell{zones.empty() ? "-" : zones},
-        Cell{ifaces.empty() ? "(nowhere)" : ifaces,
-             ifaces.empty() ? Semantic::Dim : Semantic::Default},
+        Cell{want.empty() ? "-" : want, Semantic::Dim},
+        Cell{answers, answers_sem},
         Cell{s.value("unit", ""), Semantic::Dim},
     });
   }
@@ -1371,9 +1423,45 @@ auto RenderShowServices(const Response& resp, Renderer& renderer)
 
   auto& out = renderer.Out();
   for (const auto& s : j.value("services", json::array())) {
+    auto mismatch = s.value("mismatch_detail", "");
+    if (!mismatch.empty()) {
+      out << "\n" << s.value("name", "") << ": " << mismatch << "\n";
+    }
     auto detail = s.value("detail", "");
     if (!detail.empty()) {
       out << "\n" << s.value("name", "") << ": " << detail << "\n";
+    }
+    auto listening = JoinStrings(s.value("listening", json::array()));
+    if (!listening.empty() && s.value("wildcard", false)) {
+      out << "\n" << s.value("name", "") << " sockets: " << listening
+          << "\n  a wildcard socket (0.0.0.0/::) is on every port, so "
+             "it is not evidence about any one of them. dnsmasq's "
+             "DHCP socket is always one: DHCP containment is enforced "
+             "per received packet, not by binding.\n";
+    }
+  }
+  // The DNS setting whose failure mode is an internal name that
+  // silently does not exist. It is stated here whichever way it is
+  // set, because the symptom points nowhere near it.
+  if (j.contains("rebind_protection")) {
+    auto exempt = JoinStrings(j.value("rebind_exempt", json::array()));
+    if (j.value("rebind_protection", false)) {
+      out << "\nDNS rebind protection is ON"
+          << (exempt.empty() ? ", exempting no domain"
+                             : ", exempting " + exempt)
+          << ". An upstream answer pointing into private address "
+             "space is discarded and the client sees an empty answer "
+             "with no error"
+          << (exempt.empty()
+                  ? " — every internal name in the building resolves "
+                    "to nothing. List the internal domains under "
+                    "`rebind_ok:`."
+                  : ".")
+          << "\n";
+    } else {
+      out << "\nDNS rebind protection is off: private-addressed "
+             "answers are passed through, which is what an office's "
+             "own names need.\n";
     }
   }
   auto drift = j.value("drift", "none");
@@ -1608,7 +1696,20 @@ auto RenderApplySystem(const Response& resp, Renderer& renderer)
   for (const auto& p : j.value("written", json::array())) {
     out << "wrote " << p.get<std::string>() << "\n";
   }
-  if (via == "direct" && j.value("written", json::array()).empty()) {
+  // A removal is as load-bearing as a write here: two `.link` units
+  // pinning one MAC to two names are decided by filename order, and
+  // the leftover usually wins.
+  for (const auto& p : j.value("removed", json::array())) {
+    out << "removed " << p.get<std::string>()
+        << " (its interface is no longer in the configuration)\n";
+  }
+  for (const auto& p : j.value("leftover", json::array())) {
+    out << "LEFT IN PLACE " << p.get<std::string>()
+        << " — we did not write it, so it is not ours to delete. "
+           "It may still decide a port's name.\n";
+  }
+  if (via == "direct" && j.value("written", json::array()).empty() &&
+      j.value("removed", json::array()).empty()) {
     out << "already up to date\n";
   }
   // The countdown is the only thing standing between the operator and
@@ -1624,6 +1725,14 @@ auto RenderApplySystem(const Response& resp, Renderer& renderer)
   auto dhcp_on = JoinStrings(j.value("dhcp_on", json::array()));
   if (!dhcp_on.empty()) {
     out << "dhcp answers on: " << dhcp_on << "\n";
+  }
+  // Last, and loudest: "applied" is a claim about files. If the ports
+  // this configuration names do not exist yet, the box is not running
+  // it, and saying so is the difference between an outage and a
+  // firewall aimed at the wrong socket.
+  auto pending_note = j.value("pending_note", "");
+  if (!pending_note.empty()) {
+    out << "\n" << pending_note << "\n";
   }
 }
 

@@ -182,7 +182,44 @@ auto PlanDnsmasq(const SystemConfig& cfg) -> DnsmasqPlan {
     o << "bogus-priv\n";
     for (const auto& d : cfg.dns) {
       o << "# zone " << d.bind.zone << "\n";
-      if (d.stop_dns_rebind) o << "stop-dns-rebind\n";
+      // The stance is written out either way. It used to be a line
+      // that appeared or did not, and its absence was the only clue
+      // that `intranet.corp -> 10.99.82.9` had been discarded on the
+      // way through — an empty answer, no error, and one journal line
+      // no procedure led anybody to.
+      if (d.stop_dns_rebind) {
+        plan.rebind_protection = true;
+        for (const auto& dom : d.rebind_ok) {
+          plan.rebind_exempt.push_back(dom);
+        }
+        o << "# rebind protection: ON. An upstream answer pointing "
+             "into\n"
+          << "# private address space is DISCARDED and the client "
+             "gets an\n"
+          << "# empty answer. Internal names resolve only if their "
+             "domain\n"
+          << "# is exempted below.\n";
+        o << "stop-dns-rebind\n";
+        if (d.rebind_ok.empty()) {
+          o << "# no domain is exempt: every private-addressed "
+               "internal name\n"
+            << "# served by an upstream resolver will fail here\n";
+        }
+        for (const auto& dom : d.rebind_ok) {
+          o << "rebind-domain-ok=/" << dom << "/\n";
+        }
+      } else {
+        o << "# rebind protection: OFF (the default). An office's "
+             "internal\n"
+          << "# names are private-addressed by definition, and "
+             "discarding\n"
+          << "# them presents to the user as a name that silently "
+             "does not\n"
+          << "# exist. Set `stop_dns_rebind: true` with `rebind_ok:` "
+             "to\n"
+          << "# turn it on for a zone that only ever resolves public "
+             "names.\n";
+      }
       if (!d.upstreams.empty()) {
         o << "no-resolv\n";
         for (const auto& u : d.upstreams) {

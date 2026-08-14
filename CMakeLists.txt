@@ -134,6 +134,7 @@ add_library(libf-sysconfig STATIC
   src/sysconfig/model.cc
   src/sysconfig/net.cc
   src/sysconfig/networkd.cc
+  src/sysconfig/observe.cc
   src/sysconfig/parse.cc
   src/sysconfig/service_status.cc
   src/sysconfig/storage.cc

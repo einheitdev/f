@@ -91,6 +91,24 @@ services:
   dns:
     - zone: testnet
       upstream: [9.9.9.9, 1.1.1.1]
+      # DNS rebind protection: discard any upstream answer pointing
+      # into private address space. Off by default, deliberately.
+      #
+      # This box lives inside a company, and inside a company every
+      # internal name — the file server, the git server, the printer —
+      # is private-addressed *by definition*. With this on, every one
+      # of them resolves to an empty answer with no error code; the
+      # only trace is a `possible DNS-rebind attack detected` line in
+      # the journal, which no symptom points you towards.
+      #
+      # Turn it on only for a zone that resolves nothing but public
+      # names, and name the exceptions when you do:
+      #   stop_dns_rebind: true
+      #   rebind_ok: [corp, internal.example]
+      #
+      # Setting it without `rebind_ok` is allowed and warned about
+      # (SC045). Listing `rebind_ok` without it is warned about too
+      # (SC046) — the domains would exempt nothing.
 
   # Time. Conntrack timeouts, rate-limit windows and every log line
   # are stated in this clock, and a board with no battery-backed RTC

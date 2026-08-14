@@ -25,6 +25,7 @@
 #include <format>
 #include <fstream>
 #include <mutex>
+#include <set>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -48,6 +49,7 @@
 #include "f/sysconfig/model.h"
 #include "f/sysconfig/net.h"
 #include "f/sysconfig/networkd.h"
+#include "f/sysconfig/observe.h"
 #include "f/sysconfig/parse.h"
 #include "f/sysconfig/service_status.h"
 #include "f/sysconfig/storage.h"
@@ -1720,8 +1722,17 @@ class FLocalTransport final
           {"services", cfg.ZoneHasService(z.name)},
       });
     }
+    // PRESENT is answered from the hardware identity the row already
+    // prints, never from the name. Matching by name reports "no" for
+    // a port that is plugged in, powered and correctly identified —
+    // and it does so at exactly the moment it matters, before a
+    // pending `.link` rename has happened.
+    auto ports = sc::ObservePorts();
+    auto presence = sc::MatchInterfaces(cfg, ports);
     json ifaces = json::array();
-    for (const auto& i : cfg.interfaces) {
+    for (std::size_t idx = 0; idx < cfg.interfaces.size(); ++idx) {
+      const auto& i = cfg.interfaces[idx];
+      const auto& p = presence[idx];
       ifaces.push_back({
           {"name", i.name},
           {"match_kind",
@@ -1731,17 +1742,36 @@ class FLocalTransport final
           {"address", i.address},
           {"gateway", i.gateway},
           {"zone", i.zone},
-          {"present", i.name.empty()
-                          ? false
-                          : IfaceExists(i.name)},
+          {"presence", sc::PortPresenceName(p.presence)},
+          {"present",
+           p.presence == sc::PortPresence::kPresentNamed},
+          {"current_name", p.current_name},
+          {"presence_detail", p.detail},
       });
     }
     auto result = sc::Validate(cfg);
+    json pending = json::array();
+    for (const auto& p : presence) {
+      if (!p.RenamePending() &&
+          p.presence != sc::PortPresence::kNameTakenByOther) {
+        continue;
+      }
+      pending.push_back({
+          {"interface", p.interface},
+          {"current_name", p.current_name},
+          {"identity", p.identity},
+          {"detail", p.detail},
+      });
+    }
     return MakeOk(req.id, {
         {"config", SystemConfigPath()},
         {"ok", !result.HasErrors()},
         {"zones", zones},
         {"interfaces", ifaces},
+        {"ports_read",
+         ports.availability == sc::PortAvailability::kObserved},
+        {"ports_detail", ports.detail},
+        {"pending", pending},
         {"listen", plan.allowed_interfaces},
         {"excluded", plan.excluded_interfaces},
         {"dhcp_on", plan.dhcp_interfaces},
@@ -1856,26 +1886,52 @@ class FLocalTransport final
 
     json services = json::array();
     for (const auto& s : sc::QueryServices(cfg)) {
+      json listening = json::array();
+      for (const auto& l : s.observed.listeners) {
+        listening.push_back(l.Format());
+      }
+      bool observed =
+          s.observed.availability ==
+          sc::BindingAvailability::kObserved;
       services.push_back({
           {"name", s.name},
           {"unit", s.unit},
           {"state", sc::ServiceStateName(s.state)},
           {"expected", s.expected},
-          {"healthy", s.state == sc::ServiceState::kRunning ||
-                          s.state ==
-                              sc::ServiceState::kNotConfigured ||
-                          s.state ==
-                              sc::ServiceState::kActivating},
+          {"healthy", (s.state == sc::ServiceState::kRunning ||
+                       s.state == sc::ServiceState::kNotConfigured ||
+                       s.state == sc::ServiceState::kActivating) &&
+                          !s.Mismatched()},
           {"zones", s.zones},
-          {"interfaces", s.interfaces},
-          {"detail", s.detail},
+          // Intent and observation are two keys, never one. A single
+          // "interfaces" key is what let this view print identical
+          // bytes for a working bind and for a daemon listening on
+          // 127.0.0.1 and nothing else.
+          {"bound_to", s.interfaces},
+          {"observed",
+           sc::BindingAvailabilityName(s.observed.availability)},
+          {"answers_on", observed ? json(s.observed.interfaces)
+                                  : json(json::array())},
+          {"answers_known", observed},
+          {"listening", listening},
+          {"wildcard", s.observed.wildcard},
+          {"loopback_only", s.observed.LoopbackOnly()},
+          {"mismatch", s.Mismatched()},
+          {"mismatch_detail", s.MismatchDetail()},
+          {"detail", s.detail.empty() ? s.observed.detail : s.detail},
       });
     }
+    auto plan = sc::PlanDnsmasq(cfg);
     auto drift = sc::CheckDnsmasqDrift(cfg, cfg_.dnsmasq_conf);
     return MakeOk(req.id, {
         {"services", services},
         {"artifact", cfg_.dnsmasq_conf},
         {"drift", sc::DriftKindName(drift)},
+        // The one DNS setting whose failure mode is a name that
+        // silently does not exist. Surfaced here because no other view
+        // of a healthy-looking box would ever mention it.
+        {"rebind_protection", plan.rebind_protection},
+        {"rebind_exempt", plan.rebind_exempt},
     });
   }
 
@@ -2358,6 +2414,7 @@ class FLocalTransport final
           "access will not be rolled back");
     }
     bool force = req.args.size() > 1 && req.args[1] == "force";
+    auto stale_before = StaleNetworkdUnits(cfg);
     auto sid = StageSystemConfig(req, force);
     if (!sid) return sid.error();
 
@@ -2381,6 +2438,10 @@ class FLocalTransport final
     body["applied"] = true;
     body["via"] = "f-confd";
     body["confirm_required"] = true;
+    AddArtifactSweep(cfg, stale_before, &body);
+    auto pending = PendingRenames(cfg);
+    body["pending"] = pending;
+    body["pending_note"] = RenameNote(pending);
     body["diagnostics"] = DiagsToJson(result.diagnostics);
     return MakeOk(req.id, body);
   }
@@ -2444,6 +2505,109 @@ class FLocalTransport final
     return out;
   }
 
+  /// Generated networkd units in the unit directory that the current
+  /// model does not name. Read from the directory, not from a record
+  /// of what we wrote, so the answer survives a previous session, a
+  /// crash, and an `apply` that ran under a different model.
+  auto StaleNetworkdUnits(const sc::SystemConfig& cfg)
+      -> std::vector<std::string> {
+    sc::NetworkdOptions opts;
+    opts.dir = cfg_.networkd_dir;
+    std::set<std::string> planned;
+    for (const auto& u : sc::PlanNetworkd(cfg, opts)) {
+      planned.insert(u.path);
+    }
+    std::vector<std::string> stale;
+    std::error_code ec;
+    std::filesystem::directory_iterator it(cfg_.networkd_dir, ec);
+    if (ec) return stale;
+    for (const auto& entry : it) {
+      auto name = entry.path().filename().string();
+      if (name.rfind("10-f-", 0) != 0) continue;
+      auto ext = entry.path().extension().string();
+      if (ext != ".link" && ext != ".network") continue;
+      auto path = entry.path().string();
+      if (planned.count(path) != 0) continue;
+      stale.push_back(path);
+    }
+    std::sort(stale.begin(), stale.end());
+    return stale;
+  }
+
+  /// Interfaces the model names that the kernel does not have under
+  /// that name yet, because a `.link` rename is still pending.
+  ///
+  /// `apply system` must say this. A reply of "applied, revision 1"
+  /// over a config whose `interface=` lines name ports that will not
+  /// exist until reboot is true about the files and false about the
+  /// box, and the difference is a DHCP server bound to nothing.
+  auto PendingRenames(const sc::SystemConfig& cfg) -> json {
+    auto ports = sc::ObservePorts();
+    json out = json::array();
+    for (const auto& p : sc::MatchInterfaces(cfg, ports)) {
+      if (p.presence != sc::PortPresence::kPendingRename &&
+          p.presence != sc::PortPresence::kNameTakenByOther) {
+        continue;
+      }
+      out.push_back({
+          {"interface", p.interface},
+          {"current_name", p.current_name},
+          {"identity", p.identity},
+          {"detail", p.detail},
+      });
+    }
+    return out;
+  }
+
+  /// The sentence that turns a pending rename into something an
+  /// operator can act on. The handbook says generated files are never
+  /// hand-edited, so the recovery cannot be "edit the unit" — it has
+  /// to be a sequence, and it has to be written down somewhere the
+  /// person reading the apply output can see it.
+  static auto RenameNote(const json& pending) -> std::string {
+    if (pending.empty()) return "";
+    std::string names;
+    std::string first_now;
+    for (const auto& p : pending) {
+      names += (names.empty() ? "" : ", ") +
+               p.value("interface", "") + " (currently " +
+               p.value("current_name", "?") + ")";
+      if (first_now.empty()) first_now = p.value("current_name", "");
+    }
+    return std::format(
+        "PENDING RENAME: {}. Until the rename happens those names "
+        "match no device, so every generated file that mentions them "
+        "binds nothing — dnsmasq will start cleanly and answer on "
+        "loopback. Either reboot, or apply the rename now:\n"
+        "  udevadm control --reload\n"
+        "  ip link set {} down\n"
+        "  udevadm trigger --action=add /sys/class/net/{}\n"
+        "Then `show system` must read PRESENT: yes before this "
+        "configuration is doing anything.",
+        names, first_now.empty() ? "<port>" : first_now,
+        first_now.empty() ? "<port>" : first_now);
+  }
+
+  /// Record what the sweep actually did, by looking twice.
+  ///
+  /// A derived file whose interface left the model is not clutter:
+  /// udev applies `.link` units in filename order, so a leftover whose
+  /// name sorts first wins the rename for a MAC the current model
+  /// pins elsewhere — and the port then never gets its configured
+  /// name, with nothing logged anywhere.
+  auto AddArtifactSweep(const sc::SystemConfig& cfg,
+                        const std::vector<std::string>& before,
+                        json* body) -> void {
+    auto after = StaleNetworkdUnits(cfg);
+    std::set<std::string> still(after.begin(), after.end());
+    json removed = json::array();
+    for (const auto& p : before) {
+      if (still.count(p) == 0) removed.push_back(p);
+    }
+    (*body)["removed"] = removed;
+    (*body)["leftover"] = after;
+  }
+
   auto HandleApplySystem(const proto::Request& req)
       -> proto::Response {
     sc::SystemConfig cfg;
@@ -2461,6 +2625,7 @@ class FLocalTransport final
     }
 
     bool force = !req.args.empty() && req.args[0] == "force";
+    auto stale_before = StaleNetworkdUnits(cfg);
 
     // Prefer f-confd: one writer, a recorded revision, and a box that
     // can be rolled back to a named configuration afterwards.
@@ -2488,6 +2653,10 @@ class FLocalTransport final
           "applied without a confirm window — use `apply system "
           "confirmed <minutes>` when the change could cut your "
           "own access";
+      AddArtifactSweep(cfg, stale_before, &body);
+      auto pending = PendingRenames(cfg);
+      body["pending"] = pending;
+      body["pending_note"] = RenameNote(pending);
       body["diagnostics"] = DiagsToJson(result.diagnostics);
       return MakeOk(req.id, body);
     }
@@ -2504,6 +2673,12 @@ class FLocalTransport final
 
     json written = json::array();
     for (const auto& p : net->changed) written.push_back(p);
+    json removed = json::array();
+    for (const auto& p : net->removed) removed.push_back(p);
+    json conflicts = json::array();
+    for (const auto& p : net->conflicts) conflicts.push_back(p);
+    auto pending = PendingRenames(cfg);
+    auto pending_note = RenameNote(pending);
 
     // Said on every direct apply, because it is the difference
     // between "the files are right" and "the box is running them".
@@ -2521,6 +2696,10 @@ class FLocalTransport final
           {"via", "direct"},
           {"activated", false},
           {"written", written},
+          {"removed", removed},
+          {"leftover", conflicts},
+          {"pending", pending},
+          {"pending_note", pending_note},
           {"dhcp_on", json::array()},
           {"note", "no service is bound to any zone; dnsmasq is "
                    "not needed. " + kDirectNote},
@@ -2549,6 +2728,10 @@ class FLocalTransport final
         {"via", "direct"},
         {"activated", false},
         {"written", written},
+        {"removed", removed},
+        {"leftover", conflicts},
+        {"pending", pending},
+        {"pending_note", pending_note},
         {"dhcp_on", dm->plan.dhcp_interfaces},
         {"note", kDirectNote},
         {"diagnostics", DiagsToJson(result.diagnostics)},
