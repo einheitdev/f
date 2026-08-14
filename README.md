@@ -171,6 +171,9 @@ All endpoints return JSON by default. When called with `HX-Request: true`, they 
 
 ## Documentation
 
+- [Operator handbook](docs/HANDBOOK.md) — commissioning, the
+  device-visibility loop, and recovery from the four failures seen so
+  far
 - [FWL v0.1 language reference](docs/FWL_V01_SPEC.md)
 - [FWL development methodology](docs/F_DEVELOPMENT_METHODOLOGY.md)
 - [FWL compiler README](fwl/README.md)
