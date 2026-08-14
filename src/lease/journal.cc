@@ -230,9 +230,10 @@ auto SaveJournal(const std::string& path, const Journal& j)
   {
     std::ofstream out(tmp, std::ios::trunc);
     if (!out) {
+      // Name the destination, not the temporary: the operator wants
+      // the path he configured, and the errno tells him what to fix.
       return std::unexpected(std::format(
-          "cannot write {}: {}", tmp.string(),
-          std::strerror(errno)));
+          "cannot write {}: {}", path, std::strerror(errno)));
     }
     out << SerializeJournal(j);
     out.flush();
