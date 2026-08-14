@@ -901,15 +901,30 @@ def _non_ip_early_out(
   rather than `proto` alone also keeps hand-built packet dicts (unit
   tests, generators) out of the early-out path.
 
-  **Do not extend this to the v0.1-shaped-program / IPv6-frame route.**
-  That route is `finding/2026-06-28-arp-early-out-overrides-default-
-  drop-v6`, an OPEN product finding: a v0.1-shaped program emits no v6
-  parse path, so v6_ok stays 0 and an IPv6 packet bypasses its
-  `default drop`. `v01_shaped_vs_v6_packet.pkt` is declared KNOWN_RED
-  to keep that visible on every run, and it stays red precisely
-  because the decoded dict still carries `src_ip6` — the group test
-  above does not fire. Mirroring it here would make the two oracles
-  agree and delete the harness's only standing report of the finding.
+  **`is_v6_frame` is part of the gate and has to be mirrored.** The
+  emitted test is `!v4_ok && !v6_ok [&& !vlan_ok] && !is_v6_frame`,
+  and the last conjunct is what `f` 473e815 added to close
+  `finding/2026-06-28-arp-early-out-overrides-default-drop-v6`: an
+  IPv6 frame must reach the default action even when its L3 header
+  did not parse. This mirror omitted it, and the omission was
+  invisible for the same reason the finding was — no corpus case
+  paired a v6 frame whose L3 keys are absent with a `default drop`.
+
+  Two frames make the keys absent: one truncated below 54 bytes, and
+  an `eth(ethertype=0x86dd)` frame with no payload. Both gave
+  interpreter PASS and BPF DROP, measured as root on deb-02, and both
+  were found by a hunt reading this function the day the `eth()`
+  builder made the second one buildable.
+
+  The docstring here used to say the opposite — "do not extend this
+  to the v0.1-shaped-program / IPv6-frame route" — on the reasoning
+  that the finding was OPEN and this mirror was its only standing
+  report. That reasoning expired when the product fixed it: the
+  KNOWN_RED entry is gone, `v01_shaped_vs_v6_packet.pkt` asserts
+  `bpf_action: drop` absolutely, and an untruncated v6 frame still
+  carries `src_ip6` so the group test below returns first. **A
+  standing instruction whose premise has changed is worth more
+  attention than one that was always wrong.**
 
   Modelling the emitter faithfully is this function's job; whether the
   early-out is the right SECURITY semantic is a product question, and
@@ -939,6 +954,11 @@ def _non_ip_early_out(
     )
   if any(key in packet for key in _L3_PRESENCE_KEYS):
     return False  # v4_ok or v6_ok
+  if _resolved_ether_type(packet) == _ETH_P_IPV6:
+    # is_v6_frame. Set from the EtherType alone, BEFORE the 40-byte
+    # bounds check, so a v6 frame whose header did not fit still
+    # reaches the default action instead of being passed as non-IP.
+    return False
   if _program_reads_vlan(program) and (
     "vlan_id" in packet or "vlan_priority" in packet
   ):

@@ -1,0 +1,12 @@
+name: "bare v6 ethertype frame reaches the default drop"
+source_fw: |
+  @xdp(eth0)
+  allow if pkt.src_ip6 in 2001:db8::1/128
+  default drop
+# is_v6_frame is set from the EtherType, before the 40-byte bounds check, so this frame is NOT non-IP: the prelude does not early out and the `default drop` applies.
+# The neighbouring non-IP cases in this strategy assert the opposite for the same policy shape. One line of the emitted gate separates them.
+test_packet:
+  builder: eth(ethertype=0x86dd, payload_len=0)
+expected:
+  compiles: true
+  bpf_action: drop

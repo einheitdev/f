@@ -1,0 +1,14 @@
+name: "v6 frame truncated to 20 bytes reaches the default drop"
+source_fw: |
+  @xdp(eth0)
+  allow if pkt.src_ip6 in 2001:db8::1/128
+  default drop
+# 20 bytes: the 40-byte IPv6 header needs 54, so v6_ok stays 0 and every L3 key is stripped.
+# is_v6_frame is set from the EtherType, before the 40-byte bounds check, so this frame is NOT non-IP: the prelude does not early out and the `default drop` applies.
+# The neighbouring non-IP cases in this strategy assert the opposite for the same policy shape. One line of the emitted gate separates them.
+test_packet:
+  builder: tcp6(src_ip="2001:db8::1", dst_ip="2001:db8::2", dst_port=80)
+  truncate_to: 20
+expected:
+  compiles: true
+  bpf_action: drop
