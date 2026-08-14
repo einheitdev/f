@@ -82,9 +82,11 @@ assert_eq "wire: the echo REPLY is de-NATed back to the host" \
 assert_eq "wire: no echo reply stranded at the masquerade address" \
   "$(hw::sniff_get "icmp:10.99.21.9>$MASQ_ADDR:0.0")" 0
 
-# What is still NOT translated, so nobody reads the above as more than
-# it is: an ICMP ERROR names its flow in its payload (the embedded IP
-# header + 8 bytes), which nothing reads. See l11_05 — path-MTU
-# discovery remains structurally broken for a masqueraded flow.
-log "NOTE: echo/echo-reply de-NAT works; ICMP ERROR translation (RFC \
-5508, the embedded datagram) does not — see l11_05_icmp_pmtu."
+# The other half of ICMP, so nobody reads the above as more than it
+# is: an ICMP ERROR names its flow in its PAYLOAD (the embedded IP
+# header + 8 bytes), which is a different lookup entirely — and the
+# one path-MTU discovery depends on. It is asserted where it belongs,
+# on a policy that is stateful, in l11_05.
+log "NOTE: this is echo/echo-reply de-NAT, keyed on the error-free \
+ports-0 mapping. ICMP ERROR translation (RFC 5508, off the embedded \
+datagram) is asserted in l11_05_icmp_pmtu."
