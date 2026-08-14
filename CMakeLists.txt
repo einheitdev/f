@@ -136,6 +136,7 @@ add_library(libf-sysconfig STATIC
   src/sysconfig/networkd.cc
   src/sysconfig/parse.cc
   src/sysconfig/service_status.cc
+  src/sysconfig/storage.cc
   src/sysconfig/validate.cc
 )
 
@@ -190,6 +191,7 @@ target_include_directories(libf-engine PUBLIC
 )
 
 target_link_libraries(libf-engine PUBLIC
+  libf-sysconfig
   ${BPF_LIB}
   nlohmann_json::nlohmann_json
   cppzmq

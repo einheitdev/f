@@ -50,6 +50,7 @@
 #include "f/sysconfig/networkd.h"
 #include "f/sysconfig/parse.h"
 #include "f/sysconfig/service_status.h"
+#include "f/sysconfig/storage.h"
 #include "f/sysconfig/validate.h"
 
 namespace fd_cmd {
@@ -588,6 +589,9 @@ class FLocalTransport final
     }
     if (req.command == "show_time") {
       return HandleShowTime(req);
+    }
+    if (req.command == "show_storage") {
+      return HandleShowStorage(req);
     }
     if (req.command == "show_services") {
       return HandleShowServices(req);
@@ -1812,6 +1816,35 @@ class FLocalTransport final
         {"reference", t.reference},
         {"detail", t.detail},
         {"banner", sc::TimeWarningBanner(t)},
+    });
+  }
+
+  /// Disk, bundles, and — the number this view exists for — how much
+  /// logging has already been thrown away.
+  auto HandleShowStorage(const proto::Request& req)
+      -> proto::Response {
+    sc::StorageSource src;
+    src.retention.compiled_dir = cfg_.compiled_dir;
+    auto r = sc::QueryStorage(src);
+    return MakeOk(req.id, {
+        {"availability",
+         sc::StorageAvailabilityName(r.availability)},
+        {"observed",
+         r.availability == sc::StorageAvailability::kObserved},
+        {"fs_total_bytes", r.fs_total_bytes},
+        {"fs_free_bytes", r.fs_free_bytes},
+        {"tight", r.Tight()},
+        {"bundle_count", r.bundle_count},
+        {"bundle_bytes", r.bundle_bytes},
+        {"bundles_over_policy", r.bundles_over_policy},
+        {"keep", src.retention.keep},
+        {"compiled_dir", src.retention.compiled_dir},
+        {"journal_bytes", r.journal_bytes},
+        {"journal_read", r.journal_read},
+        {"suppressed_messages", r.suppressed_messages},
+        {"suppression_read", r.suppression_read},
+        {"detail", r.detail},
+        {"banner", sc::StorageWarningBanner(r)},
     });
   }
 

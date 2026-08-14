@@ -27,6 +27,7 @@
 #include "f/sysconfig/networkd.h"
 #include "f/sysconfig/parse.h"
 #include "f/sysconfig/service_status.h"
+#include "f/sysconfig/storage.h"
 #include "f/sysconfig/validate.h"
 
 namespace {
@@ -39,6 +40,17 @@ using f::sysconfig::CheckDnsmasqDrift;
 using f::sysconfig::Diagnostic;
 using f::sysconfig::DnsmasqOptions;
 using f::sysconfig::ApplyChrony;
+using f::sysconfig::LogPolicy;
+using f::sysconfig::PlanLogging;
+using f::sysconfig::PlanRetention;
+using f::sysconfig::PruneBundles;
+using f::sysconfig::QueryStorage;
+using f::sysconfig::RetentionPolicy;
+using f::sysconfig::StorageAvailability;
+using f::sysconfig::StorageAvailabilityName;
+using f::sysconfig::StorageSource;
+using f::sysconfig::StorageWarningBanner;
+using f::sysconfig::kJournaldDropInPath;
 using f::sysconfig::ApplyIpv6;
 using f::sysconfig::ChronyOptions;
 using f::sysconfig::CheckChronyDrift;
@@ -263,12 +275,20 @@ auto main(int argc, char** argv) -> int {
   Ipv6Source ipv6_src;
   ChronyOptions chrony_opts;
   TimeSource time_src;
+  StorageSource storage_src;
+  std::string journald_path = kJournaldDropInPath;
   app.add_option("--dnsmasq-conf", dnsmasq_opts.conf_path,
                  "Where the generated dnsmasq config is installed");
   app.add_option("--dnsmasq-bin", dnsmasq_opts.dnsmasq_path,
                  "Path to the dnsmasq binary");
   app.add_option("--networkd-dir", networkd_opts.dir,
                  "Where generated networkd units are installed");
+  app.add_option("--compiled-dir", storage_src.retention.compiled_dir,
+                 "Directory holding compiled bundles");
+  app.add_option("--keep-bundles", storage_src.retention.keep,
+                 "How many compiled bundles to keep");
+  app.add_option("--journald-dropin", journald_path,
+                 "Where the generated journald limits are installed");
   app.add_option("--chrony-conf", chrony_opts.conf_path,
                  "Where the generated chrony config is installed");
   app.add_option("--chronyd-bin", chrony_opts.chronyd_path,
@@ -301,6 +321,13 @@ auto main(int argc, char** argv) -> int {
   render->add_option("what", what,
                      "dnsmasq | networkd | ipv6 | chrony")
       ->required();
+  auto* storage = app.add_subcommand(
+      "storage", "Disk, bundles, and what logging has lost");
+  auto* prune = app.add_subcommand(
+      "prune", "Remove compiled bundles beyond the retention limit");
+  bool dry_run = false;
+  prune->add_flag("--dry-run", dry_run,
+                  "Report what would be removed, remove nothing");
   auto* apply =
       app.add_subcommand("apply", "Generate, validate and install");
   apply->add_flag("--force", force,
@@ -416,6 +443,89 @@ auto main(int argc, char** argv) -> int {
     return service_fault ? 4 : 0;
   }
 
+  if (*storage) {
+    auto report = QueryStorage(storage_src);
+    std::cout << "storage:\n";
+    std::cout << std::format("  availability  {}\n",
+                             StorageAvailabilityName(
+                                 report.availability));
+    if (!report.detail.empty()) {
+      std::cout << std::format("  {}\n", report.detail);
+    }
+    std::cout << std::format(
+        "  filesystem    {} MiB free of {} MiB\n",
+        report.fs_free_bytes / (1024 * 1024),
+        report.fs_total_bytes / (1024 * 1024));
+    std::cout << std::format(
+        "  bundles       {} using {} KiB, {} beyond the limit of "
+        "{}\n",
+        report.bundle_count, report.bundle_bytes / 1024,
+        report.bundles_over_policy, storage_src.retention.keep);
+    // Never a bare zero: "no journal was found" and "the journal is
+    // empty" are different, and only one of them is reassuring.
+    std::cout << std::format(
+        "  journal       {}\n",
+        report.journal_read
+            ? std::format("{} MiB",
+                          report.journal_bytes / (1024 * 1024))
+            : std::string("(could not be read)"));
+    std::cout << std::format(
+        "  dropped logs  {}\n",
+        report.suppression_read
+            ? std::format("{} message(s) in {} burst(s), 24h",
+                          report.suppressed_messages,
+                          report.suppression_bursts)
+            : std::string("(could not be determined)"));
+    auto banner = StorageWarningBanner(report);
+    if (!banner.empty()) std::cerr << banner;
+    // A box losing log events, or nearly out of room, exits non-zero
+    // so a script notices without reading English.
+    bool bad = report.Tight() ||
+               report.availability ==
+                   StorageAvailability::kUnreadable ||
+               (report.suppression_read &&
+                report.suppressed_messages > 0);
+    return bad ? 6 : 0;
+  }
+
+  if (*prune) {
+    auto plan = PlanRetention(storage_src.retention);
+    if (!plan.readable) {
+      std::cerr << plan.unreadable_reason << "\n";
+      return 1;
+    }
+    if (dry_run) {
+      for (const auto& b : plan.to_remove) {
+        std::cout << std::format("would remove {} ({} KiB)\n",
+                                 b.name, b.bytes / 1024);
+      }
+      std::cout << std::format(
+          "{} of {} bundle(s) are beyond the limit of {}; {} KiB "
+          "reclaimable\n",
+          plan.to_remove.size(), plan.bundles.size(),
+          storage_src.retention.keep,
+          plan.reclaimable_bytes / 1024);
+      return 0;
+    }
+    auto report = PruneBundles(storage_src.retention);
+    if (!report) {
+      std::cerr << report.error() << "\n";
+      return 1;
+    }
+    for (const auto& n : report->removed) {
+      std::cout << "removed " << n << "\n";
+    }
+    std::cout << std::format("{} bundle(s) removed, {} KiB "
+                             "reclaimed\n",
+                             report->removed.size(),
+                             report->reclaimed_bytes / 1024);
+    // A prune that half-worked says which half, on stderr, non-zero.
+    for (const auto& f : report->failed) {
+      std::cerr << "could not remove " << f << "\n";
+    }
+    return report->failed.empty() ? 0 : 1;
+  }
+
   if (*apply) {
     auto cfg = Load(config_path, true);
     if (!cfg) return 1;
@@ -429,6 +539,20 @@ auto main(int argc, char** argv) -> int {
     }
     for (const auto& p : net->changed) {
       std::cout << "wrote " << p << "\n";
+    }
+
+    // The journal limits go in with everything else. An appliance
+    // that fills its own disk stops working, and it does it at the
+    // office rather than on the bench.
+    {
+      auto log_plan = PlanLogging(LogPolicy{});
+      auto wrote = f::sysconfig::InstallArtifact(journald_path,
+                                                 log_plan.content);
+      if (!wrote) {
+        std::cerr << wrote.error() << "\n";
+        return 1;
+      }
+      if (*wrote) std::cout << "wrote " << journald_path << "\n";
     }
 
     // The IPv6 stance goes in before any service starts. It is the

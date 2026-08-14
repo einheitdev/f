@@ -17,6 +17,8 @@
 #include <sstream>
 #include <vector>
 
+#include "f/sysconfig/storage.h"
+
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
 
@@ -428,6 +430,32 @@ auto ReloadFromSource(Engine& e)
   }
 
   UpdateCurrentSymlink(e.watcher.compiled_dir, version);
+
+  // Bound the set here, because here is where it grows. Every reload
+  // writes a new timestamped bundle and nothing ever removed the old
+  // ones — the rig accumulated ~500. Pruning after the symlink move
+  // means the running policy is already `current` and therefore
+  // never a candidate: tidying up must not be able to cause an
+  // outage. A failure to prune is logged and not propagated, because
+  // a reload that worked did work.
+  sysconfig::RetentionPolicy retention;
+  retention.compiled_dir = e.watcher.compiled_dir;
+  auto pruned = sysconfig::PruneBundles(retention);
+  if (!pruned) {
+    spdlog::warn("reload: could not prune old bundles: {}",
+                 pruned.error());
+  } else if (!pruned->removed.empty()) {
+    spdlog::info(
+        "reload: pruned {} old bundle(s), {} KiB reclaimed "
+        "(keeping {})",
+        pruned->removed.size(), pruned->reclaimed_bytes / 1024,
+        retention.keep);
+  }
+  for (const auto& f : pruned ? pruned->failed
+                              : std::vector<std::string>{}) {
+    spdlog::warn("reload: could not remove {}", f);
+  }
+
   spdlog::info(
       "reload: ok version={} rules_installed={}",
       applied->version, applied->rules_installed);

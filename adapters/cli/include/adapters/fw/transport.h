@@ -42,6 +42,10 @@ struct FLocalConfig {
   std::string dnsmasq_conf = "/etc/f/generated/dnsmasq.conf";
   /// Where the generated networkd units are installed.
   std::string networkd_dir = "/etc/systemd/network";
+  /// Where fd deposits compiled bundles. Every reload adds one, so
+  /// this is the directory that grows without a policy unless
+  /// somebody gives it one.
+  std::string compiled_dir = "/usr/share/f/compiled";
   /// The lease database dnsmasq writes. Generated into the dnsmasq
   /// artifact from the same constant the reader uses, so the two
   /// cannot disagree about where it is.

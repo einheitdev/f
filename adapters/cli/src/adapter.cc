@@ -1515,6 +1515,69 @@ auto RenderShowTime(const Response& resp, Renderer& renderer)
   if (!detail.empty()) out << "\n" << detail << "\n";
 }
 
+/// Disk, bundles, and what logging has already thrown away.
+auto RenderShowStorage(const Response& resp, Renderer& renderer)
+    -> void {
+  auto j = ParseData(resp);
+  auto& out = renderer.Out();
+
+  auto banner = j.value("banner", "");
+  if (!banner.empty()) out << banner << "\n";
+
+  if (!j.value("observed", false)) {
+    out << "no storage observation: "
+        << j.value("availability", "unknown") << "\n";
+    auto detail = j.value("detail", "");
+    if (!detail.empty()) out << detail << "\n";
+    return;
+  }
+
+  auto mib = [](std::uint64_t bytes) {
+    return std::format("{} MiB", bytes / (1024 * 1024));
+  };
+
+  Table t;
+  AddColumn(t, "WHAT", Align::Left, Priority::High);
+  AddColumn(t, "VALUE", Align::Left, Priority::High);
+  auto free_bytes = j.value("fs_free_bytes", 0ULL);
+  auto total_bytes = j.value("fs_total_bytes", 0ULL);
+  AddRow(t, {Cell{"free space", Semantic::Emphasis},
+             Cell{std::format("{} of {}", mib(free_bytes),
+                              mib(total_bytes)),
+                  j.value("tight", false) ? Semantic::Bad
+                                          : Semantic::Good}});
+  auto over = j.value("bundles_over_policy", 0ULL);
+  AddRow(t, {Cell{"compiled bundles"},
+             Cell{std::format("{} using {} KiB",
+                              j.value("bundle_count", 0ULL),
+                              j.value("bundle_bytes", 0ULL) / 1024)}});
+  AddRow(t, {Cell{"beyond the limit"},
+             Cell{std::format("{} (keeping {})", over,
+                              j.value("keep", 0ULL)),
+                  over > 0 ? Semantic::Warn : Semantic::Dim}});
+  // Never a bare zero: "no journal found" and "the journal is empty"
+  // are different, and only one of them is reassuring.
+  AddRow(t, {Cell{"journal"},
+             j.value("journal_read", false)
+                 ? Cell{mib(j.value("journal_bytes", 0ULL))}
+                 : Cell{"(could not be read)", Semantic::Warn}});
+  auto dropped = j.value("suppressed_messages", 0ULL);
+  AddRow(t, {Cell{"dropped logs"},
+             j.value("suppression_read", false)
+                 ? Cell{std::format("{} suppression burst(s) in 24h",
+                                    dropped),
+                        dropped > 0 ? Semantic::Bad : Semantic::Good}
+                 : Cell{"(could not be determined)",
+                        Semantic::Warn}});
+  RenderFormatted(t, renderer);
+
+  if (over > 0) {
+    out << "\n" << over
+        << " bundle(s) are beyond the retention limit. fd prunes "
+           "after each reload; `f-sysconf prune` does it now.\n";
+  }
+}
+
 auto RenderCheckSystem(const Response& resp, Renderer& renderer)
     -> void {
   auto j = ParseData(resp);
@@ -1626,6 +1689,9 @@ class FwAdapter final : public cli::ProductAdapter {
              "Interfaces, zones and where services will answer"),
         Show("services", "show_services",
              "DHCP/DNS health, and what they are bound to"),
+        Show("storage", "show_storage",
+             "Disk, compiled bundles, and whether log events are "
+             "being dropped"),
         Show("time", "show_time",
              "The clock, whether it is synchronised, and whether "
              "this board can keep time across a power cut"),
@@ -1695,6 +1761,8 @@ class FwAdapter final : public cli::ProductAdapter {
       RenderShowIpv6(response, renderer);
     } else if (wc == "show_time") {
       RenderShowTime(response, renderer);
+    } else if (wc == "show_storage") {
+      RenderShowStorage(response, renderer);
     } else if (wc == "check_system") {
       RenderCheckSystem(response, renderer);
     } else if (wc == "apply_system" ||

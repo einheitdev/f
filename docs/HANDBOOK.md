@@ -453,7 +453,70 @@ Two things worth knowing about how time gets here:
   bound to. `show services` names where; the uplink is never in that
   list, and with `serve: false` there is no server socket at all.
 
-### 3.4 A service is not running, and you need to know which kind of not-running
+### 3.4 The box is running out of disk, or has quietly stopped recording
+
+**Symptom:** either nothing at all, or a service that will not start
+for no reason it can articulate. An appliance that fills its own disk
+stops working, and it does it at the office rather than on the bench.
+
+Two things on this box grow, and both grow fastest exactly when it is
+busiest.
+
+```
+$ einheit-f show storage
+ WHAT             │ VALUE
+ free space       │ 3812 MiB of 4096 MiB
+ compiled bundles │ 47 using 384 KiB
+ beyond the limit │ 37 (keeping 10)
+ journal          │ 198 MiB
+ dropped logs     │ 0 message(s) in 0 burst(s), 24h
+
+37 bundle(s) are beyond the retention limit. fd prunes after each
+reload; `f-sysconf prune` does it now.
+```
+
+**Compiled bundles.** Every reload writes a new timestamped directory
+under `/usr/share/f/compiled/` and repoints `current`. `fd` prunes
+after each successful reload — after the symlink moves, so the
+running policy is already `current` and therefore never a candidate.
+Tidying up must not be able to cause an outage. To do it by hand:
+
+```
+$ f-sysconf prune --dry-run     # what would go
+$ f-sysconf prune               # do it
+```
+
+**Dropped logs.** This is the row to read. journald's default answer
+to a high event rate is to discard silently, and a broadcast storm is
+exactly a high event rate — so the default trades away the minute
+most worth having. `apply system` writes
+`/etc/systemd/journald.conf.d/10-f.conf` with `RateLimitBurst=0`,
+which disables the limiter entirely and leaves the disk cap as the
+only bound. That is the right trade for a box whose purpose is
+recording what happened on a hostile segment.
+
+If that row is ever non-zero, something put the limiter back. Re-run
+`apply system`, then find out what.
+
+**Do not trust a zero there too far.** journald reports its own
+losses badly, measured on systemd 257:
+
+- the "Suppressed N messages" record is written at the *end* of the
+  rate-limit interval, so a read taken during a storm reports zero
+  while messages are being thrown away;
+- and it is written *lazily*, on the next message from that source
+  after the interval expires — so a box that goes quiet after a storm
+  never records that it dropped anything at all.
+
+That is the argument for turning the limiter off rather than for
+watching the counter. The counter catches a limiter somebody put
+back; it is not a safety net.
+
+`show storage` exits non-zero when the disk is tight, when events
+have been dropped, or when it could not read the paths at all — the
+last because "could not look" is not the same as "nothing there".
+
+### 3.5 A service is not running, and you need to know which kind of not-running
 
 **Symptom:** DHCP is not answering. `systemctl status` is not much
 help, because systemd reports a unit that was never installed and a
@@ -490,7 +553,7 @@ looks alive in every dashboard while serving nobody; `f-dnsmasq.service`
 therefore has a `StartLimitBurst` so it eventually sits in `failed`
 where both systemd and `show services` say so out loud.
 
-### 3.5 A restart left pins behind in bpffs
+### 3.6 A restart left pins behind in bpffs
 
 **Symptom:** `fd` restarts and either refuses to load a bundle, or
 loads it and the connection tracking behaves as though it remembers
@@ -533,7 +596,7 @@ Check the `ATTACHED` and `MODE` columns afterwards. A declared
 interface with no attach shows `(none)`, and `generic` in MODE means
 you are on the software slow path, not at line rate.
 
-### 3.6 NAT stops working for new flows
+### 3.7 NAT stops working for new flows
 
 **Symptom:** existing connections through the box keep working, new
 ones go out and nothing comes back. Typically after a long soak or a
@@ -610,6 +673,7 @@ instead of guessing from the table length.
 | `show services` | Are the backing daemons running, and if not, which kind of not-running? |
 | `show ipv6` | Have router advertisements arrived, and did anything autoconfigure from one? |
 | `show time` | Is the clock synchronised, and can this board keep time across a power cut? |
+| `show storage` | How much disk is left, how many bundles have piled up, and have any log events been dropped? |
 | `check system` | Does the configuration validate, without applying it? |
 | `apply system` | Make the configuration live. |
 | `apply system confirmed <min>` | Make it live with an automatic undo if you do not confirm. |
@@ -638,6 +702,8 @@ Global flags worth knowing: `--format json|yaml|set`, `--width N`,
 | `/etc/f/generated/dnsmasq.conf` | Derived artifact. Digest-stamped; edits are reported as drift. | `apply system` |
 | `/etc/chrony/f-generated.conf` | Derived artifact. **Not** under `/etc/f/` — Debian's AppArmor profile confines chronyd to `/etc/chrony/`. | `apply system` |
 | `/etc/sysctl.d/10-f-ipv6.conf` | Derived artifact: the per-zone IPv6 stance. | `apply system` |
+| `/etc/systemd/journald.conf.d/10-f.conf` | Derived artifact: the journal cap and the rate limiter. | `apply system` |
+| `/usr/share/f/compiled/` | Compiled bundles, newest 10 plus whatever `current` points at. | `fd`, pruned after each reload |
 | `/etc/systemd/network/10-f-*.network` | Derived artifact. | `apply system` |
 | `/var/lib/f/dnsmasq.leases` | dnsmasq's lease database. Read-only to us. | dnsmasq |
 | `/var/lib/f/devices.json` | Device history: when each MAC first appeared. | whatever runs `show leases` |
