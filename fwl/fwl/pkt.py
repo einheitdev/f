@@ -101,7 +101,7 @@ class PktStep:
 _BUILDER_RE = re.compile(
   r"""
   ^\s*
-  (?P<proto>tcp6|udp6|icmp6|tcp|udp|icmp)
+  (?P<proto>tcp6|udp6|icmp6|tcp|udp|icmp|eth)
   \s*\(\s*
   (?P<args>.*?)
   \s*\)\s*$
@@ -182,7 +182,38 @@ _VLAN_BUILDER_FIELDS = frozenset({
 # alone. Both are branch-coverage instruments: nothing else in the
 # builder language can produce those frames.
 _IPV4_EDGE_FIELDS = frozenset({"ihl"})
+# The raw L2 builder. Every other builder in this file produces an IPv4
+# or IPv6 frame, so the EtherType is always 0x0800 or 0x86DD and the
+# emitted program's non-IP arm — `fwl_l3p != ETH_P_IP && fwl_l3p !=
+# ETH_P_IPV6` — has never been taken by any corpus case, in any of the
+# 90 programs that contain it.
+#
+# That arm is not an academic gap. The box this compiler targets goes
+# into a single flat L2 office network, where ARP, LLDP, STP BPDUs and
+# misdelivered junk are the NORMAL traffic. The emitter has a
+# deliberate gate for it (emitter.py `_emit_parse_prelude`, the
+# no-referenced-fields branch): FWL has no L2 fields, so no construct
+# can meaningfully act on an L2 control frame, and a program built from
+# unconditional actions otherwise WOULD — an unconditional `redirect`
+# re-emits the switch's own BPDUs out another port and real switch
+# fabric answers by blocking it. Found on an EX2300 by the storm_shield
+# hardware test; veth-based tests cannot see it.
+#
+# So the builder needs a way to make a frame that is not IP. Fields:
+#   ethertype    required, 0..0xFFFF. A value <= 1500 is an IEEE 802.3
+#                LENGTH field rather than an EtherType — which is
+#                exactly how an STP BPDU is framed, and it must reach
+#                the same arm.
+#   payload_len  bytes after the EtherType; default 46, the Ethernet
+#                minimum, giving a 60-byte frame.
+#   payload_hex  a real protocol body instead of filler, so a case can
+#                document what an actual ARP request or LLDP TLV chain
+#                looks like on this wire.
+_ETH_BUILDER_FIELDS = frozenset({
+  "ethertype", "payload_len", "payload_hex",
+})
 _BUILDER_FIELD_TABLE: dict[str, frozenset[str]] = {
+  "eth": _ETH_BUILDER_FIELDS | _VLAN_BUILDER_FIELDS,
   "tcp": (_TCP_BUILDER_FIELDS | _VLAN_BUILDER_FIELDS
           | _IPV4_EDGE_FIELDS),
   "udp": (frozenset({"src_ip", "dst_ip", "src_port", "dst_port",
@@ -523,6 +554,95 @@ def _build_v6_packet(fields: dict[str, Any]) -> Packet:
   return Packet(raw=raw, fields=decoded)
 
 
+# Ethernet's minimum payload. 46 + 14 = the 60-byte frame a real NIC
+# emits; anything shorter is padded on the wire, so a case that wants
+# a short frame should say so with `truncate_to` rather than by
+# building an impossible one.
+_ETH_MIN_PAYLOAD = 46
+_ETH_MAX_PAYLOAD = 1500
+
+
+def _validated_ethertype(raw: Any) -> int:
+  """Range-check the eth builder's `ethertype`."""
+  if raw is None:
+    raise ValueError("eth() requires an ethertype")
+  if isinstance(raw, bool) or not isinstance(raw, int):
+    raise ValueError(
+      f"eth ethertype must be an integer 0..65535: {raw!r}"
+    )
+  if not (0 <= raw <= 0xFFFF):
+    raise ValueError(f"eth ethertype out of range 0..65535: {raw}")
+  return raw
+
+
+def _eth_payload(fields: dict[str, Any]) -> bytes:
+  """The bytes after the EtherType, from `payload_hex` or a length."""
+  raw_hex = fields.get("payload_hex")
+  length = fields.get("payload_len")
+  if raw_hex is not None and length is not None:
+    raise ValueError(
+      "eth() takes payload_hex OR payload_len, not both — padding one "
+      "to the other would silently change the frame a case documents"
+    )
+  if raw_hex is not None:
+    if not isinstance(raw_hex, str):
+      raise ValueError(f"eth payload_hex must be a string: {raw_hex!r}")
+    text = raw_hex.replace(" ", "").replace(":", "")
+    try:
+      body = bytes.fromhex(text)
+    except ValueError:
+      raise ValueError(f"eth payload_hex is not hex: {raw_hex!r}")
+    if len(body) > _ETH_MAX_PAYLOAD:
+      raise ValueError(
+        f"eth payload_hex is {len(body)} bytes, over the "
+        f"{_ETH_MAX_PAYLOAD}-byte Ethernet MTU"
+      )
+    return body
+  if length is None:
+    return b"\x00" * _ETH_MIN_PAYLOAD
+  if isinstance(length, bool) or not isinstance(length, int):
+    raise ValueError(f"eth payload_len must be an integer: {length!r}")
+  if not (0 <= length <= _ETH_MAX_PAYLOAD):
+    raise ValueError(
+      f"eth payload_len out of range 0..{_ETH_MAX_PAYLOAD}: {length}"
+    )
+  return b"\x00" * length
+
+
+def _build_eth_frame(fields: dict[str, Any]) -> Packet:
+  """Build a non-IP Ethernet frame: ARP, LLDP, an STP BPDU, junk.
+
+  The decoded dict deliberately carries NO L3 or L4 field — not even
+  `proto`. That is the whole contract with the interpreter: its
+  `_non_ip_early_out` mirror keys on the presence of the L3 group
+  (`proto`/`src_ip`/`dst_ip`/`src_ip6`/`dst_ip6`), and a frame that
+  never parsed at L3 must leave that group empty or the two oracles
+  disagree about which arm the compiled program took.
+
+  `ether_type` IS carried, because two other mirrors read it: the NAT
+  helper's `h_proto != bpf_htons(ETH_P_IP)` bail (interpreter.py) and
+  the truncation mirror's v4/v6 offset choice. It is not an FWL packet
+  field and no rule can read it.
+  """
+  ether_type = _validated_ethertype(fields.get("ethertype"))
+  payload = _eth_payload(fields)
+  eth, vlan_decoded, is_qinq = _eth_header(
+    ether_type, fields.get("vlan_id"), fields.get("vlan_priority"),
+    fields.get("inner_vlan_id"), fields.get("inner_vlan_priority"),
+  )
+  # `ether_type` here means "what the emitted parser RESOLVES to",
+  # not "what the frame ultimately carries". v0.4 parses the outer tag
+  # only, so behind a second tag the value it lands on is the inner
+  # TPID — 0x8100, which is neither ETH_P_IP nor ETH_P_IPV6. That is
+  # not a technicality: double-tagged frames are one of the things a
+  # badly-segmented corporate LAN actually emits, and 802.1Q stacking
+  # is only expressible as a non-IP frame because of it.
+  resolved = _ETH_P_8021Q if is_qinq else ether_type
+  decoded: dict[str, Any] = {"ether_type": resolved}
+  decoded.update(vlan_decoded)
+  return Packet(raw=eth + payload, fields=decoded)
+
+
 def build_packet(fields: dict[str, Any]) -> Packet:
   """Build a Packet from a decoded-fields dict.
 
@@ -539,6 +659,8 @@ def build_packet(fields: dict[str, Any]) -> Packet:
   EtherType 0x86DD, 16-byte addresses, no checksum) differs from v4.
   """
   proto = fields["proto"]
+  if proto == "eth":
+    return _build_eth_frame(fields)
   if proto in ("tcp6", "udp6", "icmp6"):
     return _build_v6_packet(fields)
   src_ip = fields.get("src_ip", "1.1.1.1")

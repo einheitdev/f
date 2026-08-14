@@ -853,6 +853,21 @@ _L3_PRESENCE_KEYS = (
   "proto", "src_ip", "dst_ip", "src_ip6", "dst_ip6",
 )
 
+# The two families the emitted prelude lets past its EtherType test.
+_ETH_P_IP = 0x0800
+_ETH_P_IPV6 = 0x86DD
+
+
+def _resolved_ether_type(packet: dict[str, Any]) -> int:
+  """What `fwl_l3p` holds after the prelude parses at most one tag.
+
+  Only the `eth()` builder — and the QinQ path — can produce anything
+  other than the two IP families, so an absent key means an IPv4 frame
+  from one of the ordinary builders. Defaulting rather than raising
+  keeps hand-built packet dicts (unit tests, generators) working.
+  """
+  return int(packet.get("ether_type", _ETH_P_IP))
+
 
 def _program_reads_vlan(program: ast.Program) -> bool:
   """True iff any rule reads a VLAN field (the emitter's needs_vlan)."""
@@ -901,7 +916,27 @@ def _non_ip_early_out(
   it is recorded as one.
   """
   if not _referenced_field_names(program):
-    return False  # no prelude is emitted at all, so no early-out
+    # A program that reads no field still gets a prelude — a
+    # different, shorter one — and it still early-outs. This line used
+    # to say "no prelude is emitted at all", which was simply wrong:
+    # `emitter._emit_parse_prelude`'s no-fields branch emits the
+    # EtherType test and nothing else, deliberately, so that an
+    # unconditional `redirect` does not re-emit the switch's own BPDUs
+    # out another port. (Found on an EX2300 by the storm_shield
+    # hardware test; real fabric answers by blocking the port.)
+    #
+    # The consequence of the old answer: `@xdp(eth0) / default drop`
+    # against an ARP frame gave interpreter DROP and BPF PASS. No
+    # corpus case had ever sent a non-IP frame to a no-fields program
+    # — the arm is untaken across all 90 of them — so 1434 cases never
+    # noticed.
+    #
+    # The no-fields prelude tests the resolved EtherType and NOTHING
+    # else: it does not bounds-check L3, so a 20-byte IPv4 frame does
+    # NOT early out here even though it would in the full prelude.
+    return _resolved_ether_type(packet) not in (
+      _ETH_P_IP, _ETH_P_IPV6
+    )
   if any(key in packet for key in _L3_PRESENCE_KEYS):
     return False  # v4_ok or v6_ok
   if _program_reads_vlan(program) and (
