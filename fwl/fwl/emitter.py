@@ -1500,21 +1500,25 @@ static __always_inline int fwl_route_l2(struct xdp_md *ctx,
     return FWL_ROUTE_BRIDGE;
   }
 
-  // A router decrements. Below 2 the packet dies here and the ICMP
-  // time-exceeded that says so is the stack's job, not ours.
-  if (ip->ttl <= 1) {
-    fwl_route_stat(FWL_ROUTE_STAT_TTL);
-    return XDP_PASS;
-  }
-
-  // Re-derive after the helper call: the verifier's packet pointers do
-  // not survive a call it cannot prove leaves the frame alone.
+  // Re-derive the packet pointers before touching the frame. The
+  // verifier accepts the originals here (bpf_fib_lookup does not move
+  // the packet), so this is belt and braces rather than a requirement —
+  // but a rewrite through a stale pointer is the kind of bug that shows
+  // up as one corrupted frame in a million, and nothing above this line
+  // depends on the pointers surviving.
   data = (void *)(long)ctx->data;
   data_end = (void *)(long)ctx->data_end;
   eth = data;
   if ((void *)(eth + 1) > data_end) return FWL_ROUTE_BRIDGE;
   ip = (void *)(eth + 1);
   if ((void *)(ip + 1) > data_end) return FWL_ROUTE_BRIDGE;
+
+  // A router decrements. Below 2 the packet dies here and the ICMP
+  // time-exceeded that says so is the stack's job, not ours.
+  if (ip->ttl <= 1) {
+    fwl_route_stat(FWL_ROUTE_STAT_TTL);
+    return XDP_PASS;
+  }
 
   fwl_ip_decrease_ttl(ip);
   __builtin_memcpy(eth->h_dest, fib.dmac, ETH_ALEN);
