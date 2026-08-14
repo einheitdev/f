@@ -654,6 +654,81 @@ auto ReadPersistentMapNames(std::string_view bundle_dir)
   return names;
 }
 
+namespace {
+
+/// Comma-separated, for a message that has to name several things.
+auto Join(const std::vector<std::string>& items) -> std::string {
+  std::string out;
+  for (size_t i = 0; i < items.size(); ++i) {
+    out += (i == 0 ? "" : ", ");
+    out += items[i];
+  }
+  return out;
+}
+
+/// The attach plan, from an already-parsed manifest.
+///
+/// The one place that answers "which interfaces does this bundle want
+/// its programs on". Both the declared-zone form and the simple
+/// `@xdp(<iface>)` form are read here, so no caller has to remember
+/// that the second one exists — which is exactly what went wrong when
+/// only `manifest["zones"]` was consulted.
+auto PlanFromManifest(const nlohmann::json& manifest)
+    -> BundleAttachPlan {
+  using nlohmann::json;
+  BundleAttachPlan plan;
+  for (const auto& z : manifest.value("zones", json::array())) {
+    std::vector<std::string> ifaces;
+    for (const auto& i : z.value("interfaces", json::array())) {
+      if (i.is_string()) {
+        ifaces.push_back(i.get<std::string>());
+      }
+    }
+    plan.zone_interfaces[z.value("name", std::string{})] =
+        std::move(ifaces);
+  }
+  for (const auto& p : manifest.value("programs", json::array())) {
+    std::string zone = p.value("zone", std::string{});
+    if (zone.empty()) {
+      continue;
+    }
+    if (!plan.zone_interfaces.contains(zone)) {
+      // The simple form (FWL_V04_SPEC.md § 6.2, and § "Hook" of the
+      // v0.1 spec, where `@xdp(<interface>)` is spelled out): no zone
+      // was declared, so the @xdp argument is a bare interface name
+      // and the implicit zone has exactly that one interface.
+      // `fwl` writes this row into the manifest itself now; deriving
+      // it here as well is what keeps a bundle compiled by an older
+      // `fwl` — one already staged at <bundle_dir>/current, which a
+      // package upgrade does not recompile — attaching to the
+      // interface it names instead of refusing to load.
+      plan.zone_interfaces[zone] = {zone};
+      continue;
+    }
+    if (plan.zone_interfaces[zone].empty()) {
+      plan.zones_without_interfaces.push_back(zone);
+    }
+  }
+  return plan;
+}
+
+}  // namespace
+
+auto PlanBundleAttach(std::string_view bundle_dir) -> BundleAttachPlan {
+  using nlohmann::json;
+  std::ifstream mf(std::filesystem::path(bundle_dir) / "manifest.json");
+  if (!mf) {
+    return {};
+  }
+  std::stringstream ss;
+  ss << mf.rdbuf();
+  try {
+    return PlanFromManifest(json::parse(ss.str()));
+  } catch (const std::exception&) {
+    return {};
+  }
+}
+
 auto ManifestStatesMasquerade(std::string_view bundle_dir) -> bool {
   using nlohmann::json;
   std::ifstream mf(std::filesystem::path(bundle_dir) / "manifest.json");
@@ -958,16 +1033,68 @@ auto LoadZoneBundle(std::string_view bundle_dir,
   // zone name -> resolved ifindexes (egress targets for redirect, and
   // ingress interfaces to attach each program to). Interface names are
   // kept too: the masquerade config needs the egress zone's address.
+  //
+  // Read through PlanFromManifest rather than off manifest["zones"]
+  // directly. The array answers this question only for a unit that
+  // declares zones; the simple `@xdp(eth0)` form leaves it empty and
+  // names its interface in the program entry instead, and reading
+  // just the array gave every such bundle zero interfaces to attach
+  // to — reported as a successful load.
+  auto plan = PlanFromManifest(manifest);
+  if (!plan.zones_without_interfaces.empty()) {
+    // Distinct from a NIC that is not present yet: the manifest names
+    // no interface for this program at all, so there is nothing to
+    // wait for and nothing to resolve. Refuse before opening a single
+    // object — the bundle is malformed and no amount of loading will
+    // make it enforce anything.
+    return MakeError(BpfError::kLoadFailed,
+        std::format("bundle {}: manifest names no interface for zone "
+                    "program(s) [{}] — a zone program with no "
+                    "interface can never be attached, so this bundle "
+                    "cannot enforce anything",
+                    bundle_dir, Join(plan.zones_without_interfaces)));
+  }
   std::map<std::string, std::vector<int>> zone_ifindexes;
   std::map<std::string, std::vector<std::string>> zone_ifnames;
-  for (const auto& z : manifest.value("zones", json::array())) {
-    std::vector<std::string> ifaces;
-    for (const auto& i : z.value("interfaces", json::array())) {
-      ifaces.push_back(i.get<std::string>());
-    }
-    std::string zname = z.at("name").get<std::string>();
+  for (const auto& [zname, ifaces] : plan.zone_interfaces) {
     zone_ifindexes[zname] = ResolveZoneIfindexes(ifaces);
-    zone_ifnames[zname] = std::move(ifaces);
+    zone_ifnames[zname] = ifaces;
+  }
+
+  // Pre-flight the outcome this whole function exists to produce: is
+  // there a single interface on this host for any of the programs to
+  // land on? Asked here, before a pin root is created or an object is
+  // opened, because the answer does not depend on any of that and
+  // because refusing early leaves the running policy — and bpffs —
+  // untouched. The same condition is re-checked after the attach loop;
+  // this one is not the guarantee, it is the early, specific message.
+  std::vector<std::string> attachable;
+  std::vector<std::string> wanted;
+  size_t resolvable = 0;
+  for (const auto& p : manifest.value("programs", json::array())) {
+    if (p.value("object", json()).is_null()) {
+      continue;
+    }
+    std::string zone = p.value("zone", std::string{});
+    auto it = zone_ifindexes.find(zone);
+    if (it == zone_ifindexes.end()) {
+      continue;
+    }
+    attachable.push_back(zone);
+    wanted.push_back(
+        std::format("{} [{}]", zone, Join(zone_ifnames[zone])));
+    resolvable += it->second.size();
+  }
+  if (!attachable.empty() && resolvable == 0) {
+    return MakeError(BpfError::kAttachFailed,
+        std::format("bundle {} names {} zone program(s) and not one of "
+                    "their interfaces exists on this host, so it would "
+                    "attach to ZERO interfaces and no packet would be "
+                    "inspected. Wanted: {}. Refusing the load rather "
+                    "than reporting a firewall that is not there — "
+                    "check the interfaces the policy names against "
+                    "`ip link`.",
+                    bundle_dir, attachable.size(), Join(wanted)));
   }
 
   // Common pin root so LIBBPF_PIN_BY_NAME maps (conntrack, devmaps)
@@ -1027,8 +1154,19 @@ auto LoadZoneBundle(std::string_view bundle_dir,
                    p.value("zone", std::string{}));
       continue;
     }
-    std::string zone = p.at("zone").get<std::string>();
-    std::string obj_name = p.at("object").get<std::string>();
+    // `json::at` throws on a missing key, and this function returns
+    // std::expected precisely so control paths do not. A manifest
+    // entry with no zone is a malformed bundle, which is a refusal,
+    // not an exception out of the middle of a load.
+    std::string zone = p.value("zone", std::string{});
+    if (zone.empty() || !zone_ifnames.contains(zone)) {
+      return bail(BpfError::kLoadFailed,
+          std::format("bundle {}: program entry names no zone this "
+                      "manifest declares ({}) — it cannot be attached "
+                      "to anything",
+                      bundle_dir, p.dump()));
+    }
+    std::string obj_name = p.value("object", std::string{});
     std::string obj_path = (dir / obj_name).string();
 
     LIBBPF_OPTS(bpf_object_open_opts, open_opts);
@@ -1074,16 +1212,12 @@ auto LoadZoneBundle(std::string_view bundle_dir,
     for (const auto& d : p.value("redirects_to", json::array())) {
       zh.redirects_to.push_back(d.get<std::string>());
     }
-    // Resolve the zone's declared interface names (for `show zones`);
-    // some may not be present on the host yet.
-    for (const auto& z : manifest.value("zones", json::array())) {
-      if (z.value("name", std::string{}) == zone) {
-        for (const auto& i : z.value("interfaces", json::array())) {
-          zh.interfaces.push_back(i.get<std::string>());
-        }
-        break;
-      }
-    }
+    // The zone's interface names (for `show zones`); some may not be
+    // present on the host yet. From the same plan the attach uses, so
+    // what the operator is shown and what the loader acts on cannot
+    // disagree — the simple `@xdp(eth0)` form used to render an empty
+    // interface list here for the same reason it attached to nothing.
+    zh.interfaces = zone_ifnames[zone];
 
     // Capture the shared conntrack fd from whichever zone defines it.
     if (handles.conntrack_fd < 0) {
@@ -1128,7 +1262,11 @@ auto LoadZoneBundle(std::string_view bundle_dir,
       uint32_t masq_addr = 0;
       std::string masq_zone;
       for (const auto& dest : zh.redirects_to) {
-        masq_addr = FirstZoneIpv4(zone_ifnames[dest]);
+        auto dest_it = zone_ifnames.find(dest);
+        if (dest_it == zone_ifnames.end()) {
+          continue;
+        }
+        masq_addr = FirstZoneIpv4(dest_it->second);
         if (masq_addr != 0) {
           masq_zone = dest;
           break;
@@ -1155,17 +1293,51 @@ auto LoadZoneBundle(std::string_view bundle_dir,
     // egress ifindexes (key i -> ifindex of the i-th interface).
     for (const auto& dest : p.value("redirects_to", json::array())) {
       std::string dest_zone = dest.get<std::string>();
+      // A destination the plan does not know is a manifest naming a
+      // zone it did not declare. `zone_ifindexes[dest]` would default-
+      // construct an empty vector and fill the devmap with nothing —
+      // the same `operator[]` mechanism that made the attach loop run
+      // zero times, and with the same silence: every redirected frame
+      // is dropped and the load still says ok.
+      auto dest_it = zone_ifindexes.find(dest_zone);
+      if (dest_it == zone_ifindexes.end()) {
+        return bail(BpfError::kLoadFailed,
+            std::format("zone '{}' redirects to '{}', which the "
+                        "manifest never declares — every frame "
+                        "redirected there would be dropped",
+                        zone, dest_zone));
+      }
       std::string map_name = "fwl_devmap_" + dest_zone;
       int map_fd = FindMap(obj, map_name.c_str());
-      if (map_fd < 0) continue;
-      const auto& targets = zone_ifindexes[dest_zone];
+      if (map_fd < 0) {
+        // The compiler said this zone redirects there; the object it
+        // compiled has no devmap for it. Contract disagreement, and a
+        // bare `continue` made it a silent drop.
+        spdlog::warn("zone '{}' redirects to '{}' but its object has "
+                     "no '{}'; redirected frames will be DROPPED",
+                     zone, dest_zone, map_name);
+        continue;
+      }
+      const auto& targets = dest_it->second;
       for (uint32_t i = 0; i < targets.size(); ++i) {
         uint32_t key = i;
         uint32_t val = static_cast<uint32_t>(targets[i]);
         bpf_map_update_elem(map_fd, &key, &val, BPF_ANY);
       }
-      spdlog::info("zone '{}' devmap -> '{}' ({} ifaces)", zone,
-                   dest_zone, targets.size());
+      if (targets.empty()) {
+        // Same shape as the attach count: the map exists, so the load
+        // proceeds, but `redirect to <dest>` looks up slot 0 of an
+        // empty devmap and the frame is dropped. "0 ifaces" at info,
+        // next to a successful load, is not something anybody reads.
+        spdlog::warn(
+            "zone '{}' redirects to '{}' but that zone has no "
+            "interface on this host ([{}]); every redirected frame "
+            "will be DROPPED",
+            zone, dest_zone, Join(zone_ifnames.at(dest_zone)));
+      } else {
+        spdlog::info("zone '{}' devmap -> '{}' ({} ifaces)", zone,
+                     dest_zone, targets.size());
+      }
     }
 
     // Attach the program to every interface in its own zone. On a
@@ -1222,8 +1394,22 @@ auto LoadZoneBundle(std::string_view bundle_dir,
       }
       zh.ifindexes.push_back(ifindex);
     }
-    spdlog::info("loaded zone '{}' ({}) on {} interface(s)", zone,
-                 obj_name, zh.ifindexes.size());
+    if (zh.ifindexes.empty()) {
+      // Every interface this zone names is absent from the host. The
+      // zone's policy is not enforced, and saying so at info level
+      // beside a line that reads "loaded" is how the whole bundle
+      // being off went unnoticed. Not fatal on its own — a zone whose
+      // NIC has not appeared receives no packets either — but the
+      // bundle-level check below refuses the load when this is true
+      // of every zone.
+      spdlog::warn("zone '{}' ({}) attached to NO interface: none of "
+                   "[{}] is present on this host; this zone's policy "
+                   "is NOT enforced",
+                   zone, obj_name, Join(zh.interfaces));
+    } else {
+      spdlog::info("loaded zone '{}' ({}) on {} interface(s)", zone,
+                   obj_name, zh.ifindexes.size());
+    }
     handles.programs.push_back(std::move(zh));
   }
 
@@ -1250,6 +1436,41 @@ auto LoadZoneBundle(std::string_view bundle_dir,
                     "(every manifest entry lacks a compiled "
                     "object) — refusing to apply it",
                     bundle_dir));
+  }
+
+  // Loading is not attaching, and the count of the first is not
+  // evidence about the second. A bundle can produce a full set of
+  // ZoneProgramHandles — each with a verified object, a resolved
+  // entry program and a real prog_fd — and still be attached to
+  // nothing, in which case not one packet on this box is inspected.
+  // That state used to be reported as success, at info level, under a
+  // line reading "1 zone program(s)": a true sentence about the
+  // program list that said nothing about attachment, which is the
+  // only thing that decides whether the firewall is up.
+  //
+  // The rule is therefore about the outcome and not about any of the
+  // reasons: whatever the manifest said, whatever the host is missing,
+  // a bundle attached to zero interfaces is a failed load. Stating it
+  // that way closes every way of arriving there at once, including
+  // ones no manifest has produced yet.
+  //
+  // On reload this keeps the running policy attached (ApplyBundle
+  // propagates the error before it touches anything); on cold boot fd
+  // exits loudly instead of coming up naked and green.
+  size_t attached = 0;
+  std::vector<std::string> bare;
+  for (const auto& p : handles.programs) {
+    attached += p.ifindexes.size();
+    bare.push_back(std::format("{} [{}]", p.zone, Join(p.interfaces)));
+  }
+  if (attached == 0) {
+    return bail(BpfError::kAttachFailed,
+        std::format("bundle {} loaded {} zone program(s) but attached "
+                    "to ZERO interfaces — the firewall would be "
+                    "completely off while reporting success. Wanted: "
+                    "{}. Check that the interfaces the policy names "
+                    "exist on this host (`ip link`).",
+                    bundle_dir, handles.programs.size(), Join(bare)));
   }
 
   return handles;

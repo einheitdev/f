@@ -136,7 +136,35 @@ auto DefaultActivator() -> Activator {
             out));
       }
       if (!report.empty()) report += "; ";
-      report += "f-dnsmasq restarted";
+      // `try-restart` is a no-op that exits 0 when the unit is not
+      // running, so its exit code says the command was issued and
+      // nothing about the unit. Reporting "restarted" from it meant a
+      // dnsmasq that was `failed` when its config was rewritten stayed
+      // failed and the operator was told otherwise. Ask what the unit
+      // is NOW.
+      auto [srv_rc, srv_out] = RunCommand(
+          {"systemctl", "is-active", "f-dnsmasq.service"});
+      std::string state = srv_out;
+      while (!state.empty() &&
+             (state.back() == '\n' || state.back() == '\r')) {
+        state.pop_back();
+      }
+      if (state == "active") {
+        report += "f-dnsmasq restarted (active)";
+      } else if (state == "inactive") {
+        // Legitimate on a box that serves neither DHCP nor DNS: the
+        // config was written and nothing is running to read it. Said
+        // plainly, because "restarted" implies something is serving.
+        report += "f-dnsmasq config written, unit not running "
+                  "(inactive)";
+      } else {
+        report += std::format(
+            "f-dnsmasq config written but the unit is '{}' — it is "
+            "NOT serving the configuration that was just applied "
+            "(`systemctl status f-dnsmasq` for why)",
+            state.empty() ? "unknown" : state);
+      }
+      (void)srv_rc;
     }
     if (report.empty()) report = "nothing needed reloading";
     return report;

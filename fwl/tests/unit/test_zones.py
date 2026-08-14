@@ -4,11 +4,13 @@ Covers the parser/analyzer/emitter/interpreter surfaces added for zone
 declarations, per-zone @xdp blocks, the `redirect to <zone>` action,
 and the `pkt.zone` compile-time constant.
 """
+import json
 import re
 
 import pytest
 
-from fwl import analyzer, ast, bpf_runner, emitter, interpreter, parser, pkt
+from fwl import (analyzer, ast, bpf_runner, cli, emitter, interpreter,
+                 parser, pkt)
 from fwl.errors import FwlException
 from fwl.interpreter import XdpAction
 
@@ -354,3 +356,71 @@ class TestBackwardCompat:
     assert len(prog.rules) == 1
     c = emitter.emit(prog)
     bpf_runner.check_compiles(c)
+
+  def test_the_simple_form_names_its_interface_in_the_manifest(
+      self, tmp_path):
+    """`@xdp(eth0)` must reach the daemon as a zone it can attach.
+
+    The manifest's `zones` array is where `fd` derives every interface
+    it attaches to. The simple form declares no zones, so the array was
+    emitted empty while the program entry named `eth0` — and the
+    daemon, reading only the array, attached the program to NOTHING
+    and reported a successful load. `1 zone program(s)` was true of
+    the program list and said nothing about attachment; every packet
+    flowed unfiltered behind it.
+
+    The interface is not a guess: FWL_V04_SPEC.md § 6.2 calls the
+    degenerate file "one implicit zone whose name is the @xdp
+    argument", and the v0.1 spec spells the hook `@xdp(<interface>)`.
+    `emitter.emitting_zone_names` already writes the same implicit
+    zone into the log ABI for the same reason.
+    """
+    prog = _analyze("@xdp(eth0)\nallow if pkt.proto == tcp\n"
+                    "default drop\n")
+    bundle = tmp_path / "bundle"
+    cli._emit_bundle_dir(prog, bundle)
+    manifest = json.loads((bundle / "manifest.json").read_text())
+    assert manifest["zones"] == [
+      {"name": "eth0", "interfaces": ["eth0"]}
+    ]
+    assert [p["zone"] for p in manifest["programs"]] == ["eth0"]
+
+  def test_every_program_zone_is_in_the_manifest_zones(self, tmp_path):
+    """The invariant, stated once: no program without a zone row.
+
+    This is the contract `fd` reads. A program entry naming a zone the
+    array does not carry gets no interfaces, and a program with no
+    interfaces cannot be attached to anything — so the load either
+    does nothing or (now) fails. Asserting the join rather than the
+    one known shape means a future form that declares zones some other
+    way cannot reintroduce the same hole quietly.
+    """
+    for source in (
+        "@xdp(eth0)\nallow\n",
+        WL + "@xdp(wan)\ndrop\n@xdp(lan)\nredirect to wan\n",
+        WL + "@xdp(lan)\nredirect to wan\n",
+    ):
+      prog = _analyze(source)
+      bundle = tmp_path / "b"
+      cli._emit_bundle_dir(prog, bundle)
+      manifest = json.loads((bundle / "manifest.json").read_text())
+      named = {z["name"] for z in manifest["zones"]}
+      unrooted = [p["zone"] for p in manifest["programs"]
+                  if p["zone"] not in named]
+      assert unrooted == [], source
+      assert all(z["interfaces"] for z in manifest["zones"]), source
+
+  def test_a_declared_zone_is_not_renamed_by_the_implicit_rule(
+      self, tmp_path):
+    """The implicit row is only for a zone nobody declared.
+
+    A declared zone's interfaces come from its declaration, never from
+    its name — `zone lan = [lan0, lan1]` must not become `lan: [lan]`.
+    """
+    prog = _analyze(WL + "@xdp(lan)\ndrop\n")
+    bundle = tmp_path / "b"
+    cli._emit_bundle_dir(prog, bundle)
+    manifest = json.loads((bundle / "manifest.json").read_text())
+    by_name = {z["name"]: z["interfaces"] for z in manifest["zones"]}
+    assert by_name["lan"] == ["lan0", "lan1"]
+    assert by_name["wan"] == ["wan0"]

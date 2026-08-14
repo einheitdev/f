@@ -1014,8 +1014,24 @@ class FLocalTransport final
           "No configure session active");
     }
     // Validate all .fw files with fwl check.
-    for (const auto& path :
-         ListFwFiles(cfg_.fw_source)) {
+    //
+    // Nothing to validate is not a validated commit. `ListFwFiles`
+    // returns {} for a source directory holding no .fw file and for a
+    // path that is neither a file nor a directory, and the loop below
+    // then ran zero times — so a commit whose sources had gone missing
+    // reported the same "validated" it reports for a clean check, and
+    // the only thing left standing between the operator and a broken
+    // policy was fd's own compile.
+    auto sources = ListFwFiles(cfg_.fw_source);
+    if (sources.empty()) {
+      return MakeErr(req.id, "no_sources",
+          std::format("no .fw source found at {} — there is nothing "
+                      "to validate and nothing to commit",
+                      cfg_.fw_source),
+          "check the configured source path exists and holds at "
+          "least one .fw file");
+    }
+    for (const auto& path : sources) {
       auto [rc, out] = RunSubprocess(
           {cfg_.fwl_path, "check", path});
       if (rc != 0) {
@@ -1030,10 +1046,11 @@ class FLocalTransport final
     // The sources are valid. They are not yet *live*: fd has to
     // recompile and swap them in, and that is a second outcome with
     // its own way of failing. There is exactly one mechanism that
-    // applies a change — the kReloadProg command below. fd starts no
-    // file watcher (nothing calls WatcherStart), and a cold start
-    // loads the last compiled bundle rather than the source, so a
-    // commit fd did not apply is not applied at all.
+    // applies a change on demand — the kReloadProg command below —
+    // and a cold start loads the last compiled bundle rather than the
+    // source, so a commit fd did not apply is not applied at all.
+    // (fd does configure a file watcher at cmd/fd.cc; it is off by
+    // default and is not what `commit` relies on.)
     auto reload = AskFd(fd_cmd::kReloadProg);
     if (!reload.ok) {
       // Leave the session open: the snapshots are the only way back to
@@ -1073,14 +1090,37 @@ class FLocalTransport final
       return MakeErr(req.id, "no_session",
           "No configure session active");
     }
+    // Count the writes that succeeded, not the snapshots that were
+    // attempted. `WriteFile` returns bool and this loop used to throw
+    // it away, so a rollback that could not write a single file — a
+    // full disk, a read-only mount, the exact circumstances under
+    // which somebody is rolling back — answered "ok (N files
+    // restored)" and left the bad policy on disk.
     int restored = 0;
+    std::vector<std::string> failed;
     for (const auto& [path, content] :
          candidate_.snapshots) {
-      WriteFile(path, content);
-      restored++;
+      if (WriteFile(path, content)) {
+        restored++;
+      } else {
+        failed.push_back(path);
+      }
     }
     candidate_.active = false;
     candidate_.snapshots.clear();
+    if (!failed.empty()) {
+      std::string names;
+      for (const auto& p : failed) {
+        names += (names.empty() ? "" : ", ") + p;
+      }
+      return MakeErr(req.id, "rollback_incomplete",
+          std::format("restored {} file(s); FAILED to restore {}: {}. "
+                      "The configuration on disk is neither the "
+                      "candidate nor the previous state — fix the "
+                      "write error and restore those files by hand "
+                      "before committing.",
+                      restored, failed.size(), names));
+    }
     return MakeOk(req.id, {
         {"status", "rolled back"},
         {"files_restored", restored},

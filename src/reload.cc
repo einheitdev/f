@@ -287,9 +287,12 @@ auto ApplyBundle(Engine& e, std::string_view bundle_dir)
     out.version = manifest["version"].get<std::string>();
     out.rules_installed = 0;
     out.program_updated = true;
+    // The interface count is the one that answers "is the new policy
+    // in the packet path". A program count on its own read the same
+    // whether every interface had been swapped or none had.
     spdlog::info("reload: multi-zone bundle hot-swapped, "
-                 "{} zone program(s), atomic swap",
-                 e.zone_bundle.programs.size());
+                 "{} zone program(s) on {} interface(s), atomic swap",
+                 e.zone_bundle.programs.size(), e.ifaces.count);
     return out;
   }
 
