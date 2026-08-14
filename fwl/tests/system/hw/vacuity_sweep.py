@@ -273,10 +273,16 @@ def sweep_scenario(scen, history, keep_logs=True):
   # seconds — the product reverts the plant, the scenario passes, and the
   # sweep would call it vacuous. The bundle fd was running when the
   # scenario ended is the evidence that the plant was still in force.
+  #
+  # It can only explain a false GREEN. A scenario that went red with the
+  # plant was asked the question and answered it, and several scenarios
+  # legitimately END on a watcher bundle because driving the watcher is
+  # their subject (l8_01) — reading supersession there would throw away
+  # a good result.
   text_only = all(s.kind == 'policy_sub' for s in plant.steps)
   loaded = [r.get('value') for r in receipts if r.get('note') ==
             'current_bundle']
-  superseded = (text_only and loaded and
+  superseded = (sab['rc'] == 0 and text_only and loaded and
                 not os.path.basename(loaded[-1] or '').startswith('v-hw-'))
   if not_applied or verify_failed or superseded:
     row['verdict'] = 'unrunnable'

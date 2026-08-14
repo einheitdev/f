@@ -840,11 +840,23 @@ SCENARIOS = {s.name: s for s in [
        'conntrack GC keeps up under churn and the datapath is untouched '
        'while it runs',
        [_p('control-flow-dropped',
-           'the control flow — the one that must keep crossing while the '
-           'table churns — is no longer admitted',
+           'neither rule that admits the control flow matches it any '
+           'more, so the flow that must keep crossing while the table '
+           'churns is dropped',
            [PolicySub(tag='l11-03',
                       find='allow if pkt.src_ip == 10.99.51.1 and pkt.proto == tcp',
-                      repl='allow if pkt.src_ip == 10.99.51.9 and pkt.proto == tcp')])],
+                      repl='allow if pkt.src_ip == 10.99.51.9 and pkt.proto == tcp'),
+            PolicySub(tag='l11-03',
+                      find='allow if pkt.proto == tcp and pkt.tcp.syn',
+                      repl='allow if pkt.proto == tcp and pkt.tcp.fin')],
+           residual='FOUND BY THIS SWEEP: neutering only the '
+                    'source-specific allow left the scenario green, '
+                    'because the later `allow if ... pkt.tcp.syn` admits '
+                    'the control probe anyway. A plant has to account for '
+                    'every rule that can reach the traffic, not only the '
+                    'one that names it. The churn-resilience property '
+                    'itself — the datapath staying exact at 2500 new '
+                    'flows/s — is not reachable by a policy edit at all.')],
        witness_note='latency and occupancy under churn',
        timeout_s=900),
 
