@@ -18,6 +18,12 @@ addresses and a checksum verdict:
   tcp:<src_ip>>{dst_ip}:<dst_port>:<ok|badcsum>
 and ICMP keys carry both addresses plus type and code:
   icmp:<src_ip>>{dst_ip}:<type>.<code>
+An ICMP ERROR additionally gets a second key naming the datagram it
+CARRIES, which is the half an outer-header witness cannot see:
+  icmperr:<delivered_to>:<inner_src>:<inner_sport>>{inner_dst}:<inner_dport>:<ok|badcsum>
+The verdict covers all three checksums an RFC 5508 rewrite touches
+(outer IP, the ICMP checksum over the embedded datagram, and the
+embedded IP header's own).
 
 With --srcport (on top of --detail), the TCP/UDP key also names the
 SOURCE port:
@@ -80,6 +86,90 @@ def checksums_ok(frame: bytes, l3_off: int) -> bool:
             + bytes([0, proto])
             + struct.pack(">H", len(l4)))
   return _fold(_sum16(pseudo) + _sum16(l4)) == 0xFFFF
+
+
+# ICMPv4 types carrying the datagram that provoked them (RFC 792).
+ICMP_ERROR_TYPES = frozenset({3, 4, 5, 11, 12})
+
+
+def icmp_error_key(frame: bytes) -> str | None:
+  """A second key for an ICMP error, naming its EMBEDDED datagram.
+
+  The outer key says who the error was delivered to. That is half the
+  question: an RFC 5508 translation rewrites the embedded header too,
+  and an error that reaches the right host still describing the
+  translated connection is discarded by that host's own stack — the
+  same black hole as never delivering it, reached quietly. Without
+  this, the wire could not tell the two apart.
+
+  Key: `icmperr:<delivered_to>:<inner_src>:<inner_sport}>
+  {inner_dst>:<inner_dport>:<ok|badcsum>` — the whole property in one
+  key, checksums included, so a test asserts it with one number.
+  Returns None for anything that is not a complete IPv4 ICMP error
+  inside the test ranges.
+  """
+  if len(frame) < 34:
+    return None
+  ethertype = struct.unpack_from(">H", frame, 12)[0]
+  l3_off = 14
+  if ethertype == ETH_P_8021Q:
+    if len(frame) < 38:
+      return None
+    ethertype = struct.unpack_from(">H", frame, 16)[0]
+    l3_off = 18
+  if ethertype != ETH_P_IP:
+    return None
+  if len(frame) < l3_off + 20 or frame[l3_off + 9] != 1:
+    return None
+  ihl = (frame[l3_off] & 0x0F) * 4
+  icmp_off = l3_off + ihl
+  in_off = icmp_off + 8
+  in_l4 = in_off + 20
+  if len(frame) < in_l4 + 8:
+    return None
+  if frame[icmp_off] not in ICMP_ERROR_TYPES:
+    return None
+  if (frame[in_off] & 0x0F) != 5:
+    return None
+  dst_ip = socket.inet_ntoa(frame[l3_off + 16:l3_off + 20])
+  in_src = socket.inet_ntoa(frame[in_off + 12:in_off + 16])
+  in_dst = socket.inet_ntoa(frame[in_off + 16:in_off + 20])
+  if not (dst_ip.startswith(V4_TEST_PREFIX)
+          or in_src.startswith(V4_TEST_PREFIX)):
+    return None
+  if frame[in_off + 9] in (6, 17):
+    in_sp, in_dp = struct.unpack_from(">HH", frame, in_l4)
+  else:
+    in_sp = in_dp = 0
+  verdict = "ok" if icmp_error_csums_ok(frame, l3_off) else "badcsum"
+  return (f"icmperr:{dst_ip}:{in_src}:{in_sp}>{in_dst}:{in_dp}"
+          f":{verdict}")
+
+
+def icmp_error_csums_ok(frame: bytes, l3_off: int) -> bool:
+  """All three checksums an ICMP-error translation touches.
+
+  Outer IP, the ICMP checksum (which covers the embedded datagram),
+  and the embedded IP header's own. A rewrite that gets any of them
+  wrong is discarded by the receiver in silence, which on this wire
+  is indistinguishable from a firewall that never forwarded it.
+  """
+  ihl = (frame[l3_off] & 0x0F) * 4
+  if _fold(_sum16(frame[l3_off:l3_off + ihl])) != 0xFFFF:
+    return False
+  total_len = struct.unpack_from(">H", frame, l3_off + 2)[0]
+  if l3_off + total_len > len(frame) or total_len < ihl:
+    return False
+  icmp = frame[l3_off + ihl:l3_off + total_len]
+  if _fold(_sum16(icmp)) != 0xFFFF:
+    return False
+  in_off = l3_off + ihl + 8
+  if len(frame) < in_off + 20:
+    return False
+  in_ihl = (frame[in_off] & 0x0F) * 4
+  if len(frame) < in_off + in_ihl:
+    return False
+  return _fold(_sum16(frame[in_off:in_off + in_ihl])) == 0xFFFF
 
 
 def _v6_key(frame: bytes, l3_off: int, vlan_id) -> str | None:
@@ -233,6 +323,10 @@ def main() -> int:
       key = flow_key(frame, detail, srcport)
       if key is not None:
         tallies[key] = tallies.get(key, 0) + 1
+      if detail:
+        deep = icmp_error_key(frame)
+        if deep is not None:
+          tallies[deep] = tallies.get(deep, 0) + 1
   # PACKET_STATISTICS: (packets, drops) since socket creation. A
   # non-zero drop count means a tally above under-reports.
   # SOL_PACKET (263) is absent from some python builds.

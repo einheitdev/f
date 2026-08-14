@@ -7,6 +7,8 @@ build the test packet. Builder syntax:
     tcp(src_ip="1.2.3.4", dst_port=22, syn=true, ack=false)
     udp(dst_ip="8.8.8.8", dst_port=53)
     icmp(src_ip="1.1.1.1")
+    icmperr(src_ip="10.0.0.1", type=3, code=4, mtu=1400,
+            inner_src_ip="203.0.113.5", inner_dst_port=443)
 
 The builder produces raw Ethernet+IPv4+L4 bytes for BPF_PROG_RUN
 together with a decoded-fields dict the AST interpreter consumes.
@@ -101,7 +103,7 @@ class PktStep:
 _BUILDER_RE = re.compile(
   r"""
   ^\s*
-  (?P<proto>tcp6|udp6|icmp6|tcp|udp|icmp)
+  (?P<proto>icmperr|tcp6|udp6|icmp6|tcp|udp|icmp)
   \s*\(\s*
   (?P<args>.*?)
   \s*\)\s*$
@@ -182,6 +184,19 @@ _VLAN_BUILDER_FIELDS = frozenset({
 # alone. Both are branch-coverage instruments: nothing else in the
 # builder language can produce those frames.
 _IPV4_EDGE_FIELDS = frozenset({"ihl"})
+# The ICMP-error builder (RFC 792 §"Destination Unreachable" / RFC 1191).
+# An ICMP error carries the datagram that provoked it — the IP header
+# plus the first 8 bytes of its transport header — and THAT embedded
+# datagram, not the ICMP header, is where the error's flow identity
+# lives. Nothing else in the builder language can produce one, which is
+# why RFC 5508 translation had no corpus expression before this: the
+# `icmp` builder emits an 8-byte header over a zero body, a frame no
+# router has ever sent.
+_ICMP_ERR_BUILDER_FIELDS = frozenset({
+  "src_ip", "dst_ip", "type", "code", "mtu",
+  "inner_proto", "inner_src_ip", "inner_dst_ip",
+  "inner_src_port", "inner_dst_port", "inner_len",
+})
 _BUILDER_FIELD_TABLE: dict[str, frozenset[str]] = {
   "tcp": (_TCP_BUILDER_FIELDS | _VLAN_BUILDER_FIELDS
           | _IPV4_EDGE_FIELDS),
@@ -190,6 +205,8 @@ _BUILDER_FIELD_TABLE: dict[str, frozenset[str]] = {
           | _VLAN_BUILDER_FIELDS | _IPV4_EDGE_FIELDS),
   "icmp": (frozenset({"src_ip", "dst_ip", "type", "code"})
            | _VLAN_BUILDER_FIELDS | _IPV4_EDGE_FIELDS),
+  "icmperr": (_ICMP_ERR_BUILDER_FIELDS | _VLAN_BUILDER_FIELDS
+              | _IPV4_EDGE_FIELDS),
   # v0.2 IPv6 builders. Per PKT_V02_SPEC.md, the field names src_ip
   # and dst_ip are reused for symmetry with the v4 builders; the
   # values are RFC 4291 IPv6 strings, so the type is unambiguous to
@@ -258,6 +275,24 @@ _L4_GATED_KEYS = (
   "syn", "ack", "fin", "rst", "psh", "urg", "ece", "cwr",
 )
 _ICMP_GATED_KEYS = ("icmp_type", "icmp_code", "icmp6_type", "icmp6_code")
+# The embedded datagram's fields, gated behind the emitter's nested
+# bounds check (the whole 8-byte ICMP header + 20-byte inner IP header
+# + 8 inner transport bytes must be present). Underscored for the same
+# reason `_ihl` is: they are not FWL packet fields — no rule can name
+# them — they are what the NAT reads one header deeper.
+_INNER_GATED_KEYS = (
+  "_inner_proto", "_inner_src_ip", "_inner_dst_ip",
+  "_inner_src_port", "_inner_dst_port",
+)
+# ICMPv4 types that carry an embedded datagram, per RFC 792. The same
+# five Linux's conntrack treats as errors (nf_conntrack_proto_icmp.c):
+# destination unreachable, source quench, redirect, time exceeded,
+# parameter problem. Every other type — echo, timestamp, and the rest —
+# is a query whose body is its own, not a copy of somebody's packet.
+_ICMP_ERROR_TYPES = frozenset({3, 4, 5, 11, 12})
+# Bytes of the embedded transport header an ICMP error is required to
+# carry (RFC 792: "the first 64 bits of the original datagram's data").
+_INNER_L4_BYTES = 8
 
 _DEFAULT_SRC_MAC = b"\x02\x00\x00\x00\x00\x01"
 _DEFAULT_DST_MAC = b"\x02\x00\x00\x00\x00\x02"
@@ -357,6 +392,108 @@ def _ipv4_checksum(header: bytes) -> int:
   while total >> 16:
     total = (total & 0xFFFF) + (total >> 16)
   return (~total) & 0xFFFF
+
+
+def _ones_complement(data: bytes) -> int:
+  """Internet checksum over `data` with no pseudo-header (RFC 1071).
+
+  What ICMP uses: the checksum covers the ICMP header and everything
+  after it — for an error, that includes the whole embedded datagram.
+  Odd lengths are padded, so a caller need not know the parity.
+  """
+  if len(data) % 2:
+    data = data + b"\x00"
+  total = 0
+  for i in range(0, len(data), 2):
+    total += (data[i] << 8) | data[i + 1]
+  while total >> 16:
+    total = (total & 0xFFFF) + (total >> 16)
+  return (~total) & 0xFFFF
+
+
+def _build_icmp_error_body(
+  fields: dict[str, Any], src_ip: str, dst_ip: str
+) -> tuple[bytes, dict[str, Any]]:
+  """Build the ICMP-error message body: header + embedded datagram.
+
+  Layout (RFC 792, and RFC 1191 for the type 3 code 4 next-hop MTU
+  that occupies the second half of the "unused" word):
+
+      0        1        2        3
+      type   | code   | checksum        |  8-byte ICMP header
+      unused                | next-MTU  |
+      ... 20-byte IP header of the datagram that provoked the error
+      ... first 8 bytes of that datagram's transport header
+
+  The embedded IP header carries the ORIGINAL datagram's total length
+  (`inner_len`, 1500 by default) — a router copies the header it could
+  not forward, and that length is the whole reason the error exists.
+  Only 28 of those bytes travel, so the embedded transport checksum
+  covers a payload nothing here has; it is emitted as zero and no
+  layer of this system rewrites it (see the emitter's ICMP-error
+  de-NAT for why).
+  """
+  icmp_type = fields.get("type", 3)
+  icmp_code = fields.get("code", 4)
+  mtu = fields.get("mtu", 1400)
+  inner_proto = fields.get("inner_proto", "tcp")
+  if inner_proto not in ("tcp", "udp", "icmp"):
+    raise ValueError(
+      f"icmperr inner_proto must be tcp/udp/icmp; got {inner_proto!r}"
+    )
+  # The embedded datagram defaults to the mirror image of the error:
+  # the error comes back FROM the peer the original packet was sent TO,
+  # so the inner source is the error's destination unless overridden.
+  inner_src = fields.get("inner_src_ip", dst_ip)
+  inner_dst = fields.get("inner_dst_ip", "2.2.2.2")
+  inner_sport = int(fields.get("inner_src_port", 0))
+  inner_dport = int(fields.get("inner_dst_port", 0))
+  inner_len = int(fields.get("inner_len", 1500))
+  if inner_proto == "tcp":
+    inner_l4 = struct.pack(">HHI", inner_sport, inner_dport, 0)
+    inner_num = _IPPROTO_TCP
+  elif inner_proto == "udp":
+    # sport, dport, length, checksum — the checksum is zero, see above.
+    inner_l4 = struct.pack(
+      ">HHHH", inner_sport, inner_dport, inner_len - 20, 0
+    )
+    inner_num = _IPPROTO_UDP
+  else:
+    # An ICMP error about an ICMP packet (a masqueraded ping too big
+    # for a hop). It has no ports, and neither does its mapping.
+    inner_l4 = struct.pack(">BBHHH", 8, 0, 0, 0, 0)
+    inner_num = _IPPROTO_ICMP
+    inner_sport = 0
+    inner_dport = 0
+  # DF is set: a frag-needed is only ever generated for a datagram
+  # whose sender forbade fragmentation, which is what makes the error
+  # the sender's only notice.
+  inner_ip = struct.pack(
+    ">BBHHHBBH4s4s",
+    0x45, 0, inner_len, 0x1234, 0x4000, 64, inner_num, 0,
+    _ipv4_to_bytes(inner_src, "inner_src_ip"),
+    _ipv4_to_bytes(inner_dst, "inner_dst_ip"),
+  )
+  inner_ip = (inner_ip[:10] + struct.pack(">H", _ipv4_checksum(inner_ip))
+              + inner_ip[12:])
+  body = (struct.pack(">BBHHH", icmp_type, icmp_code, 0, 0, mtu)
+          + inner_ip + inner_l4[:_INNER_L4_BYTES])
+  body = body[:2] + struct.pack(">H", _ones_complement(body)) + body[4:]
+  decoded: dict[str, Any] = {
+    # An ICMP error IS an ICMP packet: `pkt.proto == icmp` and
+    # `pkt.icmp.type == 3` match it, which is what the operator writes.
+    "proto": "icmp",
+    "src_ip": src_ip,
+    "dst_ip": dst_ip,
+    "icmp_type": icmp_type,
+    "icmp_code": icmp_code,
+    "_inner_proto": inner_proto,
+    "_inner_src_ip": inner_src,
+    "_inner_dst_ip": inner_dst,
+    "_inner_src_port": inner_sport,
+    "_inner_dst_port": inner_dport,
+  }
+  return body, decoded
 
 
 def _l4_checksum(src4: bytes, dst4: bytes, proto_num: int,
@@ -583,11 +720,14 @@ def build_packet(fields: dict[str, Any]) -> Packet:
     decoded.setdefault("dst_port", dst_port)
   elif proto == "icmp":
     proto_num = _IPPROTO_ICMP
-    # type defaults to 8 (echo request); code defaults to 0. checksum,
-    # id, seq are left zero for tests.
+    # type defaults to 8 (echo request); code defaults to 0. id and seq
+    # are left zero for tests; the checksum is filled in below, because
+    # a NAT that must NOT touch it is only distinguishable from one that
+    # corrupts it if the frame arrived with a correct one.
     icmp_type = fields.get("type", 8)
     icmp_code = fields.get("code", 0)
     l4 = struct.pack(">BBHHH", icmp_type, icmp_code, 0, 0, 0)
+    l4 = l4[:2] + struct.pack(">H", _ones_complement(l4)) + l4[4:]
     decoded = dict(fields)
     decoded.pop("type", None)
     decoded.pop("code", None)
@@ -595,6 +735,9 @@ def build_packet(fields: dict[str, Any]) -> Packet:
     decoded.setdefault("dst_ip", dst_ip)
     decoded["icmp_type"] = icmp_type
     decoded["icmp_code"] = icmp_code
+  elif proto == "icmperr":
+    proto_num = _IPPROTO_ICMP
+    l4, decoded = _build_icmp_error_body(fields, src_ip, dst_ip)
   else:
     raise ValueError(f"unknown proto: {proto!r}")
 
@@ -702,7 +845,7 @@ def _apply_ihl_to_decoded(
   out["_ihl"] = ihl
   if ihl >= 5:
     return out
-  for key in _L4_GATED_KEYS + _ICMP_GATED_KEYS:
+  for key in _L4_GATED_KEYS + _ICMP_GATED_KEYS + _INNER_GATED_KEYS:
     out.pop(key, None)
   return out
 
@@ -736,6 +879,11 @@ _EXPECTED_KEYS = frozenset({
 _STATE_KEYS = frozenset({"rate_limit", "conntrack", "nat"})
 _OUTPUT_PACKET_KEYS = frozenset({
   "src_ip", "dst_ip", "src_port", "dst_port",
+  # RFC 5508: an ICMP error is translated in TWO places at once, and
+  # asserting only the outer header would pass on a NAT that steered
+  # the error to the right host while leaving it describing somebody
+  # else's connection — which the receiving stack would discard.
+  "inner_src_ip", "inner_dst_ip", "inner_src_port", "inner_dst_port",
 })
 _NAT_STATE_KEYS = frozenset({"masq_ip", "mappings"})
 _NAT_MAPPING_KEYS = frozenset({
@@ -1114,7 +1262,7 @@ def _strip_truncated_fields(
       "proto", "src_ip", "dst_ip", "src_ip6", "dst_ip6",
     ):
       out.pop(key, None)
-    for key in l4_keys + icmp_keys:
+    for key in l4_keys + icmp_keys + _INNER_GATED_KEYS:
       out.pop(key, None)
     return out
   # The BPF emitter's L4 parse only sets `l4_ok` after a *full*
@@ -1129,6 +1277,14 @@ def _strip_truncated_fields(
   # bytes fit. Mirror that exact boundary.
   if truncate_to < l3_end + 2:
     for key in icmp_keys:
+      out.pop(key, None)
+  # The embedded datagram needs the whole 8-byte ICMP header, the
+  # 20-byte inner IP header and 8 inner transport bytes before anything
+  # in it is readable — the emitter's nested bounds check is one test
+  # over all three, so a frame cut anywhere inside them leaves the NAT
+  # with no inner tuple at all rather than a partial one.
+  if truncate_to < l3_end + 8 + 20 + _INNER_L4_BYTES:
+    for key in _INNER_GATED_KEYS:
       out.pop(key, None)
   return out
 
