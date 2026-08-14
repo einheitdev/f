@@ -33,6 +33,11 @@
 /// | SC030 | zone asks for full IPv6, which this build refuses     |
 /// | SC031 | zone asks for IPv6 RAs but has no prefix to advertise |
 /// | SC032 | IPv6 address on a port whose zone says v6 is off      |
+/// | SC040 | malformed NTP upstream                                |
+/// | SC041 | more than one NTP server bound to one zone            |
+/// | SC042 | NTP server in a zone that also holds a DHCP client    |
+/// | SC043 | NTP zone has no statically addressed interface        |
+/// | SC044 | (warning) nothing is configured to set the clock      |
 
 #ifndef INCLUDE_F_SYSCONFIG_VALIDATE_H_
 #define INCLUDE_F_SYSCONFIG_VALIDATE_H_

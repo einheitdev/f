@@ -127,6 +127,7 @@ endif()
 # ============================================================================
 add_library(libf-sysconfig STATIC
   src/sysconfig/artifact.cc
+  src/sysconfig/chrony.cc
   src/sysconfig/dnsmasq.cc
   src/sysconfig/edit.cc
   src/sysconfig/ipv6.cc
@@ -343,6 +344,7 @@ install(FILES
   deploy/systemd/einheit-f-ui.service
   deploy/systemd/f-firstboot.service
   deploy/systemd/f-dnsmasq.service
+  deploy/systemd/f-chrony.service
   deploy/systemd/f-confd.service
   DESTINATION lib/systemd/system
 )

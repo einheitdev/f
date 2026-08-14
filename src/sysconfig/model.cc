@@ -60,13 +60,30 @@ auto SystemConfig::ZoneServesDhcp(const std::string& zone) const
                      });
 }
 
-auto SystemConfig::ZoneHasService(const std::string& zone) const
+auto SystemConfig::ZoneServesDns(const std::string& zone) const
     -> bool {
   if (zone.empty()) return false;
-  if (ZoneServesDhcp(zone)) return true;
   return std::any_of(dns.begin(), dns.end(),
                      [&](const DnsForwarder& d) {
                        return d.bind.zone == zone;
+                     });
+}
+
+auto SystemConfig::ZoneHasDnsmasqService(
+    const std::string& zone) const -> bool {
+  return ZoneServesDhcp(zone) || ZoneServesDns(zone);
+}
+
+auto SystemConfig::ZoneHasService(const std::string& zone) const
+    -> bool {
+  if (zone.empty()) return false;
+  if (ZoneHasDnsmasqService(zone)) return true;
+  // Only a serving NTP entry places anything in a zone. A client-only
+  // entry has no placement at all, so counting it here would bring
+  // dnsmasq up on a zone nobody asked to be served.
+  return std::any_of(ntp.begin(), ntp.end(),
+                     [&](const NtpService& n) {
+                       return n.serve && n.bind.zone == zone;
                      });
 }
 

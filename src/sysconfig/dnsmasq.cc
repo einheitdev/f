@@ -94,7 +94,7 @@ auto PlanDnsmasq(const SystemConfig& cfg) -> DnsmasqPlan {
   std::set<std::string> allowed;
   std::set<std::string> dhcp_ok;
   for (const auto& z : cfg.zones) {
-    if (!cfg.ZoneHasService(z.name)) continue;
+    if (!cfg.ZoneHasDnsmasqService(z.name)) continue;
     bool serves_dhcp = cfg.ZoneServesDhcp(z.name);
     for (const auto& n : cfg.InterfaceNamesInZone(z.name)) {
       allowed.insert(n);

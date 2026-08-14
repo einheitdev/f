@@ -188,9 +188,10 @@ class Parser {
           "services must be a map of service kind -> list");
       return;
     }
-    RequireMapKeys(n, {"dhcp", "dns"}, "services");
+    RequireMapKeys(n, {"dhcp", "dns", "ntp"}, "services");
     ParseDhcp(n["dhcp"], cfg);
     ParseDns(n["dns"], cfg);
+    ParseNtp(n["ntp"], cfg);
   }
 
   /// A service body is a map. Note what is *not* in the allowed key
@@ -269,6 +270,32 @@ class Parser {
         d.reservations.push_back(res);
       }
       cfg->dhcp.push_back(d);
+    }
+  }
+
+  auto ParseNtp(const YAML::Node& n, SystemConfig* cfg) -> void {
+    if (!n) return;
+    if (!n.IsSequence()) {
+      Err("SC102", SpanOf(n), "services.ntp must be a list");
+      return;
+    }
+    for (const auto& item : n) {
+      NtpService s;
+      s.bind.span = SpanOf(item);
+      if (!item.IsMap()) {
+        Err("SC102", SpanOf(item),
+            "each services.ntp entry must be a map");
+        continue;
+      }
+      RequireMapKeys(item, {"zone", "upstream", "serve"},
+                     "services.ntp entry");
+      s.bind.zone = Str(item, "zone");
+      if (item["zone"]) s.bind.span = SpanOf(item["zone"]);
+      for (const auto& u : item["upstream"]) {
+        s.upstreams.push_back(u.as<std::string>(""));
+      }
+      if (item["serve"]) s.serve = item["serve"].as<bool>(true);
+      cfg->ntp.push_back(s);
     }
   }
 

@@ -29,6 +29,7 @@ class Validator {
     CheckServiceZones();
     CheckDhcp();
     CheckDns();
+    CheckNtp();
     CheckIpv6();
     return {std::move(diags_)};
   }
@@ -238,6 +239,77 @@ class Validator {
     }
     for (const auto& d : cfg_.dns) {
       CheckBinding(d.bind, "dns forwarder");
+    }
+    for (const auto& n : cfg_.ntp) {
+      // A client-only entry has no placement, so it has nothing to
+      // check. Only the server half is bound to anywhere.
+      if (n.serve) CheckBinding(n.bind, "ntp server");
+    }
+  }
+
+  auto CheckNtp() -> void {
+    std::set<std::string> zones_served;
+    bool any_upstream = false;
+    for (const auto& n : cfg_.ntp) {
+      if (!n.upstreams.empty()) any_upstream = true;
+      for (const auto& u : n.upstreams) {
+        // Hostnames are legitimate here — pool.ntp.org is the normal
+        // answer — so only obvious nonsense is refused.
+        if (u.empty() || u.find(' ') != std::string::npos) {
+          Err("SC040", n.bind.span,
+              std::format("ntp upstream '{}' is not an address or "
+                          "hostname",
+                          u));
+        }
+      }
+      if (!n.serve) continue;
+      const auto& zone = n.bind.zone;
+      if (zone.empty() || cfg_.FindZone(zone) == nullptr) continue;
+      if (!zones_served.insert(zone).second) {
+        Err("SC041", n.bind.span,
+            std::format("more than one ntp server bound to zone "
+                        "'{}'",
+                        zone));
+      }
+      // The rogue-service check, in the shape SC022 gave it for DHCP.
+      // A zone whose port takes its own address from somebody else's
+      // server is a zone we are a guest on; answering time queries
+      // there makes us a second authority on somebody's network.
+      for (const auto* i : cfg_.InterfacesInZone(zone)) {
+        if (i->mode == AddressMode::kDhcpClient) {
+          Err("SC042", n.bind.span,
+              std::format(
+                  "ntp server is bound to zone '{}', but interface "
+                  "'{}' in that zone is a dhcp *client*",
+                  zone, i->name),
+              "we would be answering on a network we are a guest "
+              "of; set `serve: false`, or move the uplink to its "
+              "own zone");
+        }
+      }
+      if (!ZoneSubnet(zone)) {
+        Err("SC043", n.bind.span,
+            std::format("ntp server on zone '{}' has no statically "
+                        "addressed interface to answer from",
+                        zone),
+            "give one interface in the zone a static address — a "
+            "server with no address to bind is a service that "
+            "silently does nothing");
+      }
+    }
+    // Not an error: a box with no upstream is a legitimate,
+    // deliberate configuration. It is a *warning* because the
+    // consequence is invisible — conntrack timeouts, rate-limit
+    // windows and every log line are stated in a clock that will
+    // never be set, and on a board with no battery-backed RTC that
+    // means logs stamped 1970.
+    if (!cfg_.ntp.empty() && !any_upstream) {
+      Warn("SC044", cfg_.ntp.front().bind.span,
+           "no ntp upstream is configured, so nothing will ever set "
+           "this box's clock",
+           "add `upstream: [...]` — log timestamps, conntrack "
+           "timeouts and rate-limit windows all depend on it, and a "
+           "board with no battery-backed RTC boots at 1970");
     }
   }
 

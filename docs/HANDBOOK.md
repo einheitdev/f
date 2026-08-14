@@ -391,7 +391,69 @@ that port right now.
 The full stance — what `off`, `ra` and `full` mean, and why `full` is
 refused — is in `docs/IPV6_STANCE.md`.
 
-### 3.3 A service is not running, and you need to know which kind of not-running
+### 3.3 The timestamps are wrong, or you do not know whether to believe them
+
+**Symptom:** log lines dated 1970, or ages in `show leases` that make
+no sense, or a hunch that the box does not know what time it is.
+
+Conntrack timeouts, rate-limit windows and every timestamp on this box
+are stated in one clock. If that clock is wrong, none of it is a
+little bit wrong — the *ordering* is gone, which is what any later
+analysis actually depends on.
+
+**Procedure:**
+
+```
+$ einheit-f show time
+ FIELD      │ VALUE
+ trust      │ synchronised
+ rtc        │ present — rtc0 (rk808-rtc)
+ wall clock │ 2026-08-14 17:52:03 UTC
+ uptime     │ 3h
+ reference  │ Reference ID : 8EFB2A0A (192.0.2.10); Stratum : 3
+```
+
+The row that matters is **trust**, and there are four answers:
+
+| trust | What it means | What to do |
+|---|---|---|
+| `synchronised` | The kernel says a time source is disciplining the clock. Timestamps mean what they say. | nothing |
+| `NOT YET SYNCHRONISED` | An upstream is configured and has not converged. Normal for the first seconds after boot. | if it persists, check the uplink can reach the upstream |
+| `NO TIME SOURCE` | Nothing is configured to set the clock, so nothing ever will. | add an `ntp:` service with an `upstream:`, then `apply system` |
+| `unknown` | The state could not be read. **Not** the same as correct. | investigate; this should not happen |
+
+When the clock cannot be trusted, every view that prints one leads
+with a banner rather than making you notice for yourself:
+
+```
+THE CLOCK IS AT THE EPOCH. Every timestamp below is wrong, and logs
+written now are stamped 1970 — an upstream is configured and has not
+converged. This board has no RTC, so it starts from the epoch on
+every boot.
+```
+
+Note the **rtc** row. It is a hardware fact the board answers for
+itself rather than a claim in a document, and it changes what "not
+yet synchronised" means: with an RTC the clock is merely a little
+out; without one it started at zero and there is nothing to fall back
+on until the network comes up.
+
+**uptime is always trustworthy.** It is monotonic and owes nothing to
+NTP, so it is the ordering that still works for anything stamped
+before the clock was set. If you are correlating events across a
+window that includes a boot, use it.
+
+Two things worth knowing about how time gets here:
+
+- The first correction is a **step, not a slew** (`makestep 1.0 3`).
+  A board that boots at the epoch cannot be walked to the right time
+  in any useful period, and the window before the first correction is
+  exactly the window where timestamps are worthless.
+- The NTP **server** for the testnets answers only on the zone it is
+  bound to. `show services` names where; the uplink is never in that
+  list, and with `serve: false` there is no server socket at all.
+
+### 3.4 A service is not running, and you need to know which kind of not-running
 
 **Symptom:** DHCP is not answering. `systemctl status` is not much
 help, because systemd reports a unit that was never installed and a
@@ -428,7 +490,7 @@ looks alive in every dashboard while serving nobody; `f-dnsmasq.service`
 therefore has a `StartLimitBurst` so it eventually sits in `failed`
 where both systemd and `show services` say so out loud.
 
-### 3.4 A restart left pins behind in bpffs
+### 3.5 A restart left pins behind in bpffs
 
 **Symptom:** `fd` restarts and either refuses to load a bundle, or
 loads it and the connection tracking behaves as though it remembers
@@ -471,7 +533,7 @@ Check the `ATTACHED` and `MODE` columns afterwards. A declared
 interface with no attach shows `(none)`, and `generic` in MODE means
 you are on the software slow path, not at line rate.
 
-### 3.5 NAT stops working for new flows
+### 3.6 NAT stops working for new flows
 
 **Symptom:** existing connections through the box keep working, new
 ones go out and nothing comes back. Typically after a long soak or a
@@ -547,6 +609,7 @@ instead of guessing from the table length.
 | `show system` | What ports, zones and services are declared, and where will services answer? |
 | `show services` | Are the backing daemons running, and if not, which kind of not-running? |
 | `show ipv6` | Have router advertisements arrived, and did anything autoconfigure from one? |
+| `show time` | Is the clock synchronised, and can this board keep time across a power cut? |
 | `check system` | Does the configuration validate, without applying it? |
 | `apply system` | Make the configuration live. |
 | `apply system confirmed <min>` | Make it live with an automatic undo if you do not confirm. |
@@ -573,6 +636,8 @@ Global flags worth knowing: `--format json|yaml|set`, `--width N`,
 |---|---|---|
 | `/etc/f/system.yaml` | The system configuration. The only thing you edit. | you, and `set address` / `set reservation` |
 | `/etc/f/generated/dnsmasq.conf` | Derived artifact. Digest-stamped; edits are reported as drift. | `apply system` |
+| `/etc/chrony/f-generated.conf` | Derived artifact. **Not** under `/etc/f/` — Debian's AppArmor profile confines chronyd to `/etc/chrony/`. | `apply system` |
+| `/etc/sysctl.d/10-f-ipv6.conf` | Derived artifact: the per-zone IPv6 stance. | `apply system` |
 | `/etc/systemd/network/10-f-*.network` | Derived artifact. | `apply system` |
 | `/var/lib/f/dnsmasq.leases` | dnsmasq's lease database. Read-only to us. | dnsmasq |
 | `/var/lib/f/devices.json` | Device history: when each MAC first appeared. | whatever runs `show leases` |

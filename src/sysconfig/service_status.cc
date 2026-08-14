@@ -12,6 +12,7 @@
 #include <string>
 #include <utility>
 
+#include "f/sysconfig/chrony.h"
 #include "f/sysconfig/dnsmasq.h"
 
 namespace f::sysconfig {
@@ -114,6 +115,93 @@ auto ClassifyState(const std::string& active_state, bool expected,
   return ServiceState::kUnknown;
 }
 
+namespace {
+
+/// Ask systemd about one unit and classify what it says. Shared so
+/// that a second service cannot accidentally get a laxer reading of
+/// "healthy" than the first.
+auto Probe(const ServiceProbe& probe, ServiceStatus* out) -> void {
+  auto [rc, active] = RunCapture(Format(probe.is_active_cmd,
+                                        out->unit));
+  (void)rc;
+  int restarts = 0;
+  auto [rrc, restart_text] =
+      RunCapture(Format(probe.restarts_cmd, out->unit));
+  (void)rrc;
+  try {
+    auto trimmed = Trim(restart_text);
+    if (!trimmed.empty()) restarts = std::stoi(trimmed);
+  } catch (...) {
+    restarts = 0;
+  }
+  auto [src, result] = RunCapture(Format(probe.result_cmd,
+                                         out->unit));
+  (void)src;
+  auto [lsrc, load_state] =
+      RunCapture(Format(probe.load_state_cmd, out->unit));
+  (void)lsrc;
+  out->state = ClassifyState(active, out->expected, restarts, result,
+                             load_state);
+
+  if (out->state == ServiceState::kNotInstalled) {
+    out->detail = std::format(
+        "the model binds a service to {}, but {} is not installed "
+        "on this box",
+        out->zones.empty() ? "a zone" : out->zones.front(),
+        out->unit);
+    return;
+  }
+  if (out->state != ServiceState::kFailed &&
+      out->state != ServiceState::kRestarting &&
+      out->state != ServiceState::kStopped &&
+      out->state != ServiceState::kUnknown) {
+    return;
+  }
+  auto [lrc, log] = RunCapture(Format(probe.log_cmd, out->unit));
+  (void)lrc;
+  out->detail = Trim(log);
+  if (out->state == ServiceState::kRestarting) {
+    auto how = restarts > 0
+                   ? std::format("failed and restarted {} time(s)",
+                                 restarts)
+                   : std::string("failed on start and is retrying");
+    out->detail = std::format("{}{}{}", how,
+                              out->detail.empty() ? "" : ": ",
+                              out->detail);
+  }
+  if (out->detail.empty()) {
+    out->detail =
+        out->state == ServiceState::kUnknown
+            ? "systemd did not answer; state is unknown, which is "
+              "not the same as healthy"
+            : "no log output — the unit was never started";
+  }
+}
+
+/// The time service, which is a service like any other and must not
+/// be allowed to be silently absent — every timestamp on the box is
+/// stated in what it does or fails to do.
+auto ChronyStatus(const SystemConfig& cfg, const ServiceProbe& probe)
+    -> ServiceStatus {
+  ServiceStatus s;
+  s.unit = "f-chrony.service";
+  auto plan = PlanChrony(cfg);
+  s.expected = plan.needed;
+  s.zones = plan.served_zones;
+  s.interfaces = plan.bind_addresses;
+  s.name = plan.serves ? "ntp client+server (chrony)"
+                       : "ntp client (chrony)";
+  // Probed even when the model does not expect it. A chronyd running
+  // that nothing asked for is `running (not in the config)` — a box
+  // quietly taking its time from a source the model never named — and
+  // skipping the probe would render that as `unknown`, which is a
+  // fault state and would hide a real one behind it.
+  Probe(probe, &s);
+  return s;
+}
+
+}  // namespace
+
 auto QueryServices(const SystemConfig& cfg,
                    const ServiceProbe& probe)
     -> std::vector<ServiceStatus> {
@@ -197,7 +285,7 @@ auto QueryServices(const SystemConfig& cfg,
     }
   }
 
-  return {dnsmasq};
+  return {dnsmasq, ChronyStatus(cfg, probe)};
 }
 
 }  // namespace f::sysconfig

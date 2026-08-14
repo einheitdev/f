@@ -41,6 +41,7 @@
 #include "f/lease/lease.h"
 #include "f/lease/view.h"
 #include "f/sysconfig/artifact.h"
+#include "f/sysconfig/chrony.h"
 #include "f/sysconfig/dnsmasq.h"
 #include "f/sysconfig/ipv6.h"
 #include "f/sysconfig/edit.h"
@@ -584,6 +585,9 @@ class FLocalTransport final
     }
     if (req.command == "show_ipv6") {
       return HandleShowIpv6(req);
+    }
+    if (req.command == "show_time") {
+      return HandleShowTime(req);
     }
     if (req.command == "show_services") {
       return HandleShowServices(req);
@@ -1781,6 +1785,33 @@ class FLocalTransport final
         {"refused_ras", report.RefusedRas()},
         {"violations", report.Violations()},
         {"interfaces", ports},
+    });
+  }
+
+  /// The clock, and whether a timestamp taken now means anything.
+  ///
+  /// Every other view on this box is stamped in this clock — leases,
+  /// the device journal, the log ring, conntrack ages. So the honest
+  /// thing is not to print a time; it is to print the time together
+  /// with how much of it to believe.
+  auto HandleShowTime(const proto::Request& req) -> proto::Response {
+    sc::SystemConfig cfg;
+    std::optional<proto::Response> fail;
+    if (!LoadSystem(req, &cfg, &fail)) return *fail;
+
+    auto t = sc::QueryTime(cfg, sc::TimeSource{});
+    return MakeOk(req.id, {
+        {"trust", sc::TimeTrustName(t.trust)},
+        {"trustworthy", t.Trustworthy()},
+        {"rtc", sc::RtcPresenceName(t.rtc)},
+        {"rtc_name", t.rtc_name},
+        {"wall_seconds", t.wall_seconds},
+        {"uptime_seconds", t.uptime_seconds},
+        {"implausible", t.implausible},
+        {"max_error_us", t.max_error_us},
+        {"reference", t.reference},
+        {"detail", t.detail},
+        {"banner", sc::TimeWarningBanner(t)},
     });
   }
 

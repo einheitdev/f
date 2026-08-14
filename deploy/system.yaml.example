@@ -91,3 +91,17 @@ services:
   dns:
     - zone: testnet
       upstream: [9.9.9.9, 1.1.1.1]
+
+  # Time. Conntrack timeouts, rate-limit windows and every log line
+  # are stated in this clock, and a board with no battery-backed RTC
+  # boots at the epoch — logs stamped 1970 are not merely untidy, they
+  # destroy the ordering any later analysis depends on.
+  #
+  # The client half has no placement: it is outbound. The `zone` binds
+  # the *server* half, and the addresses it answers on are derived
+  # from zone membership like everything else, so it cannot answer the
+  # office. Set `serve: false` for a client-only box, which closes the
+  # server port entirely rather than merely refusing queries.
+  ntp:
+    - zone: testnet
+      upstream: [pool.ntp.org]

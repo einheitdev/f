@@ -3,6 +3,8 @@
 
 #include "adapters/fw/adapter.h"
 
+#include <array>
+#include <ctime>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -551,6 +553,29 @@ auto Age(std::int64_t seconds) -> std::string {
   if (seconds < 3600) return std::format("{}m", seconds / 60);
   if (seconds < 86400) return std::format("{}h", seconds / 3600);
   return std::format("{}d", seconds / 86400);
+}
+
+/// A wall clock, rendered so that a wrong one is obvious.
+///
+/// The epoch is spelled out rather than shown as a date, because
+/// "1970-01-01 00:00:12" reads as a date and this is not one — it is
+/// a board that has never been told what year it is.
+auto FormatWallClock(std::int64_t seconds) -> std::string {
+  if (seconds < 1577836800) {
+    return std::format("{} — THE EPOCH, not a real time", seconds);
+  }
+  std::time_t t = static_cast<std::time_t>(seconds);
+  std::tm tm{};
+  if (::gmtime_r(&t, &tm) == nullptr) return std::to_string(seconds);
+  std::array<char, 32> buf{};
+  std::strftime(buf.data(), buf.size(), "%Y-%m-%d %H:%M:%S UTC",
+                &tm);
+  return std::string(buf.data());
+}
+
+/// A duration in the same compact spelling as an age.
+auto FormatDuration(std::int64_t seconds) -> std::string {
+  return Age(seconds);
 }
 
 /// Where prose goes.
@@ -1451,6 +1476,45 @@ auto RenderShowIpv6(const Response& resp, Renderer& renderer)
       << "\n";
 }
 
+/// The clock, and how much of it to believe.
+auto RenderShowTime(const Response& resp, Renderer& renderer)
+    -> void {
+  auto j = ParseData(resp);
+  auto& out = renderer.Out();
+
+  auto banner = j.value("banner", "");
+  if (!banner.empty()) out << banner << "\n";
+
+  Table t;
+  AddColumn(t, "FIELD", Align::Left, Priority::High);
+  AddColumn(t, "VALUE", Align::Left, Priority::High);
+  auto trust = j.value("trust", "unknown");
+  bool ok = j.value("trustworthy", false);
+  AddRow(t, {Cell{"trust", Semantic::Emphasis},
+             Cell{trust, ok ? Semantic::Good : Semantic::Bad}});
+  auto rtc = j.value("rtc", "unknown");
+  auto rtc_name = j.value("rtc_name", "");
+  AddRow(t, {Cell{"rtc"},
+             Cell{rtc_name.empty() ? rtc : rtc + " — " + rtc_name,
+                  rtc == "present" ? Semantic::Default
+                                   : Semantic::Warn}});
+  AddRow(t, {Cell{"wall clock"},
+             Cell{FormatWallClock(j.value("wall_seconds", 0LL)),
+                  j.value("implausible", false) ? Semantic::Bad
+                                                : Semantic::Default}});
+  // Always shown, and shown next to the wall clock on purpose:
+  // uptime owes nothing to NTP, so it is the one ordering that still
+  // works for anything stamped before the clock was set.
+  AddRow(t, {Cell{"uptime"},
+             Cell{FormatDuration(j.value("uptime_seconds", 0LL))}});
+  auto ref = j.value("reference", "");
+  if (!ref.empty()) AddRow(t, {Cell{"reference"}, Cell{ref}});
+  RenderFormatted(t, renderer);
+
+  auto detail = j.value("detail", "");
+  if (!detail.empty()) out << "\n" << detail << "\n";
+}
+
 auto RenderCheckSystem(const Response& resp, Renderer& renderer)
     -> void {
   auto j = ParseData(resp);
@@ -1562,6 +1626,9 @@ class FwAdapter final : public cli::ProductAdapter {
              "Interfaces, zones and where services will answer"),
         Show("services", "show_services",
              "DHCP/DNS health, and what they are bound to"),
+        Show("time", "show_time",
+             "The clock, whether it is synchronised, and whether "
+             "this board can keep time across a power cut"),
         Show("ipv6", "show_ipv6",
              "Per-zone IPv6 stance: advertisements refused, and "
              "whether anything autoconfigured anyway"),
@@ -1626,6 +1693,8 @@ class FwAdapter final : public cli::ProductAdapter {
       RenderShowServices(response, renderer);
     } else if (wc == "show_ipv6") {
       RenderShowIpv6(response, renderer);
+    } else if (wc == "show_time") {
+      RenderShowTime(response, renderer);
     } else if (wc == "check_system") {
       RenderCheckSystem(response, renderer);
     } else if (wc == "apply_system" ||

@@ -172,12 +172,31 @@ struct DnsForwarder {
   bool stop_dns_rebind = true;
 };
 
+/// NTP: a client on the uplink, and optionally a server for a zone.
+///
+/// Both halves are one entry because they are one daemon and one
+/// answer to "where does this box get the time". The `zone` binding
+/// governs only the server half; the client half has no placement,
+/// because a client is outbound and needs none.
+struct NtpService {
+  ServiceBinding bind;
+  /// Upstream time sources. Empty means this box learns the time
+  /// from nowhere, which is a state `show time` names rather than a
+  /// clock that merely happens to be wrong.
+  std::vector<std::string> upstreams;
+  /// Whether to answer NTP queries from the bound zone. False leaves
+  /// the server port closed entirely — the same structural
+  /// containment as the DHCP gate, and the reason it is opt-in.
+  bool serve = true;
+};
+
 /// The whole model.
 struct SystemConfig {
   std::vector<Zone> zones;
   std::vector<Interface> interfaces;
   std::vector<DhcpServer> dhcp;
   std::vector<DnsForwarder> dns;
+  std::vector<NtpService> ntp;
 
   /// Interfaces belonging to `zone`, in declaration order. This is the
   /// single derivation from zone to devices; every backend goes
@@ -199,7 +218,19 @@ struct SystemConfig {
   /// True when any DHCP server is bound to `zone`.
   auto ZoneServesDhcp(const std::string& zone) const -> bool;
 
-  /// True when any service at all is bound to `zone`.
+  /// True when a DNS forwarder is bound to `zone`.
+  auto ZoneServesDns(const std::string& zone) const -> bool;
+
+  /// True when `zone` carries a service dnsmasq provides. This is
+  /// the predicate the dnsmasq interface list derives from, and it
+  /// is deliberately narrower than `ZoneHasService`: an NTP server
+  /// places chrony in a zone, not dnsmasq, and conflating the two
+  /// would open a dnsmasq socket on a segment nobody asked it to
+  /// answer on.
+  auto ZoneHasDnsmasqService(const std::string& zone) const -> bool;
+
+  /// True when any service at all is bound to `zone`. Used to decide
+  /// whether an empty zone is a mistake, where every service counts.
   auto ZoneHasService(const std::string& zone) const -> bool;
 
   /// The stance of the zone `iface` belongs to. An interface in no

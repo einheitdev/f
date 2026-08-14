@@ -20,6 +20,7 @@
 
 #include <CLI/CLI.hpp>
 
+#include "f/sysconfig/chrony.h"
 #include "f/sysconfig/dnsmasq.h"
 #include "f/sysconfig/ipv6.h"
 #include "f/sysconfig/model.h"
@@ -37,7 +38,17 @@ using f::sysconfig::CheckArtifactDrift;
 using f::sysconfig::CheckDnsmasqDrift;
 using f::sysconfig::Diagnostic;
 using f::sysconfig::DnsmasqOptions;
+using f::sysconfig::ApplyChrony;
 using f::sysconfig::ApplyIpv6;
+using f::sysconfig::ChronyOptions;
+using f::sysconfig::CheckChronyDrift;
+using f::sysconfig::PlanChrony;
+using f::sysconfig::QueryTime;
+using f::sysconfig::RtcPresenceName;
+using f::sysconfig::TimeSource;
+using f::sysconfig::TimeTrust;
+using f::sysconfig::TimeTrustName;
+using f::sysconfig::TimeWarningBanner;
 using f::sysconfig::DriftKind;
 using f::sysconfig::DriftKindName;
 using f::sysconfig::Ipv6Availability;
@@ -208,6 +219,34 @@ auto ReportIpv6(const SystemConfig& cfg, const Ipv6Source& src)
   return !violations.empty();
 }
 
+/// The clock, and whether it can be believed.
+///
+/// Printed as part of `status` rather than hidden behind its own
+/// command, because every other line in that output is stamped in it.
+auto ReportTime(const SystemConfig& cfg, const TimeSource& src)
+    -> void {
+  auto t = QueryTime(cfg, src);
+  std::cout << "clock:\n";
+  std::cout << std::format("  trust      {}\n",
+                           TimeTrustName(t.trust));
+  std::cout << std::format("  rtc        {}{}\n",
+                           RtcPresenceName(t.rtc),
+                           t.rtc_name.empty()
+                               ? ""
+                               : " — " + t.rtc_name);
+  std::cout << std::format("  wall       {}{}\n", t.wall_seconds,
+                           t.implausible ? "  (AT THE EPOCH)" : "");
+  std::cout << std::format("  uptime     {}s\n", t.uptime_seconds);
+  if (!t.reference.empty()) {
+    std::cout << std::format("  reference  {}\n", t.reference);
+  }
+  if (!t.detail.empty()) {
+    std::cout << std::format("  {}\n", t.detail);
+  }
+  auto banner = TimeWarningBanner(t);
+  if (!banner.empty()) std::cerr << banner;
+}
+
 }  // namespace
 
 auto main(int argc, char** argv) -> int {
@@ -222,12 +261,23 @@ auto main(int argc, char** argv) -> int {
   NetworkdOptions networkd_opts;
   Ipv6Options ipv6_opts;
   Ipv6Source ipv6_src;
+  ChronyOptions chrony_opts;
+  TimeSource time_src;
   app.add_option("--dnsmasq-conf", dnsmasq_opts.conf_path,
                  "Where the generated dnsmasq config is installed");
   app.add_option("--dnsmasq-bin", dnsmasq_opts.dnsmasq_path,
                  "Path to the dnsmasq binary");
   app.add_option("--networkd-dir", networkd_opts.dir,
                  "Where generated networkd units are installed");
+  app.add_option("--chrony-conf", chrony_opts.conf_path,
+                 "Where the generated chrony config is installed");
+  app.add_option("--chronyd-bin", chrony_opts.chronyd_path,
+                 "Path to the chronyd binary");
+  app.add_option("--rtc-dir", time_src.rtc_dir,
+                 "Where RTC devices are enumerated");
+  app.add_option("--chronyc-cmd", time_src.chronyc_cmd,
+                 "Command that reports the time reference "
+                 "(empty to skip)");
   app.add_option("--ipv6-sysctl", ipv6_opts.sysctl_path,
                  "Where the generated IPv6 sysctl file is installed");
   app.add_option("--proc-sys", ipv6_opts.proc_sys_root,
@@ -248,7 +298,8 @@ auto main(int argc, char** argv) -> int {
   auto* render =
       app.add_subcommand("render", "Print a derived artifact");
   std::string what;
-  render->add_option("what", what, "dnsmasq | networkd | ipv6")
+  render->add_option("what", what,
+                     "dnsmasq | networkd | ipv6 | chrony")
       ->required();
   auto* apply =
       app.add_subcommand("apply", "Generate, validate and install");
@@ -282,9 +333,11 @@ auto main(int argc, char** argv) -> int {
       }
     } else if (what == "ipv6") {
       std::cout << PlanIpv6(*cfg).sysctl_content;
+    } else if (what == "chrony") {
+      std::cout << PlanChrony(*cfg).content;
     } else {
-      std::cerr << "render: expected 'dnsmasq', 'networkd' or "
-                   "'ipv6'\n";
+      std::cerr << "render: expected 'dnsmasq', 'networkd', 'ipv6' "
+                   "or 'chrony'\n";
       return 2;
     }
     return 0;
@@ -306,6 +359,13 @@ auto main(int argc, char** argv) -> int {
                                DriftKindName(ud), "networkd",
                                u.path);
       drifted = drifted || ud == DriftKind::kHandEdited;
+    }
+    {
+      auto cd = CheckChronyDrift(*cfg, chrony_opts.conf_path);
+      std::cout << std::format("  {:<12} {:<9} {}\n",
+                               DriftKindName(cd), "chrony",
+                               chrony_opts.conf_path);
+      drifted = drifted || cd == DriftKind::kHandEdited;
     }
     {
       auto vd = CheckArtifactDrift(ipv6_opts.sysctl_path,
@@ -343,6 +403,7 @@ auto main(int argc, char** argv) -> int {
       }
     }
     bool violated = ReportIpv6(*cfg, ipv6_src);
+    ReportTime(*cfg, time_src);
 
     // Precedence is deliberate and this order is the argument: a port
     // that is `ipv6 off` and holds a global address is a bypass that
@@ -401,6 +462,30 @@ auto main(int argc, char** argv) -> int {
       std::cerr << "until this is resolved those ports may still "
                    "autoconfigure from an upstream advertisement.\n";
       return 6;
+    }
+
+    auto chrony_plan = PlanChrony(*cfg);
+    if (chrony_plan.needed) {
+      chrony_opts.refuse_on_drift = !force;
+      auto ch = ApplyChrony(*cfg, chrony_opts);
+      if (!ch) {
+        std::cerr << ch.error().message << "\n";
+        return 1;
+      }
+      if (ch->changed) {
+        std::cout << "wrote " << ch->conf_path << "\n";
+      }
+      std::cout << std::format(
+          "ntp answers on: {}\n", [&] {
+            std::string s;
+            for (const auto& a : chrony_plan.bind_addresses) {
+              if (!s.empty()) s += ",";
+              s += a;
+            }
+            return s.empty() ? "(nowhere — the server port is "
+                               "closed)"
+                             : s;
+          }());
     }
 
     auto plan = PlanDnsmasq(*cfg);
