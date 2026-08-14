@@ -2,32 +2,16 @@
 
 ## What FWL Is
 
-FWL is a small declarative language for writing firewall rules. A `.fw`
-file declares a sequence of rules; the compiler turns it into an
-XDP/eBPF program that runs at line rate in the kernel.
+FWL is a small declarative language for writing firewall rules. A `.fw` file declares a sequence of rules; the compiler turns it into an XDP/eBPF program that runs at line rate in the kernel.
 
-This document specifies the v0.4 protocol-field additions. v0.4 is a
-strict superset of [v0.2](FWL_V02_SPEC.md): every v0.2 program is a
-valid v0.4 program with identical packet semantics. v0.4 adds two
-protocol-field constructs to the v0.2 surface:
+This document specifies the v0.4 protocol-field additions. v0.4 is a strict superset of [v0.2](FWL_V02_SPEC.md): every v0.2 program is a valid v0.4 program with identical packet semantics. v0.4 adds two protocol-field constructs to the v0.2 surface:
 
-1. **All eight TCP flags** — `pkt.tcp.fin`, `pkt.tcp.rst`,
-   `pkt.tcp.psh`, `pkt.tcp.urg`, `pkt.tcp.ece`, `pkt.tcp.cwr` join the
-   existing `pkt.tcp.syn` and `pkt.tcp.ack`.
-2. **ICMP and ICMPv6 type/code** — `pkt.icmp.type`, `pkt.icmp.code`,
-   `pkt.icmp6.type`, `pkt.icmp6.code`.
+1. **All eight TCP flags** — `pkt.tcp.fin`, `pkt.tcp.rst`, `pkt.tcp.psh`, `pkt.tcp.urg`, `pkt.tcp.ece`, `pkt.tcp.cwr` join the existing `pkt.tcp.syn` and `pkt.tcp.ack`.
+2. **ICMP and ICMPv6 type/code** — `pkt.icmp.type`, `pkt.icmp.code`, `pkt.icmp6.type`, `pkt.icmp6.code`.
 
-Everything else from v0.2 is preserved. Both constructs follow the
-same pattern as the existing `pkt.tcp.syn`/`pkt.tcp.ack` fields: a
-typed packet accessor with a protocol guard requirement, evaluated by
-three independent oracles (the spec, the AST interpreter, and
-`BPF_PROG_TEST_RUN`).
+Everything else from v0.2 is preserved. Both constructs follow the same pattern as the existing `pkt.tcp.syn`/`pkt.tcp.ack` fields: a typed packet accessor with a protocol guard requirement, evaluated by three independent oracles (the spec, the AST interpreter, and `BPF_PROG_TEST_RUN`).
 
-v0.4 also adds two larger surfaces documented in their own sections
-below: **VLAN 802.1Q** matching (`pkt.vlan_id`, `pkt.vlan_priority`)
-and **stateful conntrack** (`conntrack(pkt).state`). Conntrack is the
-first construct with a side effect — an allowed `new` packet creates
-the connection-tracking entry a later packet reads as `established`.
+v0.4 also adds two larger surfaces documented in their own sections below: **VLAN 802.1Q** matching (`pkt.vlan_id`, `pkt.vlan_priority`) and **stateful conntrack** (`conntrack(pkt).state`). Conntrack is the first construct with a side effect — an allowed `new` packet creates the connection-tracking entry a later packet reads as `established`.
 
 ## Surface deltas relative to v0.2
 
@@ -41,19 +25,11 @@ the connection-tracking entry a later packet reads as `established`.
 | Program shape | Tier 1 rule sequence **xor** one Tier 2 `def` | unchanged |
 | `rate_limit` | `rate_limit(N, per=<field>)` | adds optional `scope=zone\|global` (§ 6.7), default `zone` |
 
-No v0.4 reservation breaks v0.2 backward compatibility: the new field
-spellings (`fin`, `rst`, `psh`, `urg`, `ece`, `cwr`, `type`, `code`)
-are recognized only as field segments after `pkt.tcp.` / `pkt.icmp.` /
-`pkt.icmp6.`, not as globally reserved words. A Tier 2 local named
-`type` or a counter named `code` remains permitted. `global` is
-likewise not a reserved word — it is recognized only as the value of a
-`rate_limit` `scope=` field, so an interface, zone, or counter named
-`global` keeps working.
+No v0.4 reservation breaks v0.2 backward compatibility: the new field spellings (`fin`, `rst`, `psh`, `urg`, `ece`, `cwr`, `type`, `code`) are recognized only as field segments after `pkt.tcp.` / `pkt.icmp.` / `pkt.icmp6.`, not as globally reserved words. A Tier 2 local named `type` or a counter named `code` remains permitted. `global` is likewise not a reserved word — it is recognized only as the value of a `rate_limit` `scope=` field, so an interface, zone, or counter named `global` keeps working.
 
 ## TCP Flags (all 8)
 
-**Construct.** Six new bool fields on the `pkt` object, completing the
-TCP flag set:
+**Construct.** Six new bool fields on the `pkt` object, completing the TCP flag set:
 
 ```
 pkt.tcp.fin              # FIN flag — sender finished sending
@@ -64,61 +40,28 @@ pkt.tcp.ece              # ECE flag — ECN-Echo
 pkt.tcp.cwr              # CWR flag — Congestion Window Reduced
 ```
 
-These join the v0.1 `pkt.tcp.syn` and `pkt.tcp.ack`. All eight are
-single bits in the TCP header flags byte (offset 13).
+These join the v0.1 `pkt.tcp.syn` and `pkt.tcp.ack`. All eight are single bits in the TCP header flags byte (offset 13).
 
 **Type rules.**
 
-- Every TCP flag field has type `bool`. Boolean fields appear directly
-  as conditions; there are no boolean literals (`true`, `false`), so
-  write `pkt.tcp.fin` to test whether the FIN flag is set and
-  `not pkt.tcp.fin` to test whether it is clear. `pkt.tcp.fin == true`
-  is not valid (no `true` literal), identical to the v0.1 rule for
-  syn/ack.
-- A TCP flag read is valid only on a path guarded by `pkt.proto == tcp`
-  (see Compile errors). Accessing a flag without the guard is a compile
-  error, exactly as for syn/ack.
-- A `bool` flag is a valid bare `if` condition primary in Tier 2; both
-  sides of `==`/`!=` may be `bool` flags or `bool` locals, but mixing a
-  `bool` flag with a non-`bool` value is a type error. There is no
-  implicit truthiness coercion: `if pkt.dst_port:` stays a type error,
-  while `if pkt.tcp.rst:` is fine.
+- Every TCP flag field has type `bool`. Boolean fields appear directly as conditions; there are no boolean literals (`true`, `false`), so write `pkt.tcp.fin` to test whether the FIN flag is set and `not pkt.tcp.fin` to test whether it is clear. `pkt.tcp.fin == true` is not valid (no `true` literal), identical to the v0.1 rule for syn/ack.
+- A TCP flag read is valid only on a path guarded by `pkt.proto == tcp` (see Compile errors). Accessing a flag without the guard is a compile error, exactly as for syn/ack.
+- A `bool` flag is a valid bare `if` condition primary in Tier 2; both sides of `==`/`!=` may be `bool` flags or `bool` locals, but mixing a `bool` flag with a non-`bool` value is a type error. There is no implicit truthiness coercion: `if pkt.dst_port:` stays a type error, while `if pkt.tcp.rst:` is fine.
 
 **Semantics.**
 
-- Single-bit extraction from the TCP header flags byte (offset 13).
-  Bit positions, low to high: FIN `0x01`, SYN `0x02`, RST `0x04`,
-  PSH `0x08`, ACK `0x10`, URG `0x20`, ECE `0x40`, CWR `0x80`.
-- The compiler emits the TCP L4 parse only when a flag (or port) field
-  is referenced. The flag byte is read after the parser bounds-checks
-  the full TCP header; on a truncated TCP header, or any non-TCP frame,
-  the flag reads do not happen and conditions touching them fall
-  through (the rule does not match).
-- Flags compose like any other bool: `pkt.tcp.syn and not pkt.tcp.ack`
-  matches a bare SYN; `pkt.tcp.fin and pkt.tcp.psh and pkt.tcp.urg`
-  matches the "XMAS" flag combination.
-- Flags are readable on both IPv4 TCP (`tcp(...)`) and IPv6 TCP
-  (`tcp6(...)`) frames — the dual-stack prelude extracts them on both
-  paths into the same variables.
+- Single-bit extraction from the TCP header flags byte (offset 13). Bit positions, low to high: FIN `0x01`, SYN `0x02`, RST `0x04`, PSH `0x08`, ACK `0x10`, URG `0x20`, ECE `0x40`, CWR `0x80`.
+- The compiler emits the TCP L4 parse only when a flag (or port) field is referenced. The flag byte is read after the parser bounds-checks the full TCP header; on a truncated TCP header, or any non-TCP frame, the flag reads do not happen and conditions touching them fall through (the rule does not match).
+- Flags compose like any other bool: `pkt.tcp.syn and not pkt.tcp.ack` matches a bare SYN; `pkt.tcp.fin and pkt.tcp.psh and pkt.tcp.urg` matches the "XMAS" flag combination.
+- Flags are readable on both IPv4 TCP (`tcp(...)`) and IPv6 TCP (`tcp6(...)`) frames — the dual-stack prelude extracts them on both paths into the same variables.
 
 **Edge cases.**
 
-- *Flag on a non-TCP packet.* A rule referencing `pkt.tcp.rst` does not
-  match a UDP, ICMP, or ICMPv6 packet — the L4 TCP parse never runs, so
-  the flag stays unread and the condition is false.
-- *Truncated TCP header.* A frame whose TCP header is cut short (less
-  than the full 20-byte `struct tcphdr`) does not satisfy any flag
-  read; the rule falls through, identical to truncated-port behaviour.
-- *All flags clear.* A TCP segment with a zero flags byte matches
-  `not pkt.tcp.fin and not pkt.tcp.syn and ...` for every flag.
-- *Flag combinations.* `pkt.tcp.fin and pkt.tcp.syn` (an illegal but
-  observable combination) is matchable — FWL reports what the bits say,
-  it does not validate TCP state.
-- *Interaction with `not`.* `not pkt.tcp.ece` is true on a non-TCP
-  frame only if the surrounding condition's other terms already
-  established that the field is unreadable — by itself `not pkt.tcp.ece`
-  evaluates the unread (false) bit, so `not pkt.tcp.ece` is true. This
-  matches the existing syn/ack `not` semantics.
+- *Flag on a non-TCP packet.* A rule referencing `pkt.tcp.rst` does not match a UDP, ICMP, or ICMPv6 packet — the L4 TCP parse never runs, so the flag stays unread and the condition is false.
+- *Truncated TCP header.* A frame whose TCP header is cut short (less than the full 20-byte `struct tcphdr`) does not satisfy any flag read; the rule falls through, identical to truncated-port behaviour.
+- *All flags clear.* A TCP segment with a zero flags byte matches `not pkt.tcp.fin and not pkt.tcp.syn and ...` for every flag.
+- *Flag combinations.* `pkt.tcp.fin and pkt.tcp.syn` (an illegal but observable combination) is matchable — FWL reports what the bits say, it does not validate TCP state.
+- *Interaction with `not`.* `not pkt.tcp.ece` is true on a non-TCP frame only if the surrounding condition's other terms already established that the field is unreadable — by itself `not pkt.tcp.ece` evaluates the unread (false) bit, so `not pkt.tcp.ece` is true. This matches the existing syn/ack `not` semantics.
 
 **Compile errors.**
 
@@ -159,9 +102,7 @@ pkt.icmp6.type           # ICMPv6 type byte   (e.g. 128 = echo request)
 pkt.icmp6.code           # ICMPv6 code byte
 ```
 
-`pkt.icmp.*` reads the ICMPv4 header; `pkt.icmp6.*` reads the ICMPv6
-header. They are distinct fields with distinct guards — the wire
-protocols, EtherTypes, and type-number spaces differ.
+`pkt.icmp.*` reads the ICMPv4 header; `pkt.icmp6.*` reads the ICMPv6 header. They are distinct fields with distinct guards — the wire protocols, EtherTypes, and type-number spaces differ.
 
 Operands they accept:
 
@@ -171,82 +112,31 @@ Operands they accept:
 | integer range | `lo..hi` | `pkt.icmp6.type in 133..137` |
 | integer list | `[ n, ... ]` | `pkt.icmp.type in [0, 3, 11]` |
 
-Operators: `==`, `!=`, `<`, `<=`, `>`, `>=`, `in` — the same surface as
-port fields. There is no boolean form (these are numeric u8 fields, not
-flags).
+Operators: `==`, `!=`, `<`, `<=`, `>`, `>=`, `in` — the same surface as port fields. There is no boolean form (these are numeric u8 fields, not flags).
 
 **Type rules.**
 
-- `pkt.icmp.type`, `pkt.icmp.code`, `pkt.icmp6.type`, `pkt.icmp6.code`
-  all have type `u8` (an unsigned byte, value range 0..255).
-- An integer literal compared against any of these fields must be in
-  `0..255`. A literal outside that range is a compile error (the wire
-  field is a single byte; a larger constant can never match and almost
-  always signals a mistake).
+- `pkt.icmp.type`, `pkt.icmp.code`, `pkt.icmp6.type`, `pkt.icmp6.code` all have type `u8` (an unsigned byte, value range 0..255).
+- An integer literal compared against any of these fields must be in `0..255`. A literal outside that range is a compile error (the wire field is a single byte; a larger constant can never match and almost always signals a mistake).
 - A range `lo..hi` requires `0 <= lo <= hi <= 255`.
-- `pkt.icmp.*` reads require a `pkt.proto == icmp` guard on the path.
-  `pkt.icmp6.*` reads require a `pkt.proto == icmp6` guard. Crossing
-  them — `pkt.icmp.type` under an `icmp6` guard, or vice versa — is a
-  compile error (the guard table treats `icmp` and `icmp6` as distinct
-  protocols).
-- When hoisted into a Tier 2 local (`t = pkt.icmp.type`), the local
-  takes the smallest unsigned scalar that holds a byte: `u16` (v0.4 has
-  no `u8` local type). The strict `0..255` literal check applies to
-  direct field comparisons; once a value lives in a `u16` local the
-  ordinary `u16` comparison rules apply, and a literal in `256..65535`
-  simply never matches the byte.
+- `pkt.icmp.*` reads require a `pkt.proto == icmp` guard on the path. `pkt.icmp6.*` reads require a `pkt.proto == icmp6` guard. Crossing them — `pkt.icmp.type` under an `icmp6` guard, or vice versa — is a compile error (the guard table treats `icmp` and `icmp6` as distinct protocols).
+- When hoisted into a Tier 2 local (`t = pkt.icmp.type`), the local takes the smallest unsigned scalar that holds a byte: `u16` (v0.4 has no `u8` local type). The strict `0..255` literal check applies to direct field comparisons; once a value lives in a `u16` local the ordinary `u16` comparison rules apply, and a literal in `256..65535` simply never matches the byte.
 
 **Semantics.**
 
-- **ICMPv4.** When the program references a `pkt.icmp.*` field, the
-  compiler emits an ICMP parse branch inside the IPv4 L4 region: after
-  the variable-IHL IPv4 header, if `pkt.proto == icmp` (IP protocol 1)
-  and the first two header bytes are in-bounds, `type` (offset 0) and
-  `code` (offset 1) are read. The branch is gated by an `icmp_ok` flag
-  set only when those bytes are present.
-- **ICMPv6.** When the program references a `pkt.icmp6.*` field, the
-  compiler emits an ICMPv6 branch in the IPv6 path: at the fixed offset
-  after the 40-byte IPv6 header, if `next_header == IPPROTO_ICMPV6`
-  (58) and the two bytes are in-bounds, `type` and `code` are read,
-  gated by an `icmp6_ok` flag. No extension-header chasing — an ICMPv6
-  packet behind a Hop-by-Hop or any other extension header has no
-  readable `pkt.icmp6.*` (the field reads fall through), identical to
-  the v0.2 rule for L4 fields behind extension headers.
-- A read on the wrong family does not match: `pkt.icmp.type` never
-  matches an IPv6 frame (the v4 ICMP parse runs only on EtherType
-  `0x0800`), and `pkt.icmp6.type` never matches an IPv4 frame.
-- Byte semantics: `type` is the ICMP message type, `code` is the
-  subtype. The values are protocol-defined integers; FWL does not name
-  them. Common ICMPv4 types: 0 (echo reply), 3 (destination
-  unreachable), 8 (echo request), 11 (time exceeded). Common ICMPv6
-  types: 1 (destination unreachable), 128 (echo request), 129 (echo
-  reply), 133–137 (NDP: router/neighbor solicitation/advertisement,
-  redirect).
+- **ICMPv4.** When the program references a `pkt.icmp.*` field, the compiler emits an ICMP parse branch inside the IPv4 L4 region: after the variable-IHL IPv4 header, if `pkt.proto == icmp` (IP protocol 1) and the first two header bytes are in-bounds, `type` (offset 0) and `code` (offset 1) are read. The branch is gated by an `icmp_ok` flag set only when those bytes are present.
+- **ICMPv6.** When the program references a `pkt.icmp6.*` field, the compiler emits an ICMPv6 branch in the IPv6 path: at the fixed offset after the 40-byte IPv6 header, if `next_header == IPPROTO_ICMPV6` (58) and the two bytes are in-bounds, `type` and `code` are read, gated by an `icmp6_ok` flag. No extension-header chasing — an ICMPv6 packet behind a Hop-by-Hop or any other extension header has no readable `pkt.icmp6.*` (the field reads fall through), identical to the v0.2 rule for L4 fields behind extension headers.
+- A read on the wrong family does not match: `pkt.icmp.type` never matches an IPv6 frame (the v4 ICMP parse runs only on EtherType `0x0800`), and `pkt.icmp6.type` never matches an IPv4 frame.
+- Byte semantics: `type` is the ICMP message type, `code` is the subtype. The values are protocol-defined integers; FWL does not name them. Common ICMPv4 types: 0 (echo reply), 3 (destination unreachable), 8 (echo request), 11 (time exceeded). Common ICMPv6 types: 1 (destination unreachable), 128 (echo request), 129 (echo reply), 133–137 (NDP: router/neighbor solicitation/advertisement, redirect).
 
 **Edge cases.**
 
-- *Echo vs unreachable vs redirect.* `pkt.icmp.type == 8` matches a
-  ping request; `pkt.icmp.type == 3` matches destination-unreachable;
-  `pkt.icmp.type == 5` matches a redirect. Distinct type values are
-  independently matchable.
-- *ICMPv6 NDP range.* `pkt.icmp6.type in 133..137` matches the
-  Neighbor Discovery message types (router solicitation 133, router
-  advertisement 134, neighbor solicitation 135, neighbor advertisement
-  136, redirect 137) — the canonical "allow NDP" rule.
-- *Truncated ICMP.* A frame cut before the 2-byte type/code pair does
-  not satisfy any `pkt.icmp.*` / `pkt.icmp6.*` read; the rule falls
-  through (`icmp_ok` / `icmp6_ok` stays 0).
-- *v4 vs v6 ICMP.* An ICMPv4 echo request (`icmp(type=8)`) does not
-  match `pkt.icmp6.type == 8`, and an ICMPv6 echo request
-  (`icmp6(type=128)`) does not match `pkt.icmp.type == 128`. The two
-  protocols' type spaces are independent (echo request is 8 in v4, 128
-  in v6).
-- *Code on a type with no codes.* `pkt.icmp.code` reads byte 1
-  regardless of type; for an echo request (code always 0) it reads 0,
-  matchable by `pkt.icmp.code == 0`.
-- *Boundary type values.* `pkt.icmp.type == 0` (echo reply) and
-  `pkt.icmp.type == 255` (the maximum u8) are both valid; `== 256` is a
-  compile error.
+- *Echo vs unreachable vs redirect.* `pkt.icmp.type == 8` matches a ping request; `pkt.icmp.type == 3` matches destination-unreachable; `pkt.icmp.type == 5` matches a redirect. Distinct type values are independently matchable.
+- *ICMPv6 NDP range.* `pkt.icmp6.type in 133..137` matches the Neighbor Discovery message types (router solicitation 133, router advertisement 134, neighbor solicitation 135, neighbor advertisement 136, redirect 137) — the canonical "allow NDP" rule.
+- *Truncated ICMP.* A frame cut before the 2-byte type/code pair does not satisfy any `pkt.icmp.*` / `pkt.icmp6.*` read; the rule falls through (`icmp_ok` / `icmp6_ok` stays 0).
+- *v4 vs v6 ICMP.* An ICMPv4 echo request (`icmp(type=8)`) does not match `pkt.icmp6.type == 8`, and an ICMPv6 echo request (`icmp6(type=128)`) does not match `pkt.icmp.type == 128`. The two protocols' type spaces are independent (echo request is 8 in v4, 128 in v6).
+- *Code on a type with no codes.* `pkt.icmp.code` reads byte 1 regardless of type; for an echo request (code always 0) it reads 0, matchable by `pkt.icmp.code == 0`.
+- *Boundary type values.* `pkt.icmp.type == 0` (echo reply) and `pkt.icmp.type == 255` (the maximum u8) are both valid; `== 256` is a compile error.
 
 **Compile errors.**
 
@@ -292,36 +182,21 @@ def filter(pkt):
 
 ### Construct
 
-Two new read-only packet fields, available on every program (Tier 1
-rules and Tier 2 function bodies):
+Two new read-only packet fields, available on every program (Tier 1 rules and Tier 2 function bodies):
 
 | Field | Width | Range | Meaning |
 |-------|-------|-------|---------|
 | `pkt.vlan_id` | u16 | 0–4095 | 802.1Q VLAN identifier (VID, 12 bits) |
 | `pkt.vlan_priority` | u8 | 0–7 | 802.1p priority code point (PCP, 3 bits) |
 
-Both are integer-valued. The 1-bit DEI (drop-eligible indicator) is
-parsed past but not exposed in v0.4.
+Both are integer-valued. The 1-bit DEI (drop-eligible indicator) is parsed past but not exposed in v0.4.
 
 ### Type rules
 
-- `pkt.vlan_id` and `pkt.vlan_priority` are integer fields. They
-  behave like port fields for comparison purposes: the operators
-  `==`, `!=`, `<`, `>`, `<=`, `>=`, and `in` (over an integer list
-  or `lo..hi` range) all apply.
-- **No protocol guard is required.** VLAN is an L2 construct, parsed
-  before any L3/L4 dispatch. Unlike `pkt.src_port` (which needs
-  `pkt.proto == tcp/udp`) or `pkt.tcp.syn` (which needs
-  `pkt.proto == tcp`), a VLAN field read is legal in any context,
-  exactly like `pkt.src_ip` is legal without a guard. This mirrors
-  the `_ALL_PROTOS` (empty-guard) treatment the analyzer already
-  gives the L3 IP fields.
-- In Tier 2, `pkt.vlan_id` and `pkt.vlan_priority` are typed `u16`
-  and bind to `u16` locals. Ordered comparisons (`<`, `>`, `<=`,
-  `>=`) follow the same matching-integer-type rule as ports.
-- Comparison operands must be integer literals (or integer lists /
-  ranges for `in`). Comparing a VLAN field against an IP, proto, or
-  IPv6 literal is a type error, identical to the port-field rule.
+- `pkt.vlan_id` and `pkt.vlan_priority` are integer fields. They behave like port fields for comparison purposes: the operators `==`, `!=`, `<`, `>`, `<=`, `>=`, and `in` (over an integer list or `lo..hi` range) all apply.
+- **No protocol guard is required.** VLAN is an L2 construct, parsed before any L3/L4 dispatch. Unlike `pkt.src_port` (which needs `pkt.proto == tcp/udp`) or `pkt.tcp.syn` (which needs `pkt.proto == tcp`), a VLAN field read is legal in any context, exactly like `pkt.src_ip` is legal without a guard. This mirrors the `_ALL_PROTOS` (empty-guard) treatment the analyzer already gives the L3 IP fields.
+- In Tier 2, `pkt.vlan_id` and `pkt.vlan_priority` are typed `u16` and bind to `u16` locals. Ordered comparisons (`<`, `>`, `<=`, `>=`) follow the same matching-integer-type rule as ports.
+- Comparison operands must be integer literals (or integer lists / ranges for `in`). Comparing a VLAN field against an IP, proto, or IPv6 literal is a type error, identical to the port-field rule.
 
 ### Semantics
 
@@ -333,67 +208,25 @@ The Ethernet parse prelude dispatches on EtherType at offset 12:
    - bits 11–0: VID → `pkt.vlan_id`
    - The *real* EtherType follows the tag (offset 16).
    - L3 starts at **offset 18** (14 + 4).
-2. If EtherType is not `0x8100`, there is no tag. L3 starts at the
-   usual **offset 14**, and the VLAN fields are not readable.
+2. If EtherType is not `0x8100`, there is no tag. L3 starts at the usual **offset 14**, and the VLAN fields are not readable.
 
-The compiler computes the L3 offset once (14 untagged, 18 tagged)
-and derives every downstream offset — IPv4 fixed header, IPv6 fixed
-header, TCP/UDP/ICMP — from it. The VLAN tag is **transparent to IP
-rules**: an existing IPv4 or IPv6 program matches a VLAN-tagged frame
-exactly as it would the untagged equivalent, because the parser
-re-reads the real EtherType after the tag.
+The compiler computes the L3 offset once (14 untagged, 18 tagged) and derives every downstream offset — IPv4 fixed header, IPv6 fixed header, TCP/UDP/ICMP — from it. The VLAN tag is **transparent to IP rules**: an existing IPv4 or IPv6 program matches a VLAN-tagged frame exactly as it would the untagged equivalent, because the parser re-reads the real EtherType after the tag.
 
-A VLAN field read on a frame with no VLAN tag yields "unreadable":
-the field comparison evaluates false (the rule does not match) and
-the program falls through, identical to reading `pkt.dst_port` on an
-ICMP packet. The emitter gates VLAN field comparisons on a `vlan_ok`
-flag set to 1 only inside the tagged branch after the 4-byte tag's
-bounds check succeeds — the same pattern as `v4_ok`/`v6_ok`/`l4_ok`.
+A VLAN field read on a frame with no VLAN tag yields "unreadable": the field comparison evaluates false (the rule does not match) and the program falls through, identical to reading `pkt.dst_port` on an ICMP packet. The emitter gates VLAN field comparisons on a `vlan_ok` flag set to 1 only inside the tagged branch after the 4-byte tag's bounds check succeeds — the same pattern as `v4_ok`/`v6_ok`/`l4_ok`.
 
 ### Edge cases
 
-- **Untagged frames.** `pkt.vlan_id` / `pkt.vlan_priority` are not
-  readable; rules using them do not match. IP rules still match
-  normally. No regression for any pre-v0.4 program.
-- **Double-tagged (QinQ).** A frame whose outer EtherType is
-  `0x88A8` (or a second `0x8100` after the first tag) is a stacked
-  VLAN. v0.4 parses the **outer tag only**: for an `0x8100` outer
-  tag, the outer VID/PCP are exposed and L3 is parsed after the
-  single 4-byte tag — if the real frame carried a second tag, the
-  bytes the parser reads as the real EtherType are actually the
-  inner tag's TPID, so an IP rule will not match (the inner tag is
-  not skipped). For an `0x88A8` outer TPID, v0.4 does not recognize
-  the tag at all (only `0x8100` triggers VLAN parsing); the frame is
-  treated as non-IP and falls through. QinQ inner-tag parsing is
-  deferred to a later version.
-- **Native VLAN (VID = 0).** A priority-tagged frame (tag present,
-  VID = 0) is a valid tagged frame: `pkt.vlan_id == 0` matches,
-  `pkt.vlan_priority` carries the PCP. This is distinct from an
-  untagged frame, where `pkt.vlan_id` is unreadable and
-  `pkt.vlan_id == 0` does **not** match.
-- **Tagged + truncated.** A frame truncated inside the 4-byte tag,
-  or after the tag but before the L3 header fits, leaves the
-  affected fields unreadable (VLAN, then L3, then L4 gates fall in
-  that order).
-- **Tagged + IPv6 + extension header.** The VLAN shift composes with
-  the v0.2 IPv6 rules: L3 starts at offset 18, the IPv6 fixed header
-  is read there, and a non-TCP/UDP next-header (extension header)
-  leaves the L4 fields at zero, exactly as in the untagged v6 path.
+- **Untagged frames.** `pkt.vlan_id` / `pkt.vlan_priority` are not readable; rules using them do not match. IP rules still match normally. No regression for any pre-v0.4 program.
+- **Double-tagged (QinQ).** A frame whose outer EtherType is `0x88A8` (or a second `0x8100` after the first tag) is a stacked VLAN. v0.4 parses the **outer tag only**: for an `0x8100` outer tag, the outer VID/PCP are exposed and L3 is parsed after the single 4-byte tag — if the real frame carried a second tag, the bytes the parser reads as the real EtherType are actually the inner tag's TPID, so an IP rule will not match (the inner tag is not skipped). For an `0x88A8` outer TPID, v0.4 does not recognize the tag at all (only `0x8100` triggers VLAN parsing); the frame is treated as non-IP and falls through. QinQ inner-tag parsing is deferred to a later version.
+- **Native VLAN (VID = 0).** A priority-tagged frame (tag present, VID = 0) is a valid tagged frame: `pkt.vlan_id == 0` matches, `pkt.vlan_priority` carries the PCP. This is distinct from an untagged frame, where `pkt.vlan_id` is unreadable and `pkt.vlan_id == 0` does **not** match.
+- **Tagged + truncated.** A frame truncated inside the 4-byte tag, or after the tag but before the L3 header fits, leaves the affected fields unreadable (VLAN, then L3, then L4 gates fall in that order).
+- **Tagged + IPv6 + extension header.** The VLAN shift composes with the v0.2 IPv6 rules: L3 starts at offset 18, the IPv6 fixed header is read there, and a non-TCP/UDP next-header (extension header) leaves the L4 fields at zero, exactly as in the untagged v6 path.
 
 ### Compile errors
 
-- `pkt.vlan_id` compared against a literal **above 4095** (e.g.
-  `pkt.vlan_id == 5000`, `pkt.vlan_id > 9000`, or a range/list member
-  such as `pkt.vlan_id in [1, 9000]`) is a compile error:
-  *"vlan_id value N outside valid range 0..4095"*. The boundary
-  value 4095 is itself valid, so `pkt.vlan_id == 4095` compiles;
-  this mirrors the established port rule, where `pkt.dst_port ==
-  65535` compiles but `pkt.dst_port == 70000` does not.
-- `pkt.vlan_priority` compared against a literal **above 7** (e.g.
-  `pkt.vlan_priority == 8`) is a compile error:
-  *"vlan_priority value N outside valid range 0..7"*.
-- Comparing a VLAN field against a non-integer operand (IP, IPv6, or
-  proto literal) is the usual type-mismatch error.
+- `pkt.vlan_id` compared against a literal **above 4095** (e.g. `pkt.vlan_id == 5000`, `pkt.vlan_id > 9000`, or a range/list member such as `pkt.vlan_id in [1, 9000]`) is a compile error: *"vlan_id value N outside valid range 0..4095"*. The boundary value 4095 is itself valid, so `pkt.vlan_id == 4095` compiles; this mirrors the established port rule, where `pkt.dst_port == 65535` compiles but `pkt.dst_port == 70000` does not.
+- `pkt.vlan_priority` compared against a literal **above 7** (e.g. `pkt.vlan_priority == 8`) is a compile error: *"vlan_priority value N outside valid range 0..7"*.
+- Comparing a VLAN field against a non-integer operand (IP, IPv6, or proto literal) is the usual type-mismatch error.
 
 ### Examples
 
@@ -410,31 +243,19 @@ default drop
 
 ### Builder additions (PKT format)
 
-All packet builders — `tcp()`, `udp()`, `icmp()`, `tcp6()`,
-`udp6()`, `icmp6()` — gain two optional parameters: `vlan_id` and
-`vlan_priority`. When either is set, the builder inserts a 4-byte
-802.1Q tag (TPID `0x8100`, PCP/DEI/VID) immediately after the
-Ethernet source MAC, shifting the L3 header by 4 bytes. The decoded
-fields dict gains `vlan_id` and `vlan_priority` keys so the
-interpreter oracle reads the same values the BPF parser sees. A
-builder call with neither parameter produces an untagged frame
-(unchanged from v0.2).
+All packet builders — `tcp()`, `udp()`, `icmp()`, `tcp6()`, `udp6()`, `icmp6()` — gain two optional parameters: `vlan_id` and `vlan_priority`. When either is set, the builder inserts a 4-byte 802.1Q tag (TPID `0x8100`, PCP/DEI/VID) immediately after the Ethernet source MAC, shifting the L3 header by 4 bytes. The decoded fields dict gains `vlan_id` and `vlan_priority` keys so the interpreter oracle reads the same values the BPF parser sees. A builder call with neither parameter produces an untagged frame (unchanged from v0.2).
 
 ## Conntrack — `conntrack(pkt).state`
 
 ### Construct
 
-A single new accessor exposes the daemon's connection-tracking table
-to the language:
+A single new accessor exposes the daemon's connection-tracking table to the language:
 
 ```
 conntrack(pkt).state
 ```
 
-`conntrack(pkt)` denotes the connection-tracking view of the packet;
-`.state` reads its state as a `ct_state`-typed value compared against
-state keywords. A bare `conntrack(pkt)` (without `.state`) is not a
-valid expression.
+`conntrack(pkt)` denotes the connection-tracking view of the packet; `.state` reads its state as a `ct_state`-typed value compared against state keywords. A bare `conntrack(pkt)` (without `.state`) is not a valid expression.
 
 The four states:
 
@@ -447,86 +268,39 @@ The four states:
 
 ### Type rules
 
-- `conntrack(pkt).state` has type `ct_state`. The only operators are
-  `==`, `!=`, and `in` over a list of state keywords:
+- `conntrack(pkt).state` has type `ct_state`. The only operators are `==`, `!=`, and `in` over a list of state keywords:
   ```
   allow if conntrack(pkt).state == established
   drop  if conntrack(pkt).state == invalid
   allow if conntrack(pkt).state in [established, related]
   ```
   Ordered comparisons (`<`, `>`, `<=`, `>=`) are a compile error.
-- The right-hand side must be a state keyword (`new`, `established`,
-  `related`, `invalid`). Comparing against a proto keyword, integer, or
-  any other operand is a compile error.
-- **No protocol guard is required.** Conntrack is evaluated on every
-  frame; a non-IP or IPv6 frame simply reads `new` (see Semantics).
-  Like the L3 IP fields and the VLAN fields, `conntrack(pkt).state` is
-  legal in any context, including before any `pkt.proto ==` test.
-- The state keywords (`new`, `established`, `related`, `invalid`) are
-  reserved words, like the proto keywords (`tcp`, `udp`, ...). An
-  identifier that merely starts with one (e.g. a counter named
-  `established_flows`) is unaffected.
-- There is no `ct_state` Tier 2 local: `conntrack(pkt).state` cannot be
-  hoisted into a variable (`x = conntrack(pkt).state` is invalid). It
-  may be compared directly inside Tier 2 `if` conditions.
+- The right-hand side must be a state keyword (`new`, `established`, `related`, `invalid`). Comparing against a proto keyword, integer, or any other operand is a compile error.
+- **No protocol guard is required.** Conntrack is evaluated on every frame; a non-IP or IPv6 frame simply reads `new` (see Semantics). Like the L3 IP fields and the VLAN fields, `conntrack(pkt).state` is legal in any context, including before any `pkt.proto ==` test.
+- The state keywords (`new`, `established`, `related`, `invalid`) are reserved words, like the proto keywords (`tcp`, `udp`, ...). An identifier that merely starts with one (e.g. a counter named `established_flows`) is unaffected.
+- There is no `ct_state` Tier 2 local: `conntrack(pkt).state` cannot be hoisted into a variable (`x = conntrack(pkt).state` is invalid). It may be compared directly inside Tier 2 `if` conditions.
 
 ### Semantics
 
-- **5-tuple.** The lookup key is `(src addr, dst addr, src port, dst
-  port, protocol)`, extracted from the variable `l3` pointer so it is
-  correct on VLAN-tagged frames. Addresses are network byte order, ports
-  host byte order — byte-matching the daemon's `conntrack` map
-  (`struct ConnKey` in `include/f/types.h`). For ICMP (and any frame
-  with no L4 header) the ports are 0.
-- **Lookup.** A single hash-map probe on the forward key; on a miss, a
-  second probe on the reverse key (src/dst addresses and ports swapped).
-  A hit in **either** direction is `established` — this is what lets a
-  reply match the entry its initiating packet created.
-- **Classification.** Forward-or-reverse hit → `established`. Otherwise a
-  TCP segment with no SYN flag → `invalid` (data/ACK/RST for a flow whose
-  handshake was never seen). Everything else → `new`. `established` takes
-  precedence over `invalid`.
-- **Entry creation (side effect).** Two constructs insert a forward
-  5-tuple into the conntrack table (via `BPF_NOEXIST`):
-  1. An explicit `allow` rule (or an explicit `default allow`) that
-     permits a packet reading `new` — the packet's own 5-tuple.
-  2. A **source-NAT** action (`masquerade`/`snat`) that actually rewrites
-     the source — the **post-NAT** 5-tuple (the rewritten source, the
-     unchanged destination, and the preserved ports). A NAT'd flow is a
-     tracked connection: inserting the post-NAT tuple is what lets the
-     reply — which arrives with that tuple reversed — read `established`,
-     so a stateful gateway can redirect return traffic back in. Without
-     it the canonical `masquerade` + `redirect to wan` / `redirect to lan
-     if established` gateway would be outbound-only.
+- **5-tuple.** The lookup key is `(src addr, dst addr, src port, dst port, protocol)`, extracted from the variable `l3` pointer so it is correct on VLAN-tagged frames. Addresses are network byte order, ports host byte order — byte-matching the daemon's `conntrack` map (`struct ConnKey` in `include/f/types.h`). For ICMP (and any frame with no L4 header) the ports are 0.
+- **Lookup.** A single hash-map probe on the forward key; on a miss, a second probe on the reverse key (src/dst addresses and ports swapped). A hit in **either** direction is `established` — this is what lets a reply match the entry its initiating packet created.
+- **Classification.** Forward-or-reverse hit → `established`. Otherwise a TCP segment with no SYN flag → `invalid` (data/ACK/RST for a flow whose handshake was never seen). Everything else → `new`. `established` takes precedence over `invalid`.
+- **Entry creation (side effect).** Two constructs insert a forward 5-tuple into the conntrack table (via `BPF_NOEXIST`):
+  1. An explicit `allow` rule (or an explicit `default allow`) that permits a packet reading `new` — the packet's own 5-tuple.
+  2. A **source-NAT** action (`masquerade`/`snat`) that actually rewrites the source — the **post-NAT** 5-tuple (the rewritten source, the unchanged destination, and the preserved ports). A NAT'd flow is a tracked connection: inserting the post-NAT tuple is what lets the reply — which arrives with that tuple reversed — read `established`, so a stateful gateway can redirect return traffic back in. Without it the canonical `masquerade` + `redirect to wan` / `redirect to lan if established` gateway would be outbound-only.
 
-  A `drop` on a `new` packet creates **nothing**, the implicit
-  fall-through `XDP_PASS` (no matching rule and no `default`) does
-  **not** create an entry, and `redirect` alone creates none. This is the
-  first family of constructs whose evaluation of one packet changes the
-  state a later packet sees.
-- **IPv4 only.** v0.4 conntrack tracks IPv4 flows (the daemon's `ConnKey`
-  is keyed on 32-bit addresses). On an IPv6 frame `conntrack(pkt).state`
-  is always `new`, and an allowed IPv6 packet creates no entry. A program
-  may freely mix conntrack rules with IPv6 rules; the IPv6 packets simply
-  read `new`.
+  A `drop` on a `new` packet creates **nothing**, the implicit fall-through `XDP_PASS` (no matching rule and no `default`) does **not** create an entry, and `redirect` alone creates none. This is the first family of constructs whose evaluation of one packet changes the state a later packet sees.
+- **IPv4 only.** v0.4 conntrack tracks IPv4 flows (the daemon's `ConnKey` is keyed on 32-bit addresses). On an IPv6 frame `conntrack(pkt).state` is always `new`, and an allowed IPv6 packet creates no entry. A program may freely mix conntrack rules with IPv6 rules; the IPv6 packets simply read `new`.
 
 ### Edge cases
 
 - *Non-IP / IPv6 frame.* Reads `new`; creates no entry.
-- *ICMP packet.* Tracked as a 5-tuple with ports 0; an untracked ICMP
-  packet is `new` (never `invalid` — `invalid` is TCP-only).
-- *UDP.* An untracked UDP datagram is `new`; its reply matches via the
-  reverse key once the query created the entry.
-- *Truncated TCP.* A frame cut before the flags byte cannot prove a SYN,
-  so an untracked truncated-TCP segment reads `invalid` (the `l4_ok` /
-  flag reads never happen).
-- *`established` vs `invalid`.* A non-SYN packet that matches an existing
-  entry is `established`, not `invalid` — the table lookup wins.
-- *`related`.* No packet is ever classified `related` in v0.4, so
-  `conntrack(pkt).state == related` never matches and
-  `in [established, related]` is effectively `== established`.
-- *5-tuple specificity.* A packet to a different port (or address, or
-  protocol) than a tracked flow does not match it — it reads `new`.
+- *ICMP packet.* Tracked as a 5-tuple with ports 0; an untracked ICMP packet is `new` (never `invalid` — `invalid` is TCP-only).
+- *UDP.* An untracked UDP datagram is `new`; its reply matches via the reverse key once the query created the entry.
+- *Truncated TCP.* A frame cut before the flags byte cannot prove a SYN, so an untracked truncated-TCP segment reads `invalid` (the `l4_ok` / flag reads never happen).
+- *`established` vs `invalid`.* A non-SYN packet that matches an existing entry is `established`, not `invalid` — the table lookup wins.
+- *`related`.* No packet is ever classified `related` in v0.4, so `conntrack(pkt).state == related` never matches and `in [established, related]` is effectively `== established`.
+- *5-tuple specificity.* A packet to a different port (or address, or protocol) than a tracked flow does not match it — it reads `new`.
 
 ### Compile errors
 
@@ -568,24 +342,15 @@ def filter(pkt):
 
 ### PKT format additions
 
-The `.pkt` test format gains two v0.4 extensions for conntrack, both
-exercised by the three-oracle runner:
+The `.pkt` test format gains two v0.4 extensions for conntrack, both exercised by the three-oracle runner:
 
-- **`state.conntrack`** — a list of pre-seeded forward 5-tuple entries
-  (analogous to `state.rate_limit`). Each entry has `src_ip`, `dst_ip`,
-  `proto` (required) and optional `src_port`/`dst_port` (default 0). The
-  interpreter starts its conntrack table with these entries; the BPF
-  oracle seeds the `conntrack` map. v0.4 entries are IPv4 only.
+- **`state.conntrack`** — a list of pre-seeded forward 5-tuple entries (analogous to `state.rate_limit`). Each entry has `src_ip`, `dst_ip`, `proto` (required) and optional `src_port`/`dst_port` (default 0). The interpreter starts its conntrack table with these entries; the BPF oracle seeds the `conntrack` map. v0.4 entries are IPv4 only.
   ```yaml
   state:
     conntrack:
       - { src_ip: "1.2.3.4", dst_ip: "2.2.2.2", src_port: 12345, dst_port: 80, proto: tcp }
   ```
-- **`sequence`** — an ordered list of packets sharing one conntrack
-  table, replacing the single `test_packet`/`expected` pair. The runner
-  loads the BPF program **once** and runs each step against it, so an
-  allowed `new` packet's created entry is visible to a later step. Each
-  step carries its own `expected`.
+- **`sequence`** — an ordered list of packets sharing one conntrack table, replacing the single `test_packet`/`expected` pair. The runner loads the BPF program **once** and runs each step against it, so an allowed `new` packet's created entry is visible to a later step. Each step carries its own `expected`.
   ```yaml
   sequence:
     - name: client SYN out
@@ -598,12 +363,7 @@ exercised by the three-oracle runner:
 
 ## Zones, Per-Zone @xdp, Redirect & `pkt.zone`
 
-The zone model abstracts policy over physical interfaces. The operator
-declares named zones (`wan`, `lan`, `dmz`) bound to interface lists,
-writes one `@xdp(<zone>)` block per zone, and forwards traffic between
-zones with `redirect to <zone>`. This is the first construct where one
-`.fw` file compiles to **multiple** BPF programs — one per zone —
-cooperating through bpffs-pinned shared maps.
+The zone model abstracts policy over physical interfaces. The operator declares named zones (`wan`, `lan`, `dmz`) bound to interface lists, writes one `@xdp(<zone>)` block per zone, and forwards traffic between zones with `redirect to <zone>`. This is the first construct where one `.fw` file compiles to **multiple** BPF programs — one per zone — cooperating through bpffs-pinned shared maps.
 
 ### 6.1 Zone declarations
 
@@ -615,18 +375,11 @@ zone lan = [lan0, lan1, lan2, lan3]
 zone dmz = [dmz0]
 ```
 
-Zero or more `zone` declarations appear at the top of the file, before
-any `@xdp` block. A zone names a set of one or more interfaces; every
-interface in a zone gets the same program attached. Interface names are
-resolved to ifindexes by the daemon at load time (a missing interface is
-a load-time error, not a compile error — interfaces may appear after
-boot).
+Zero or more `zone` declarations appear at the top of the file, before any `@xdp` block. A zone names a set of one or more interfaces; every interface in a zone gets the same program attached. Interface names are resolved to ifindexes by the daemon at load time (a missing interface is a load-time error, not a compile error — interfaces may appear after boot).
 
 #### Type rules
 
-A zone name is a compile-time identifier, not a runtime value. It
-appears only in `@xdp(<zone>)` declarations, `redirect to <zone>`
-actions, and `pkt.zone` comparisons — never as a packet-field operand.
+A zone name is a compile-time identifier, not a runtime value. It appears only in `@xdp(<zone>)` declarations, `redirect to <zone>` actions, and `pkt.zone` comparisons — never as a packet-field operand.
 
 #### Compile errors
 
@@ -652,35 +405,19 @@ def from_wan(pkt):
 redirect to wan
 ```
 
-Each `@xdp(<zone>)` block defines the policy for traffic arriving on
-that zone's interfaces. A block is either a Tier 1 rule sequence
-(optionally with `default`) or a single Tier 2 `def`, exactly as in
-v0.2 — the two tiers stay mutually exclusive **per block**. The
-single-`@xdp` file with no zone declarations is the degenerate case: one
-implicit zone whose name is the `@xdp` argument.
+Each `@xdp(<zone>)` block defines the policy for traffic arriving on that zone's interfaces. A block is either a Tier 1 rule sequence (optionally with `default`) or a single Tier 2 `def`, exactly as in v0.2 — the two tiers stay mutually exclusive **per block**. The single-`@xdp` file with no zone declarations is the degenerate case: one implicit zone whose name is the `@xdp` argument.
 
 #### Compilation model
 
-- Each zone compiles to its own BPF program (its own `<zone>.bpf.c` →
-  `<zone>.bpf.o`), named `fwl_prog` within its object. The daemon
-  attaches each object to every interface in its zone.
-- Shared state is held in bpffs-**pinned** maps (`LIBBPF_PIN_BY_NAME`):
-  above all the `conntrack` map, so a flow established on one zone is
-  `established` for every other zone — the requirement that makes a
-  stateful gateway work. Loading every zone object under a common pin
-  root resolves the pinned maps to one kernel map each. `fwl compile
-  --bundle <dir>` emits the per-zone sources, objects, a shared header,
-  and a `manifest.json` describing zones, objects, redirect topology,
-  and the pinned maps.
+- Each zone compiles to its own BPF program (its own `<zone>.bpf.c` → `<zone>.bpf.o`), named `fwl_prog` within its object. The daemon attaches each object to every interface in its zone.
+- Shared state is held in bpffs-**pinned** maps (`LIBBPF_PIN_BY_NAME`): above all the `conntrack` map, so a flow established on one zone is `established` for every other zone — the requirement that makes a stateful gateway work. Loading every zone object under a common pin root resolves the pinned maps to one kernel map each. `fwl compile --bundle <dir>` emits the per-zone sources, objects, a shared header, and a `manifest.json` describing zones, objects, redirect topology, and the pinned maps.
 
 #### Compile errors
 
-- `@xdp(<name>)` naming an undeclared zone (when the file declares
-  zones).
+- `@xdp(<name>)` naming an undeclared zone (when the file declares zones).
 - More than one `@xdp` block targeting the same zone.
 
-A declared zone need not have its own `@xdp` block — it may exist only
-as a redirect destination.
+A declared zone need not have its own `@xdp` block — it may exist only as a redirect destination.
 
 ### 6.3 Redirect action
 
@@ -690,27 +427,16 @@ as a redirect destination.
 redirect to <zone>
 ```
 
-A terminal action (like `allow`/`drop`) that forwards the packet out one
-of the destination zone's interfaces and returns `XDP_REDIRECT`. Valid
-as a Tier 1 rule action (`redirect to wan if <cond>`) and as a Tier 2
-action statement. **Not** valid as a `default` action — `default` admits
-only `allow`/`drop` — so `default redirect to <zone>` is a syntax error.
+A terminal action (like `allow`/`drop`) that forwards the packet out one of the destination zone's interfaces and returns `XDP_REDIRECT`. Valid as a Tier 1 rule action (`redirect to wan if <cond>`) and as a Tier 2 action statement. **Not** valid as a `default` action — `default` admits only `allow`/`drop` — so `default redirect to <zone>` is a syntax error.
 
 #### Semantics
 
-The emitter declares one `BPF_MAP_TYPE_DEVMAP` per destination zone
-(`fwl_devmap_<zone>`) and emits `bpf_redirect_map(&fwl_devmap_<zone>, 0,
-0)`. The daemon populates the devmap with the destination zone's egress
-ifindex(es) at load time; for a multi-interface zone the switch chip's
-FDB/MAC learning picks the physical egress port. `redirect` does not
-open a conntrack entry in v0.4 (NAT-driven flow creation is Phase 5).
+The emitter declares one `BPF_MAP_TYPE_DEVMAP` per destination zone (`fwl_devmap_<zone>`) and emits `bpf_redirect_map(&fwl_devmap_<zone>, 0, 0)`. The daemon populates the devmap with the destination zone's egress ifindex(es) at load time; for a multi-interface zone the switch chip's FDB/MAC learning picks the physical egress port. `redirect` does not open a conntrack entry in v0.4 (NAT-driven flow creation is Phase 5).
 
 #### Edge cases
 
-- **Hairpin** (`redirect to <ingress zone>`) is permitted — it forwards
-  back out the arriving zone (an unusual but valid configuration).
-- **Redirect destination down**: the kernel drops the frame at
-  `xdp_do_redirect`; no crash.
+- **Hairpin** (`redirect to <ingress zone>`) is permitted — it forwards back out the arriving zone (an unusual but valid configuration).
+- **Redirect destination down**: the kernel drops the frame at `xdp_do_redirect`; no crash.
 - **Redirect without prior NAT** is valid — pure L2/L3 forwarding.
 
 #### Compile errors
@@ -728,16 +454,11 @@ allow if pkt.zone == lan      # constant-true in this block
 drop
 ```
 
-`pkt.zone` is a **compile-time constant** within an `@xdp` block — the
-compiler knows the block's zone, so the comparison folds to `1`/`0` in
-the emitted C and to a fixed boolean in the interpreter. Useful in
-shared helpers (future multi-def, § 6.5) that branch on ingress zone.
+`pkt.zone` is a **compile-time constant** within an `@xdp` block — the compiler knows the block's zone, so the comparison folds to `1`/`0` in the emitted C and to a fixed boolean in the interpreter. Useful in shared helpers (future multi-def, § 6.5) that branch on ingress zone.
 
 #### Type rules
 
-Type: zone enum. Operators: `==`, `!=`, and `in [<zone>, ...]`. The RHS
-zone names must be declared. Ordered operators (`<`, `>`, `<=`, `>=`)
-are a compile error.
+Type: zone enum. Operators: `==`, `!=`, and `in [<zone>, ...]`. The RHS zone names must be declared. Ordered operators (`<`, `>`, `<=`, `>=`) are a compile error.
 
 #### Compile errors
 
@@ -747,12 +468,7 @@ are a compile error.
 
 ### 6.7 `rate_limit` zone scope — `scope=`
 
-v0.1 defined `rate_limit(N, per=<field>)` for a world with one program.
-v0.4 compiles one program per zone, which raises a question v0.1 could
-not ask: when a policy carries that rule in more than one zone, is `N`
-a budget per zone or a budget for the bundle? Through v0.4 the answer
-was per zone, by implementation and not by statement. `scope=` states
-it.
+v0.1 defined `rate_limit(N, per=<field>)` for a world with one program. v0.4 compiles one program per zone, which raises a question v0.1 could not ask: when a policy carries that rule in more than one zone, is `N` a budget per zone or a budget for the bundle? Through v0.4 the answer was per zone, by implementation and not by statement. `scope=` states it.
 
 #### Construct
 
@@ -760,106 +476,43 @@ it.
 <rule> limited by rate_limit(<N>, per=<field>[, scope=<zone|global>])
 ```
 
-`scope` is optional and its **default is `zone`** — the behaviour every
-policy written before this section already had, so adding the field
-changes no deployed policy's meaning.
+`scope` is optional and its **default is `zone`** — the behaviour every policy written before this section already had, so adding the field changes no deployed policy's meaning.
 
 #### Semantics
 
-- **`scope=zone`** (default) — the bucket belongs to the zone program
-  that holds the rule. A rule written into three zones is three
-  independent budgets: each zone admits `N` per second per bucket key,
-  so the bundle admits up to `3N`.
-- **`scope=global`** — one bucket for the rule across the whole
-  bundle. Every zone program that holds the rule spends the same
-  budget, so the bundle admits `N` per second per bucket key no matter
-  which zone the traffic arrives on.
+- **`scope=zone`** (default) — the bucket belongs to the zone program that holds the rule. A rule written into three zones is three independent budgets: each zone admits `N` per second per bucket key, so the bundle admits up to `3N`.
+- **`scope=global`** — one bucket for the rule across the whole bundle. Every zone program that holds the rule spends the same budget, so the bundle admits `N` per second per bucket key no matter which zone the traffic arrives on.
 
-Everything else about the primitive is unchanged: the one-second
-window, the pre-increment comparison, and the "fires once the bucket
-already holds `N`" reading of v0.1 § *The rate_limit Modifier* all
-apply identically under both scopes.
+Everything else about the primitive is unchanged: the one-second window, the pre-increment comparison, and the "fires once the bucket already holds `N`" reading of v0.1 § *The rate_limit Modifier* all apply identically under both scopes.
 
-**`scope` does not change the per-CPU nature of the count.** v0.1 chose
-a per-CPU map for `rate_limit`, and that is still the map a global
-bucket shares: `scope=global` makes two zones read the same *map*, and
-each CPU still keeps its own counter within it. So a global budget is
-`N` per second per bucket key **per CPU** — the same multiplier
-`scope=zone` has always carried, and the same one a single-zone v0.1
-policy has. Two zones' traffic therefore shares a budget when it is
-processed on the same CPU, which for one flow (one RSS bucket) it
-normally is, and does not when the kernel spreads it. Removing that
-multiplier is a change to `rate_limit` itself, not to `scope`, and is
-not in v0.4.
+**`scope` does not change the per-CPU nature of the count.** v0.1 chose a per-CPU map for `rate_limit`, and that is still the map a global bucket shares: `scope=global` makes two zones read the same *map*, and each CPU still keeps its own counter within it. So a global budget is `N` per second per bucket key **per CPU** — the same multiplier `scope=zone` has always carried, and the same one a single-zone v0.1 policy has. Two zones' traffic therefore shares a budget when it is processed on the same CPU, which for one flow (one RSS bucket) it normally is, and does not when the kernel spreads it. Removing that multiplier is a change to `rate_limit` itself, not to `scope`, and is not in v0.4.
 
-**Which rules share a global bucket.** A `scope=global` bucket is one
-bucket *per rule*, and "the same rule" means structurally the same
-rule: same action, same condition, same threshold, same `per=` field,
-same scope. That is what makes the common multi-zone shape work — one
-rule written once per `@xdp` block is one rule, so it gets one bucket.
-Two rules that differ anywhere in that list are two rules and get two
-buckets, even when both say `scope=global`. Source position is not part
-of the identity; a rule's line number and its index within its zone are
-not.
+**Which rules share a global bucket.** A `scope=global` bucket is one bucket *per rule*, and "the same rule" means structurally the same rule: same action, same condition, same threshold, same `per=` field, same scope. That is what makes the common multi-zone shape work — one rule written once per `@xdp` block is one rule, so it gets one bucket. Two rules that differ anywhere in that list are two rules and get two buckets, even when both say `scope=global`. Source position is not part of the identity; a rule's line number and its index within its zone are not.
 
 #### Composition with `per=`
 
-`scope` and `per=` are independent and orthogonal, and both are needed
-to describe a bucket: `per=` chooses **how the traffic is divided into
-buckets**, `scope` chooses **how far each bucket reaches**.
+`scope` and `per=` are independent and orthogonal, and both are needed to describe a bucket: `per=` chooses **how the traffic is divided into buckets**, `scope` chooses **how far each bucket reaches**.
 
 | | `scope=zone` (default) | `scope=global` |
 |---|---|---|
 | `per=src_ip` | each source IP gets `N`/s **in each zone** | each source IP gets `N`/s **across the bundle** |
 | `per=dst_port` | each destination port gets `N`/s in each zone | each destination port gets `N`/s across the bundle |
 
-`per=src_ip, scope=global` is the meaningful combination for a DoS
-control: one attacking source cannot get a fresh budget by moving to
-another zone's interface. `per=src_ip, scope=zone` is the meaningful
-combination for a fairness control within a zone.
+`per=src_ip, scope=global` is the meaningful combination for a DoS control: one attacking source cannot get a fresh budget by moving to another zone's interface. `per=src_ip, scope=zone` is the meaningful combination for a fairness control within a zone.
 
 #### Composition with the v0.2 dominator rule
 
-Unchanged. `scope` does not alter what `rate_limit` reads, only where
-the resulting count is kept, so the implicit `pkt.<field>` read at the
-call site is exactly the read v0.2 already governs: `per=src_port` /
-`per=dst_port` still require a `pkt.proto == tcp`/`udp` dominator,
-`per=src_ip` / `per=dst_ip` still require an IPv4-establishing
-dominator, and the same
-`error: rate_limit(per=<field>) call site does not dominate the
-implicit read of pkt.<field>` applies. Dominance is a property of the
-control-flow path to the call site within one program; a scope is a
-property of the state behind the call. Adding `scope=global` neither
-satisfies nor weakens a guard, and a rule shared across zones must
-still be individually dominated **in every zone that holds it** — each
-zone program is analysed on its own.
+Unchanged. `scope` does not alter what `rate_limit` reads, only where the resulting count is kept, so the implicit `pkt.<field>` read at the call site is exactly the read v0.2 already governs: `per=src_port` / `per=dst_port` still require a `pkt.proto == tcp`/`udp` dominator, `per=src_ip` / `per=dst_ip` still require an IPv4-establishing dominator, and the same `error: rate_limit(per=<field>) call site does not dominate the implicit read of pkt.<field>` applies. Dominance is a property of the control-flow path to the call site within one program; a scope is a property of the state behind the call. Adding `scope=global` neither satisfies nor weakens a guard, and a rule shared across zones must still be individually dominated **in every zone that holds it** — each zone program is analysed on its own.
 
 #### Compilation model
 
-- A `scope=zone` bucket compiles to a map private to the zone object,
-  named for the zone and the rule's index within it
-  (`fwl_rl_<zone>_<idx>`), and is **not** pinned. Two zones cannot
-  reach each other's buckets even when their rate-limit rules sit at
-  the same index.
-- A `scope=global` bucket compiles to a map named for its **bundle**
-  slot (`fwl_rl_g<slot>`) and pinned `LIBBPF_PIN_BY_NAME`, so every
-  zone object that declares it resolves to one kernel map under the
-  bundle's common pin root.
-- The slot number is allocated over the whole compilation unit from the
-  rule's structure, never from its index inside a zone, and
-  `max_entries` is a constant. Both are required, not incidental: a map
-  wearing a bundle-global name whose shape or index meaning came from
-  one zone's own analysis fails to load with `-EINVAL` when two zones
-  disagree, and silently aliases their slots when they agree. A global
-  bucket is on the shared side of that line precisely because the
-  author declared the state bundle-wide; per-zone counters, geoip
-  tries, log-sample accumulators and `scope=zone` buckets are not.
+- A `scope=zone` bucket compiles to a map private to the zone object, named for the zone and the rule's index within it (`fwl_rl_<zone>_<idx>`), and is **not** pinned. Two zones cannot reach each other's buckets even when their rate-limit rules sit at the same index.
+- A `scope=global` bucket compiles to a map named for its **bundle** slot (`fwl_rl_g<slot>`) and pinned `LIBBPF_PIN_BY_NAME`, so every zone object that declares it resolves to one kernel map under the bundle's common pin root.
+- The slot number is allocated over the whole compilation unit from the rule's structure, never from its index inside a zone, and `max_entries` is a constant. Both are required, not incidental: a map wearing a bundle-global name whose shape or index meaning came from one zone's own analysis fails to load with `-EINVAL` when two zones disagree, and silently aliases their slots when they agree. A global bucket is on the shared side of that line precisely because the author declared the state bundle-wide; per-zone counters, geoip tries, log-sample accumulators and `scope=zone` buckets are not.
 
 #### Diagnostic
 
-When a `rate_limit` rule appears in **more than one zone** and the
-author did **not** write `scope=`, the compiler warns and names the
-effective aggregate:
+When a `rate_limit` rule appears in **more than one zone** and the author did **not** write `scope=`, the compiler warns and names the effective aggregate:
 
 ```
 warning: 6:58: rate_limit(1000, per=src_ip) appears in 3 zones
@@ -869,17 +522,11 @@ scope=global for one shared bucket, or scope=zone to say per-zone is
 what you meant
 ```
 
-The warning is not a deprecation of the default — per-zone stays the
-default and stays correct. It exists because per-zone is *more
-permissive* than the naive reading of a single `rate_limit(N)`, and for
-a rule used as a DoS control that gap is security-relevant. It fires
-only for the implicit default: once any copy of the rule states a
-scope, the author has declared intent and is not warned again.
+The warning is not a deprecation of the default — per-zone stays the default and stays correct. It exists because per-zone is *more permissive* than the naive reading of a single `rate_limit(N)`, and for a rule used as a DoS control that gap is security-relevant. It fires only for the implicit default: once any copy of the rule states a scope, the author has declared intent and is not warned again.
 
 #### Compile errors
 
-- `scope=` with any value other than `zone` or `global`:
-  `error: rate_limit scope= must be zone or global, not '<value>'`
+- `scope=` with any value other than `zone` or `global`: `error: rate_limit scope= must be zone or global, not '<value>'`
 
 #### Examples
 
@@ -916,17 +563,9 @@ allow
 
 ### 6.8 Log-event record ABI
 
-`log` submits one record to `fwl_log_events`, a `BPF_MAP_TYPE_RINGBUF`
-that is **bundle-wide**: every zone object in a unit pins it by name
-and writes into one kernel ring. That is deliberate — the ring is fixed
-size and genuinely unit-wide, and splitting it per zone would push
-multiplexing onto every consumer for no gain.
+`log` submits one record to `fwl_log_events`, a `BPF_MAP_TYPE_RINGBUF` that is **bundle-wide**: every zone object in a unit pins it by name and writes into one kernel ring. That is deliberate — the ring is fixed size and genuinely unit-wide, and splitting it per zone would push multiplexing onto every consumer for no gain.
 
-It does mean a record is only meaningful *with* its zone. `rule_index`
-is numbered within a zone, so zone `wan`'s rule 2 and zone `lan`'s rule
-2 write the same number into the same ring. **A logged rule is
-identified by the pair `(zone_id, rule_index)`, never by `rule_index`
-alone.**
+It does mean a record is only meaningful *with* its zone. `rule_index` is numbered within a zone, so zone `wan`'s rule 2 and zone `lan`'s rule 2 write the same number into the same ring. **A logged rule is identified by the pair `(zone_id, rule_index)`, never by `rule_index` alone.**
 
 #### Record layout (v1)
 
@@ -951,39 +590,19 @@ struct fwl_log_event {
 };                      /* 40 bytes */
 ```
 
-The layout is defined once, in `fwl/log_abi.py`: both the C the
-emitter stamps into every object and the `struct` format its consumers
-unpack come from that module, and a unit test compiles the struct and
-asserts each offset against the format. Two copies of a record layout
-is how a reader and a datapath drift apart without either reporting an
-error.
+The layout is defined once, in `fwl/log_abi.py`: both the C the emitter stamps into every object and the `struct` format its consumers unpack come from that module, and a unit test compiles the struct and asserts each offset against the format. Two copies of a record layout is how a reader and a datapath drift apart without either reporting an error.
 
 #### Header fields
 
-A consumer **must** validate `magic`, `version` and `event_size`
-before reading any other field, and **must** treat a mismatch as an
-error rather than skipping the record. The failure this guards against
-is not a crash: a changed layout unpacks into values that all look
-legal — a rule index that names a real rule, a port in range — so
-without the header a mismatch produces plausible wrong data and no
-diagnostic anywhere.
+A consumer **must** validate `magic`, `version` and `event_size` before reading any other field, and **must** treat a mismatch as an error rather than skipping the record. The failure this guards against is not a crash: a changed layout unpacks into values that all look legal — a rule index that names a real rule, a port in range — so without the header a mismatch produces plausible wrong data and no diagnostic anywhere.
 
 #### `zone_id`
 
-`zone_id` is FNV-1a 32 over the UTF-8 zone name (offset basis
-`0x811C9DC5`, prime `0x01000193`).
+`zone_id` is FNV-1a 32 over the UTF-8 zone name (offset basis `0x811C9DC5`, prime `0x01000193`).
 
-It is a hash of the name and not an ordinal assigned at emit time,
-because an ordinal is a property of a zone's *position* in the unit:
-inserting a zone renumbers every zone after it, and a table read back
-against a previous compilation then names the wrong zone — silently.
-The name is what every other artifact already keys on
-(`fwl_counters_<zone>`, the manifest, `pkt.zone`), so the id follows
-the name.
+It is a hash of the name and not an ordinal assigned at emit time, because an ordinal is a property of a zone's *position* in the unit: inserting a zone renumbers every zone after it, and a table read back against a previous compilation then names the wrong zone — silently. The name is what every other artifact already keys on (`fwl_counters_<zone>`, the manifest, `pkt.zone`), so the id follows the name.
 
-A hash's one failure mode is a collision, and a collision restores
-exactly the ambiguity this field removes. It is therefore a **compile
-error**, checked across the whole unit's zone set:
+A hash's one failure mode is a collision, and a collision restores exactly the ambiguity this field removes. It is therefore a **compile error**, checked across the whole unit's zone set:
 
 ```
 error: zones 'wan' and 'lan' share log-event zone id 0x0BADC0DE. Log
@@ -992,17 +611,11 @@ the two zones' events indistinguishable — the ambiguity the zone tag
 removes. Rename one of them.
 ```
 
-`zone_id == 0` is reserved to mean "unattributed" and no zone may
-compile to it.
+`zone_id == 0` is reserved to mean "unattributed" and no zone may compile to it.
 
 #### The lookup table
 
-A numeric id a consumer cannot resolve to a name is no improvement on
-no id at all, so the table ships **with the bundle**. Every bundle's
-`manifest.json` carries a `zone_ids` object mapping name to id, over
-every zone the unit can emit an event from (including the degenerate
-`@xdp(eth0)` case, which declares no zones and still tags its records
-`eth0`):
+A numeric id a consumer cannot resolve to a name is no improvement on no id at all, so the table ships **with the bundle**. Every bundle's `manifest.json` carries a `zone_ids` object mapping name to id, over every zone the unit can emit an event from (including the degenerate `@xdp(eth0)` case, which declares no zones and still tags its records `eth0`):
 
 ```json
 "zone_ids": {
@@ -1011,18 +624,13 @@ every zone the unit can emit an event from (including the degenerate
 }
 ```
 
-`fwl_shared.h` repeats the table as a comment for a human reading the
-bundle; `manifest.json` is the machine-readable copy.
+`fwl_shared.h` repeats the table as a comment for a human reading the bundle; `manifest.json` is the machine-readable copy.
 
 #### Rejected alternatives
 
-- **Bundle-global rule numbering.** Would couple every zone object to
-  whole-unit knowledge at emit time — the same coupling that made the
-  shared-counter-map defect possible.
-- **Packing the zone into the high bits of `rule_index`.** Saves four
-  bytes, costs clarity, and caps the rule count.
-- **One ring buffer per zone.** The shared ring is correct; splitting
-  it moves multiplexing into every consumer and buys nothing.
+- **Bundle-global rule numbering.** Would couple every zone object to whole-unit knowledge at emit time — the same coupling that made the shared-counter-map defect possible.
+- **Packing the zone into the high bits of `rule_index`.** Saves four bytes, costs clarity, and caps the rule count.
+- **One ring buffer per zone.** The shared ring is correct; splitting it moves multiplexing into every consumer and buys nothing.
 
 ### Examples
 
@@ -1059,11 +667,7 @@ def from_dmz(pkt):
 
 ## NAT — `masquerade`, `snat to <ip>`, `dnat to <ip>:<port>` (Phase 5)
 
-NAT rewrites packets in flight: the source for outbound traffic
-(`snat`/`masquerade`), the destination for inbound port forwarding
-(`dnat`), and the matching reverse rewrite on the return path. NAT
-builds on zones — `masquerade` + `redirect to wan` is the core gateway
-pattern.
+NAT rewrites packets in flight: the source for outbound traffic (`snat`/`masquerade`), the destination for inbound port forwarding (`dnat`), and the matching reverse rewrite on the return path. NAT builds on zones — `masquerade` + `redirect to wan` is the core gateway pattern.
 
 ### Construct
 
@@ -1073,63 +677,26 @@ snat to <ip>                # rewrite source -> a fixed IPv4 literal
 dnat to <ip>:<port>         # rewrite destination -> a fixed IPv4:port
 ```
 
-All three are **non-terminal rewrite actions**: they translate the
-packet in place and fall through, so the *following* terminal action
-(`redirect to <zone>` or `allow`) emits the rewritten frame. They are
-valid as Tier 1 rule actions (`snat to 203.0.113.1 if pkt.proto == tcp`)
-and as Tier 2 action statements. They are **not** valid `default`
-actions — `default masquerade` is a syntax error.
+All three are **non-terminal rewrite actions**: they translate the packet in place and fall through, so the *following* terminal action (`redirect to <zone>` or `allow`) emits the rewritten frame. They are valid as Tier 1 rule actions (`snat to 203.0.113.1 if pkt.proto == tcp`) and as Tier 2 action statements. They are **not** valid `default` actions — `default masquerade` is a syntax error.
 
 ### Type rules
 
-`masquerade` takes no operand. `snat to` takes an IPv4 literal. `dnat
-to` takes an IPv4 literal and a port (`1`–`65535`). A `dnat` port
-outside that range is a compile error.
+`masquerade` takes no operand. `snat to` takes an IPv4 literal. `dnat to` takes an IPv4 literal and a port (`1`–`65535`). A `dnat` port outside that range is a compile error.
 
 ### Semantics
 
-- **Source NAT (`snat`/`masquerade`).** When the action fires, the
-  emitter rewrites the source address (to the literal, or — for
-  `masquerade` — to the address the daemon wrote into the per-zone
-  `fwl_nat_cfg` map), fixes the IPv4 header checksum and the TCP/UDP
-  checksum, and installs a **reply mapping** in the shared `fwl_nat`
-  map so the return packet is de-NAT'd. v0.4 is **port-preserving**:
-  the translated source port equals the original, so two oracles agree
-  deterministically and the only L4-checksum delta is the address
-  change. (Ephemeral-port reallocation on collision is Phase 5.3.)
-- **Destination NAT (`dnat`).** Rewrites the destination address **and**
-  port, fixes both checksums, and installs the reply mapping that
-  restores the original (public) destination on return traffic.
-- **Return traffic (automatic de-NAT).** Before any rule evaluates,
-  each NAT-carrying program probes `fwl_nat` with the packet's forward
-  5-tuple; on a hit it rewrites the recorded side (destination for an
-  SNAT/masquerade reply, source for a DNAT reply) back to the original
-  endpoint, fixing checksums. In a bundle, **every** zone program emits
-  this de-NAT pass and the shared `fwl_nat` map, so the egress zone
-  installs the mapping and the ingress zone consumes it.
-- **Checksums.** XDP has no `bpf_l3/l4_csum_replace` (skb-only), so the
-  IPv4 header checksum is recomputed with `bpf_csum_diff` and the L4
-  checksum is updated incrementally (RFC 1624) in native byte order.
-  A wrong checksum compiles and passes the interpreter but is silently
-  dropped on the wire — the BPF oracle therefore recomputes both
-  checksums of every asserted `expected.output_packet`.
-- **Conditions read the original packet.** A NAT rewrite affects the
-  emitted frame and the reply mapping only; rule conditions evaluated
-  after a `snat`/`dnat` still read the pre-NAT parsed fields (the
-  emitter captures them into locals up front, and the interpreter
-  mirrors this).
-- **IPv4 only.** v0.4 NAT translates IPv4 only (the `fwl_nat` key is
-  32-bit, like conntrack). An IPv6 frame is never rewritten and creates
-  no mapping. Only the no-IP-options common case (`ihl == 5`) is
-  rewritten.
+- **Source NAT (`snat`/`masquerade`).** When the action fires, the emitter rewrites the source address (to the literal, or — for `masquerade` — to the address the daemon wrote into the per-zone `fwl_nat_cfg` map), fixes the IPv4 header checksum and the TCP/UDP checksum, and installs a **reply mapping** in the shared `fwl_nat` map so the return packet is de-NAT'd. v0.4 is **port-preserving**: the translated source port equals the original, so two oracles agree deterministically and the only L4-checksum delta is the address change. (Ephemeral-port reallocation on collision is Phase 5.3.)
+- **Destination NAT (`dnat`).** Rewrites the destination address **and** port, fixes both checksums, and installs the reply mapping that restores the original (public) destination on return traffic.
+- **Return traffic (automatic de-NAT).** Before any rule evaluates, each NAT-carrying program probes `fwl_nat` with the packet's forward 5-tuple; on a hit it rewrites the recorded side (destination for an SNAT/masquerade reply, source for a DNAT reply) back to the original endpoint, fixing checksums. In a bundle, **every** zone program emits this de-NAT pass and the shared `fwl_nat` map, so the egress zone installs the mapping and the ingress zone consumes it.
+- **Checksums.** XDP has no `bpf_l3/l4_csum_replace` (skb-only), so the IPv4 header checksum is recomputed with `bpf_csum_diff` and the L4 checksum is updated incrementally (RFC 1624) in native byte order. A wrong checksum compiles and passes the interpreter but is silently dropped on the wire — the BPF oracle therefore recomputes both checksums of every asserted `expected.output_packet`.
+- **Conditions read the original packet.** A NAT rewrite affects the emitted frame and the reply mapping only; rule conditions evaluated after a `snat`/`dnat` still read the pre-NAT parsed fields (the emitter captures them into locals up front, and the interpreter mirrors this).
+- **IPv4 only.** v0.4 NAT translates IPv4 only (the `fwl_nat` key is 32-bit, like conntrack). An IPv6 frame is never rewritten and creates no mapping. Only the no-IP-options common case (`ihl == 5`) is rewritten.
 
 ### Edge cases
 
-- *Guard miss.* `snat to <ip> if pkt.proto == tcp` leaves a UDP frame
-  unrewritten (the action never fires).
+- *Guard miss.* `snat to <ip> if pkt.proto == tcp` leaves a UDP frame unrewritten (the action never fires).
 - *IPv6 frame.* No rewrite, no mapping (NAT is IPv4-only).
-- *UDP with checksum 0.* Left as 0 ("no checksum"); a computed checksum
-  that folds to 0 is stored as `0xffff`.
+- *UDP with checksum 0.* Left as 0 ("no checksum"); a computed checksum that folds to 0 is stored as `0xffff`.
 - *ICMP.* v0.4 NAT does not rewrite ICMP (ICMP-error NAT is Phase 5.3).
 
 ### Compile errors
@@ -1146,17 +713,27 @@ outside that range is a compile error.
 # Outbound gateway: the LAN masquerades behind the WAN address and
 # redirects out; return traffic is de-NAT'd automatically before the
 # WAN program redirects it back.
+#
+# INCOMPLETE ON A REAL SEGMENT — see the note below. The two rules at
+# the top of the lan block are not optional on a box that also runs
+# DHCP or DNS.
 zone wan = [wan0]
 zone lan = [lan0, lan1]
 
 @xdp(lan)
+allow if pkt.proto == udp and pkt.dst_port == 67   # DHCP, to us
+allow if pkt.dst_ip == 10.0.0.1                    # our own address
 masquerade
 redirect to wan
 
 @xdp(wan)
-redirect to lan if conntrack(pkt).state == established
+redirect to lan if conntrack(pkt).state in [established, related]
 drop
 ```
+
+**`masquerade` + `redirect` swallows traffic addressed to the box itself.** Both are unconditional, so anything reaching them is source-NATed and emitted on the other port — including packets that were never going anywhere, because their destination was the appliance. The case that finds this is DHCP: a client with no lease addresses its DISCOVER to `255.255.255.255`, since it has neither an address of its own nor yours. Without a terminal `allow` ahead of the rewrite the request is masqueraded onto the uplink and arrives on the far side as `<gateway>.68 > 255.255.255.255.67`, while the appliance's own DHCP server — correctly bound, correctly contained — never sees it. `allow` is terminal, so a rule that matches it never reaches `masquerade`.
+
+The same reasoning covers the segment's own broadcast and multicast (`224.0.0.0/4`, `255.255.255.255`, the directed broadcast, NetBIOS): none of it is routable, and all of it would otherwise be masqueraded onto the uplink one frame at a time. `fwl/examples/storm_shield.fw` is the worked example.
 
 ```
 # Port forward TCP/80 on the WAN address to an internal web server.
@@ -1169,11 +746,7 @@ redirect to lan
 
 The `.pkt` test format gains two Phase 5 extensions:
 
-- **`expected.output_packet`** — the packet header fields after the
-  program's NAT rewrite (`src_ip`, `dst_ip`, `src_port`, `dst_port`;
-  only the listed keys are checked). Verified by both oracles; when set,
-  the BPF oracle also recomputes the IPv4 + TCP/UDP checksums of the
-  rewritten frame and fails on any invalid checksum.
+- **`expected.output_packet`** — the packet header fields after the program's NAT rewrite (`src_ip`, `dst_ip`, `src_port`, `dst_port`; only the listed keys are checked). Verified by both oracles; when set, the BPF oracle also recomputes the IPv4 + TCP/UDP checksums of the rewritten frame and fails on any invalid checksum.
   ```yaml
   expected:
     bpf_action: allow
@@ -1182,11 +755,7 @@ The `.pkt` test format gains two Phase 5 extensions:
       dst_ip: "93.184.216.34"
       src_port: 12345
   ```
-- **`state.nat`** — the masquerade source IP and pre-seeded reply
-  mappings for return-traffic de-NAT (analogous to `state.conntrack`).
-  Each mapping carries the forward 5-tuple the return packet presents,
-  the address+port to restore, and `nat_type` (`snat` rewrites source,
-  `dnat` rewrites destination).
+- **`state.nat`** — the masquerade source IP and pre-seeded reply mappings for return-traffic de-NAT (analogous to `state.conntrack`). Each mapping carries the forward 5-tuple the return packet presents, the address+port to restore, and `nat_type` (`snat` rewrites source, `dnat` rewrites destination).
   ```yaml
   state:
     nat:
@@ -1201,46 +770,23 @@ The `.pkt` test format gains two Phase 5 extensions:
 
 The two constructs activate parse paths the same way v0.2 fields do:
 
-- **TCP flags** extend the existing TCP L4 parse. Each referenced flag
-  adds one byte-field read (`tcp->{flag}`) inside the bounds-checked
-  TCP branch, on both the IPv4 and IPv6 paths. No flag read happens
-  unless the program references that flag.
-- **ICMP type/code** add a new protocol branch. `pkt.icmp.*` emits an
-  ICMPv4 branch in the IPv4 L4 region (after the variable-IHL header);
-  `pkt.icmp6.*` emits an ICMPv6 branch at the fixed offset in the IPv6
-  path and activates the v6 parse path (EtherType dispatch on
-  `0x86DD`). The type/code bytes are read through a minimal two-byte
-  header struct, gated by `icmp_ok` / `icmp6_ok` so a truncated or
-  wrong-protocol frame falls through.
+- **TCP flags** extend the existing TCP L4 parse. Each referenced flag adds one byte-field read (`tcp->{flag}`) inside the bounds-checked TCP branch, on both the IPv4 and IPv6 paths. No flag read happens unless the program references that flag.
+- **ICMP type/code** add a new protocol branch. `pkt.icmp.*` emits an ICMPv4 branch in the IPv4 L4 region (after the variable-IHL header); `pkt.icmp6.*` emits an ICMPv6 branch at the fixed offset in the IPv6 path and activates the v6 parse path (EtherType dispatch on `0x86DD`). The type/code bytes are read through a minimal two-byte header struct, gated by `icmp_ok` / `icmp6_ok` so a truncated or wrong-protocol frame falls through.
 
-The strict-superset guarantee holds: a v0.2-shaped program emits
-exactly the v0.2 code (no ICMP branch, no extra flag reads), so its
-behaviour on every packet is unchanged.
+The strict-superset guarantee holds: a v0.2-shaped program emits exactly the v0.2 code (no ICMP branch, no extra flag reads), so its behaviour on every packet is unchanged.
 
 ## What Is Not in v0.4
 
-- No symbolic names for ICMP types/codes (`echo_request`, `unreachable`)
-  — v0.4 matches on the numeric byte only. Named constants are a future
-  ergonomics item.
+- No symbolic names for ICMP types/codes (`echo_request`, `unreachable`) — v0.4 matches on the numeric byte only. Named constants are a future ergonomics item.
 - No ICMP `id`/`sequence` field matching — only `type` and `code`.
-- No `related` conntrack state keyed on the ICMP error's embedded
-  5-tuple (deferred to Phase 4.3 conntrack, which builds on this
-  construct).
-- No extension-header chasing for ICMPv6 — a packet behind an extension
-  header has no readable `pkt.icmp6.*` (same conservatism as v0.2 L4
-  fields).
+- No `related` conntrack state keyed on the ICMP error's embedded 5-tuple (deferred to Phase 4.3 conntrack, which builds on this construct).
+- No extension-header chasing for ICMPv6 — a packet behind an extension header has no readable `pkt.icmp6.*` (same conservatism as v0.2 L4 fields).
 - No `per=` rate-limit bucket keyed on ICMP type/code.
 - QinQ inner-tag parsing (only the outer tag is exposed).
 - The DEI bit as a readable field.
 - VLAN rewriting / pushing / popping (read-only matching only).
 - `0x88A8` TPID recognition (only `0x8100` triggers VLAN parsing).
-- **Conntrack `related`** — ICMP-error tracking (an ICMP error whose
-  embedded 5-tuple matches an established flow) is deferred. The
-  `related` keyword is accepted in the language, but no packet is ever
-  classified `related` in v0.4, so `== related` never matches.
-- **IPv6 conntrack** — v0.4 tracks IPv4 flows only (the daemon's
-  `ConnKey` is 32-bit). IPv6 packets read `new` and create no entry.
-- **Conntrack on fragments** — no special handling; only the first
-  fragment carries the L4 header that the 5-tuple needs.
-- **Configurable UDP/TCP conntrack timeouts in the language** — timeouts
-  live in the daemon (`fd.yaml`) and its GC, not the `.fw` surface.
+- **Conntrack `related`** — ICMP-error tracking (an ICMP error whose embedded 5-tuple matches an established flow) is deferred. The `related` keyword is accepted in the language, but no packet is ever classified `related` in v0.4, so `== related` never matches.
+- **IPv6 conntrack** — v0.4 tracks IPv4 flows only (the daemon's `ConnKey` is 32-bit). IPv6 packets read `new` and create no entry.
+- **Conntrack on fragments** — no special handling; only the first fragment carries the L4 header that the 5-tuple needs.
+- **Configurable UDP/TCP conntrack timeouts in the language** — timeouts live in the daemon (`fd.yaml`) and its GC, not the `.fw` surface.
