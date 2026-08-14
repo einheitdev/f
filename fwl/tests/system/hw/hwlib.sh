@@ -185,6 +185,13 @@ hw::teach_fdb() {
 # Name->slot comes from the fwl_counter_table comment in the zone's
 # generated C; counters are zone-private, so the pinned map is
 # fwl_counters_<zone> (zone = the .bpf.c basename).
+#
+# Prints -1 when no zone in the running bundle declares that counter, the
+# same way hw::map_sum and hw::map_entries report a missing pin. It used
+# to print 0, and four assertions in this suite read a counter and expect
+# exactly 0 — a renamed, misspelled or silently-dropped counter satisfied
+# every one of them. "Absent" and "zero" are different measurements and a
+# check that cannot tell them apart is not checking anything.
 hw::counter() {
   local name="$1"
   local src slot zone=""
@@ -199,7 +206,7 @@ hw::counter() {
   done
   if [ -z "$zone" ]; then
     echo "unknown counter $name" >&2
-    echo 0
+    echo -1
     return 1
   fi
   bpftool map dump pinned "$PIN/fwl_counters_$zone" 2>/dev/null \
@@ -551,6 +558,19 @@ hw::mirror_off() {
 }
 
 hw::finish() {
+  # Which bundle was actually loaded when the scenario ended. The sweep
+  # needs this BEFORE restore_smoke moves the symlink: a text plant
+  # compiled into v-hw-<tag> can be superseded mid-run by fd's own
+  # watcher recompiling the pristine /etc/f/rules.fw, and the scenario
+  # then passes against a policy the plant never touched. Two vacuity
+  # findings turned out to be exactly that, so the sweep records the
+  # symlink instead of assuming the plant stayed live.
+  if [ -n "${HW_SABOTAGE:-}" ]; then
+    $PY "$HERE/sweep_lib.py" note --scenario "$HW_SABOTAGE" \
+      --key current_bundle \
+      --value "$(readlink -f "$BUNDLE_ROOT/current" 2>/dev/null)" \
+      --receipt "${HW_SABOTAGE_RECEIPT:-}" >/dev/null 2>&1 || true
+  fi
   hw::hosts_down
   hw::restore_smoke
   echo

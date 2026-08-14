@@ -40,6 +40,27 @@ from sweep_lib import UnitDropIn
 PIN = '/sys/fs/bpf/f'
 RECV_IF = os.environ.get('RECV_IF', 'enp1s0f1')
 
+# A stand-in compiler for the l3_06 plant. fd's watcher runs whatever
+# `watch.fwl` names, so pointing it here makes every commit — including
+# a syntactically broken one — produce a valid, permissive bundle. That
+# is the defect l3_06 exists to catch: a bad commit taking the running
+# policy down with it.
+PERMISSIVE_FWL = r"""#!/bin/sh
+prev=""
+dir=""
+for a in "$@"; do
+  [ "$prev" = "--bundle" ] && dir="$a"
+  prev="$a"
+done
+[ "$1" = check ] && exit 0
+[ -n "$dir" ] || exit 1
+tmp=$(mktemp --suffix=.fw)
+printf 'zone t = [%s]\n\n@xdp(t)\n\ncount good if pkt.src_ip == 10.99.52.5\ndefault allow\n' > "$tmp"
+exec /usr/local/bin/fwl compile --bundle "$dir" "$tmp"
+""" % RECV_IF
+PERMISSIVE_PATH = '/usr/local/bin/fwl-sweep-permissive'
+
+
 def _s(name, subject, plants=(), declared='', witness_note='',
        timeout_s=600):
   return Scenario(name=name, subject=subject, plants=tuple(plants),
@@ -331,12 +352,21 @@ SCENARIOS = {s.name: s for s in [
     _s('l3_02_ab_swap',
        'the changed rule flips mid-stream while the untouched flow is '
        'uninterrupted',
-       [_p('pre-reload-rule-inert',
-           'the pre-reload drop names the wrong source, so flow B was '
-           'never blocked and the "flip" is not a flip',
-           [PolicySub(tag='l3-02',
-                      find='drop if pkt.proto == udp and pkt.src_ip == 10.99.53.2',
-                      repl='drop if pkt.proto == udp and pkt.src_ip == 10.99.53.9')])],
+       [_p('watcher-never-fires',
+           'the watcher is off, so the mid-stream change never lands and '
+           'the flip this scenario measures does not happen',
+           [FileSub(path='/etc/f/fd.yaml', find='  enabled: true',
+                    repl='  enabled: false')],
+           residual='FOUND BY THIS SWEEP: the first plant here edited the '
+                    'pre-reload policy instead, and the scenario stayed '
+                    'green because it hands the SAME policy to '
+                    '/etc/f/rules.fw and fd\'s watcher recompiles that '
+                    'file itself — the plant was reverted by the product '
+                    'within five seconds. Every scenario that drives the '
+                    'watcher (l3_01, l3_02, l8_04, l8_05, l8_10) is '
+                    'therefore planted at the watcher rather than in the '
+                    'policy text: a compile fd performs does not pass '
+                    'through the harness\'s `fwl` wrapper.')],
        witness_note='as l3_01: the claim is that one flow lost nothing '
                     'and the other flipped, both measured as arrivals on '
                     'one cable; no delivery to a host is asserted',
@@ -358,30 +388,45 @@ SCENARIOS = {s.name: s for s in [
     _s('l3_05_crash_containment',
        'the XDP program keeps enforcing the last-committed policy with '
        'the daemon dead',
-       [_p('datapath-dies-with-the-daemon',
-           'an ExecStopPost detaches the program when the unit stops, so '
-           'the datapath no longer outlives fd — exactly the property '
-           'this scenario claims',
-           [UnitDropIn(unit='fd',
-                       body='[Service]\nExecStopPost=/bin/sh -c "ip link '
-                            'set dev %s xdp off"\n' % RECV_IF)],
-           verify='systemctl show fd -p ExecStopPost --value '
-                  '| grep -q "xdp off"')],
+       [_p('no-datapath-to-outlive-it',
+           'the program is gone from the netdev, so there is no datapath '
+           'to survive the daemon: the drop rule stops being enforced and '
+           'the counter stops moving',
+           [DeployCmd(tag='l3-05', phase='post',
+                      cmd='ip link set dev %s xdp off' % RECV_IF)],
+           residual='the plant removes the program directly rather than '
+                    'making fd\'s DEATH remove it. An ExecStopPost drop-in '
+                    'was tried first and left the scenario green — the '
+                    'drop-in installed, and the program was still attached '
+                    'with fd dead, which is worth a look on its own: '
+                    'either the hook did not run or something re-attached '
+                    'inside the window.')],
        timeout_s=300),
 
     _s('l3_06_bad_commit',
        'a broken policy write does not disturb the policy that is '
        'running',
-       [_p('running-policy-inert',
-           'the running policy\'s drop names the wrong port, so "the old '
-           'rule is still enforced" was never true to begin with',
-           [PolicySub(tag='l3-06',
-                      find='drop if pkt.proto == udp and pkt.dst_port == 6666',
-                      repl='drop if pkt.proto == udp and pkt.dst_port == 6667')],
-           residual='the other half — that a VALID replacement would '
-                    'have been adopted — is not planted: the broken '
-                    'policy is written straight to /etc/f/rules.fw and '
-                    'never passes through the compile hook')],
+       [_p('the-bad-commit-lands',
+           'the compiler fd\'s watcher runs accepts anything and emits a '
+           'permissive bundle, so the broken commit is adopted and takes '
+           'the running policy down with it — the exact failure this '
+           'scenario exists to refuse',
+           [DeployCmd(tag='l3-06', phase='pre',
+                      cmd=('cat > %s <<\'SWEEP_EOF\'\n%s\nSWEEP_EOF\n'
+                           'chmod +x %s'
+                           % (PERMISSIVE_PATH, PERMISSIVE_FWL,
+                              PERMISSIVE_PATH)),
+                      undo='rm -f %s' % PERMISSIVE_PATH),
+            FileSub(path='/etc/f/fd.yaml',
+                    find='  fwl: /usr/local/bin/fwl',
+                    repl='  fwl: %s' % PERMISSIVE_PATH)],
+           residual='FOUND BY THIS SWEEP: the first plant here edited the '
+                    'good policy instead, and the scenario stayed green '
+                    'because it copies that policy to /etc/f/rules.fw and '
+                    'fd\'s watcher recompiles the pristine file within '
+                    'six seconds. A text plant cannot survive contact '
+                    'with the watcher; the plant has to be aimed at what '
+                    'the watcher RUNS.')],
        witness_note='disposition only: the claim is that the OLD rules '
                     'still bite, which the tap after XDP answers',
        timeout_s=300),
@@ -699,11 +744,17 @@ SCENARIOS = {s.name: s for s in [
        'a per-CPU counter sums exactly across every CPU when RSS spreads '
        'traffic over queues',
        [_p('counter-misses-a-source-block',
-           'the counter\'s CIDR is narrowed to a /25, so half the source '
-           'addresses stop being counted — indistinguishable from a '
-           'missed CPU unless the assertion is exact',
+           'the counter\'s CIDR is narrowed to a /28, so 17 of the 32 '
+           'source addresses stop being counted — a short count, which is '
+           'exactly what a summing bug or a missed CPU looks like',
            [PolicySub(tag='l9-01', find='pkt.src_ip in 10.99.180.0/24',
-                      repl='pkt.src_ip in 10.99.180.0/25')])],
+                      repl='pkt.src_ip in 10.99.180.0/28')],
+           residual='the first plant here used a /25 and the scenario '
+                    'stayed green, because all 32 sources are '
+                    '10.99.180.1..32 and a /25 still contains every one '
+                    'of them. A plant has to be checked against the '
+                    'traffic the scenario actually sends, not only '
+                    'against the policy text.')],
        witness_note='the counter IS the subject',
        timeout_s=300),
 

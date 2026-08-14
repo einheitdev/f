@@ -80,7 +80,11 @@ EOF
 sleep 2
 
 SEEN=$(hw::counter seen)
-OVERFLOW=$(hw::counter __rate_limit_overflow 2>/dev/null || echo 0)
+# -1 means the running bundle declares no such counter at all,
+# which is a different answer from "it stayed at zero" and the
+# note below now says which one it got.
+OVERFLOW=$(hw::counter __rate_limit_overflow 2>/dev/null)
+OVERFLOW=${OVERFLOW:--1}
 log "distributed flood: program saw $SEEN frames, \
 __rate_limit_overflow=$OVERFLOW"
 
@@ -111,8 +115,9 @@ if [ "$OVERFLOW" -gt 0 ]; then
   record "__rate_limit_overflow reported the pressure ($OVERFLOW), so \
 the condition is at least observable"
 else
-  log "NOTE: __rate_limit_overflow stayed at 0. Either the table \
-never overflowed, or the overflow path did not tick — if evasion \
+  log "NOTE: __rate_limit_overflow read $OVERFLOW (-1 = the bundle \
+declares no such counter; 0 = it exists and did not tick). Either the \
+table never overflowed, or the overflow path did not tick — if evasion \
 was confirmed above while this stayed 0, the condition is happening \
 silently and that is the more serious half."
 fi

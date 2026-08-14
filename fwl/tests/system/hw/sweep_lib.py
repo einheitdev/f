@@ -499,6 +499,12 @@ def main(argv=None):
   rw.add_argument('--plant-dir', default=os.path.join(STATE_DIR, 'plants'))
   rw.add_argument('rest', nargs=argparse.REMAINDER)
 
+  nt = sub.add_parser('note')
+  nt.add_argument('--scenario', required=True)
+  nt.add_argument('--key', required=True)
+  nt.add_argument('--value', default='')
+  nt.add_argument('--receipt', default='')
+
   dh = sub.add_parser('deploy-hook')
   dh.add_argument('--scenario', required=True)
   dh.add_argument('--plant', default=None)
@@ -514,6 +520,9 @@ def main(argv=None):
     out = rewrite_argv(args.scenario, args.plant, rest, args.receipt,
                        args.plant_dir)
     sys.stdout.write('\0'.join(out) + '\0')
+    return 0
+  if args.cmd == 'note':
+    _receipt(args.receipt, {'note': args.key, 'value': args.value})
     return 0
   if args.cmd == 'deploy-hook':
     return deploy_hook(args.scenario, args.plant, args.tag, args.phase,

@@ -93,6 +93,12 @@ class PlantedEnv:
     return self
 
   def __exit__(self, *exc):
+    # A deploy-phase plant can leave a file behind (a stand-in compiler,
+    # a scratch policy). Its undo runs whether or not the command itself
+    # ran, because the rig has to come back clean either way.
+    for step in (self.plant.steps if self.plant else ()):
+      if step.kind == 'deploy_cmd' and step.undo:
+        _run(['bash', '-c', step.undo])
     for fn in reversed(self.undo):
       try:
         fn()
@@ -261,12 +267,29 @@ def sweep_scenario(scen, history, keep_logs=True):
 
   verify_failed = any(r.get('step') == 'verify' and not r.get('applied')
                       for r in receipts)
-  if not_applied or verify_failed:
+  # A text plant compiled into v-hw-<tag> is live only while fd is
+  # running that bundle. Several scenarios hand the same policy to
+  # /etc/f/rules.fw, and fd's watcher recompiles the PRISTINE file within
+  # seconds — the product reverts the plant, the scenario passes, and the
+  # sweep would call it vacuous. The bundle fd was running when the
+  # scenario ended is the evidence that the plant was still in force.
+  text_only = all(s.kind == 'policy_sub' for s in plant.steps)
+  loaded = [r.get('value') for r in receipts if r.get('note') ==
+            'current_bundle']
+  superseded = (text_only and loaded and
+                not os.path.basename(loaded[-1] or '').startswith('v-hw-'))
+  if not_applied or verify_failed or superseded:
     row['verdict'] = 'unrunnable'
     if verify_failed:
       row['reason'] = ('the plant was installed but its own verification '
                        'says the defect is NOT present, so the scenario '
                        'was never asked the question')
+    elif superseded:
+      row['reason'] = ('the plant was superseded: fd was running %s when '
+                       'the scenario ended, which is not the planted '
+                       'bundle. A text plant cannot survive a scenario '
+                       'that hands the same policy to the watcher.'
+                       % os.path.basename(loaded[-1] or '?'))
     else:
       row['reason'] = ('the plant did not apply (step(s) %s); the scenario '
                        'was never asked the question' %
@@ -468,10 +491,65 @@ def report(rows, history):
       add('  %-42s %s' % (name, text))
     add('')
 
+  add(movement_report(rows))
   add(witness_report())
   add(invariance_report(history))
   add(lint_report())
   return '\n'.join(lines)
+
+def check_movement(name):
+  """Per-CHECK discrimination, read back from the two stored runs.
+
+  A scenario can be discriminating while most of its checks are not: the
+  plant moves one assertion and the other eleven read the same either
+  way. Those eleven are not necessarily wrong — many measure something
+  the plant does not touch — but they are the population the next plant
+  should be aimed at, and nothing else in the sweep names them.
+
+  Free-form pass/fail pairs do not share a label (the pass text and the
+  fail text are different sentences), so a check that is FAIL under the
+  plant and absent from the baseline is counted as red too.
+  """
+  paths = {mode: os.path.join(LOGS, '%s.%s.log' % (name, mode))
+           for mode in ('baseline', 'sabotage')}
+  if not all(os.path.exists(p) for p in paths.values()):
+    return None
+  parsed = {}
+  for mode, path in paths.items():
+    with open(path) as fh:
+      parsed[mode], _ = sweep_lib.parse_checks(fh.read())
+  base, sab = parsed['baseline'], parsed['sabotage']
+  return {
+      'moved': sorted(k for k, v in sab.items()
+                      if v == 'FAIL' and base.get(k) == 'PASS'),
+      'new_red': sorted(k for k, v in sab.items()
+                        if v == 'FAIL' and k not in base),
+      'unmoved': sorted(k for k, v in sab.items()
+                        if v == 'PASS' and base.get(k) == 'PASS'),
+  }
+
+def movement_report(rows):
+  lines = ['CHECK-LEVEL DISCRIMINATION — which assertions the plant moved']
+  lines.append('  A scenario can be discriminating on one assertion while')
+  lines.append('  the rest read the same either way. The unmoved ones are')
+  lines.append('  where the next plant should be aimed.')
+  total_moved = total_unmoved = 0
+  detail = []
+  for name in sorted(rows):
+    if rows[name]['verdict'] != 'discriminating':
+      continue
+    move = check_movement(name)
+    if move is None:
+      continue
+    red = move['moved'] + move['new_red']
+    total_moved += len(red)
+    total_unmoved += len(move['unmoved'])
+    detail.append('    %-42s %d red / %d unmoved'
+                  % (name, len(red), len(move['unmoved'])))
+  lines.append('  %d check(s) went red under a plant; %d stayed green'
+               % (total_moved, total_unmoved))
+  lines.extend(detail)
+  return '\n'.join(lines) + '\n'
 
 def witness_report():
   reg = sweep_lib._load_registry()
