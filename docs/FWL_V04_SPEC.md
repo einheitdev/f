@@ -420,6 +420,44 @@ interpreter oracle reads the same values the BPF parser sees. A
 builder call with neither parameter produces an untagged frame
 (unchanged from v0.2).
 
+A seventh builder, `icmperr()`, produces an ICMP **error**: the 8-byte
+ICMP header (whose "unused" word carries the RFC 1191 next-hop MTU for
+type 3 code 4) followed by the embedded datagram — a full 20-byte IP
+header plus the first 8 bytes of its transport header. Nothing else in
+the builder language can produce one: `icmp()` emits an 8-byte header
+over a zero body, which no router has ever sent and which carries no
+flow identity at all.
+
+| Field | Default | Meaning |
+|---|---|---|
+| `src_ip`, `dst_ip` | `1.1.1.1`, `2.2.2.2` | the error's own addresses |
+| `type`, `code` | `3`, `4` | fragmentation needed |
+| `mtu` | `1400` | next-hop MTU (RFC 1191) |
+| `inner_proto` | `tcp` | `tcp`, `udp` or `icmp` |
+| `inner_src_ip` | the error's `dst_ip` | embedded source — an error comes back from the peer a packet went to, so its datagram was addressed *from* the error's destination |
+| `inner_dst_ip` | `2.2.2.2` | embedded destination |
+| `inner_src_port`, `inner_dst_port` | `0` | embedded ports (ignored when `inner_proto` is `icmp`) |
+| `inner_len` | `1500` | the ORIGINAL datagram's total length — the router copies the header it could not forward, and that length is why the error exists |
+
+`vlan_id`, `vlan_priority` and `ihl` apply as to every other v4
+builder. The decoded-fields dict reports `proto: icmp` with
+`icmp_type` / `icmp_code` (an error IS an ICMP packet, and
+`pkt.proto == icmp` matches it), no `src_port` / `dst_port` (an error
+has none), and the embedded tuple under `_inner_proto`,
+`_inner_src_ip`, `_inner_dst_ip`, `_inner_src_port`, `_inner_dst_port`
+— underscored, like `_ihl`, because no rule can name them.
+
+`expected.output_packet` gains `inner_src_ip`, `inner_dst_ip`,
+`inner_src_port` and `inner_dst_port` so a case can assert the
+embedded rewrite. A case that asserted only the outer header would
+pass on a NAT that steered an error to the right host and left it
+describing the wrong connection.
+
+All ICMP frames the builder produces now carry a **correct** checksum
+(they carried a zero placeholder until ICMP-error NAT existed), and the
+BPF oracle validates the ICMP and embedded-IP checksums of every
+asserted `output_packet` alongside the outer IP and L4 ones.
+
 ## Conntrack — `conntrack(pkt).state`
 
 ### Construct
@@ -442,7 +480,7 @@ The four states:
 |-------|---------|
 | `new` | the packet's 5-tuple is absent from the conntrack table |
 | `established` | the 5-tuple was found (forward **or** reverse direction) |
-| `related` | reserved; **never produced in v0.4** (see deferrals) |
+| `related` | an ICMP error whose **embedded datagram** names a tracked flow |
 | `invalid` | a TCP state-machine violation: a non-SYN segment for an untracked flow |
 
 ### Type rules
@@ -535,9 +573,26 @@ The four states:
   flag reads never happen).
 - *`established` vs `invalid`.* A non-SYN packet that matches an existing
   entry is `established`, not `invalid` — the table lookup wins.
-- *`related`.* No packet is ever classified `related` in v0.4, so
-  `conntrack(pkt).state == related` never matches and
-  `in [established, related]` is effectively `== established`.
+- *`related`.* An ICMP **error** — types 3, 4, 5, 11 and 12, the five
+  RFC 792 messages that carry the datagram that provoked them — reads
+  `related` when the 5-tuple of that embedded datagram matches a
+  tracked flow in either direction. Nothing else is ever `related`: an
+  ICMP **query** (echo, timestamp, …) carries nobody's packet and reads
+  `new`, however closely its payload resembles one.
+- *`related` creates nothing and refreshes nothing.* An error is
+  evidence ABOUT a flow, not traffic belonging to one, so an allowed
+  `related` packet adds no conntrack entry and does not stop an idle
+  flow from being collected.
+- *`established` does not include `related`.* This is the migration
+  every policy written against v0.4 must make, and it is the same one
+  nftables and iptables require: `allow if conntrack(pkt).state ==
+  established` does **not** admit the ICMP errors your own outbound
+  flows provoke, which for a masquerading gateway means path-MTU
+  discovery is dead and large transfers hang with nothing logged. The
+  idiom is `allow if conntrack(pkt).state in [established, related]`.
+- *Classification is a property of the packet, not of NAT.* A policy
+  with no NAT rule anywhere still classifies errors, because the flows
+  it is protecting still provoke them.
 - *5-tuple specificity.* A packet to a different port (or address, or
   protocol) than a tracked flow does not match it — it reads `new`.
 
@@ -1152,7 +1207,8 @@ outside that range is a compile error.
 - **Occupancy is observable.** `fctl status` carries a `nat` section:
   live mappings, the cap, occupancy percentage, high-water mark, total
   reclaimed, and the datapath's own tally (`installed`,
-  `port_reallocated`, `refused`, `table_full`, `denat`). `fd` logs a
+  `port_reallocated`, `refused`, `table_full`, `denat`,
+  `icmp_error`). `fd` logs a
   warning as the table crosses 80 % and an error naming the count
   whenever refusals move.
 - **Checksums.** XDP has no `bpf_l3/l4_csum_replace` (skb-only), so the
@@ -1171,6 +1227,50 @@ outside that range is a compile error.
   no mapping. Only the no-IP-options common case (`ihl == 5`) is
   rewritten.
 
+### ICMP-error translation (RFC 5508 § 4.2)
+
+An ICMP error carries no ports, so its own 5-tuple identifies nothing.
+The flow it is about is named in the datagram it **carries** — the IP
+header of the packet that provoked it plus the first 8 bytes of that
+packet's transport header. For a translated flow, that embedded packet
+is the one this NAT put on the wire, so reversing its tuple yields the
+reply mapping's own key. No new state and no second table: the mapping
+that de-NATs a flow's replies de-NATs the errors about it.
+
+- **Which errors.** Types 3, 4, 5, 11 and 12 — the five RFC 792
+  messages that carry an embedded datagram. A query type carries
+  nobody's packet and is never treated as an error, whatever its
+  payload contains.
+- **Two rewrites, and either alone is useless.** The outer header is
+  re-addressed to the host behind the NAT (destination for a
+  masquerade reply, source for a port-forward reply); the embedded
+  header is put back the way that host sent it, address and port. An
+  error left addressed to the firewall never reaches the host; an error
+  delivered to the host still describing the translated connection is
+  discarded by that host's own stack — the same black hole, reached the
+  quiet way.
+- **Three checksums.** The embedded IP header's checksum is updated for
+  its changed address; the ICMP checksum, which covers the embedded
+  datagram, is updated for every word changed inside it (including that
+  embedded checksum); the outer IP checksum is recomputed. Note that
+  the embedded IP checksum absorbs an address change **exactly**, so an
+  address-only translation leaves the ICMP checksum unmoved — only a
+  changed embedded PORT makes that update observable.
+- **The embedded tuple wins.** It is consulted before the error's own
+  5-tuple, which is `(error-sender, us, 0, 0, icmp)` — a key that a
+  ports-0 ICMP mapping (a guest's ping to that same router) can hold.
+  Reading the outer header first delivers one host's path-MTU error to
+  whichever host last pinged the sender.
+- **Bounds.** The whole 8-byte ICMP header, 20-byte embedded IP header
+  and 8 embedded transport bytes must be present, and the embedded
+  header must have `ihl == 5`. Anything less names no flow: the error
+  is neither `related` nor translated.
+- **Counted.** `icmp_error` in the `nat` section of `fctl status`, a
+  subset of `denat`. It is reported even at zero: a masquerading
+  gateway carrying return traffic and translating no ICMP errors is a
+  path-MTU black hole, and that failure produces no drop, no log, and
+  no other counter movement.
+
 ### Edge cases
 
 - *Guard miss.* `snat to <ip> if pkt.proto == tcp` leaves a UDP frame
@@ -1186,9 +1286,12 @@ outside that range is a compile error.
   move, two hosts pinging the same peer collide, and the second is
   **refused and dropped** rather than silently taking over the first's
   mapping. `dnat` does not touch ICMP at all (there is no port to
-  rewrite). ICMP **error** translation — reading the embedded datagram
-  per RFC 5508, which is what path-MTU discovery needs — is **not** in
-  v0.4; see § What Is Not in v0.4.
+  rewrite).
+- *ICMP error.* An ICMP error (types 3, 4, 5, 11, 12) is translated
+  off the datagram **embedded** in it, per RFC 5508 § 4.2 — see
+  § ICMP-error translation below. The embedded tuple is consulted
+  **before** the error's own 5-tuple, because that tuple is
+  (error-sender, us, 0, 0, icmp) and can belong to an unrelated ping.
 - *Table at its cap.* Refused and dropped, never evicted. Freeing is
   driven by flow end, so reaching the cap means flows are genuinely
   live, not that the table failed to drain.
@@ -1284,9 +1387,6 @@ behaviour on every packet is unchanged.
   — v0.4 matches on the numeric byte only. Named constants are a future
   ergonomics item.
 - No ICMP `id`/`sequence` field matching — only `type` and `code`.
-- No `related` conntrack state keyed on the ICMP error's embedded
-  5-tuple (deferred to Phase 4.3 conntrack, which builds on this
-  construct).
 - No extension-header chasing for ICMPv6 — a packet behind an extension
   header has no readable `pkt.icmp6.*` (same conservatism as v0.2 L4
   fields).
@@ -1295,25 +1395,21 @@ behaviour on every packet is unchanged.
 - The DEI bit as a readable field.
 - VLAN rewriting / pushing / popping (read-only matching only).
 - `0x88A8` TPID recognition (only `0x8100` triggers VLAN parsing).
-- **Conntrack `related`** — ICMP-error tracking (an ICMP error whose
-  embedded 5-tuple matches an established flow) is deferred. The
-  `related` keyword is accepted in the language, but no packet is ever
-  classified `related` in v0.4, so `== related` never matches.
 - **IPv6 conntrack** — v0.4 tracks IPv4 flows only (the daemon's
   `ConnKey` is 32-bit). IPv6 packets read `new` and create no entry.
 - **Conntrack on fragments** — no special handling; only the first
   fragment carries the L4 header that the 5-tuple needs.
 - **Configurable UDP/TCP conntrack timeouts in the language** — timeouts
   live in the daemon (`fd.yaml`) and its GC, not the `.fw` surface.
-- **ICMP-error NAT (RFC 5508)** — an ICMP error carries the flow it is
-  about in its *payload* (the embedded IP header plus 8 bytes), not in
-  its own header, so translating it means reading one header deeper.
-  v0.4 de-NATs an ICMP error's outer addresses only if the error itself
-  happens to match a ports-0 mapping, which a frag-needed from a router
-  never does. The cost is measured, not assumed: `l11_05` shows a
-  genuine RFC 1191 frag-needed reaching the datapath and never reaching
-  the guest behind masquerade, so **path-MTU discovery is structurally
-  broken for a masqueraded flow**. Fixing it needs both halves — the
-  translation above *and* `related` (the previous item), because an
-  ICMP error has no ports, reads `new`, and a realistic stateful policy
-  drops it before translation is even reached.
+- **ICMP-error translation for IPv6 / ICMPv6** — RFC 5508 covers IPv4
+  only here, as all of v0.4's NAT and conntrack do.
+- **Rewriting the embedded transport checksum.** An ICMP error carries
+  8 bytes of the transport header, so that header's checksum covers a
+  payload the error does not carry: no receiver can validate it and no
+  oracle can check it, and for TCP the checksum field is not even among
+  the 8 bytes. Linux's `nf_nat` skips it for the same reason.
+- **Errors about a flow whose outer header carries IP options.** Every
+  NAT rewrite in v0.4 bails on `ihl != 5`; an ICMP error is no
+  exception. It is still classified `related` (classification walks a
+  variable IHL) and so is admitted, but it stops at the firewall's own
+  address.

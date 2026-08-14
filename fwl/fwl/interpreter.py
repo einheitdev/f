@@ -79,7 +79,9 @@ _TERMINAL_ACTION_TO_XDP = {
 # without sharing code with the emitter. v0.4 tracks IPv4 only — the
 # daemon's `conntrack` map is keyed on 32-bit addresses — so an IPv6
 # or non-IP frame is always NEW and never creates an entry. RELATED is
-# never produced (ICMP-error tracking is deferred).
+# an ICMP error whose EMBEDDED datagram names a tracked flow — the only
+# way an error can be classified at all, because it carries no ports of
+# its own and its own 5-tuple therefore matches nothing.
 
 
 # Sentinel for "this frame is not conntracked" — an IPv6 frame (v0.4
@@ -129,6 +131,40 @@ def _ct_key(packet: dict[str, Any]) -> tuple | None:
   return (proto, _ipv4_to_int(src), _ipv4_to_int(dst), sport, dport)
 
 
+# ICMPv4 types that carry the datagram that provoked them (RFC 792).
+# Mirrors the emitter's FWL_ICMP_IS_ERROR; written out separately per
+# the oracle-independence rule.
+_ICMP_ERROR_TYPES = frozenset({3, 4, 5, 11, 12})
+
+
+def _icmp_inner_key(packet: dict[str, Any]) -> tuple | None:
+  """Forward 5-tuple of the datagram embedded in an ICMP error.
+
+  None for anything that is not an ICMP error carrying a readable
+  embedded datagram — a query type, a frame the builder cut before the
+  embedded IP header + 8 transport bytes, or an outer header the parse
+  never reached. Ports are 0 when the embedded datagram is itself ICMP,
+  matching the key its own mapping was installed under.
+
+  This tuple is the error's real identity. Its OWN 5-tuple is
+  (error-sender, us, 0, 0, icmp), which belongs to no flow.
+  """
+  if packet.get("proto") != "icmp":
+    return None
+  if packet.get("icmp_type") not in _ICMP_ERROR_TYPES:
+    return None
+  proto = packet.get("_inner_proto")
+  src = packet.get("_inner_src_ip")
+  dst = packet.get("_inner_dst_ip")
+  if proto is None or src is None or dst is None:
+    return None
+  return (
+    proto, _ipv4_to_int(src), _ipv4_to_int(dst),
+    int(packet.get("_inner_src_port") or 0),
+    int(packet.get("_inner_dst_port") or 0),
+  )
+
+
 class ConntrackTable:
   """Mutable set of forward 5-tuple keys, the interpreter's CT state.
 
@@ -136,6 +172,10 @@ class ConntrackTable:
   reverse (src/dst and sport/dport swapped) is present — matching the
   BPF lookup's forward-then-reverse probe. `create` adds the forward
   key, the side effect an allowed NEW packet produces.
+
+  An ICMP error is RELATED when the datagram it CARRIES names a tracked
+  flow, forward or reverse. Nothing is created or refreshed for it: an
+  error is evidence about a flow, not traffic belonging to one.
   """
   def __init__(self, entries=None):
     self._fwd: set[tuple] = set(entries or ())
@@ -149,6 +189,12 @@ class ConntrackTable:
     rev = (proto, dst, src, dport, sport)
     if key in self._fwd or rev in self._fwd:
       return ast.CtState.ESTABLISHED
+    inner = _icmp_inner_key(packet)
+    if inner is not None:
+      i_proto, i_src, i_dst, i_sport, i_dport = inner
+      i_rev = (i_proto, i_dst, i_src, i_dport, i_sport)
+      if inner in self._fwd or i_rev in self._fwd:
+        return ast.CtState.RELATED
     # A TCP segment with no SYN for an untracked flow is a state-machine
     # violation (data/ACK/RST without a handshake we ever saw).
     if proto == "tcp" and not packet.get("syn", False):
@@ -191,6 +237,26 @@ class NatState:
     if not isinstance(key, tuple):
       return None  # untracked frame: no reply mapping can apply
     return self._reply.get(key)
+
+  def denat_icmp_error(self, packet: dict[str, Any]) -> tuple | None:
+    """Return the rewrite for an ICMP error, off its embedded datagram.
+
+    Mirrors `fwl_nat_denat_icmp_error` (RFC 5508 § 4.2). The embedded
+    datagram is the packet this NAT already translated on its way out,
+    so reversing its tuple yields the reply mapping's own key — no new
+    state and no second table.
+
+    Tried BEFORE the ordinary lookup, because an error's own 5-tuple is
+    (error-sender, us, 0, 0, icmp), which can collide with the ports-0
+    mapping of an unrelated ICMP echo the same host sent. Which header
+    identifies the flow is not a preference: for an error it is the
+    inner one.
+    """
+    inner = _icmp_inner_key(packet)
+    if inner is None:
+      return None
+    proto, src, dst, sport, dport = inner
+    return self._reply.get((proto, dst, src, dport, sport))
 
   def _claim(
     self, key: tuple, value: tuple, may_realloc: bool
@@ -1401,11 +1467,27 @@ def _nat_work_init(packet: dict[str, Any]) -> dict[str, Any]:
 
   Carries the dotted-quad src/dst IPs and src/dst ports (when present)
   so output_packet reports the post-rewrite 5-tuple regardless of which
-  fields a given action changes."""
+  fields a given action changes.
+
+  For an ICMP error the embedded datagram's tuple is carried too, under
+  the names the BPF oracle's frame decoder reports. Seeding it (rather
+  than adding it only when a rewrite touches it) is what lets a case
+  assert that the inner header was left ALONE — the failure mode where
+  the error reaches the right host still describing the wrong
+  connection.
+  """
   work: dict[str, Any] = {}
   for k in ("src_ip", "dst_ip", "src_port", "dst_port", "proto"):
     if packet.get(k) is not None:
       work[k] = packet[k]
+  for inner, out in (
+    ("_inner_src_ip", "inner_src_ip"),
+    ("_inner_dst_ip", "inner_dst_ip"),
+    ("_inner_src_port", "inner_src_port"),
+    ("_inner_dst_port", "inner_dst_port"),
+  ):
+    if packet.get(inner) is not None:
+      work[out] = packet[inner]
   return work
 
 
@@ -1436,6 +1518,8 @@ def _apply_ingress_denat(packet: dict[str, Any], ctx: "_Ctx") -> None:
     return
   if not _nat_can_parse(packet):
     return
+  if _apply_icmp_error_denat(packet, ctx):
+    return
   hit = ctx.nat.denat(packet)
   if hit is None:
     return
@@ -1449,6 +1533,44 @@ def _apply_ingress_denat(packet: dict[str, Any], ctx: "_Ctx") -> None:
     if new_port is not None:
       ctx.work["src_port"] = new_port
   ctx.nat_fired = True
+
+
+def _apply_icmp_error_denat(packet: dict[str, Any], ctx: "_Ctx") -> bool:
+  """Translate an ICMP error in both places at once (RFC 5508 § 4.2).
+
+  Returns True when the frame was translated. Mirrors
+  `fwl_nat_denat_icmp_error`: the outer header is re-addressed to the
+  host behind the NAT, and the EMBEDDED header is put back the way that
+  host sent it. Either alone is useless — an error the guest receives
+  describing a connection it never opened is discarded by its own
+  stack, which is the same black hole as never delivering it.
+
+  The embedded transport checksum is not modelled because the emitter
+  does not rewrite it: only 8 bytes of that header travel, so its
+  checksum covers a payload the error does not carry.
+  """
+  hit = ctx.nat.denat_icmp_error(packet)
+  if hit is None:
+    return False
+  kind, new_addr, new_port = hit
+  addr = _int_to_ipv4(new_addr)
+  # An embedded ICMP datagram has no ports, and its mapping is keyed on
+  # ports 0 — there is nothing to put back.
+  has_ports = packet.get("_inner_proto") in ("tcp", "udp")
+  if kind == "dnat":
+    ctx.work["dst_ip"] = addr
+    ctx.work["inner_src_ip"] = addr
+    if has_ports and new_port is not None:
+      ctx.work["inner_src_port"] = new_port
+  elif kind == "snat":
+    ctx.work["src_ip"] = addr
+    ctx.work["inner_dst_ip"] = addr
+    if has_ports and new_port is not None:
+      ctx.work["inner_dst_port"] = new_port
+  else:
+    return False
+  ctx.nat_fired = True
+  return True
 
 
 # `fwl_snat_egress` has TWO side effects on the maps, and the next two

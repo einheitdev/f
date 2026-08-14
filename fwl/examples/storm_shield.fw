@@ -40,7 +40,13 @@ drop if pkt.proto == udp
 drop limited by rate_limit(2000, per=src_ip)
 
 # --- replies to testnet-initiated flows only; nothing else exists ---
-allow if conntrack(pkt).state == established
+# `related` is not optional here. An ICMP error carries no ports, so it
+# is never `established`, and the errors this list admits are the ones
+# the testnets' OWN outbound flows provoke — above all the frag-needed
+# that path-MTU discovery runs on. With `== established` alone, ping
+# works, DNS works, and every large transfer hangs with nothing logged
+# anywhere (measured on the rig: l11_05).
+allow if conntrack(pkt).state in [established, related]
 
 default drop
 

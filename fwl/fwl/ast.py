@@ -76,10 +76,16 @@ class CtState(Enum):
   The value of `conntrack(pkt).state`. NEW means the packet's 5-tuple
   is absent from the conntrack table; ESTABLISHED means it was found
   (forward or reverse direction); INVALID is a TCP state-machine
-  violation (a non-SYN TCP segment for an untracked flow). RELATED
-  (ICMP-error embedded 5-tuple) is reserved in the language but not
-  detected in v0.4 — no packet is ever classified RELATED, so
-  `== related` never matches (deferred to post-ICMP-error tracking).
+  violation (a non-SYN TCP segment for an untracked flow). RELATED is
+  an ICMP error whose EMBEDDED datagram names a tracked flow — its own
+  5-tuple has no ports and matches nothing, so this is the only way an
+  error can be classified at all.
+
+  ESTABLISHED does not include RELATED, exactly as in nftables: a
+  policy listing only `established` keeps dropping the ICMP errors its
+  own outbound flows provoke, and for a masquerading gateway that
+  means path-MTU discovery is dead. `in [established, related]` is the
+  idiom.
   """
   NEW = "new"
   ESTABLISHED = "established"

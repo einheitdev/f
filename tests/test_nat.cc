@@ -138,6 +138,23 @@ TEST(NatMgrTest, GetStateReportsOccupancyAgainstTheRealCap) {
   EXPECT_TRUE(j.contains("refused"));
   EXPECT_TRUE(j.contains("table_full"));
   EXPECT_TRUE(j.contains("port_reallocated"));
+  // `icmp_error` is a subset of `denat`, and its absence is the one
+  // NAT failure that produces no drop, no log and no other counter
+  // movement — a masquerading network where path-MTU discovery is
+  // silently dead. Reported, therefore, rather than inferred.
+  EXPECT_TRUE(j.contains("denat"));
+  EXPECT_TRUE(j.contains("icmp_error"));
+}
+
+TEST(NatMgrTest, StatSlotsCoverEveryNamedEvent) {
+  // The slot numbering is the FWL emitter's, not the daemon's: slot i
+  // means the same event under every compilation, and the two ends
+  // agree only because both count from this enum. A slot added on one
+  // side and not the other reads a neighbour's counter and reports a
+  // plausible wrong number, which is worse than reporting none.
+  EXPECT_EQ(static_cast<uint32_t>(kFwlNatStatSlots), 6u);
+  EXPECT_EQ(static_cast<uint32_t>(kFwlNatStatIcmpErr),
+            static_cast<uint32_t>(kFwlNatStatSlots) - 1);
 }
 
 TEST(NatMgrTest, OccupancyIsZeroWhenTheCapIsUnknown) {

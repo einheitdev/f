@@ -271,6 +271,20 @@ auto RenderShowStatus(const Response& resp,
     if (realloc > 0) {
       row("nat_port_moved", std::to_string(realloc), Semantic::Info);
     }
+    // Shown whenever anything has been de-NAT'd at all, INCLUDING at
+    // zero. Every other row here is hidden when idle because idle is
+    // the good state; this one is the opposite. A masquerading box
+    // carrying return traffic and translating no ICMP errors is the
+    // path-MTU black hole, and its whole difficulty is that it looks
+    // like nothing: large transfers hang, every counter climbs, and
+    // no line anywhere says why.
+    auto denat = n.value("denat", uint64_t{0});
+    if (denat > 0) {
+      auto icmp_err = n.value("icmp_error", uint64_t{0});
+      row("nat_icmp_errors",
+          std::format("{} of {} return translations", icmp_err, denat),
+          icmp_err > 0 ? Semantic::Good : Semantic::Info);
+    }
   }
   if (j.contains("slow_path")) {
     auto& sp = j["slow_path"];

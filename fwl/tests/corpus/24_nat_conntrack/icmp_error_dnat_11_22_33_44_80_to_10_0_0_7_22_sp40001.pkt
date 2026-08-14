@@ -1,0 +1,27 @@
+name: "icmp error dnat 11.22.33.44 80 to 10.0.0.7 22 sp40001"
+source_fw: |
+  @xdp(lan)
+  dnat to 10.0.0.7:22 if pkt.proto == tcp and pkt.dst_port == 80
+  allow if pkt.proto == tcp and pkt.tcp.syn
+  allow if conntrack(pkt).state in [established, related]
+  default drop
+sequence:
+  - name: inbound SYN — DNAT'd to the backend and tracked
+    builder: tcp(src_ip="8.8.8.8", dst_ip="11.22.33.44", src_port=40001, dst_port=80, syn=true)
+    expected:
+      bpf_action: allow
+      output_packet:
+        src_ip: "8.8.8.8"
+        dst_ip: "10.0.0.7"
+        dst_port: 22
+  - name: the error about it, leaving — outer source and BOTH embedded endpoint fields restored to the published ones
+    builder: icmperr(src_ip="10.0.0.7", dst_ip="8.8.8.8", type=3, code=4, mtu=1400, inner_proto="tcp", inner_src_ip="8.8.8.8", inner_dst_ip="10.0.0.7", inner_src_port=40001, inner_dst_port=22)
+    expected:
+      bpf_action: allow
+      output_packet:
+        src_ip: "11.22.33.44"
+        dst_ip: "8.8.8.8"
+        inner_src_ip: "8.8.8.8"
+        inner_dst_ip: "11.22.33.44"
+        inner_src_port: 40001
+        inner_dst_port: 80

@@ -1,0 +1,27 @@
+name: "icmp error dnat 198.51.100.9 80 to 10.44.0.3 53 sp12345"
+source_fw: |
+  @xdp(lan)
+  dnat to 10.44.0.3:53 if pkt.proto == tcp and pkt.dst_port == 80
+  allow if pkt.proto == tcp and pkt.tcp.syn
+  allow if conntrack(pkt).state in [established, related]
+  default drop
+sequence:
+  - name: inbound SYN — DNAT'd to the backend and tracked
+    builder: tcp(src_ip="151.101.0.1", dst_ip="198.51.100.9", src_port=12345, dst_port=80, syn=true)
+    expected:
+      bpf_action: allow
+      output_packet:
+        src_ip: "151.101.0.1"
+        dst_ip: "10.44.0.3"
+        dst_port: 53
+  - name: the error about it, leaving — outer source and BOTH embedded endpoint fields restored to the published ones
+    builder: icmperr(src_ip="10.44.0.3", dst_ip="151.101.0.1", type=3, code=4, mtu=1400, inner_proto="tcp", inner_src_ip="151.101.0.1", inner_dst_ip="10.44.0.3", inner_src_port=12345, inner_dst_port=53)
+    expected:
+      bpf_action: allow
+      output_packet:
+        src_ip: "198.51.100.9"
+        dst_ip: "151.101.0.1"
+        inner_src_ip: "151.101.0.1"
+        inner_dst_ip: "198.51.100.9"
+        inner_src_port: 12345
+        inner_dst_port: 80

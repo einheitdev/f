@@ -144,7 +144,14 @@ enum FwlNatStat : uint32_t {
   kFwlNatStatRefused = 2,     ///< no mapping could be claimed; packet dropped
   kFwlNatStatTableFull = 3,   ///< the refusal was the table hitting its cap
   kFwlNatStatDenat = 4,       ///< return packets translated back
-  kFwlNatStatSlots = 5,
+  /// ICMP errors translated off their embedded datagram (RFC 5508).
+  /// A SUBSET of kFwlNatStatDenat, not a separate event: an error is a
+  /// return-direction translation like any other. Counted apart
+  /// because it is the one whose absence looks like nothing at all —
+  /// path-MTU discovery fails as "the network is slow", with no drop,
+  /// no log, and every other counter still climbing.
+  kFwlNatStatIcmpErr = 5,
+  kFwlNatStatSlots = 6,
 };
 
 // Per-zone masquerade config (`fwl_nat_cfg`, slot 0). `masq_addr` is the

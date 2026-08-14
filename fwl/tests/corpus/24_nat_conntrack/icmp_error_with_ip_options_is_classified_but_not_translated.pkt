@@ -1,0 +1,22 @@
+name: "an icmp error with IP options reads RELATED, and the NAT still declines it"
+source_fw: |
+  @xdp(lan)
+  masquerade if pkt.src_ip in [10.0.0.0/8]
+  allow if pkt.proto == tcp and pkt.tcp.syn
+  allow if conntrack(pkt).state in [established, related]
+  default drop
+state:
+  nat:
+    masq_ip: "203.0.113.5"
+sequence:
+  - name: the flow is open and tracked
+    builder: tcp(src_ip="10.0.0.7", dst_ip="8.8.8.8", src_port=40000, dst_port=443, syn=true)
+    expected:
+      bpf_action: allow
+      output_packet:
+        src_ip: "203.0.113.5"
+        src_port: 40000
+  - name: the same error with an IP-options header. The two halves part company here on purpose - classification walks a variable IHL, so the embedded tuple is found and the packet is RELATED, while every NAT helper bails on ihl != 5 and leaves the frame alone. It is admitted and stops at the firewall's own address rather than being dropped, which is the same answer this NAT gives an options frame anywhere else
+    builder: icmperr(src_ip="192.0.2.1", dst_ip="203.0.113.5", type=3, code=4, mtu=1400, ihl=6, inner_src_ip="203.0.113.5", inner_dst_ip="8.8.8.8", inner_src_port=40000, inner_dst_port=443)
+    expected:
+      bpf_action: allow

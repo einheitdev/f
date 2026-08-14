@@ -91,6 +91,12 @@ auto NatMgr::GetState() const -> nlohmann::json {
       {"refused", refused},
       {"table_full", Stat(kFwlNatStatTableFull)},
       {"denat", Stat(kFwlNatStatDenat)},
+      // A subset of `denat`: the return translations that were ICMP
+      // errors read off their embedded datagram. Reported separately
+      // because a masquerading network with this at zero and TCP
+      // flowing is the path-MTU black hole, and nothing else in this
+      // object would say so.
+      {"icmp_error", Stat(kFwlNatStatIcmpErr)},
   };
 }
 

@@ -1,0 +1,38 @@
+name: "an icmp error is steered by its embedded datagram, not by its own address"
+source_fw: |
+  @xdp(lan)
+  masquerade if pkt.src_ip in [10.0.0.0/8]
+  allow if pkt.proto == icmp and pkt.icmp.type == 8
+  allow if pkt.proto == tcp and pkt.tcp.syn
+  allow if conntrack(pkt).state in [established, related]
+  default drop
+state:
+  nat:
+    masq_ip: "203.0.113.5"
+sequence:
+  - name: guest A pings the router, which installs a mapping keyed on ports 0 for (router, masq, icmp) — the very key an icmp error arriving from that router would present
+    builder: icmp(src_ip="10.0.0.9", dst_ip="192.0.2.1", type=8, code=0)
+    expected:
+      bpf_action: allow
+      output_packet:
+        src_ip: "203.0.113.5"
+        dst_ip: "192.0.2.1"
+  - name: guest B opens a TCP flow through the same masquerade address
+    builder: tcp(src_ip="10.0.0.7", dst_ip="8.8.8.8", src_port=40000, dst_port=443, syn=true)
+    expected:
+      bpf_action: allow
+      output_packet:
+        src_ip: "203.0.113.5"
+        dst_ip: "8.8.8.8"
+        src_port: 40000
+  - name: the router's frag-needed about B's flow. Its OWN 5-tuple is A's ping mapping — a de-NAT that read the outer header first would hand B's path-MTU error to A and leave the embedded header describing the firewall. The inner tuple is the flow identity, so it wins, and B gets it with both headers restored
+    builder: icmperr(src_ip="192.0.2.1", dst_ip="203.0.113.5", type=3, code=4, mtu=1400, inner_src_ip="203.0.113.5", inner_dst_ip="8.8.8.8", inner_src_port=40000, inner_dst_port=443)
+    expected:
+      bpf_action: allow
+      output_packet:
+        src_ip: "192.0.2.1"
+        dst_ip: "10.0.0.7"
+        inner_src_ip: "10.0.0.7"
+        inner_dst_ip: "8.8.8.8"
+        inner_src_port: 40000
+        inner_dst_port: 443

@@ -481,6 +481,37 @@ struct fwl_icmphdr {
   __u8 code;
 };
 
+// ICMPv4 types that carry the datagram that provoked them (RFC 792):
+// destination unreachable, source quench, redirect, time exceeded,
+// parameter problem. The same five Linux treats as errors when it
+// tracks connections. Every other type is a query — its body is its
+// own, not a copy of somebody else's packet — so it names no flow.
+#define FWL_ICMP_IS_ERROR(t) \\
+  ((t) == 3 || (t) == 4 || (t) == 5 || (t) == 11 || (t) == 12)
+
+// The full 8-byte ICMP header, declared alongside the 2-byte one
+// because reading a type is not writing a checksum: a struct that
+// stops before the checksum field cannot address it, and the ICMP
+// checksum covers the embedded datagram an error translation rewrites.
+// For type 3 code 4 the second half of `rest` is the next-hop MTU
+// (RFC 1191) — read by the host that receives the error, never here.
+struct fwl_icmp_err {
+  __u8  type;
+  __u8  code;
+  __u16 check;
+  __u32 rest;
+};
+
+// The 8 bytes of embedded transport header an ICMP error is required
+// to carry ("the first 64 bits of the original datagram's data"). The
+// ports sit at the same two offsets in TCP and UDP, which is the only
+// reason one struct serves both.
+struct fwl_inner_l4 {
+  __be16 source;
+  __be16 dest;
+  __u32 rest;
+};
+
 struct fwl_rl_state {
   __u64 ts;
   __u32 count;
@@ -529,9 +560,12 @@ _TERMINAL_ACTION_TO_RETURN = {
 
 # Numeric encoding of conntrack states in the emitted C. NEW is 0 so an
 # unparsed (non-IP / IPv6) frame's zero-initialized `ct_state` reads as
-# NEW for free. ESTABLISHED/RELATED/INVALID follow; RELATED is never
-# produced in v0.4 (deferred), but the keyword is encoded for the rare
-# `== related` comparison (which thus never matches).
+# NEW for free. ESTABLISHED/RELATED/INVALID follow. RELATED is produced
+# by `fwl_ct_icmp_related`: an ICMP error whose EMBEDDED datagram names
+# a tracked flow. Until that existed no packet was ever classified 2,
+# so `in [established, related]` was a longer spelling of
+# `== established` and path-MTU discovery had no rule that could admit
+# it (measured on the rig, l11_05).
 _CT_STATE_TO_INT = {
   ast.CtState.NEW: 0,
   ast.CtState.ESTABLISHED: 1,
@@ -572,6 +606,63 @@ struct {
 """
 
 
+# The RELATED classifier. Emitted with the conntrack map (it is a
+# conntrack property, not a NAT one — a policy with no NAT anywhere
+# still has to admit the errors its own outbound flows provoke).
+_CONNTRACK_HELPERS = """\
+// RELATED (FWL_V04_SPEC.md § 4.3): an ICMP error carries no ports of
+// its own, so the 5-tuple probe above finds nothing and the packet
+// reads NEW — which a `default drop` policy drops, before any NAT gets
+// the chance to translate it. That is not a policy mistake to be
+// worked around: `conntrack(pkt).state == established` CANNOT match an
+// ICMP error, and the only rule that admits one is
+// `allow if pkt.proto == icmp`, which admits every ICMP from anywhere.
+//
+// An error names its flow in the datagram it carries. Probe conntrack
+// with that inner tuple, forward and reverse, so an error is RELATED
+// whichever end of the flow provoked it. For a translated flow the
+// embedded packet is the POST-NAT one, which is the tuple conntrack
+// was keyed on — this runs in the prelude, BEFORE de-NAT rewrites it,
+// and that ordering is what makes the key match.
+//
+// Nothing is created and nothing is refreshed: an error is evidence
+// ABOUT a flow, not traffic belonging to one, so a flood of them must
+// not be able to hold a dead entry open.
+static __always_inline int fwl_ct_icmp_related(
+    struct iphdr *ip, void *data_end) {
+  // A non-first fragment carries no ICMP header, only payload — the
+  // same tiny-fragment reasoning the L4 parse is gated on.
+  if ((bpf_ntohs(ip->frag_off) & 0x1FFF) != 0) return 0;
+  __u32 hlen = ip->ihl * 4;
+  if (hlen < sizeof(struct iphdr)) return 0;
+  struct fwl_icmp_err *ic = (void *)ip + hlen;
+  if ((void *)(ic + 1) > data_end) return 0;
+  if (!FWL_ICMP_IS_ERROR(ic->type)) return 0;
+  struct iphdr *in_ip = (void *)(ic + 1);
+  if ((void *)(in_ip + 1) > data_end) return 0;
+  if (in_ip->ihl != 5) return 0;
+  struct fwl_inner_l4 *in_l4 = (void *)(in_ip + 1);
+  if ((void *)(in_l4 + 1) > data_end) return 0;
+  __u16 sp = 0, dp = 0;
+  if (in_ip->protocol == IPPROTO_TCP ||
+      in_ip->protocol == IPPROTO_UDP) {
+    sp = bpf_ntohs(in_l4->source);
+    dp = bpf_ntohs(in_l4->dest);
+  }
+  struct fwl_conn_key _f = {
+    .src_addr = in_ip->saddr, .dst_addr = in_ip->daddr,
+    .src_port = sp, .dst_port = dp, .proto = in_ip->protocol,
+  };
+  if (bpf_map_lookup_elem(&conntrack, &_f)) return 1;
+  struct fwl_conn_key _r = {
+    .src_addr = in_ip->daddr, .dst_addr = in_ip->saddr,
+    .src_port = dp, .dst_port = sp, .proto = in_ip->protocol,
+  };
+  return bpf_map_lookup_elem(&conntrack, &_r) != 0;
+}
+"""
+
+
 # Phase 5 NAT mapping table + masquerade config. The key byte-matches
 # the conntrack 5-tuple (network-order addresses, host-order ports). The
 # value records what a *return* packet must rewrite: FWL_NAT_DNAT
@@ -606,7 +697,8 @@ _NAT_DECL = """\
 #define FWL_NAT_STAT_REFUSED    2
 #define FWL_NAT_STAT_TABLE_FULL 3
 #define FWL_NAT_STAT_DENAT      4
-#define FWL_NAT_STAT_SLOTS      5
+#define FWL_NAT_STAT_ICMPERR    5
+#define FWL_NAT_STAT_SLOTS      6
 
 // The port range the NAT owns. A source port is reallocated out of it
 // only when the port the guest chose is already spoken for by a
@@ -721,6 +813,32 @@ static __always_inline __u16 fwl_l4_fix(
     sum += (__u16)~old_p;
     sum += new_p;
   }
+  sum = (sum & 0xffff) + (sum >> 16);
+  sum = (sum & 0xffff) + (sum >> 16);
+  return ~sum;
+}
+
+// Incremental ones-complement arithmetic (RFC 1624), split into a
+// delta accumulator and a single application. `fwl_l4_fix` folds one
+// address+port pair, which is all a TCP/UDP rewrite ever changes; an
+// ICMP error's checksum covers FOUR changed words at once — the two
+// halves of the embedded address, the embedded port, and the embedded
+// IP header's own checksum — so the parts are separated here and
+// folded once at the end.
+static __always_inline __u32 fwl_csum_delta16(__be16 old_w, __be16 new_w) {
+  return (__u32)(__u16)~old_w + (__u32)(__u16)new_w;
+}
+
+static __always_inline __u32 fwl_csum_delta32(__be32 old_w, __be32 new_w) {
+  __u16 *o = (__u16 *)&old_w;
+  __u16 *n = (__u16 *)&new_w;
+  return fwl_csum_delta16(o[0], n[0]) + fwl_csum_delta16(o[1], n[1]);
+}
+
+// Two folds are enough: the accumulated delta of five 16-bit words
+// cannot exceed 6 * 0xffff, so the first fold leaves at most 0x10000.
+static __always_inline __u16 fwl_csum_apply(__u16 check, __u32 delta) {
+  __u32 sum = (__u32)(__u16)~check + delta;
   sum = (sum & 0xffff) + (sum >> 16);
   sum = (sum & 0xffff) + (sum >> 16);
   return ~sum;
@@ -1024,6 +1142,121 @@ static __always_inline int fwl_dnat_ingress(
   return 0;
 }
 
+// RFC 5508 § 4.2: translate an ICMP error off the datagram embedded in
+// it. Returns 1 when the frame was translated, 0 when it was not an
+// ICMP error, was truncated below the embedded datagram, or named a
+// flow this NAT holds no mapping for — the caller then falls through
+// to the ordinary lookup.
+//
+// An ICMP error carries no ports of its own, so its flow identity is
+// the header of the packet that provoked it. For a translated flow
+// that embedded packet is what THIS NAT put on the wire, so reversing
+// its tuple yields the reply mapping's own key — the same key the
+// flow's TCP reply would use. No new state and no second table: the
+// mapping that de-NATs the reply de-NATs the error about it.
+//
+// The rewrite happens in two places at once, and either alone is
+// useless. The outer destination is re-addressed to the host behind
+// the NAT — without it the error stops at the firewall. The embedded
+// header is put back the way that host sent it — without it the error
+// arrives describing a connection the host never opened, and every
+// stack on earth discards it in silence, which is the same black hole
+// as never delivering it at all.
+//
+// The embedded TRANSPORT checksum is deliberately not touched. Only 8
+// bytes of that header travel, so its checksum covers a payload the
+// error does not carry: no receiver can validate it, and neither can
+// an oracle. A rewrite nothing can check is a rewrite nothing holds to
+// account. Linux's nf_nat skips it for the same reason — for TCP the
+// checksum field is not even among the 8 bytes.
+static __always_inline int fwl_nat_denat_icmp_error(
+    struct xdp_md *ctx, __u32 ip_off) {
+  void *data = (void *)(long)ctx->data;
+  void *data_end = (void *)(long)ctx->data_end;
+  struct iphdr *ip = (void *)((__u8 *)data + ip_off);
+  if ((void *)(ip + 1) > data_end) return 0;
+  struct fwl_icmp_err *ic =
+      (void *)((__u8 *)data + ip_off + sizeof(struct iphdr));
+  if ((void *)(ic + 1) > data_end) return 0;
+  if (!FWL_ICMP_IS_ERROR(ic->type)) return 0;
+  struct iphdr *in_ip = (void *)(ic + 1);
+  if ((void *)(in_ip + 1) > data_end) return 0;
+  // Same restriction the outer parse takes: an embedded header with
+  // options would move the ports, and nothing here would find them.
+  if (in_ip->ihl != 5) return 0;
+  struct fwl_inner_l4 *in_l4 = (void *)(in_ip + 1);
+  if ((void *)(in_l4 + 1) > data_end) return 0;
+  __u8 in_proto = in_ip->protocol;
+  __be16 in_sport = 0, in_dport = 0;
+  int in_has_ports = 0;
+  if (in_proto == IPPROTO_TCP || in_proto == IPPROTO_UDP) {
+    in_sport = in_l4->source;
+    in_dport = in_l4->dest;
+    in_has_ports = 1;
+  }
+  // The embedded tuple, reversed: what the reply to that flow looks
+  // like, which is exactly how the mapping is keyed.
+  struct fwl_nat_key k = {
+    .src_addr = in_ip->daddr, .dst_addr = in_ip->saddr,
+    .src_port = bpf_ntohs(in_dport), .dst_port = bpf_ntohs(in_sport),
+    .proto = in_proto,
+  };
+  struct fwl_nat_value *v = bpf_map_lookup_elem(&fwl_nat, &k);
+  if (!v) return 0;
+  // Every datapath touch of a mapping stamps it — this is the de-NAT
+  // of a reply like any other, and a flow whose errors are arriving is
+  // a flow that has not gone idle.
+  v->last_seen_ns = bpf_ktime_get_ns();
+  fwl_nat_stat(FWL_NAT_STAT_DENAT);
+  fwl_nat_stat(FWL_NAT_STAT_ICMPERR);
+  __be32 new_a = v->new_addr;
+  __be16 new_p = bpf_htons(v->new_port);
+  __u32 d = 0;
+  if (v->nat_type == FWL_NAT_DNAT) {
+    // The error is coming back to a masqueraded host: the embedded
+    // packet is the one it SENT, so its source is the translated one.
+    __be32 old_in = in_ip->saddr;
+    in_ip->saddr = new_a;
+    d += fwl_csum_delta32(old_in, new_a);
+    if (in_has_ports) {
+      d += fwl_csum_delta16(in_l4->source, new_p);
+      in_l4->source = new_p;
+    }
+    __be16 old_ck = in_ip->check;
+    in_ip->check = fwl_csum_apply(old_ck, fwl_csum_delta32(old_in, new_a));
+    // The embedded IP header's checksum is itself inside the ICMP
+    // checksum, so its change folds in too.
+    d += fwl_csum_delta16(old_ck, in_ip->check);
+    ic->check = fwl_csum_apply(ic->check, d);
+    ip->daddr = new_a;
+    fwl_fix_ip_csum(ip);
+  } else if (v->nat_type == FWL_NAT_SNAT) {
+    // The error is heading out to a client of a port forward: the
+    // embedded packet is the one the CLIENT sent, so its destination
+    // is the translated one.
+    __be32 old_in = in_ip->daddr;
+    in_ip->daddr = new_a;
+    d += fwl_csum_delta32(old_in, new_a);
+    if (in_has_ports) {
+      d += fwl_csum_delta16(in_l4->dest, new_p);
+      in_l4->dest = new_p;
+    }
+    __be16 old_ck = in_ip->check;
+    in_ip->check = fwl_csum_apply(old_ck, fwl_csum_delta32(old_in, new_a));
+    d += fwl_csum_delta16(old_ck, in_ip->check);
+    ic->check = fwl_csum_apply(ic->check, d);
+    // The outer source is rewritten to the mapping's public address
+    // whatever it was. An error about a forwarded connection may come
+    // from the server itself or from a router inside the network, and
+    // the client can only accept one address as the peer it is
+    // talking to — sending it any other leaks an internal address and
+    // is discarded at the far end anyway.
+    ip->saddr = new_a;
+    fwl_fix_ip_csum(ip);
+  }
+  return 1;
+}
+
 // Return-traffic de-NAT, run before any rule: if this packet matches an
 // installed reply mapping, rewrite the recorded side back to the
 // original endpoint.
@@ -1036,6 +1269,15 @@ static __always_inline void fwl_nat_denat(struct xdp_md *ctx) {
   void *data_end = (void *)(long)ctx->data_end;
   __u32 l4_off = ip_off + sizeof(struct iphdr);
   __be16 sport = 0, dport = 0;
+  // An ICMP error is tried against its EMBEDDED datagram first. It has
+  // no ports of its own, so the outer key below reads (router,
+  // firewall, 0, 0, icmp) — a key belonging to a ping the guest may
+  // have sent to the router, not to the flow the error is about. Which
+  // header identifies the flow is not a preference: for an error it is
+  // the inner one, and only when there is no mapping for it does the
+  // outer tuple (a plain echo reply) get its turn.
+  if (proto == IPPROTO_ICMP && fwl_nat_denat_icmp_error(ctx, ip_off))
+    return;
   // A frame with no L4 ports still has a mapping — fwl_snat_egress
   // installs one keyed on ports 0 — and de-NAT used to return here
   // without consuming it. That combination is incoherent: the egress
@@ -1679,6 +1921,8 @@ def _emit_parse_prelude(
           ct_state = 1;
           _ct_v->last_seen_ns = bpf_ktime_get_ns();
           _ct_v->packets += 1;
+        } else if (proto == IPPROTO_ICMP) {
+          ct_state = fwl_ct_icmp_related(ip, data_end) ? 2 : 0;
         } else if (proto == IPPROTO_TCP && !tcp_syn) {
           ct_state = 3;
         }"""
@@ -3056,6 +3300,11 @@ def _emit_zone_source(
     _maybe_pin(_CONNTRACK_DECL, pinned_shared)
     if (uses_ct or nat_active) else ""
   )
+  # The RELATED classifier is only referenced by the prelude's ct
+  # block, so it follows `uses_ct` alone — a NAT-only program declares
+  # the map (for the post-NAT insert) but never reads a state.
+  if uses_ct:
+    conntrack_decl += _CONNTRACK_HELPERS
   ct_create = _emit_ct_create() if uses_ct else ""
 
   nat_decl = _maybe_pin(_NAT_DECL, pinned_shared) if nat_active else ""
