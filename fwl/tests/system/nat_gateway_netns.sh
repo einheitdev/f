@@ -6,6 +6,19 @@
 # physically reaches the original LAN host. A stub (or a wrong checksum)
 # cannot pass this — it is observed with tcpdump + scapy on real veths.
 #
+# KNOWN LIMIT OF THIS WITNESS (2026-08-14). tcpdump is promiscuous, so
+# this proves the frame reached the peer's cable and NOT that the peer's
+# stack would accept it. A frame addressed to the wrong destination MAC
+# is captured here and dropped by a real host as PACKET_OTHERHOST — which
+# is exactly the defect `redirect` carried until it learned to resolve
+# its next hop (v0.4 6.3), and exactly why this test and eleven hardware
+# scenarios all stayed green through it. The acceptance question is asked
+# on the rig instead, with real non-promiscuous sockets either side:
+# tests/system/hw/l2_03_masquerade.sh. Bringing that witness down here
+# would need addresses on lan0/wan0 in the root namespace plus
+# ip_forward, and is worth doing: it would make the routed path
+# CI-testable, which today it is not.
+#
 #   ns lansrc                 root ns                    ns wandst
 #   --------                  -------                    --------
 #   lan0p(10.0.0.5) <=======> lan0 [XDP from_lan]        wan0p(EXT) <= cap

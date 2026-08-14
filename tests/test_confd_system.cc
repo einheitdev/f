@@ -112,6 +112,8 @@ class Box {
     o.config_path = config().string();
     o.snapshot_dir = snapshots().string();
     o.networkd_dir = networkd().string();
+    o.sysctl_dir = (root_ / "sysctl.d").string();
+    o.sysctl_proc_dir = (root_ / "proc-sys").string();
     o.dnsmasq_conf = (root_ / "dnsmasq.conf").string();
     return o;
   }

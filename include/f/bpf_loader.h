@@ -126,6 +126,13 @@ struct ZoneBundleHandles {
   /// refusal means the packet was dropped). Read by NatMgr for
   /// `fctl status` and for the log line that fires when refusals move.
   int nat_stats_fd = -1;
+  /// The shared `fwl_route_stats` per-CPU tally fd, or -1 when no zone
+  /// program can redirect. Says whether a forwarded frame was ROUTED
+  /// (next hop resolved through the zone the policy named, MACs
+  /// rewritten, TTL decremented) or BRIDGED (forwarded with the header
+  /// it arrived with). A masquerading gateway whose forwards are all
+  /// bridged is a black hole, and nothing on the wire says so.
+  int route_stats_fd = -1;
   /// The shared masquerade config map fd (`fwl_nat_cfg`), or -1 when no
   /// zone program masquerades. The loader seeds slot 0 with the
   /// masquerade source address so the XDP `masquerade` action rewrites

@@ -159,6 +159,21 @@ _MAP_KINDS: tuple[_MapKind, ...] = (
     ),
   ),
   _MapKind(
+    r"fwl_route_stats", MapScope.SHARED,
+    "counts what the ONE routing table under this box did to forwarded "
+    "frames. Routing is a property of the host, not of a zone, so a "
+    "per-zone copy would report whichever zone happened to forward "
+    "rather than what the box does; slots are numbered by the "
+    "emitter's own header, so a slot means the same event everywhere",
+    lifetime=MapLifetime.POLICY,
+    lifetime_why=(
+      "a counter, and every other counter restarts from zero across a "
+      "reload for the same reason: a number carried over from a policy "
+      "that is no longer running is attributed to a redirect that "
+      "never produced it"
+    ),
+  ),
+  _MapKind(
     r"fwl_nat_cfg", MapScope.SHARED,
     "one unit-wide masquerade address, written once by the daemon",
     lifetime=MapLifetime.POLICY,
@@ -531,6 +546,12 @@ struct fwl_vlanhdr {
 // -1 never collides with a real XDP_* code (XDP_ABORTED..XDP_REDIRECT
 // are 0..4).
 #define FWL_CONTINUE (-1)
+
+// bpf_fib_lookup wants an address family and <linux/bpf.h> does not
+// carry one; <sys/socket.h> does not compile under `clang -target bpf`.
+#ifndef AF_INET
+#define AF_INET 2
+#endif
 """
 
 
@@ -1351,6 +1372,175 @@ static __always_inline void fwl_nat_denat(struct xdp_md *ctx) {
     }
   }
 }
+"""
+
+
+# Routed-forward state (v0.4 § 6.3). Declared by any program that can
+# `redirect to <zone>`, whether or not it also translates addresses.
+#
+# A redirect used to be one `bpf_redirect_map()`, which forwards the
+# frame with the Ethernet header it arrived with. That is correct for a
+# zone-to-zone hop on ONE L2 segment and wrong for every hop that
+# crosses a subnet boundary: the destination MAC is still the firewall's
+# own, so the next hop's NIC reports PACKET_OTHERHOST and its IP stack
+# discards the frame before any socket sees it. Masquerade toward an
+# upstream gateway is that second case by definition — you cannot
+# translate the source to your own address and then hand the frame to a
+# MAC you never addressed — so it never worked, and a promiscuous
+# AF_PACKET witness could not tell (it counts frames a real stack
+# drops).
+_ROUTE_DECL = """\
+#define FWL_ROUTE_STAT_ROUTED    0
+#define FWL_ROUTE_STAT_BRIDGED   1
+#define FWL_ROUTE_STAT_NO_ROUTE  2
+#define FWL_ROUTE_STAT_NO_NEIGH  3
+#define FWL_ROUTE_STAT_TTL       4
+#define FWL_ROUTE_STAT_OFF_ZONE  5
+#define FWL_ROUTE_STAT_SLOTS     6
+
+struct {
+  __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+  __uint(max_entries, FWL_ROUTE_STAT_SLOTS);
+  __type(key, __u32);
+  __type(value, __u64);
+} fwl_route_stats SEC(".maps");
+"""
+
+
+# `fwl_route_l2` returns this when the box does not route this packet
+# out this zone, and the caller forwards the frame unchanged — exactly
+# what a redirect did before routing existed. That fallback is what
+# keeps a genuine L2 zone hop (and every bridged test, and the corpus,
+# where no devmap is populated at all) behaving as it always has.
+_ROUTE_HELPERS = """\
+#define FWL_ROUTE_BRIDGE (-1)
+
+static __always_inline void fwl_route_stat(__u32 slot) {
+  __u64 *c = bpf_map_lookup_elem(&fwl_route_stats, &slot);
+  if (c) __sync_fetch_and_add(c, 1);
+}
+
+// RFC 1141 incremental checksum update for a TTL decrement. Written out
+// rather than recomputed with bpf_csum_diff because the route helpers
+// are emitted for programs that carry no NAT, where fwl_fix_ip_csum
+// does not exist.
+static __always_inline void fwl_ip_decrease_ttl(struct iphdr *ip) {
+  __u32 check = (__u32)ip->check;
+  check += (__u32)bpf_htons(0x0100);
+  ip->check = (__u16)(check + (check >= 0xFFFF));
+  ip->ttl--;
+}
+
+// Resolve the next hop for an IPv4 frame and address the frame to it.
+//
+// `zone_ifindex` is the egress interface the policy named (devmap slot
+// 0 of the destination zone). The FIB's answer is only usable when it
+// agrees: a box with a default route resolves EVERY destination, so
+// without this check a zone-to-zone hop on an unrouted segment would be
+// stamped with the MACs of the default gateway — which sits on a
+// different interface entirely. Route through the zone the policy
+// named, or do not route.
+//
+// Returns an XDP action, or FWL_ROUTE_BRIDGE for "this box does not
+// route this packet out this zone" — the caller then forwards the frame
+// with the header it arrived with, which is what a redirect has always
+// done.
+static __always_inline int fwl_route_l2(struct xdp_md *ctx,
+                                        __u32 zone_ifindex) {
+  void *data = (void *)(long)ctx->data;
+  void *data_end = (void *)(long)ctx->data_end;
+  struct ethhdr *eth = data;
+  if ((void *)(eth + 1) > data_end) return FWL_ROUTE_BRIDGE;
+  // A tagged frame's next hop is a property of its VLAN, and rewriting
+  // the MACs without touching the tag addresses the right host on the
+  // wrong segment. v0.4 routes untagged IPv4 only; everything else
+  // keeps the L2-adjacent behaviour. (IPv6 has no conntrack and no NAT
+  // here either — same version boundary, stated once.)
+  if (eth->h_proto != bpf_htons(ETH_P_IP)) return FWL_ROUTE_BRIDGE;
+  struct iphdr *ip = (void *)(eth + 1);
+  if ((void *)(ip + 1) > data_end) return FWL_ROUTE_BRIDGE;
+
+  struct bpf_fib_lookup fib = {};
+  fib.family = AF_INET;
+  fib.l4_protocol = ip->protocol;
+  fib.tot_len = bpf_ntohs(ip->tot_len);
+  fib.ipv4_src = ip->saddr;
+  fib.ipv4_dst = ip->daddr;
+  fib.ifindex = ctx->ingress_ifindex;
+
+  long rc = bpf_fib_lookup(ctx, &fib, sizeof(fib), 0);
+  if (rc != BPF_FIB_LKUP_RET_SUCCESS) {
+    // The three the kernel documents as droppable: a routing table
+    // exists, was consulted, and said no. Everything else means "this
+    // box is not routing this packet" (no route, forwarding disabled,
+    // an encapsulating route, a bad argument) and falls back to the
+    // L2-adjacent forward.
+    if (rc == BPF_FIB_LKUP_RET_BLACKHOLE ||
+        rc == BPF_FIB_LKUP_RET_UNREACHABLE ||
+        rc == BPF_FIB_LKUP_RET_PROHIBIT) {
+      fwl_route_stat(FWL_ROUTE_STAT_NO_ROUTE);
+      return XDP_DROP;
+    }
+    // The route is known and the next hop's MAC is not. XDP cannot
+    // resolve it; the stack can, so hand the frame over and let it send
+    // the ARP. Counted because for a SOURCE-TRANSLATED frame the stack
+    // will discard it (its source is one of our own addresses, which
+    // fib_validate_source rejects as martian) — the resolution happens,
+    // this packet does not survive it, and the counter is the only
+    // trace.
+    if (rc == BPF_FIB_LKUP_RET_NO_NEIGH) {
+      fwl_route_stat(FWL_ROUTE_STAT_NO_NEIGH);
+      return XDP_PASS;
+    }
+    return FWL_ROUTE_BRIDGE;
+  }
+
+  if (fib.ifindex != zone_ifindex) {
+    fwl_route_stat(FWL_ROUTE_STAT_OFF_ZONE);
+    return FWL_ROUTE_BRIDGE;
+  }
+
+  // A router decrements. Below 2 the packet dies here and the ICMP
+  // time-exceeded that says so is the stack's job, not ours.
+  if (ip->ttl <= 1) {
+    fwl_route_stat(FWL_ROUTE_STAT_TTL);
+    return XDP_PASS;
+  }
+
+  // Re-derive after the helper call: the verifier's packet pointers do
+  // not survive a call it cannot prove leaves the frame alone.
+  data = (void *)(long)ctx->data;
+  data_end = (void *)(long)ctx->data_end;
+  eth = data;
+  if ((void *)(eth + 1) > data_end) return FWL_ROUTE_BRIDGE;
+  ip = (void *)(eth + 1);
+  if ((void *)(ip + 1) > data_end) return FWL_ROUTE_BRIDGE;
+
+  fwl_ip_decrease_ttl(ip);
+  __builtin_memcpy(eth->h_dest, fib.dmac, ETH_ALEN);
+  __builtin_memcpy(eth->h_source, fib.smac, ETH_ALEN);
+  return XDP_REDIRECT;
+}
+"""
+
+
+# One per redirect-destination zone: the devmap name has to be a
+# compile-time constant at the bpf_redirect_map() call site, so the
+# zone's redirect is a function of its own rather than an argument.
+_ROUTE_ZONE_TEMPLATE = """\
+static __always_inline int fwl_redirect_{zone}(struct xdp_md *ctx) {{
+  __u32 _rk = 0;
+  __u32 *_rif = bpf_map_lookup_elem(&fwl_devmap_{zone}, &_rk);
+  int _ra = _rif ? fwl_route_l2(ctx, *_rif) : FWL_ROUTE_BRIDGE;
+  if (_ra == FWL_ROUTE_BRIDGE) {{
+    fwl_route_stat(FWL_ROUTE_STAT_BRIDGED);
+  }} else if (_ra == XDP_REDIRECT) {{
+    fwl_route_stat(FWL_ROUTE_STAT_ROUTED);
+  }} else {{
+    return _ra;
+  }}
+  return bpf_redirect_map(&fwl_devmap_{zone}, 0, 0);
+}}
 """
 
 
@@ -2527,14 +2717,19 @@ def _emit_ct_create(indent: str = "    ") -> str:
 
 
 def _redirect_return(zone: str) -> str:
-  """C expression that redirects out the destination zone (v0.4 § 6.3).
+  """C expression that forwards out the destination zone (v0.4 § 6.3).
 
-  Uses bpf_redirect_map() against the zone's devmap (key 0 = the
-  zone's first/representative egress ifindex, which the daemon
-  populates at load time). For a multi-interface zone the switch chip's
-  FDB picks the physical egress port. Returns XDP_REDIRECT.
+  `fwl_redirect_<zone>` routes when this box's own routing table says
+  the destination is reachable through that zone — next-hop MAC from
+  `bpf_fib_lookup`, TTL decremented — and otherwise forwards the frame
+  with the Ethernet header it arrived with, which is all a redirect
+  ever did. Egress is still the zone's devmap (key 0 = the zone's
+  first/representative ifindex, populated by the daemon at load time);
+  for a multi-interface zone the switch chip's FDB picks the physical
+  port. Returns XDP_REDIRECT, or XDP_DROP/XDP_PASS when the route
+  lookup says the packet must not go out as it is.
   """
-  return f"bpf_redirect_map(&fwl_devmap_{zone}, 0, 0)"
+  return f"fwl_redirect_{zone}(ctx)"
 
 
 def _emit_rule(
@@ -3092,7 +3287,23 @@ struct {{
   __uint(max_entries, 64);{pin}
 }} fwl_devmap_{z} SEC(".maps");
 """)
+  if blocks:
+    blocks.append(_maybe_pin(_ROUTE_DECL, pinned))
   return "\n".join(blocks)
+
+
+def _emit_route_helpers(zones: list[str]) -> str:
+  """The routing helpers, plus one redirect function per destination.
+
+  Emitted only when the object can redirect somewhere. Must follow the
+  devmap declarations (each function names its own map) and precede any
+  `static __noinline` helper body, since a helper may redirect too.
+  """
+  if not zones:
+    return ""
+  return _ROUTE_HELPERS + "\n" + "\n".join(
+    _ROUTE_ZONE_TEMPLATE.format(zone=z) for z in zones
+  )
 
 
 def _walk_calls_in_stmts(stmts):
@@ -3285,6 +3496,7 @@ def _emit_zone_source(
       if z not in redirect_zones:
         redirect_zones.append(z)
   devmaps = _emit_devmaps(redirect_zones, pinned_shared)
+  route_helpers = _emit_route_helpers(redirect_zones)
 
   # Phase 5 NAT. Emit the maps + helpers when this program uses NAT, or
   # when forced (a bundle where some other zone does — so return traffic
@@ -3384,7 +3596,7 @@ def _emit_zone_source(
     src = f"""{_HEADER}
 {scratch_struct}
 {maps_block}{scratch_map}{prog_array}
-{nat_helpers}
+{nat_helpers}{route_helpers}
 {helper_protos}{helper_defs}{programs}
 char _license[] SEC("license") = "GPL";
 {counter_table}"""
@@ -3407,7 +3619,7 @@ char _license[] SEC("license") = "GPL";
 
   src = f"""{_HEADER}
 {maps_block}
-{nat_helpers}
+{nat_helpers}{route_helpers}
 {helper_protos}{helper_defs}SEC("xdp")
 int fwl_prog(struct xdp_md *ctx) {{
 {prelude}{nat_denat}{body}  {final_stmt}

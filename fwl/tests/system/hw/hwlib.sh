@@ -244,6 +244,143 @@ with open('$SNIFF_OUT') as fh:
 "
 }
 
+# --- Real hosts on the far side -------------------------------------
+#
+# `sniff.py` answers "did the frame reach this cable". A firewall has
+# to pass a different test: "did the far side ACCEPT it". The two came
+# apart for the entire life of this suite — a redirect never rewrote the
+# destination MAC, so every masqueraded frame left addressed to the
+# firewall's own MAC, and a promiscuous AF_PACKET witness counted every
+# one of them while a real IP stack would have reported PACKET_OTHERHOST
+# and dropped it before any socket existed.
+#
+# These build ordinary Linux hosts: their own netns, their own stack,
+# their own MAC, NOT promiscuous. A byte only arrives at a socket there
+# if the frame was addressed to it and was valid.
+FAR_HOSTS=()
+
+# hw::host_up <ns> <parent-if> <vlan|none> <cidr> [gateway]
+#
+# `vlan` none gives a macvlan (its own MAC on the parent's untagged
+# segment); a number gives an 802.1Q subinterface, which is how a
+# second segment is reached over the one trunk port the bench has.
+hw::host_up() {
+  local ns="$1" parent="$2" vlan="$3" cidr="$4" gw="${5:-}"
+  local dev
+  ip netns del "$ns" 2>/dev/null || true
+  ip netns add "$ns" || hw::abort "netns add $ns"
+  if [ "$vlan" = "none" ]; then
+    dev="mv${ns}"
+    ip link del "$dev" 2>/dev/null || true
+    ip link add "$dev" link "$parent" type macvlan mode bridge \
+      || hw::abort "macvlan $dev on $parent"
+  else
+    dev="vl${vlan}${ns}"
+    ip link del "$dev" 2>/dev/null || true
+    ip link add link "$parent" name "$dev" type vlan id "$vlan" \
+      || hw::abort "vlan $dev on $parent"
+  fi
+  ip link set "$dev" netns "$ns" || hw::abort "move $dev into $ns"
+  ip netns exec "$ns" ip link set lo up
+  ip netns exec "$ns" ip link set "$dev" up
+  ip netns exec "$ns" ip addr add "$cidr" dev "$dev"
+  if [ -n "$gw" ]; then
+    ip netns exec "$ns" ip route add default via "$gw" dev "$dev" \
+      || hw::abort "default route via $gw in $ns"
+  fi
+  # Asserted, not assumed. A promiscuous far side accepts frames a real
+  # host drops, which is the exact defect this machinery exists to make
+  # visible — so a test whose witness had quietly become promiscuous
+  # would be back to proving nothing.
+  if ip netns exec "$ns" ip link show "$dev" | grep -q PROMISC; then
+    hw::abort "$ns/$dev is PROMISC; it would accept frames a real host drops"
+  fi
+  FAR_HOSTS+=("$ns")
+  log "far host $ns: $cidr on $dev (parent $parent, vlan $vlan)"
+}
+
+hw::hosts_down() {
+  local ns
+  for ns in "${FAR_HOSTS[@]:-}"; do
+    [ -n "$ns" ] && ip netns del "$ns" 2>/dev/null || true
+  done
+  FAR_HOSTS=()
+}
+
+# hw::in <ns> <cmd...> — run a command inside a far host.
+hw::in() {
+  local ns="$1"; shift
+  ip netns exec "$ns" "$@"
+}
+
+# hw::server_start <ns> <bind> <port> <n> <timeout_s> — a real listening
+# socket on the far side; hw::server_get <key> reads its JSON report.
+SERVER_OUT=""
+SERVER_PID=""
+hw::server_start() {
+  local ns="$1" bind="$2" port="$3" n="$4" secs="$5"
+  SERVER_OUT=$(mktemp)
+  ip netns exec "$ns" $PY "$HERE/realsock.py" server \
+    "$bind" "$port" "$n" "$secs" > "$SERVER_OUT" &
+  SERVER_PID=$!
+  sleep 0.5
+}
+
+hw::server_wait() {
+  wait "$SERVER_PID" 2>/dev/null || true
+}
+
+hw::server_get() {
+  $PY -c "
+import json, sys
+with open('$SERVER_OUT') as fh:
+  d = json.load(fh)
+v = d.get('$1', 0)
+print(','.join(map(str, v)) if isinstance(v, list) else v)
+"
+}
+
+# hw::client <ns> <dst> <port> <n> <timeout_s> [src_port] — a real
+# client; prints the JSON report so a caller can read a field.
+hw::client() {
+  local ns="$1"; shift
+  ip netns exec "$ns" $PY "$HERE/realsock.py" client "$@"
+}
+
+# hw::jget <json> <key> — one field out of a JSON line.
+hw::jget() {
+  $PY -c "
+import json, sys
+d = json.loads(sys.argv[1])
+v = d.get(sys.argv[2], 0)
+print(','.join(map(str, v)) if isinstance(v, list) else v)
+" "$1" "$2"
+}
+
+# hw::route <field> — one field of `fctl status`'s "route" section, or
+# -1 when absent. `routed` vs `bridged` is the difference between a
+# gateway and a black hole, and it is the ONLY place that difference is
+# written down: both put the same frame on the same cable.
+hw::route() {
+  fctl status 2>/dev/null | $PY -c "
+import json, sys
+try:
+  v = json.load(sys.stdin)['route']['$1']
+  print(int(v) if isinstance(v, bool) else v)
+except Exception:
+  print(-1)
+"
+}
+
+# hw::forwarding <0|1> — set net.ipv4.ip_forward and report the old
+# value, so a test can turn routing off as a CONTROL and put it back.
+hw::forwarding() {
+  local old
+  old=$(cat /proc/sys/net/ipv4/ip_forward)
+  echo "$1" > /proc/sys/net/ipv4/ip_forward
+  echo "$old"
+}
+
 # hw::nat <field> — one field of `fctl status`'s "nat" section, or -1
 # when the section (or the field) is absent. Reading the table through
 # the CLI rather than through bpftool is the point: the l11_02 finding
@@ -357,6 +494,7 @@ hw::mirror_off() {
 }
 
 hw::finish() {
+  hw::hosts_down
   hw::restore_smoke
   echo
   log "==== evidence ===="

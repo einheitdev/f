@@ -18,6 +18,7 @@
 #include "f/sysconfig/model.h"
 #include "f/sysconfig/networkd.h"
 #include "f/sysconfig/parse.h"
+#include "f/sysconfig/sysctl.h"
 #include "f/sysconfig/validate.h"
 
 namespace f::confd {
@@ -287,8 +288,26 @@ auto SystemBackend::Apply(const cc::Candidate& candidate)
         Fail(cc::ApplyError::HardwareRejected, net.error()));
   }
 
+  // Forwarding travels with the interfaces. A rollback does not need
+  // to undo it: `net.ipv4.ip_forward` is a property of the box being a
+  // router, not of any one revision of its configuration, and a
+  // rollback that turns routing off would cut the session it exists to
+  // protect.
+  sc::SysctlOptions sysctl_opts;
+  sysctl_opts.dir = opts_.sysctl_dir;
+  sysctl_opts.proc_dir = opts_.sysctl_proc_dir;
+  sysctl_opts.refuse_on_drift = !force;
+  auto sysctl = sc::ApplySysctl(*parsed, sysctl_opts);
+  if (!sysctl) {
+    return std::unexpected(
+        Fail(cc::ApplyError::HardwareRejected, sysctl.error()));
+  }
+
   Activation activation;
   activation.networkd_changed = net->changed;
+  if (sysctl->changed) {
+    activation.networkd_changed.push_back(sysctl->unit.path);
+  }
 
   auto plan = sc::PlanDnsmasq(*parsed);
   std::string dnsmasq_note = "no service is bound to a zone";

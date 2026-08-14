@@ -925,6 +925,7 @@ auto CloseZoneBundle(ZoneBundleHandles& handles) -> void {
   handles.conntrack_fd = -1;
   handles.nat_fd = -1;
   handles.nat_stats_fd = -1;
+  handles.route_stats_fd = -1;
   handles.nat_cfg_fd = -1;
 }
 
@@ -1113,6 +1114,16 @@ auto LoadZoneBundle(std::string_view bundle_dir,
     if (handles.nat_stats_fd < 0) {
       int ns = FindMap(obj, "fwl_nat_stats");
       if (ns >= 0) handles.nat_stats_fd = ns;
+    }
+
+    // And the routing tally, for the same reason one slot up: whether
+    // a redirect re-addressed the frame to a next hop or handed it on
+    // with the MAC it arrived with is not observable from the wire by
+    // anything that captures promiscuously. This map is the only place
+    // the difference is written down.
+    if (handles.route_stats_fd < 0) {
+      int rs = FindMap(obj, "fwl_route_stats");
+      if (rs >= 0) handles.route_stats_fd = rs;
     }
 
     // masquerade (v0.4 § NAT): the program translates sources to "the

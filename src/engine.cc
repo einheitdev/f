@@ -454,6 +454,23 @@ auto HandleRequest(Engine& e, const std::string& req_str)
 
 }  // namespace
 
+auto AttachRouteMgr(Engine& e) -> void {
+  e.route.stats_fd = e.zone_bundle.route_stats_fd;
+  e.route.enabled = e.route.stats_fd >= 0;
+  // POLICY-lifetime map: the pin is discarded on a reload and the new
+  // bundle counts from zero, so the "already reported" watermarks have
+  // to reset with it. Otherwise the first drops after a reload sit
+  // below the old mark and are never logged — the daemon goes quiet
+  // about exactly the event it exists to shout about.
+  e.route.reported_no_route = 0;
+  e.route.reported_no_neigh = 0;
+  bool redirects = false;
+  for (const auto& p : e.zone_bundle.programs) {
+    if (!p.redirects_to.empty()) redirects = true;
+  }
+  e.route.CheckForwarding(redirects);
+}
+
 auto AttachNatMgr(Engine& e) -> void {
   e.nat.map_fd = e.zone_bundle.nat_fd;
   e.nat.stats_fd = e.zone_bundle.nat_stats_fd;
@@ -579,6 +596,7 @@ auto EngineInit(Engine& e,
           e.conntrack.timeout_s, e.conntrack.gc_interval_s);
     }
     AttachNatMgr(e);
+    AttachRouteMgr(e);
     // Record the attached interfaces for status reporting.
     for (const auto& prog : e.zone_bundle.programs) {
       for (int idx : prog.ifindexes) {
@@ -835,6 +853,10 @@ auto EngineRun(Engine& e, std::stop_token stop)
     // read anchors this tick was about to delete and keep every dead
     // mapping for one extra interval.
     e.nat.MaybeRunGc(now_ns, e.conntrack.gc_interval_s);
+    // Not a sweep — nothing to collect. Routing failures are
+    // counted by the datapath and are invisible everywhere
+    // else, so this is where they become a log line.
+    e.route.Report();
   }
 
   spdlog::info("Engine stopping.");
@@ -1009,6 +1031,11 @@ auto GetFullState(const Engine& e) -> nlohmann::json {
   // connections hang, old ones are fine", and nothing in the CLI to
   // see it in.
   j["nat"] = e.nat.GetState();
+  // Whether a redirect re-addressed the frame to a next hop or handed
+  // it on with the MAC it arrived carrying. Not visible in any capture
+  // — a frame addressed to the wrong MAC is still on the cable — so
+  // this section is the only place the difference is written down.
+  j["route"] = e.route.GetState();
 
   // Slow path stats.
   j["slow_path"] = {

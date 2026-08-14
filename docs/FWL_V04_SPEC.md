@@ -767,11 +767,76 @@ only `allow`/`drop` — so `default redirect to <zone>` is a syntax error.
 #### Semantics
 
 The emitter declares one `BPF_MAP_TYPE_DEVMAP` per destination zone
-(`fwl_devmap_<zone>`) and emits `bpf_redirect_map(&fwl_devmap_<zone>, 0,
-0)`. The daemon populates the devmap with the destination zone's egress
-ifindex(es) at load time; for a multi-interface zone the switch chip's
-FDB/MAC learning picks the physical egress port. `redirect` does not
-open a conntrack entry in v0.4 (NAT-driven flow creation is Phase 5).
+(`fwl_devmap_<zone>`). The daemon populates it with the destination
+zone's egress ifindex(es) at load time; for a multi-interface zone the
+switch chip's FDB/MAC learning picks the physical egress port.
+`redirect` does not open a conntrack entry in v0.4 (NAT-driven flow
+creation is Phase 5).
+
+**`f` routes.** A redirect is not only an egress decision, it is a
+next-hop decision, and the two are not the same question. Through v0.4
+the emitted code was one `bpf_redirect_map()`, which forwards the frame
+with the Ethernet header it arrived carrying. For a zone-to-zone hop on
+one L2 segment that is correct. For a hop across a subnet boundary it
+is not, and **masquerade is that second case by construction**: you
+cannot translate the source to your own address and then hand the frame
+to a MAC you never addressed. The next hop's NIC reports the frame as
+`PACKET_OTHERHOST` and its stack discards it before any socket exists.
+
+So a redirect now resolves the next hop through the kernel's own
+routing table (`bpf_fib_lookup`) and re-addresses the frame to it:
+
+1. Read the destination zone's ifindex from devmap slot 0. If the slot
+   is empty, nothing is known about this zone and the frame is
+   forwarded L2-adjacent (this is also what makes an unpopulated devmap
+   behave exactly as before, which is what the `.pkt` corpus sees).
+2. `bpf_fib_lookup` with the packet's post-NAT addresses and the
+   ingress ifindex.
+3. On `BPF_FIB_LKUP_RET_SUCCESS`, **the egress ifindex the FIB returns
+   must be the zone's own**. A box with a default route resolves every
+   destination, so without this check a zone hop on an unrouted segment
+   would be stamped with the default gateway's MAC, which lives on a
+   different interface. A mismatch is counted (`off_zone`) and the
+   frame is forwarded L2-adjacent.
+4. Otherwise: the destination MAC and source MAC are written from the
+   lookup, the TTL is decremented, and the IP checksum updated. Egress
+   is still the zone's devmap — the policy named a zone and the frame
+   leaves through it.
+
+The failure outcomes follow the kernel's own classification:
+
+| FIB result | Outcome |
+|---|---|
+| `SUCCESS`, ifindex matches | routed (MACs rewritten, TTL decremented) |
+| `SUCCESS`, ifindex differs | forwarded L2-adjacent, counted `off_zone` |
+| `BLACKHOLE` / `UNREACHABLE` / `PROHIBIT` | `XDP_DROP`, counted `no_route` |
+| `NO_NEIGH` | `XDP_PASS` so the stack can ARP, counted `no_neigh` |
+| anything else (incl. `FWD_DISABLED`, no route) | forwarded L2-adjacent |
+| TTL ≤ 1 | `XDP_PASS`; the stack owns the ICMP time-exceeded |
+
+`NO_NEIGH` is the one that does not fully recover: handing the packet to
+the stack is what triggers the ARP, but a **source-translated** packet
+does not survive that trip, because its source is one of this box's own
+addresses and `fib_validate_source` rejects it as a martian. The
+resolution happens; that packet does not. It is counted and logged for
+exactly that reason.
+
+`net.ipv4.ip_forward` is therefore load-bearing rather than advisory:
+with it at 0 the lookup returns `FWD_DISABLED`, no next hop is
+resolved, and every forward degrades to the L2-adjacent behaviour. It is
+generated as part of the appliance system configuration
+(`f-sysconf render sysctl`), not documented as a manual step.
+
+Which of the two a forward took is **not observable on the wire**. Both
+put the same frame on the same cable; only the far side's stack tells
+them apart, and only by dropping one of them. `fwl_route_stats` (one
+per-CPU array per bundle, surfaced as the `route` section of
+`fctl status`) is where the difference is written down.
+
+Routing is IPv4-and-untagged only in v0.4, the same boundary as
+conntrack and NAT. A tagged frame or an IPv6 frame keeps the
+L2-adjacent behaviour, because re-addressing a tagged frame without
+touching its tag addresses the right host on the wrong segment.
 
 #### Edge cases
 
@@ -780,6 +845,19 @@ open a conntrack entry in v0.4 (NAT-driven flow creation is Phase 5).
 - **Redirect destination down**: the kernel drops the frame at
   `xdp_do_redirect`; no crash.
 - **Redirect without prior NAT** is valid — pure L2/L3 forwarding.
+- **Redirect on a segment the box has no route to** keeps working: the
+  lookup fails, the frame is forwarded unchanged, and `bridged` counts
+  it. A bridge does not need a routing table.
+- **A multi-interface zone routes only through devmap slot 0** — the
+  zone's first declared interface. A route whose egress is one of the
+  zone's OTHER interfaces reads as `off_zone` and is forwarded
+  L2-adjacent. That is the safe degradation (it never stamps a next hop
+  from another segment onto a frame leaving the wrong port), but it is a
+  real limitation and it is untested: every zone on the bench has one
+  interface. Lifting it means matching the FIB's egress ifindex against
+  every populated devmap slot and redirecting to the slot that matches,
+  which is a small change and should not be made without a two-port
+  zone to prove it on.
 
 #### Compile errors
 

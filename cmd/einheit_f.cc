@@ -50,6 +50,7 @@ auto main(int argc, char** argv) -> int {
   std::string dnsmasq_conf = "/etc/f/generated/dnsmasq.conf";
   std::string confd_socket = "ipc:///run/f/confd.sock";
   std::string networkd_dir = "/etc/systemd/network";
+  std::string sysctl_dir = "/etc/sysctl.d";
   bool locked = false;
 
   app.add_option("--color", color, "always|never|auto");
@@ -67,6 +68,8 @@ auto main(int argc, char** argv) -> int {
                  "services");
   app.add_option("--dnsmasq-conf", dnsmasq_conf,
                  "Where the generated dnsmasq config lives");
+  app.add_option("--sysctl-dir", sysctl_dir,
+                 "Where the generated sysctl drop-in is installed");
   app.add_option("--networkd-dir", networkd_dir,
                  "Where generated networkd units are installed");
   app.add_option("--confd-socket", confd_socket,
@@ -101,6 +104,7 @@ auto main(int argc, char** argv) -> int {
   tcfg.system_config = system_config;
   tcfg.dnsmasq_conf = dnsmasq_conf;
   tcfg.networkd_dir = networkd_dir;
+  tcfg.sysctl_dir = sysctl_dir;
   tcfg.confd_socket = confd_socket;
   auto tx_result = adapters::fw::NewFLocalTransport(tcfg);
   if (!tx_result) {

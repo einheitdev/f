@@ -134,6 +134,7 @@ add_library(libf-sysconfig STATIC
   src/sysconfig/networkd.cc
   src/sysconfig/parse.cc
   src/sysconfig/service_status.cc
+  src/sysconfig/sysctl.cc
   src/sysconfig/validate.cc
 )
 
@@ -156,6 +157,7 @@ add_library(libf-engine STATIC
   src/slow_path.cc
   src/components.cc
   src/nat_mgr.cc
+  src/route_mgr.cc
   src/watcher.cc
 )
 

@@ -34,6 +34,7 @@
 #include "f/sysconfig/edit.h"
 #include "f/sysconfig/model.h"
 #include "f/sysconfig/networkd.h"
+#include "f/sysconfig/sysctl.h"
 #include "f/sysconfig/parse.h"
 #include "f/sysconfig/service_status.h"
 #include "f/sysconfig/validate.h"
@@ -1140,6 +1141,21 @@ class FLocalTransport final
     (*out)["via"] = "direct";
     json written = json::array();
     for (const auto& p : net->changed) written.push_back(p);
+    // Addresses without forwarding is a box that answers pings and
+    // routes nothing. It ships in the same apply as the interfaces
+    // because it is the same fact about the box.
+    sc::SysctlOptions sysctl_opts;
+    sysctl_opts.dir = cfg_.sysctl_dir;
+    sysctl_opts.proc_dir = cfg_.sysctl_proc_dir;
+    auto sysctl = sc::ApplySysctl(*parsed, sysctl_opts);
+    if (!sysctl) {
+      (*out)["warning"] = sysctl.error();
+    } else {
+      if (sysctl->changed) written.push_back(sysctl->unit.path);
+      json applied = json::array();
+      for (const auto& k : sysctl->applied) applied.push_back(k);
+      (*out)["sysctl_applied"] = applied;
+    }
     (*out)["written"] = written;
     return std::nullopt;
   }

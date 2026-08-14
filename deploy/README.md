@@ -91,6 +91,20 @@ If nobody confirms, the previous configuration — the exact document, not a re-
 
 Without `f-confd`, `apply system` still works as a direct apply, and says so: no revision is recorded, no revert timer is armed, and nothing is reloaded. `apply system confirmed` is *refused* rather than performed, because a confirmed apply with no timer behind it is the one thing worse than no timer at all.
 
+### 5. Forwarding — generated, not a step you perform
+
+`f` routes. A policy that sends a packet from one zone to another sends it to a next hop, and Linux will not resolve one with `net.ipv4.ip_forward` at 0 — the XDP datapath asks the same kernel, so `bpf_fib_lookup` answers `FWD_DISABLED`, the redirect falls back to forwarding the frame with the destination MAC it arrived carrying, and the far side discards it as `PACKET_OTHERHOST`. Nothing on the wire says so.
+
+So it is **not** a line in this guide that you are expected to remember. It is derived from the system configuration model like the networkd units, installed as `/etc/sysctl.d/10-f-forwarding.conf`, and written to the running kernel in the same apply — because a drop-in nobody has read is a box that forwards after the next reboot and not now.
+
+```sh
+f-sysconf render sysctl     # what it generates
+f-sysconf apply             # install it and apply it now
+f-sysconf status            # says NOT-APPLIED when the kernel disagrees
+```
+
+`einheit-f apply system` (and f-confd's commit path) do the same thing as part of applying the configuration. `fctl status` reports the live value in its `route` section, and `fd` logs an error at policy load when a policy that redirects meets a kernel that will not forward.
+
 ## Capabilities
 
 The unit grants `fd` the smallest cap set that supports the BPF program lifecycle:

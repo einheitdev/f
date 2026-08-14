@@ -12,12 +12,67 @@ asserts on two independent witnesses:
    XDP_DROP happens before AF_PACKET, so dropped frames are invisible
    to the sniffer while passed frames appear. The sniffer therefore
    observes the *disposition*, not just the arrival.
+3. **A real socket on a real far side** (`realsock.py` +
+   `hw::host_up`) — an ordinary Linux stack in its own namespace, with
+   its own MAC, NOT promiscuous, completing a real TCP exchange.
+
+### Why the third witness exists, and when you must use it
+
+Witnesses 1 and 2 answer "what did the datapath do to the frame" and
+"did the frame reach this cable". Neither answers "would a real host
+accept it", and for a whole class of defect those are different
+questions. The instance that motivated this: `redirect` never rewrote
+the destination MAC, so every masqueraded frame left carrying the
+firewall's own address. The next hop's NIC reports `PACKET_OTHERHOST`
+and its stack discards the frame before any socket exists — but a
+promiscuous AF_PACKET witness counts it, and every counter climbs. 1822
+unit cases, eleven `l11_*` scenarios and a NAT soak all agreed
+masquerade worked.
+
+Worse, most NAT scenarios pair the translation with `allow`, not
+`redirect`, so the frame is handed to the local stack on a port with no
+address and dropped. It was never forwarded anywhere at all. Their
+evidence is real evidence *of the rewrite* and none whatsoever *of
+delivery*.
+
+**Any assertion of the form "the packet got there" needs witness 3.**
+Use 1 and 2 for per-frame counts, checksum validity, disposition, and
+anything a socket cannot see (an ICMP error's embedded header, a
+crafted malformed frame, 80 000 flows). They are not interchangeable
+and both are kept.
 
 ## Topology
 
 ```
 enp1s0f0 (sender, no XDP) ==EX2300==> enp1s0f1 (zone t, XDP + sniffer)
 ```
+
+For the routed scenarios (`l2_02` acceptance leg, `l2_03`, `l11_04`
+acceptance leg, `l12_01`) the same three ports carry a real gateway,
+with both far hosts hanging off the one trunk port:
+
+```
+  netns fguest  10.99.21.5        (macvlan on f0, untagged -> vlan 801)
+        |
+     [ EX2300 ]
+        |
+  enp1s0f1  10.99.21.1   zone lan  [XDP: masquerade + redirect]
+  enp1s0f2  10.99.200.2  zone wan  [XDP: de-NAT + redirect]
+        |
+     [ EX2300 ]
+        |
+  netns fserver 10.99.200.9       (vlan 802 subinterface of f0)
+```
+
+Both far hosts are on `enp1s0f0` because it is the only trunk port: a
+macvlan carries the untagged (VLAN 801) side and an 802.1Q
+subinterface carries the tagged (VLAN 802) side, each moved into its
+own namespace. Neither is promiscuous, and `hw::host_up` asserts that
+rather than assuming it.
+
+These scenarios need `net.ipv4.ip_forward=1` and set it themselves,
+restoring the previous value on exit. They also put transient addresses
+on the two data ports and remove them on exit.
 
 Test frames use inert addresses (10.99.0.0/16, locally-administered
 MACs 02:00:00:00:00:01/02). The receive port runs promiscuous — the
@@ -44,6 +99,14 @@ on exit, so the rig is always left in the walk-up state.
 - `hwlib.sh` — deploy/counters/sniffer/FDB plumbing shared by tests.
 - `sendmany.py` — batch AF_PACKET sender using `fwl.pkt` builders.
 - `sniff.py` — receiving-port witness; JSON tallies by flow key.
+- `realsock.py` — the acceptance witness: a real listening socket and a
+  real client, both on ordinary non-promiscuous stacks. The server
+  reports the PEER address of each accepted connection, so one object
+  proves the far side took the bytes AND that the source was
+  translated; neither is evidence without the other.
+- `tc_egress_probe.bpf.c` — a measurement for `l12_01`, not a product
+  component: counts IPv4 packets at a TC egress hook, to establish what
+  such a hook can and cannot see.
 - `ringlog.py` — consumes the pinned `fwl_log_events` ring buffer.
   Decodes with `fwl.log_abi` (the same layout the .pkt oracle reads),
   validates each record's ABI header, and resolves `zone_id` to a zone

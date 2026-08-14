@@ -187,3 +187,74 @@ else
   fail "partial/unreadable result: est=$NAT_EST home=$NAT_HOME \
 raw=$NAT_RAW — investigate before drawing a conclusion"
 fi
+
+# ---------------------------------------------------------------------
+# Fourth leg: the office policy, on a routed path, proved by ACCEPTANCE.
+#
+# Everything above is crafted frames witnessed by a promiscuous
+# AF_PACKET socket on the interface they arrived on. That is exactly
+# the right instrument for the question those legs ask — which conntrack
+# key a reply is looked up under — and it is the wrong instrument for
+# "does this policy carry a network", because it counts frames a real
+# stack drops and it never required the packet to leave the box at all.
+#
+# So the composition the office actually deploys gets asserted the other
+# way: two real Linux hosts either side, neither promiscuous, and a TCP
+# exchange that has to complete. Nothing here can pass on a frame that
+# was addressed to the wrong MAC, or that was never forwarded.
+# ---------------------------------------------------------------------
+PARENT="${SEND_IF}"
+WAN_VLAN="${WAN_VLAN:-802}"
+LAN_ADDR=10.99.60.1
+RGUEST=10.99.60.5
+RSERVER=10.99.200.9
+RPORT=8443
+FWD_SAVED=""
+ip addr add "$LAN_ADDR/24" dev "$RECV_IF" 2>/dev/null || true
+
+OFFICE=$(mktemp --suffix=.fw)
+cat > "$OFFICE" <<EOF3
+zone lan = [$RECV_IF]
+zone wanz = [$WAN_IF]
+
+@xdp(lan)
+
+count out_new if pkt.proto == tcp and pkt.tcp.syn
+masquerade if pkt.src_ip in 10.99.60.0/24
+redirect to wanz if pkt.src_ip in 10.99.60.0/24
+allow
+
+@xdp(wanz)
+
+count back_est if conntrack(pkt).state in [established, related]
+redirect to lan if conntrack(pkt).state in [established, related]
+default drop
+EOF3
+hw::deploy l11-04c "$OFFICE"
+hw::host_up oguest "$PARENT" none "$RGUEST/24" "$LAN_ADDR"
+hw::host_up oserver "$PARENT" "$WAN_VLAN" "$RSERVER/24"
+FWD_SAVED=$(hw::forwarding 1)
+ping -c1 -W2 -I "$RECV_IF" "$RGUEST" >/dev/null 2>&1 || true
+ping -c1 -W2 -I "$WAN_IF" "$RSERVER" >/dev/null 2>&1 || true
+
+hw::server_start oserver "$RSERVER" "$RPORT" 8 25
+OFFICE_CLIENT=$(hw::client oguest "$RSERVER" "$RPORT" 8 4)
+hw::server_wait
+log "office client: $OFFICE_CLIENT"
+log "office server: $(cat "$SERVER_OUT")"
+
+assert_eq "office policy: the far side ACCEPTED every connection" \
+  "$(hw::server_get accepted)" 8
+assert_eq "office policy: every exchange completed end to end" \
+  "$(hw::jget "$OFFICE_CLIENT" completed)" 8
+assert_str "office policy: the server saw only the masquerade address" \
+  "$(hw::server_get peer_addrs)" "$MASQ_ADDR"
+# The return direction crossed `default drop` on the strength of the
+# conntrack state alone. Without the post-translation tuple this probe
+# was written to measure, this number is 0 and nothing above completes.
+assert_eq "office policy: the replies were admitted as established" \
+  "$([ "$(hw::counter back_est)" -gt 0 ] && echo 1 || echo 0)" 1
+assert_eq "office policy: the datapath ROUTED both directions" \
+  "$([ "$(hw::route routed)" -gt 0 ] && echo 1 || echo 0)" 1
+echo "$FWD_SAVED" > /proc/sys/net/ipv4/ip_forward
+ip addr del "$LAN_ADDR/24" dev "$RECV_IF" 2>/dev/null || true

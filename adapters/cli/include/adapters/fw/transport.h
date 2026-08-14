@@ -39,6 +39,11 @@ struct FLocalConfig {
   std::string dnsmasq_conf = "/etc/f/generated/dnsmasq.conf";
   /// Where the generated networkd units are installed.
   std::string networkd_dir = "/etc/systemd/network";
+  /// Where the generated sysctl drop-in is installed.
+  std::string sysctl_dir = "/etc/sysctl.d";
+  /// Where the live kernel knobs are written. A test points this at a
+  /// temp tree; nothing else should.
+  std::string sysctl_proc_dir = "/proc/sys";
   /// f-confd's control socket. f-confd owns the commit-confirmed
   /// revert timer, which has to outlive the session that armed it —
   /// so applying the system configuration goes through it whenever it

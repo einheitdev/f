@@ -103,6 +103,8 @@ class Box {
     fw::FLocalConfig cfg;
     cfg.system_config = config().string();
     cfg.networkd_dir = networkd().string();
+    cfg.sysctl_dir = (root_ / "sysctl.d").string();
+    cfg.sysctl_proc_dir = (root_ / "proc-sys").string();
     cfg.dnsmasq_conf = (root_ / "dnsmasq.conf").string();
     cfg.confd_socket = endpoint();
     cfg.fd_socket = "ipc://" + (root_ / "fd.sock").string();
@@ -116,6 +118,8 @@ class Box {
     o.config_path = config().string();
     o.snapshot_dir = (root_ / "snapshots").string();
     o.networkd_dir = networkd().string();
+    o.sysctl_dir = (root_ / "sysctl.d").string();
+    o.sysctl_proc_dir = (root_ / "proc-sys").string();
     o.dnsmasq_conf = (root_ / "dnsmasq.conf").string();
     o.activate = f::confd::NullActivator();
     return o;

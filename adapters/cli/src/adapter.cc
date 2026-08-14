@@ -286,6 +286,45 @@ auto RenderShowStatus(const Response& resp,
           icmp_err > 0 ? Semantic::Good : Semantic::Info);
     }
   }
+  // A forward either went out addressed to a next hop this box
+  // resolved, or it went out carrying the MAC it arrived with. Nothing
+  // on the wire tells the two apart — a frame addressed to the wrong
+  // MAC is on the cable, in the capture, and dropped by the far side's
+  // NIC before any socket sees it — so this row is the operator's only
+  // view of it. Shown from the first forward onward, including when
+  // `routed` is zero, because zero-routed is the failure.
+  if (j.contains("route") && j["route"].value("enabled", false)) {
+    auto& rt = j["route"];
+    auto routed = rt.value("routed", uint64_t{0});
+    auto bridged = rt.value("bridged", uint64_t{0});
+    if (routed > 0 || bridged > 0) {
+      row("forwards",
+          std::format("{} routed / {} L2-adjacent", routed, bridged),
+          routed > 0 ? Semantic::Good : Semantic::Info);
+    }
+    auto no_route = rt.value("no_route", uint64_t{0});
+    if (no_route > 0) {
+      row("route_unreachable",
+          std::format("{} (packets DROPPED)", no_route), Semantic::Bad);
+    }
+    auto no_neigh = rt.value("no_neigh", uint64_t{0});
+    if (no_neigh > 0) {
+      row("route_no_neighbour",
+          std::format("{} (next hop not in the ARP table)", no_neigh),
+          Semantic::Warn);
+    }
+    auto off_zone = rt.value("off_zone", uint64_t{0});
+    if (off_zone > 0) {
+      row("route_off_zone",
+          std::format("{} (route leaves via another interface)",
+                      off_zone),
+          Semantic::Info);
+    }
+    auto ttl = rt.value("ttl_expired", uint64_t{0});
+    if (ttl > 0) {
+      row("route_ttl_expired", std::to_string(ttl), Semantic::Info);
+    }
+  }
   if (j.contains("slow_path")) {
     auto& sp = j["slow_path"];
     if (sp.contains("events")) {

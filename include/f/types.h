@@ -154,6 +154,40 @@ enum FwlNatStat : uint32_t {
   kFwlNatStatSlots = 6,
 };
 
+/// Slots in the shared `fwl_route_stats` per-CPU array, numbered by the
+/// FWL emitter's routing header.
+///
+/// A `redirect to <zone>` forwards the frame with whatever destination
+/// MAC it arrived carrying unless the box's own routing table says the
+/// destination is reachable through that zone. Which of the two
+/// happened is invisible on the wire to anything that captures
+/// promiscuously — a frame addressed to the wrong MAC is on the cable
+/// and in the tcpdump, and only the far side's stack discards it — so
+/// the count is the operator's only view of whether this box is
+/// routing or bridging.
+enum FwlRouteStat : uint32_t {
+  /// Next hop resolved through the zone the policy named; the frame
+  /// was re-addressed and its TTL decremented.
+  kFwlRouteStatRouted = 0,
+  /// No usable route out that zone: forwarded L2-adjacent, exactly as
+  /// a redirect did before routing existed. Correct for a zone hop on
+  /// one segment, and a black hole for a masqueraded flow.
+  kFwlRouteStatBridged = 1,
+  /// The routing table was consulted and said no (blackhole,
+  /// unreachable, prohibited). Dropped.
+  kFwlRouteStatNoRoute = 2,
+  /// Route known, next-hop MAC not. Handed to the stack so it can ARP.
+  kFwlRouteStatNoNeigh = 3,
+  /// TTL would have reached zero. Handed to the stack, which owns the
+  /// ICMP time-exceeded.
+  kFwlRouteStatTtl = 4,
+  /// A route exists but leaves through a DIFFERENT interface than the
+  /// zone the policy named. Forwarded L2-adjacent rather than stamped
+  /// with a next hop that lives on another segment.
+  kFwlRouteStatOffZone = 5,
+  kFwlRouteStatSlots = 6,
+};
+
 // Per-zone masquerade config (`fwl_nat_cfg`, slot 0). `masq_addr` is the
 // network-byte-order source the XDP masquerade action rewrites to.
 struct FwlNatCfg {

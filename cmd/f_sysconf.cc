@@ -25,6 +25,7 @@
 #include "f/sysconfig/networkd.h"
 #include "f/sysconfig/parse.h"
 #include "f/sysconfig/service_status.h"
+#include "f/sysconfig/sysctl.h"
 #include "f/sysconfig/validate.h"
 
 namespace {
@@ -32,8 +33,10 @@ namespace {
 using f::sysconfig::AddressModeName;
 using f::sysconfig::ApplyDnsmasq;
 using f::sysconfig::ApplyNetworkd;
+using f::sysconfig::ApplySysctl;
 using f::sysconfig::CheckArtifactDrift;
 using f::sysconfig::CheckDnsmasqDrift;
+using f::sysconfig::CheckSysctlDrift;
 using f::sysconfig::Diagnostic;
 using f::sysconfig::DnsmasqOptions;
 using f::sysconfig::DriftKind;
@@ -43,10 +46,13 @@ using f::sysconfig::NetworkdOptions;
 using f::sysconfig::ParseSystemConfigFile;
 using f::sysconfig::PlanDnsmasq;
 using f::sysconfig::PlanNetworkd;
+using f::sysconfig::PlanSysctl;
 using f::sysconfig::QueryServices;
+using f::sysconfig::ReadLiveSysctl;
 using f::sysconfig::ServiceState;
 using f::sysconfig::ServiceStateName;
 using f::sysconfig::Severity;
+using f::sysconfig::SysctlOptions;
 using f::sysconfig::SystemConfig;
 using f::sysconfig::Validate;
 
@@ -147,12 +153,15 @@ auto main(int argc, char** argv) -> int {
 
   DnsmasqOptions dnsmasq_opts;
   NetworkdOptions networkd_opts;
+  SysctlOptions sysctl_opts;
   app.add_option("--dnsmasq-conf", dnsmasq_opts.conf_path,
                  "Where the generated dnsmasq config is installed");
   app.add_option("--dnsmasq-bin", dnsmasq_opts.dnsmasq_path,
                  "Path to the dnsmasq binary");
   app.add_option("--networkd-dir", networkd_opts.dir,
                  "Where generated networkd units are installed");
+  app.add_option("--sysctl-dir", sysctl_opts.dir,
+                 "Where the generated sysctl drop-in is installed");
 
   bool force = false;
   auto* check = app.add_subcommand("check", "Validate the model");
@@ -162,7 +171,7 @@ auto main(int argc, char** argv) -> int {
   auto* render =
       app.add_subcommand("render", "Print a derived artifact");
   std::string what;
-  render->add_option("what", what, "dnsmasq | networkd")
+  render->add_option("what", what, "dnsmasq | networkd | sysctl")
       ->required();
   auto* apply =
       app.add_subcommand("apply", "Generate, validate and install");
@@ -194,8 +203,12 @@ auto main(int argc, char** argv) -> int {
       for (const auto& u : PlanNetworkd(*cfg, networkd_opts)) {
         std::cout << std::format("### {}\n{}\n", u.path, u.content);
       }
+    } else if (what == "sysctl") {
+      auto u = PlanSysctl(*cfg, sysctl_opts);
+      std::cout << std::format("### {}\n{}", u.path, u.content);
     } else {
-      std::cerr << "render: expected 'dnsmasq' or 'networkd'\n";
+      std::cerr
+          << "render: expected 'dnsmasq', 'networkd' or 'sysctl'\n";
       return 2;
     }
     return 0;
@@ -217,6 +230,24 @@ auto main(int argc, char** argv) -> int {
                                DriftKindName(ud), "networkd",
                                u.path);
       drifted = drifted || ud == DriftKind::kHandEdited;
+    }
+    // The drop-in AND the live value, because they fail apart: a
+    // correct file the kernel has not read yet is a box that forwards
+    // after the next reboot and not now, which is the version of this
+    // fault that survives a test.
+    {
+      auto u = PlanSysctl(*cfg, sysctl_opts);
+      auto sd = CheckSysctlDrift(u);
+      std::cout << std::format("  {:<12} {:<9} {}\n",
+                               DriftKindName(sd), "sysctl", u.path);
+      drifted = drifted || sd == DriftKind::kHandEdited;
+      auto live = ReadLiveSysctl(sysctl_opts.proc_dir,
+                                 "net.ipv4.ip_forward");
+      std::cout << std::format(
+          "  {:<12} {:<9} net.ipv4.ip_forward = {}\n",
+          live == "1" ? "live" : "NOT-APPLIED", "sysctl",
+          live.empty() ? "(unreadable)" : live);
+      if (live != "1") drifted = true;
     }
 
     // The other half of "what does the operator see": a service that
@@ -254,6 +285,21 @@ auto main(int argc, char** argv) -> int {
     if (!cfg) return 1;
     dnsmasq_opts.refuse_on_drift = !force;
     networkd_opts.refuse_on_drift = !force;
+
+    sysctl_opts.refuse_on_drift = !force;
+    // Before the interfaces, because it costs nothing and because a
+    // box that comes up addressed but not forwarding looks healthy.
+    auto sysctl = ApplySysctl(*cfg, sysctl_opts);
+    if (!sysctl) {
+      std::cerr << sysctl.error() << "\n";
+      return 1;
+    }
+    if (sysctl->changed) {
+      std::cout << "wrote " << sysctl->unit.path << "\n";
+    }
+    for (const auto& k : sysctl->applied) {
+      std::cout << "applied " << k << "\n";
+    }
 
     auto net = ApplyNetworkd(*cfg, networkd_opts);
     if (!net) {

@@ -86,6 +86,13 @@ struct SystemBackendOptions {
   std::string dnsmasq_path = "/usr/sbin/dnsmasq";
   /// Generated networkd unit directory.
   std::string networkd_dir = "/etc/systemd/network";
+  /// Generated sysctl drop-in directory. The forwarding setting lives
+  /// here because a router that does not forward is a configuration
+  /// fault, not a deployment note.
+  std::string sysctl_dir = "/etc/sysctl.d";
+  /// Where the live kernel knobs are written. A test points this at a
+  /// temp tree; nothing else should.
+  std::string sysctl_proc_dir = "/proc/sys";
   /// Discard hand edits to generated artifacts instead of refusing.
   bool force = false;
   /// How the written artifacts are made live. Defaults to

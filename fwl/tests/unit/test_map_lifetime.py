@@ -161,7 +161,8 @@ def test_shared_pinned_maps_is_read_off_the_bundle(tmp_path):
   """
   from fwl import analyzer, cli, parser
   # Two zones, one redirecting into the other: pins conntrack (both
-  # read it) and fwl_devmap_b, and pins no NAT map.
+  # read it), fwl_devmap_b and the routing tally every redirect now
+  # carries, and pins no NAT map.
   source = (
     "zone a = [e0]\n"
     "zone b = [e1]\n"
@@ -176,7 +177,9 @@ def test_shared_pinned_maps_is_read_off_the_bundle(tmp_path):
   bundle = tmp_path / "bundle"
   cli._emit_bundle_dir(program, bundle)
   manifest = json.loads((bundle / "manifest.json").read_text())
-  assert manifest["shared_pinned_maps"] == ["conntrack", "fwl_devmap_b"]
+  assert manifest["shared_pinned_maps"] == [
+    "conntrack", "fwl_devmap_b", "fwl_route_stats"
+  ]
 
 
 def test_the_daemon_fallback_list_has_not_drifted():

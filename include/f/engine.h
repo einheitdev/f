@@ -22,6 +22,7 @@
 #include "f/error.h"
 #include "f/iface_mgr.h"
 #include "f/nat_mgr.h"
+#include "f/route_mgr.h"
 #include "f/protocol.h"
 #include "f/rule_table.h"
 #include "f/slow_path.h"
@@ -73,6 +74,7 @@ struct Engine {
   IfaceMgr ifaces;
   ConntrackMgr conntrack;
   NatMgr nat;
+  RouteMgr route;
 
   // Current firewall config.
   FwConfig current_config{};
@@ -150,6 +152,9 @@ auto GetFullState(const Engine& e)
 /// a manager left holding the previous bundle's fds reports plausible
 /// numbers about a table nothing is using.
 auto AttachNatMgr(Engine& e) -> void;
+
+/// Point RouteMgr at the loaded bundle's routing tally.
+auto AttachRouteMgr(Engine& e) -> void;
 
 /// Open pinned BPF maps (for f-api read access).
 auto OpenPinnedMaps(std::string_view pin_path)
