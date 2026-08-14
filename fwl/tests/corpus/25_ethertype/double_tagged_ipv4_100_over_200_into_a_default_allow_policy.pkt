@@ -1,0 +1,10 @@
+name: "double tagged ipv4 100 over 200 into a default allow policy"
+source_fw: |
+  @xdp(eth0)
+  default allow
+# Two 802.1Q tags. v0.4 parses the outer tag only, so fwl_l3p becomes the INNER TPID (0x8100) rather than 0x0800, and the frame takes the non-IP arm. The payload is IPv4 and is never reached.
+test_packet:
+  builder: eth(ethertype=0x0800, vlan_id=100, inner_vlan_id=200)
+expected:
+  compiles: true
+  bpf_action: allow

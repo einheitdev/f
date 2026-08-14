@@ -1,0 +1,10 @@
+name: "ipv6 frame reaches the default drop"
+source_fw: |
+  @xdp(eth0)
+  default drop
+# The negative arm of the EtherType sweep. This frame IS one of the two families, so the prelude does not early out and the policy's `default drop` applies. Every non-IP case in this strategy asserts allow against this same policy; without this case a program that passed everything would satisfy all of them.
+test_packet:
+  builder: tcp6(src_ip="2001:db8::1", dst_ip="2001:db8::2", dst_port=80)
+expected:
+  compiles: true
+  bpf_action: drop

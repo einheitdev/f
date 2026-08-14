@@ -1,0 +1,17 @@
+name: "lldp is not redirected out of the lan zone"
+source_fw: |
+  zone wan = [wan0]
+  zone lan = [lan0]
+  @xdp(lan)
+  count lan_out
+  masquerade
+  redirect to wan
+ingress_zone: lan
+# storm_shield.fw's lan block. The early-out must fire before `redirect to wan`, or the firewall re-emits L2 control traffic — including the upstream switch's own BPDUs — out a port in a different broadcast domain. XDP_PASS here, XDP_REDIRECT is the defect.
+test_packet:
+  builder: eth(ethertype=0x88cc, payload_hex="0207040200000000010403053031060200780000")
+expected:
+  compiles: true
+  bpf_action: allow
+  counter_changes:
+    lan_out: 0

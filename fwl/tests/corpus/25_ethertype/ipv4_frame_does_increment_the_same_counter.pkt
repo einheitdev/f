@@ -1,0 +1,13 @@
+name: "ipv4 frame does increment the same counter"
+source_fw: |
+  @xdp(eth0)
+  count l2_noise
+  default drop
+# The control arm for the six cases above. An IPv4 frame does NOT early out, so it reaches `count l2_noise` and then the `default drop`. A counter that never moves would satisfy every `l2_noise: 0` assertion while proving nothing.
+test_packet:
+  builder: tcp(src_ip="10.0.0.1", dst_ip="10.0.0.2", dst_port=80)
+expected:
+  compiles: true
+  bpf_action: drop
+  counter_changes:
+    l2_noise: 1

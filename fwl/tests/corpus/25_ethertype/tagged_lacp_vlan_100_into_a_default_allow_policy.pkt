@@ -1,0 +1,10 @@
+name: "tagged lacp vlan 100 into a default allow policy"
+source_fw: |
+  @xdp(eth0)
+  default allow
+# 802.1Q tag 100, then EtherType 0x8809. The prelude reads the tag and re-reads fwl_l3p from vh->inner_proto, so the non-IP test runs against the REAL type and not against 0x8100.
+test_packet:
+  builder: eth(ethertype=0x8809, vlan_id=100)
+expected:
+  compiles: true
+  bpf_action: allow

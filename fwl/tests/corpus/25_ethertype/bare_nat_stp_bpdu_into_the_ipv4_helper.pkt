@@ -1,0 +1,15 @@
+name: "bare nat stp bpdu into the ipv4 helper"
+source_fw: |
+  @xdp(wan)
+  masquerade
+  allow
+state:
+  nat:
+    masq_ip: "198.51.100.9"
+# EtherType 0x0026 reaches `h_proto != bpf_htons(ETH_P_IP)` inside fwl_find_ipv4.
+# NAT is IPv4-only by design; the frame is forwarded untranslated rather than mangled.
+test_packet:
+  builder: eth(ethertype=0x0026, payload_hex="4242030000000000800002000000000100000000800002000000000180010000140002000f00")
+expected:
+  compiles: true
+  bpf_action: allow
