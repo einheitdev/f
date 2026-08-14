@@ -42,6 +42,7 @@
 #include "f/lease/view.h"
 #include "f/sysconfig/artifact.h"
 #include "f/sysconfig/dnsmasq.h"
+#include "f/sysconfig/ipv6.h"
 #include "f/sysconfig/edit.h"
 #include "f/sysconfig/model.h"
 #include "f/sysconfig/net.h"
@@ -580,6 +581,9 @@ class FLocalTransport final
     }
     if (req.command == "show_system") {
       return HandleShowSystem(req);
+    }
+    if (req.command == "show_ipv6") {
+      return HandleShowIpv6(req);
     }
     if (req.command == "show_services") {
       return HandleShowServices(req);
@@ -1737,6 +1741,46 @@ class FLocalTransport final
         // told the clock is running without having to know to ask.
         {"confirm", ConfirmState()},
         {"diagnostics", DiagsToJson(result.diagnostics)},
+    });
+  }
+
+  /// The v6 stance, as it stands on this box right now.
+  ///
+  /// The question an operator has is not "what does the config say" —
+  /// it is "is anything routing around me". So the answer carries the
+  /// two numbers that settle it together: how many advertisements
+  /// arrived, and how many addresses were formed. A zero on its own
+  /// is ambiguous in exactly the direction that gets someone hurt.
+  auto HandleShowIpv6(const proto::Request& req) -> proto::Response {
+    sc::SystemConfig cfg;
+    std::optional<proto::Response> fail;
+    if (!LoadSystem(req, &cfg, &fail)) return *fail;
+
+    auto report = sc::ObserveIpv6(cfg, sc::Ipv6Source{});
+    json ports = json::array();
+    for (const auto& i : report.interfaces) {
+      ports.push_back({
+          {"interface", i.intent.interface},
+          {"zone", i.intent.zone},
+          {"stance", sc::Ipv6StanceName(i.intent.stance)},
+          {"counters_read", i.counters_read},
+          {"ras_received", i.ras_received},
+          {"v6_received", i.v6_received},
+          {"v6_discarded", i.v6_discarded},
+          {"addresses", i.global_addresses},
+          {"sends_ra", i.intent.sends_ra},
+          {"advertised_prefix", i.intent.advertised_prefix},
+      });
+    }
+    return MakeOk(req.id, {
+        {"availability",
+         sc::Ipv6AvailabilityName(report.availability)},
+        {"observed",
+         report.availability == sc::Ipv6Availability::kObserved},
+        {"forwarding", report.forwarding},
+        {"refused_ras", report.RefusedRas()},
+        {"violations", report.Violations()},
+        {"interfaces", ports},
     });
   }
 

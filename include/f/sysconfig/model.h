@@ -72,6 +72,11 @@ struct Interface {
   AddressMode mode = AddressMode::kUnconfigured;
   /// CIDR, e.g. "10.10.0.1/24". Only meaningful when mode is kStatic.
   std::string address;
+  /// Optional static IPv6 CIDR, e.g. "fd00:10:10::1/64". Only a zone
+  /// whose stance is `ra` may carry one: it is the prefix we
+  /// advertise, so it exists to be handed out. On an `off` zone it is
+  /// a contradiction and is refused rather than ignored.
+  std::string address6;
   /// Optional default gateway for a static interface.
   std::string gateway;
   /// The zone this interface belongs to. An interface belongs to
@@ -89,11 +94,30 @@ struct Interface {
 /// routes around the v4 firewall entirely while appearing to work, so
 /// the stance is stated per zone rather than inherited from whatever
 /// the upstream broadcasts.
+///
+/// The stance is a statement about *both directions*. `off` is not
+/// "we do not send RAs" — that would leave the interesting direction
+/// unstated, and the interesting direction is inbound.
 enum class Ipv6Stance {
-  /// No v6 on this zone. The safe default.
+  /// No v6 on this zone, in either direction. An RA arriving here is
+  /// counted and refused; nothing autoconfigures; no v6 is forwarded.
+  /// The safe default.
   kOff,
-  /// We are the router: we send the RAs here.
+  /// We are the router on this zone: we send the RAs, and we still
+  /// take orders from nobody else's. Requires a v6 prefix on one of
+  /// the zone's interfaces — there is nothing to advertise without
+  /// one, and an RA config with no prefix is a stance that generates
+  /// a config line and delivers nothing.
   kRouterAdvertise,
+  /// Full dual stack: accept upstream RAs, forward v6, filter it like
+  /// v4. **Refused today** — see validate.h SC030. The datapath cannot
+  /// classify an ICMPv6 error as `related`, so `Packet Too Big` cannot
+  /// reach a host in the zone; IPv6 routers never fragment, so PMTU
+  /// discovery is the only mechanism there is and a path with a
+  /// smaller MTU anywhere along it fails completely. It presents as
+  /// "the network is slow", which is the failure this whole model
+  /// exists to refuse. Representable so the refusal can name it.
+  kFull,
 };
 
 /// A named grouping of interfaces. Owned by the system config; FWL
@@ -177,6 +201,16 @@ struct SystemConfig {
 
   /// True when any service at all is bound to `zone`.
   auto ZoneHasService(const std::string& zone) const -> bool;
+
+  /// The stance of the zone `iface` belongs to. An interface in no
+  /// zone gets `kOff`: an unzoned port carries no policy, so the only
+  /// safe reading of it is the safe one.
+  auto StanceOf(const Interface& iface) const -> Ipv6Stance;
+
+  /// True when any zone asks for v6 to move through the box. When no
+  /// zone does, v6 forwarding is turned off globally rather than left
+  /// at whatever the distribution shipped.
+  auto AnyZoneWantsIpv6() const -> bool;
 };
 
 /// Severity of a diagnostic.

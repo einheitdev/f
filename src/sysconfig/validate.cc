@@ -375,8 +375,41 @@ class Validator {
     }
   }
 
+  /// The zone's own v6 prefix, if any interface in it carries one.
+  auto ZonePrefix6(const std::string& zone) const -> std::string {
+    for (const auto* i : cfg_.InterfacesInZone(zone)) {
+      if (i->address6.empty()) continue;
+      auto p = ParseCidr6(i->address6);
+      if (p) return i->address6;
+    }
+    return "";
+  }
+
   auto CheckIpv6() -> void {
     for (const auto& z : cfg_.zones) {
+      // `full` is representable so that the refusal can name it. The
+      // reason is not "unimplemented": the datapath forwards v6 today
+      // and would forward it here too. It is that the datapath cannot
+      // classify an ICMPv6 error as `related`, and IPv6 routers never
+      // fragment — PMTU discovery is the ONLY mechanism there is — so
+      // a path with a smaller MTU anywhere along it fails completely,
+      // with no drop counter and no log, presenting as "the network
+      // is slow". Offering the stance and letting the operator find
+      // that at the office is the failure mode this whole model
+      // exists to refuse.
+      if (z.ipv6 == Ipv6Stance::kFull) {
+        Err("SC030", z.span,
+            std::format("zone '{}' asks for full IPv6, which this "
+                        "build refuses",
+                        z.name),
+            "the datapath cannot classify an ICMPv6 error as "
+            "`related`, so Packet Too Big cannot reach a host in "
+            "this zone; IPv6 routers never fragment, so path-MTU "
+            "discovery is the only mechanism and a large transfer "
+            "would hang with nothing logged. Use ipv6: off, or "
+            "ipv6: ra if this box is the router here");
+        continue;
+      }
       if (z.ipv6 != Ipv6Stance::kRouterAdvertise) continue;
       if (!cfg_.ZoneServesDhcp(z.name)) {
         Err("SC029", z.span,
@@ -386,6 +419,46 @@ class Validator {
                         z.name),
             "router advertisements come from the same daemon; bind "
             "a dhcp service to this zone or set ipv6: off");
+      }
+      // dnsmasq advertises a prefix taken from the interface's own v6
+      // address. Without one, `enable-ra` is a line in a config file
+      // that sends nothing — a stance that reads as configured and is
+      // not, which is the shape of every bug this week.
+      if (ZonePrefix6(z.name).empty()) {
+        Err("SC031", z.span,
+            std::format("zone '{}' asks for IPv6 router "
+                        "advertisements but no interface in it "
+                        "carries a v6 prefix to advertise",
+                        z.name),
+            "give one interface in the zone an `address6:`, e.g. "
+            "fd00:10:10::1/64 — without a prefix the advertisement "
+            "would be generated and send nothing");
+      }
+    }
+
+    // The other direction: a v6 address on a port whose zone says v6
+    // is off is a contradiction, and the resolution must not be
+    // "quietly ignore one of them".
+    for (const auto& i : cfg_.interfaces) {
+      if (i.address6.empty()) continue;
+      if (!ParseCidr6(i.address6)) {
+        Err("SC032", i.span,
+            std::format("interface '{}': '{}' is not an IPv6 "
+                        "address with a prefix length",
+                        i.name, i.address6),
+            "e.g. fd00:10:10::1/64");
+        continue;
+      }
+      if (cfg_.StanceOf(i) == Ipv6Stance::kOff) {
+        Err("SC032", i.span,
+            std::format("interface '{}' has a v6 address but its "
+                        "zone '{}' is ipv6: off",
+                        i.name,
+                        i.zone.empty() ? "(none)" : i.zone),
+            "either drop the address6, or set the zone to ipv6: ra "
+            "— an address on a port the stance says has no v6 is a "
+            "disagreement, and the resolution must not be to "
+            "silently pick one");
       }
     }
   }

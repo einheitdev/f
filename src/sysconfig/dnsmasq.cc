@@ -55,6 +55,18 @@ auto ZoneSubnet(const SystemConfig& cfg, const std::string& zone)
   return std::nullopt;
 }
 
+/// The v6 prefix advertised into a zone: the first interface in it
+/// that carries one, in network form.
+auto ZonePrefix6(const SystemConfig& cfg, const std::string& zone)
+    -> std::string {
+  for (const auto* i : cfg.InterfacesInZone(zone)) {
+    if (i->address6.empty()) continue;
+    auto p = ParseCidr6(i->address6);
+    if (p) return p->NetworkString();
+  }
+  return "";
+}
+
 /// dnsmasq tags are [A-Za-z0-9_-]; zone names come from the config so
 /// sanitise rather than trust.
 auto ZoneTag(const std::string& zone) -> std::string {
@@ -99,6 +111,18 @@ auto PlanDnsmasq(const SystemConfig& cfg) -> DnsmasqPlan {
   }
   plan.needed = !allowed.empty();
 
+  // Every port whose zone is not `ra` is named here, so the refusal
+  // to advertise is in the artifact rather than implied by the
+  // absence of a line.
+  for (const auto& i : cfg.interfaces) {
+    if (i.name.empty()) continue;
+    if (cfg.StanceOf(i) != Ipv6Stance::kRouterAdvertise) {
+      plan.ra_refused_interfaces.push_back(i.name);
+    } else {
+      plan.ra_interfaces.push_back(i.name);
+    }
+  }
+
   std::ostringstream o;
   o << "# dnsmasq configuration for the f appliance.\n"
     << "#\n"
@@ -136,6 +160,15 @@ auto PlanDnsmasq(const SystemConfig& cfg) -> DnsmasqPlan {
         o << "no-dhcp-interface=" << n << "\n";
       }
     }
+  }
+  // v6 containment is stated separately because it is not implied by
+  // the v4 one: `no-dhcp-interface` covers DHCPv4 and DHCPv6, but a
+  // router advertisement is neither, and it is the one that matters.
+  // A port in an `off` zone gets both spellings so no dnsmasq version
+  // can be the reason a testnet heard an advertisement from us.
+  for (const auto& n : plan.ra_refused_interfaces) {
+    o << "no-dhcpv6-interface=" << n << "\n";
+    o << "ra-param=" << n << ",0,0\n";
   }
   o << "\n";
 
@@ -200,9 +233,30 @@ auto PlanDnsmasq(const SystemConfig& cfg) -> DnsmasqPlan {
         for (const auto& s : d.dns_servers) o << "," << s;
         o << "\n";
       }
+      // The zone's v6 stance, rendered where it takes effect. Note
+      // what `enable-ra` on its own does: nothing. dnsmasq only sends
+      // advertisements on an interface that also has a v6 dhcp-range,
+      // so a stance that emitted the flag alone declared itself and
+      // delivered silence — the exact failure this model exists to
+      // refuse. The range is therefore emitted with it or the stance
+      // is refused upstream in Validate (SC031).
       const auto* z = cfg.FindZone(zone);
       if (z != nullptr && z->ipv6 == Ipv6Stance::kRouterAdvertise) {
-        o << "enable-ra\n";
+        auto prefix = ZonePrefix6(cfg, zone);
+        if (prefix.empty()) {
+          o << "# refused: zone asks for router advertisements but "
+               "no interface in it carries a v6 prefix\n";
+        } else {
+          o << "enable-ra\n";
+          // ra-stateless: addresses come from the prefix by SLAAC,
+          // other configuration (DNS) from us. ra-names lets the
+          // lease view name a v6 host from its v4 lease.
+          o << std::format(
+              "dhcp-range=set:{},::,constructor:{},ra-stateless,"
+              "ra-names,64,{}\n",
+              tag, names.empty() ? zone : names.front(),
+              d.lease_seconds);
+        }
       }
       for (const auto& r : d.reservations) {
         o << "dhcp-host=" << r.mac << "," << r.address;

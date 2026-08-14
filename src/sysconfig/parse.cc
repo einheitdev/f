@@ -105,11 +105,17 @@ class Parser {
           z.ipv6 = Ipv6Stance::kOff;
         } else if (v6 == "ra") {
           z.ipv6 = Ipv6Stance::kRouterAdvertise;
+        } else if (v6 == "full") {
+          // Parsed, then refused by name in Validate (SC030). An
+          // unknown-key error would tell the operator the word does
+          // not exist; the real answer is that it exists and does not
+          // work yet, and why.
+          z.ipv6 = Ipv6Stance::kFull;
         } else {
           Err("SC103", SpanOf(body["ipv6"]),
               std::format("zone '{}': unknown ipv6 stance '{}'",
                           z.name, v6),
-              "expected 'off' or 'ra'");
+              "expected 'off', 'ra' or 'full'");
         }
       } else if (body && !body.IsNull()) {
         Err("SC102", SpanOf(body),
@@ -139,9 +145,10 @@ class Parser {
         cfg->interfaces.push_back(iface);
         continue;
       }
-      RequireMapKeys(
-          body, {"mac", "path", "address", "gateway", "zone"},
-          std::format("interface '{}'", iface.name));
+      RequireMapKeys(body,
+                     {"mac", "path", "address", "address6",
+                      "gateway", "zone"},
+                     std::format("interface '{}'", iface.name));
 
       auto mac = Str(body, "mac");
       auto path = Str(body, "path");
@@ -166,6 +173,7 @@ class Parser {
         iface.mode = AddressMode::kStatic;
         iface.address = addr;
       }
+      iface.address6 = Str(body, "address6");
       iface.gateway = Str(body, "gateway");
       iface.zone = Str(body, "zone");
       cfg->interfaces.push_back(iface);

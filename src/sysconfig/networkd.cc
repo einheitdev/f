@@ -36,34 +36,70 @@ auto RenderLink(const Interface& iface) -> std::string {
 }
 
 /// The .network unit: addressing for an already-named interface.
-auto RenderNetwork(const Interface& iface) -> std::string {
+///
+/// `stance` is the zone's IPv6 stance, and it decides two things no
+/// v4 key can: whether this port takes an address from somebody else's
+/// router advertisement, and whether it carries a v6 address of its
+/// own. Neither is inferred from the v4 address mode — an uplink that
+/// is a v4 DHCP client is exactly the port an office RA arrives on.
+auto RenderNetwork(const Interface& iface, Ipv6Stance stance)
+    -> std::string {
   std::ostringstream o;
   o << kBanner;
-  o << std::format("# zone: {}\n\n",
-                   iface.zone.empty() ? "(none)" : iface.zone);
+  o << std::format("# zone: {}   ipv6: {}\n\n",
+                   iface.zone.empty() ? "(none)" : iface.zone,
+                   Ipv6StanceName(stance));
   o << "[Match]\n";
   o << "Name=" << iface.name << "\n\n";
   o << "[Network]\n";
   switch (iface.mode) {
     case AddressMode::kDhcpClient:
       o << "DHCP=ipv4\n";
-      // The uplink hands us a default route; a testnet must not.
-      o << "IPv6AcceptRA=no\n";
       break;
     case AddressMode::kStatic:
       o << "Address=" << iface.address << "\n";
-      o << "IPv6AcceptRA=no\n";
       if (!iface.gateway.empty()) {
         o << "Gateway=" << iface.gateway << "\n";
       }
       break;
     case AddressMode::kUnconfigured:
-      // Link up, no L3. The normal state for a port that only carries
+      // Link up, no v4. The normal state for a port that only carries
       // filtered traffic.
-      o << "LinkLocalAddressing=no\n";
-      o << "IPv6AcceptRA=no\n";
       break;
   }
+
+  // v6 is decided by the stance and by nothing else. No stance we
+  // allow accepts an RA: `off` because v6 is not wanted here, `ra`
+  // because we are the router on this segment and a router that
+  // autoconfigures from a peer has been told what to do by whoever
+  // shouted last.
+  o << "IPv6AcceptRA=no\n";
+  if (!iface.address6.empty()) {
+    o << "Address=" << iface.address6 << "\n";
+  }
+  if (stance == Ipv6Stance::kOff) {
+    // A port with no v6 address of its own and no v4 address has no
+    // reason to hold a link-local either. Where there IS a v4
+    // address the link-local stays: the kernel keeps the ICMPv6
+    // counters that `f show ipv6` reads only for an interface that
+    // still receives v6, and a refusal nobody can count is
+    // indistinguishable from a network that never spoke.
+    if (iface.mode == AddressMode::kUnconfigured &&
+        iface.address6.empty()) {
+      o << "LinkLocalAddressing=no\n";
+    } else {
+      o << "LinkLocalAddressing=ipv6\n";
+    }
+    o << "IPv6SendRA=no\n";
+  } else {
+    o << "LinkLocalAddressing=ipv6\n";
+    // We advertise, but through dnsmasq, which is the one daemon that
+    // knows the zone's prefix and its DNS answer. Two RA sources on
+    // one segment is a race whose winner decides the network.
+    o << "IPv6SendRA=no\n";
+    o << "IPForward=ipv6\n";
+  }
+
   o << "ConfigureWithoutCarrier=yes\n";
   o << "\n[Link]\n";
   o << "RequiredForOnline=no\n";
@@ -85,7 +121,8 @@ auto PlanNetworkd(const SystemConfig& cfg,
     }
     units.push_back(
         {std::format("{}/10-f-{}.network", opts.dir, iface.name),
-         WrapWithDigest(RenderNetwork(iface)), iface.name});
+         WrapWithDigest(RenderNetwork(iface, cfg.StanceOf(iface))),
+         iface.name});
   }
   return units;
 }

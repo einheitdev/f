@@ -129,6 +129,7 @@ add_library(libf-sysconfig STATIC
   src/sysconfig/artifact.cc
   src/sysconfig/dnsmasq.cc
   src/sysconfig/edit.cc
+  src/sysconfig/ipv6.cc
   src/sysconfig/model.cc
   src/sysconfig/net.cc
   src/sysconfig/networkd.cc

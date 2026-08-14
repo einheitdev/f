@@ -45,6 +45,14 @@ struct DnsmasqPlan {
   /// Interfaces on which DHCP may answer. A strict subset of
   /// `allowed_interfaces`.
   std::vector<std::string> dhcp_interfaces;
+  /// Interfaces into which we advertise a v6 prefix — the zones whose
+  /// stance is `ra`, and only those.
+  std::vector<std::string> ra_interfaces;
+  /// Interfaces into which we explicitly refuse to advertise. Every
+  /// declared interface is in exactly one of these two lists, so the
+  /// artifact states its v6 containment rather than implying it by
+  /// omission.
+  std::vector<std::string> ra_refused_interfaces;
 };
 
 /// Render the model as a dnsmasq config. Pure: no I/O, no clock, no

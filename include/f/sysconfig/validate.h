@@ -30,6 +30,9 @@
 /// | SC027 | bad or out-of-subnet reservation                      |
 /// | SC028 | more than one DNS forwarder bound to one zone         |
 /// | SC029 | zone asks for IPv6 RAs but nothing can send them      |
+/// | SC030 | zone asks for full IPv6, which this build refuses     |
+/// | SC031 | zone asks for IPv6 RAs but has no prefix to advertise |
+/// | SC032 | IPv6 address on a port whose zone says v6 is off      |
 
 #ifndef INCLUDE_F_SYSCONFIG_VALIDATE_H_
 #define INCLUDE_F_SYSCONFIG_VALIDATE_H_

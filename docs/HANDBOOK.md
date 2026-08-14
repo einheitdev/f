@@ -346,7 +346,52 @@ hint: start it (systemctl start f-confd), or use `apply system` and
 Start `f-confd` first. Verified on a VM: armed, counted down, and
 reverted the file after the window with no session attached.
 
-### 3.2 A service is not running, and you need to know which kind of not-running
+### 3.2 Something on the segment might be getting IPv6 around you
+
+**Symptom:** none. That is the problem. A testnet device that
+autoconfigures IPv6 from an office router advertisement gets a
+globally routable address and a default route that have nothing to do
+with `f`, routes around the v4 NAT and the whole firewall, and every
+counter on the box keeps climbing exactly as before.
+
+**Procedure:** ask what has arrived and what was formed.
+
+```
+$ einheit-f show ipv6
+ INTERFACE │ ZONE    │ STANCE │ RAS SEEN │ ADDRESSES
+ wan0      │ wan     │ off    │       17 │ (none)
+ lan0      │ testnet │ off    │        0 │ (none)
+
+17 router advertisement(s) arrived on a zone whose stance is off,
+and were refused. Nothing autoconfigured.
+forwarding: off
+```
+
+Read the two numbers **together**. `17 / (none)` is the gate holding:
+the office is advertising and nothing here took an address. `0 /
+(none)` is not the same thing — it is a quiet network, and the box
+says so rather than taking credit for it.
+
+The row that matters is any `off` zone with something in ADDRESSES:
+
+```
+IPv6 STANCE VIOLATED: wan0 (zone wan) is ipv6 off but holds
+2001:0db8:dead:0000:5054:00ff:fef6:0001
+```
+
+That is the bypass, live. Re-run `apply system` to put the stance
+back, then find out what removed it — the usual answer is something
+else on the box writing `net.ipv6.conf.*.accept_ra`, or a port that
+came up before `systemd-sysctl` reached it.
+
+`?` in a counter column means the device is not present. It is never
+rendered as `0`, because the office may be shouting advertisements at
+that port right now.
+
+The full stance — what `off`, `ra` and `full` mean, and why `full` is
+refused — is in `docs/IPV6_STANCE.md`.
+
+### 3.3 A service is not running, and you need to know which kind of not-running
 
 **Symptom:** DHCP is not answering. `systemctl status` is not much
 help, because systemd reports a unit that was never installed and a
@@ -383,7 +428,7 @@ looks alive in every dashboard while serving nobody; `f-dnsmasq.service`
 therefore has a `StartLimitBurst` so it eventually sits in `failed`
 where both systemd and `show services` say so out loud.
 
-### 3.3 A restart left pins behind in bpffs
+### 3.4 A restart left pins behind in bpffs
 
 **Symptom:** `fd` restarts and either refuses to load a bundle, or
 loads it and the connection tracking behaves as though it remembers
@@ -426,7 +471,7 @@ Check the `ATTACHED` and `MODE` columns afterwards. A declared
 interface with no attach shows `(none)`, and `generic` in MODE means
 you are on the software slow path, not at line rate.
 
-### 3.4 NAT stops working for new flows
+### 3.5 NAT stops working for new flows
 
 **Symptom:** existing connections through the box keep working, new
 ones go out and nothing comes back. Typically after a long soak or a
@@ -501,6 +546,7 @@ instead of guessing from the table length.
 |---|---|
 | `show system` | What ports, zones and services are declared, and where will services answer? |
 | `show services` | Are the backing daemons running, and if not, which kind of not-running? |
+| `show ipv6` | Have router advertisements arrived, and did anything autoconfigure from one? |
 | `check system` | Does the configuration validate, without applying it? |
 | `apply system` | Make the configuration live. |
 | `apply system confirmed <min>` | Make it live with an automatic undo if you do not confirm. |

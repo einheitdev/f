@@ -822,6 +822,7 @@ interfaces:
   lan0:
     mac: "52:54:00:aa:bb:02"
     address: 10.10.0.1/24
+    address6: fd00:10:10::1/64
     zone: testnet
 services:
   dhcp:
@@ -829,6 +830,78 @@ services:
       range: 10.10.0.100-10.10.0.200
 )YAML"));
   EXPECT_TRUE(HasLine(on.content, "enable-ra"));
+}
+
+// BUGLOG #29. `enable-ra` on its own advertises nothing: dnsmasq only
+// sends advertisements on an interface that also carries a v6
+// dhcp-range. The stance therefore generated a config line, passed
+// `dnsmasq --test`, started the daemon and delivered silence — a
+// stance that reads as configured and is not.
+TEST(DnsmasqTest, RouterAdvertisementsCarryAPrefixOrAreRefused) {
+  auto with_prefix = PlanDnsmasq(MustParse(R"YAML(
+zones:
+  testnet:
+    ipv6: ra
+interfaces:
+  lan0:
+    mac: "52:54:00:aa:bb:02"
+    address: 10.10.0.1/24
+    address6: fd00:10:10::1/64
+    zone: testnet
+services:
+  dhcp:
+    - zone: testnet
+      range: 10.10.0.100-10.10.0.200
+)YAML"));
+  EXPECT_TRUE(HasLine(with_prefix.content, "enable-ra"));
+  // The line that makes enable-ra do anything at all.
+  EXPECT_NE(with_prefix.content.find(
+                "dhcp-range=set:zone_testnet,::,constructor:lan0,"
+                "ra-stateless"),
+            std::string::npos)
+      << with_prefix.content;
+
+  // No prefix: refused in the artifact, and the reason is in it.
+  auto no_prefix = PlanDnsmasq(MustParse(R"YAML(
+zones:
+  testnet:
+    ipv6: ra
+interfaces:
+  lan0:
+    mac: "52:54:00:aa:bb:02"
+    address: 10.10.0.1/24
+    zone: testnet
+services:
+  dhcp:
+    - zone: testnet
+      range: 10.10.0.100-10.10.0.200
+)YAML"));
+  EXPECT_FALSE(HasLine(no_prefix.content, "enable-ra"));
+  EXPECT_NE(no_prefix.content.find("no interface in it carries a v6 "
+                                   "prefix"),
+            std::string::npos)
+      << no_prefix.content;
+}
+
+// The v4 containment says nothing about advertisements: a router
+// advertisement is neither DHCPv4 nor DHCPv6, and it is the one that
+// matters. Every declared port is named in exactly one of the two
+// lists so the refusal is stated, not implied by an absent line.
+TEST(DnsmasqTest, EveryPortIsNamedInTheV6Containment) {
+  auto cfg = MustParse(kOfficeShape);
+  auto plan = PlanDnsmasq(cfg);
+  std::set<std::string> named;
+  for (const auto& n : plan.ra_interfaces) named.insert(n);
+  for (const auto& n : plan.ra_refused_interfaces) named.insert(n);
+  EXPECT_EQ(named.size(), cfg.AllInterfaceNames().size());
+  for (const auto& n : cfg.AllInterfaceNames()) {
+    EXPECT_EQ(named.count(n), 1u) << n;
+    EXPECT_TRUE(HasLine(plan.content, "no-dhcpv6-interface=" + n))
+        << plan.content;
+    EXPECT_TRUE(HasLine(plan.content, "ra-param=" + n + ",0,0"))
+        << plan.content;
+  }
+  EXPECT_TRUE(plan.ra_interfaces.empty());
 }
 
 TEST(DnsmasqTest, GenerationIsDeterministic) {

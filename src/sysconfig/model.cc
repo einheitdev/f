@@ -70,6 +70,18 @@ auto SystemConfig::ZoneHasService(const std::string& zone) const
                      });
 }
 
+auto SystemConfig::StanceOf(const Interface& iface) const
+    -> Ipv6Stance {
+  const auto* z = FindZone(iface.zone);
+  return z != nullptr ? z->ipv6 : Ipv6Stance::kOff;
+}
+
+auto SystemConfig::AnyZoneWantsIpv6() const -> bool {
+  return std::any_of(zones.begin(), zones.end(), [](const Zone& z) {
+    return z.ipv6 != Ipv6Stance::kOff;
+  });
+}
+
 auto Diagnostic::Format() const -> std::string {
   const char* level = severity == Severity::kError ? "error"
                                                    : "warning";
@@ -115,6 +127,8 @@ auto Ipv6StanceName(Ipv6Stance s) -> std::string {
   switch (s) {
     case Ipv6Stance::kRouterAdvertise:
       return "ra";
+    case Ipv6Stance::kFull:
+      return "full";
     case Ipv6Stance::kOff:
       break;
   }

@@ -1364,6 +1364,93 @@ auto RenderShowServices(const Response& resp, Renderer& renderer)
   }
 }
 
+/// The v6 stance as it stands on the box.
+///
+/// Two numbers per port, deliberately side by side: advertisements
+/// that arrived, and addresses that were formed. Either alone is
+/// ambiguous in exactly the direction that gets someone hurt — a
+/// silent port is a gate holding *or* a network that never spoke, and
+/// an address without a count is a bypass whose origin is unknown.
+auto RenderShowIpv6(const Response& resp, Renderer& renderer)
+    -> void {
+  auto j = ParseData(resp);
+  auto& out = renderer.Out();
+
+  if (!j.value("observed", false)) {
+    out << "no IPv6 observation: "
+        << j.value("availability", "unknown") << "\n";
+    return;
+  }
+
+  Table t;
+  AddColumn(t, "INTERFACE", Align::Left, Priority::High);
+  AddColumn(t, "ZONE", Align::Left, Priority::High);
+  AddColumn(t, "STANCE", Align::Left, Priority::High);
+  AddColumn(t, "RAS SEEN", Align::Right, Priority::High);
+  AddColumn(t, "V6 FRAMES", Align::Right, Priority::Low);
+  AddColumn(t, "ADDRESSES", Align::Left, Priority::High);
+  for (const auto& i : j.value("interfaces", json::array())) {
+    auto stance = i.value("stance", "off");
+    auto addrs = JoinStrings(i.value("addresses", json::array()));
+    bool bad = stance == "off" && !addrs.empty();
+    if (!i.value("counters_read", false)) {
+      // An unread counter is never rendered as a zero: the office
+      // may be shouting advertisements at that port right now.
+      AddRow(t, {
+          Cell{i.value("interface", ""), Semantic::Emphasis},
+          Cell{i.value("zone", "-")},
+          Cell{stance, Semantic::Dim},
+          Cell{"?", Semantic::Dim},
+          Cell{"?", Semantic::Dim},
+          Cell{"(device not present)", Semantic::Dim},
+      });
+      continue;
+    }
+    AddRow(t, {
+        Cell{i.value("interface", ""), Semantic::Emphasis},
+        Cell{i.value("zone", "-")},
+        Cell{stance, stance == "off" ? Semantic::Default
+                                     : Semantic::Warn},
+        Cell{std::to_string(i.value("ras_received", 0ULL))},
+        Cell{std::to_string(i.value("v6_received", 0ULL)),
+             Semantic::Dim},
+        Cell{addrs.empty() ? "(none)" : addrs,
+             bad ? Semantic::Bad
+                 : addrs.empty() ? Semantic::Dim
+                                 : Semantic::Default},
+    });
+  }
+  RenderFormatted(t, renderer);
+
+  auto violations = j.value("violations", json::array());
+  if (!violations.empty()) {
+    out << "\n";
+    for (const auto& v : violations) {
+      out << "IPv6 STANCE VIOLATED: " << v.get<std::string>()
+          << "\n";
+    }
+    out << "That port is carrying v6 the policy does not see. "
+           "Re-run `apply system`, then find out what put it "
+           "back.\n";
+    return;
+  }
+
+  auto refused = j.value("refused_ras", 0ULL);
+  out << "\n";
+  if (refused > 0) {
+    out << refused
+        << " router advertisement(s) arrived on a zone whose "
+           "stance is off, and were refused. Nothing "
+           "autoconfigured.\n";
+  } else {
+    out << "no router advertisement has arrived on an off zone. "
+           "That is a quiet network, not proof the gate works.\n";
+  }
+  out << "forwarding: " << (j.value("forwarding", false) ? "on"
+                                                         : "off")
+      << "\n";
+}
+
 auto RenderCheckSystem(const Response& resp, Renderer& renderer)
     -> void {
   auto j = ParseData(resp);
@@ -1475,6 +1562,9 @@ class FwAdapter final : public cli::ProductAdapter {
              "Interfaces, zones and where services will answer"),
         Show("services", "show_services",
              "DHCP/DNS health, and what they are bound to"),
+        Show("ipv6", "show_ipv6",
+             "Per-zone IPv6 stance: advertisements refused, and "
+             "whether anything autoconfigured anyway"),
         MakeCheckSystem(),
         MakeApplySystem(),
         MakeApplySystemConfirmed(),
@@ -1534,6 +1624,8 @@ class FwAdapter final : public cli::ProductAdapter {
       RenderShowSystem(response, renderer);
     } else if (wc == "show_services") {
       RenderShowServices(response, renderer);
+    } else if (wc == "show_ipv6") {
+      RenderShowIpv6(response, renderer);
     } else if (wc == "check_system") {
       RenderCheckSystem(response, renderer);
     } else if (wc == "apply_system" ||
