@@ -32,6 +32,7 @@ EOF
 hw::deploy l3-02 "$FW"
 cp "$FW" /etc/f/rules.fw
 
+hw::journal_mark
 hw::sniff_start 18
 $PY "$HERE/sendmany.py" --pps 200 "$SEND_IF" 2400 \
   'udp(src_ip="10.99.53.1", dst_port=5301)' > /tmp/l3a.out &
@@ -58,7 +59,7 @@ hw::sniff_wait
 A_WIRE=$(hw::sniff_get udp:10.99.53.1:5301)
 B_WIRE=$(hw::sniff_get udp:10.99.53.2:5302)
 
-journalctl -u fd --since "-60s" --no-pager | grep -q reload \
+hw::journal_since | grep -q reload \
   && pass "reload fired mid-stream" \
   || fail "no reload observed"
 

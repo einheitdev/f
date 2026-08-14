@@ -73,6 +73,7 @@ cat > "$VER/manifest.json" <<EOF
 EOF
 
 # Drive it through the reload path exactly as the watcher would.
+hw::journal_mark
 ln -sfT "$VER" "$BUNDLE_ROOT/current"
 systemctl reload-or-restart fd 2>/dev/null || systemctl restart fd
 sleep 4
@@ -106,8 +107,7 @@ fi
 # The reload path is where the fix protects traffic: LoadZoneBundle
 # fails, ApplyBundle propagates the error, and the previously
 # attached bundle keeps running. That half is covered below.
-if journalctl -u fd --since "-2min" --no-pager \
-     | grep -q "no loadable zone programs"; then
+if hw::journal_since | grep -q "no loadable zone programs"; then
   pass "the refusal is diagnosable: the journal names the cause \
 (no loadable zone programs) rather than a generic load error"
 else

@@ -142,6 +142,12 @@ default allow
 EOF
 # This is the step that used to end the test: fd could not load, so
 # hw::deploy aborts on "fd did not attach XDP".
+#
+# Mark the journal first. The discard assertion below used a 120 s
+# window, and l8_07 discards a pin of the same name; run back to back by
+# the vacuity sweep, this scenario passed on the OTHER one's log line and
+# the next run of the identical plant went red.
+hw::journal_mark
 hw::deploy l8-09b "$FW"
 
 # ==================================================================
@@ -192,8 +198,7 @@ assert_eq "zone c's counter map sized from zone c's analysis" \
      2>/dev/null || echo -1)" 5
 
 # fd said what it did, in the journal the operator reads.
-if journalctl -u fd --since "-120s" --no-pager \
-   | grep -q "discarded stale pin 'fwl_counters_b'"; then
+if hw::journal_since | grep -q "discarded stale pin 'fwl_counters_b'"; then
   pass "journal names the discarded stale pin"
 else
   fail "journal does not report the discard"

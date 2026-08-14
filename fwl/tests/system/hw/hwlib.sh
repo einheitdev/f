@@ -222,6 +222,32 @@ else:
 "
 }
 
+# hw::journal_mark — remember where fd's journal is right now.
+# hw::journal_since — print only what fd has logged since that mark.
+#
+# `journalctl --since "-60s"` reads a log every scenario on this rig
+# writes into, and the sweep runs them back to back. l8_09 asserted that
+# the journal names the pin it discarded, and passed with the plant in
+# place because l8_07 — a different scenario, two minutes earlier — had
+# discarded a pin of the same name. The next run of the identical plant
+# went red. A time window is not a scope; a cursor is.
+JOURNAL_CURSOR=""
+hw::journal_mark() {
+  JOURNAL_CURSOR=$(journalctl -u fd -n 1 --no-pager --show-cursor 2>/dev/null \
+    | sed -n 's/^-- cursor: //p')
+}
+
+hw::journal_since() {
+  if [ -n "$JOURNAL_CURSOR" ]; then
+    journalctl -u fd --after-cursor "$JOURNAL_CURSOR" --no-pager 2>/dev/null
+  else
+    # No mark taken: fall back to a window, and say so, rather than
+    # silently reading an empty stream.
+    log "WARNING: no journal mark taken; falling back to a 2 min window"
+    journalctl -u fd --since "-2min" --no-pager 2>/dev/null
+  fi
+}
+
 # hw::map_sum <pin-name> — total of every value in a pinned (per-CPU)
 # array, summed over all keys and all CPUs. Prints -1 when the pin
 # does not exist, so a missing map fails an assertion instead of

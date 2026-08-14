@@ -82,6 +82,7 @@ else
 fi
 
 BUNDLES_BEFORE=$(ls -d "$BUNDLE_ROOT"/*/ | wc -l)
+hw::journal_mark
 
 # The reload: append an unrelated rule to the watched source. The
 # watcher recompiles and applies it in place — no restart, no detach.
@@ -99,7 +100,7 @@ for i in $(seq 1 30); do
 done
 sleep 2
 if [ "$(ls -d "$BUNDLE_ROOT"/*/ | wc -l)" -gt "$BUNDLES_BEFORE" ] \
-   && journalctl -u fd --since "-90s" --no-pager | grep -q "atomic swap"; then
+   && hw::journal_since | grep -q "atomic swap"; then
   pass "watcher reloaded the policy in place (atomic swap)"
 else
   journalctl -u fd -n 15 --no-pager >&2

@@ -39,6 +39,9 @@ cp "$FW" /etc/f/rules.fw
 
 # Watcher-produced bundles are timestamp-named (no v- prefix).
 BUNDLES_BEFORE=$(ls -d "$BUNDLE_ROOT"/*/ | wc -l)
+# Scope the reload evidence to THIS run: every scenario on this rig logs
+# "atomic swap", so a 60 s window reads other people's reloads too.
+hw::journal_mark
 
 # 2000 frames at 200 pps = a 10 s window.
 hw::sniff_start 14
@@ -59,8 +62,7 @@ RECEIVED=$(hw::sniff_get udp:10.99.50.5:5050)
 # line) while the stream was running.
 BUNDLES_AFTER=$(ls -d "$BUNDLE_ROOT"/*/ | wc -l)
 if [ "$BUNDLES_AFTER" -gt "$BUNDLES_BEFORE" ] \
-   && journalctl -u fd --since "-60s" --no-pager \
-      | grep -q "atomic swap"; then
+   && hw::journal_since | grep -q "atomic swap"; then
   pass "watcher reloaded mid-stream (atomic swap applied)"
 else
   fail "no reload observed — watcher did not fire"
