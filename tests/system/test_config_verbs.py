@@ -287,8 +287,8 @@ def scenario_build_the_document(cli, mac):
         "10.79.0.50" in text)
   # No key anywhere in a service block names an interface, here as in
   # the model: that is what makes the rogue-DHCP case inexpressible.
-  services = text.split("services:", 1)[-1] if "services:" in text \
-      else ""
+  services = (
+    text.split("services:", 1)[-1] if "services:" in text else "")
   check("no service names an interface", IFACE not in services,
         services)
 
@@ -350,8 +350,9 @@ def scenario_policy(cli, daemon, work):
         arrives(DROPPED_PORT, "before"))
 
   rc, rows = cli.json("show", "policy", ZONE)
-  stmts = [r for r in rows if r.get("ZONE") == ZONE] \
-      if isinstance(rows, list) else []
+  stmts = (
+    [r for r in rows if r.get("ZONE") == ZONE]
+    if isinstance(rows, list) else [])
   check("show policy numbers the statements", len(stmts) == 3,
         json.dumps(rows)[:300])
   check("show policy marks the unconditional statement",
