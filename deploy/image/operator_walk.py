@@ -554,6 +554,41 @@ def phase_reboot(out, walk, proc, key):
              f"net.ipv4.ip_forward = {live} after a cold boot with no "
              f"manual intervention; the drop-in on disk says 0")
   walk.fact("reboot", "status_row", row)
+  # Warm the neighbour table before asking the wire anything, the way
+  # `firstboot_walk.wire_probe` does. A cold box has no ARP entries,
+  # and a SOURCE-TRANSLATED packet does not survive the trip to the
+  # stack that resolves them — its source is one of the box's own
+  # addresses and `fib_validate_source` rejects it as a martian. So
+  # the first flow after a reboot is lost, `route.no_neigh` counts it,
+  # and it is a documented gap rather than a fail-closed regression.
+  # Measured here without the warm-up: `reaches-the-far-side` went red
+  # on the run of 2026-08-15, on a box whose forwarding was correctly
+  # open. A phase that cannot tell that from a routing failure is
+  # measuring the ARP cache.
+  fw.warm_neighbours(key, walk, "reboot")
+  # The state a post-reboot forwarding failure has to be diagnosed
+  # from, captured BEFORE the probe rather than guessed at after it.
+  #
+  # On the run of 2026-08-15 this phase's flow timed out while
+  # `routed`, `bridged` AND `no_neigh` were all 0 — so the datapath
+  # saw nothing to forward, which rules out the documented cold-ARP
+  # gap (that one COUNTS, in no_neigh) and rules out a policy drop
+  # (bridged would move). Nothing else recorded was enough to say
+  # which of "the box lost its addresses", "the frames never arrived"
+  # and "conntrack came back empty and the reply was dropped" it was,
+  # and the box was shut down by the time anybody looked. These four
+  # answer that next time.
+  for what, cmd in (("addresses", "ip -br addr"),
+                    ("neighbours", "ip neigh"),
+                    ("xdp", "ip -d link show | grep -c prog/xdp"),
+                    ("routes", "ip route")):
+    _, got, _ = box(walk, key, "reboot", cmd)
+    walk.fact("reboot", f"after_reboot_{what}", got)
+  _, zones, _ = cli(walk, key, "reboot", "show zones")
+  walk.check("reboot", "zones-still-addressed-after-a-reboot",
+             vm.LAN_BOX in zones or vm.LAN_BOX in
+             walk.facts["reboot"].get("after_reboot_addresses", ""),
+             f"{vm.LAN_BOX} is on this box after the reboot")
   _, dropin, _ = box(walk, key, "reboot",
                      "grep -v '^#' /etc/sysctl.d/10-f-forwarding.conf "
                      "| grep ip_forward")
