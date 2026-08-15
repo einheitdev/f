@@ -56,11 +56,13 @@ Usage:
   sudo python3 three_zone_gateway_netns.py --fd build/fd [--fwl fwl]
 """
 import argparse
+import atexit
 import json
 import os
 import pathlib
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -324,6 +326,37 @@ def exchange(res: Result, label: str, expect: int) -> list[dict]:
   return reports
 
 
+def arm_forwarding_restore(saved):
+  """Put net.ipv4.ip_forward back on every exit path, and say so."""
+  path = pathlib.Path("/proc/sys/net/ipv4/ip_forward")
+  done = []
+
+  def restore(*_):
+    """Restore once, verify, and report."""
+    if done:
+      return
+    done.append(True)
+    try:
+      path.write_text(saved)
+    except OSError as exc:
+      print(f"[3z] RESTORE FAILED: could not write {path} ({exc}); "
+            f"set it back with `sysctl -w "
+            f"net.ipv4.ip_forward={saved.strip()}`",
+            file=sys.stderr, flush=True)
+      return
+    now = path.read_text().strip()
+    print(f"[3z] restored net.ipv4.ip_forward = {now} "
+          f"(it was {saved.strip()} when this run started)",
+          flush=True)
+    if now != saved.strip():
+      print(f"[3z] RESTORE FAILED: {path} reads {now}, wanted "
+            f"{saved.strip()}", file=sys.stderr, flush=True)
+
+  atexit.register(restore)
+  for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+    signal.signal(sig, lambda *_: sys.exit(1))
+
+
 def main() -> int:
   """Build the bench, run both exchanges, and report."""
   ap = argparse.ArgumentParser(description=__doc__)
@@ -375,6 +408,16 @@ def main() -> int:
   bundle = work / "bundle"
   fd_proc = None
   fwd_saved = pathlib.Path("/proc/sys/net/ipv4/ip_forward").read_text()
+  # `net.ipv4.ip_forward` is the HOST's, not this bench's. On a
+  # workstation that routes for its own VMs, the seconds this file
+  # spends with it at 0 — the control below sets it deliberately —
+  # are seconds those guests have no path out, and a run that dies
+  # without restoring takes their network with it silently. It
+  # happened. Registered with atexit and with the signals a `finally`
+  # does not cover, verified by reading it back, and printed either
+  # way: a restore nobody can see is one nobody can tell did not
+  # happen.
+  arm_forwarding_restore(fwd_saved)
   teardown()
   os.makedirs(PIN_ROOT, exist_ok=True)
   try:
@@ -476,7 +519,9 @@ def main() -> int:
               f"control: the far side accepted "
               f"{control[-1].get('accepted')} connections")
   finally:
-    pathlib.Path("/proc/sys/net/ipv4/ip_forward").write_text(fwd_saved)
+    # Restored by the atexit hook armed above, which also covers the
+    # signal paths and reports what the kernel ended up holding.
+    pass
     if fd_proc is not None:
       fd_proc.terminate()
       try:

@@ -43,11 +43,27 @@ Two controls, so a pass is attributable:
   * the attach itself is asserted from `ip link`, because "forwarding
     is on" proves nothing about a daemon that never armed anything
 
+THIS BENCH WRITES A GLOBAL KERNEL KNOB. `net.ipv4.ip_forward` is
+per-namespace but not per-bench: on a workstation that routes for its
+own VMs or containers, the seconds this file spends with the knob at 0
+are seconds those guests have no path out, and a run that dies without
+restoring takes their network with it until somebody notices. It
+happened during the run this file was written in — a bench left the
+host at 0 and the VMs on it lost the internet, and nothing said so
+because the restore was a bare line in a `finally` that prints
+nothing.
+
+So the restore is registered with `atexit` AND with the three signals
+that otherwise skip it, it is verified by reading the knob back, and
+the value is PRINTED on every run. A restore nobody can see is a
+restore nobody can tell did not happen.
+
 Usage:
   sudo python3 fail_closed_netns.py --fd build/fd [--fwl fwl]
 """
 
 import argparse
+import atexit
 import os
 import pathlib
 import shutil
@@ -105,6 +121,43 @@ def forwarding():
 def set_forwarding(value):
   """Put the knob somewhere, so a phase that does nothing shows."""
   FWD.write_text(f"{value}\n")
+
+
+def arm_restore(saved):
+  """Guarantee the host's own forwarding comes back, and say so.
+
+  Registered with `atexit` and with SIGINT/SIGTERM/SIGHUP, because a
+  bare `finally` covers neither a signal nor an `os._exit`, and this
+  knob is the host's, not the bench's. The read-back is the half that
+  matters: a restore that silently failed is exactly the state that
+  cost somebody their VM's network once already.
+  """
+  done = []
+
+  def restore(*_):
+    """Put it back, once, and report what the kernel now holds."""
+    if done:
+      return
+    done.append(True)
+    try:
+      FWD.write_text(f"{saved}\n")
+    except OSError as exc:
+      print(f"[fc] RESTORE FAILED: could not write {FWD} ({exc}). "
+            f"This host's own forwarding is left at {forwarding()}; "
+            f"set it back with: sysctl -w net.ipv4.ip_forward={saved}",
+            file=sys.stderr, flush=True)
+      return
+    now = forwarding()
+    print(f"[fc] restored net.ipv4.ip_forward = {now} "
+          f"(it was {saved} when this run started)", flush=True)
+    if now != saved:
+      print(f"[fc] RESTORE FAILED: {FWD} reads {now}, wanted {saved}",
+            file=sys.stderr, flush=True)
+
+  atexit.register(restore)
+  for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+    signal.signal(sig, lambda *_: sys.exit(1))
+  return restore
 
 
 def attached():
@@ -313,6 +366,9 @@ def main(argv=None):
      "/sbin"])
   res = Result()
   saved = forwarding()
+  # Before anything is touched, and it covers the signal paths a
+  # `finally` does not.
+  arm_restore(saved)
   work = pathlib.Path(tempfile.mkdtemp(prefix="fc-work-"))
   bundle = work / "compiled"
   try:
@@ -332,7 +388,6 @@ def main(argv=None):
     phase_killed(res, args.fd, bundle, work)
   finally:
     tear_down()
-    FWD.write_text(f"{saved}\n")
     shutil.rmtree(work, ignore_errors=True)
   total = res.passed + res.failed
   print(f"[fc] {'PASS' if not res.failed else 'FAIL'}: "
