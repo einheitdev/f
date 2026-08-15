@@ -611,8 +611,14 @@ auto EngineInit(Engine& e,
         e.ifaces.count++;
       }
     }
-    spdlog::info("Multi-zone bundle loaded: {} zone program(s).",
-                 e.zone_bundle.programs.size());
+    // Both numbers, because the first one alone was the whole
+    // problem: "1 zone program(s)" was true of a bundle attached to
+    // no interface at all. The program count comes from the manifest;
+    // the interface count comes from what the kernel accepted. Only
+    // the second says the firewall is in the path.
+    spdlog::info("Multi-zone bundle loaded: {} zone program(s), "
+                 "attached to {} interface(s).",
+                 e.zone_bundle.programs.size(), e.ifaces.count);
   }
 
   // Load BPF program. When the operator has staged a bundle at

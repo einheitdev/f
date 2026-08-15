@@ -172,6 +172,15 @@ struct ZoneBundleHandles {
 /// generic (SKB) mode; some NICs have no native XDP at all — the
 /// RTL8125 (`r8169`) rejects a native attach outright — and there the
 /// program must run generic or not run.
+///
+/// A load that ends with ZERO interfaces attached is an error, always.
+/// Loading and attaching are different jobs, and a count of the first
+/// is not evidence about the second: the failure this rule exists to
+/// close reported "1 zone program(s)" — which was true — while every
+/// packet on the box flowed unfiltered. There is no bundle for which
+/// "attached to nothing" is a correct outcome, whatever the manifest
+/// said, so the caller never has to know why the interface list came
+/// out empty to know the firewall is not up.
 auto LoadZoneBundle(std::string_view bundle_dir,
                     std::string_view pin_root,
                     const ZoneBundleHandles* replace = nullptr)
@@ -252,6 +261,39 @@ auto DefaultPersistentMapNames() -> std::vector<std::string>;
 /// DefaultPersistentMapNames() when the manifest is missing the field.
 auto ReadPersistentMapNames(std::string_view bundle_dir)
     -> std::vector<std::string>;
+
+/// What a bundle asks the loader to attach, and where.
+///
+/// The manifest's `zones` array does not answer this on its own. A
+/// unit written in the simple form — `@xdp(eth0)` with no `zone`
+/// declaration, which FWL_V04_SPEC.md § 6.2 defines as "one implicit
+/// zone whose name is the @xdp argument" — declares no zones at all,
+/// so its `zones` array is `[]` while its `programs` array names
+/// `eth0`. Reading only the array yielded an empty interface list for
+/// that program, and the loader attached it to nothing and returned
+/// success.
+struct BundleAttachPlan {
+  /// Zone name -> the interface names belonging to it. Carries every
+  /// DECLARED zone, including one with no `@xdp` block of its own (it
+  /// is still a redirect destination, and its interfaces are what
+  /// fills the destination devmap), plus one implicit entry per `@xdp`
+  /// block whose zone is not declared — the simple form, where the
+  /// zone name IS the interface name.
+  std::map<std::string, std::vector<std::string>> zone_interfaces;
+  /// Zone programs for which the manifest names no interface at all.
+  /// This is a malformed bundle — a compiler/daemon contract
+  /// disagreement — and is a different thing from a host that is
+  /// missing a NIC the manifest did name.
+  std::vector<std::string> zones_without_interfaces;
+};
+
+/// Derive the attach plan from `<bundle_dir>/manifest.json`.
+///
+/// Exposed so the whole manifest-to-interfaces derivation is testable
+/// without bpffs, root, or a compiled object. An unreadable or
+/// unparseable manifest yields an empty plan; LoadZoneBundle reports
+/// those cases itself with the parse error attached.
+auto PlanBundleAttach(std::string_view bundle_dir) -> BundleAttachPlan;
 
 /// True when the bundle's manifest states, per program, which zones
 /// masquerade (the `masquerades` flag).

@@ -6,18 +6,27 @@
 # the second data port (idle here — its masquerade+redirect path is
 # covered by l2_01/l2_03).
 #
+# NOTE: the lan block of storm_shield.fw now carries the appliance's
+# own testnet address (10.99.82.1) and that segment's directed
+# broadcast, because without them a client's DHCP DISCOVER was
+# masqueraded and broadcast onto the uplink (A3). This test only sends
+# on the wan side, so the sed below does not rewrite those; a rig run
+# that exercises the lan side must set them to the rig's own segment.
+# The interpreter/BPF coverage of that ordering is
+# tests/corpus/25_local_delivery and tests/unit/test_examples.py.
+#
 # The last assertion is a CONTROL, not a known gap. It used to be a
 # gap: in v0.4 bundle mode the lan program (masquerade + redirect)
 # created no conntrack entry, so `allow if conntrack(pkt).state ==
 # established` on the wan side could never match and every reply was
-# de-NATed and then dropped. That is closed — `fwl_snat_egress` now
+# de-NATed and then dropped. That is closed -- `fwl_snat_egress` now
 # inserts the post-NAT tuple as the NAT mapping's reclamation anchor,
 # and that entry is exactly what the wan zone's conntrack lookup
 # finds. Verified end to end on 2026-08-14: a far-side SYN-ACK to a
 # masqueraded flow crosses `default drop` and is de-NATed home.
 #
-# So the frame this test sends is dropped for the RIGHT reason now —
-# nothing on the testnet initiated it — and the assertion below is
+# So the frame this test sends is dropped for the RIGHT reason now --
+# nothing on the testnet initiated it -- and the assertion below is
 # what would catch a policy that started admitting unsolicited
 # replies. Do not read it as a pinned defect.
 source "$(dirname "$0")/hwlib.sh"

@@ -1,0 +1,74 @@
+[Unit]
+Description=f — time for the appliance and its testnets (chrony)
+Documentation=man:chronyd(8)
+
+# Ordering only, deliberately NOT Requires=: a service dying must not
+# take the firewall with it, and time being wrong must not be blamed
+# on the datapath. Note what this means in practice — the box filters
+# packets correctly for the whole window before the first correction,
+# and only its *timestamps* are worthless. `f show time` says so.
+After=network-online.target fd.service
+Wants=network-online.target
+
+# The config is a derived artifact. Its absence means the model bound
+# no ntp service, and this unit should not have been enabled — so
+# failing to start is the right answer, never a silent no-op.
+#
+# The path is inside /etc/chrony/ rather than /etc/f/generated/ with
+# the other artifacts, because Debian's stock AppArmor profile
+# confines chronyd to reading /etc/chrony/{,**}. Putting it anywhere
+# else produces "Permission denied" on a file the operator can read
+# perfectly well. See BUGLOG #30.
+AssertPathExists=/etc/chrony/f-generated.conf
+
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+
+# chronyd's own parser is the authority on its own syntax; a config
+# that does not pass here never replaces a working one.
+ExecStartPre=/usr/sbin/chronyd -p -f /etc/chrony/f-generated.conf
+ExecStart=/usr/sbin/chronyd -d -f /etc/chrony/f-generated.conf
+
+Restart=on-failure
+RestartSec=5s
+
+# CAP_SYS_TIME is the whole point; the rest are for binding the
+# server port and for hardware timestamping.
+CapabilityBoundingSet=CAP_SYS_TIME CAP_NET_BIND_SERVICE CAP_NET_ADMIN \
+  CAP_NET_RAW CAP_SETGID CAP_SETUID CAP_SYS_RESOURCE CAP_CHOWN \
+  CAP_DAC_OVERRIDE
+AmbientCapabilities=CAP_SYS_TIME CAP_NET_BIND_SERVICE CAP_NET_ADMIN \
+  CAP_NET_RAW
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+# Not PrivateDevices: writing the disciplined time back to /dev/rtc0
+# is what makes the *next* boot start from something sane, which is
+# the whole reason a board with an RTC is better than one without.
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET AF_INET6
+LockPersonality=true
+RestrictRealtime=false
+RestrictSUIDSGID=true
+SystemCallArchitectures=native
+
+# The drift file lives in chrony's own state directory for the same
+# AppArmor reason as the config. A drift file it cannot write is a
+# daemon that relearns the oscillator's error on every boot.
+ReadWritePaths=/var/lib/chrony /var/log/chrony /run/chrony /dev/rtc0
+StateDirectory=chrony
+RuntimeDirectory=chrony
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=f-chrony
+
+[Install]
+WantedBy=multi-user.target

@@ -8,6 +8,10 @@
 # Known gap: ARP (non-IP) passes the FWL program untouched — the
 # kernel needs it for the wan gateway anyway, and FWL has no L2
 # fields yet.
+#
+# SITE EDIT: `10.99.82.1` below is the appliance's own address on the
+# testnet, and `10.99.82.255` that segment's directed broadcast. Both
+# appear in the lan block. Change them together with system.yaml.
 
 zone wan = [wan0]
 zone lan = [lan0]
@@ -52,6 +56,44 @@ default drop
 
 @xdp(lan)
 
+# THE ORDER OF THIS BLOCK IS THE POLICY. `masquerade` and `redirect to
+# wan` are unconditional, so anything that reaches them leaves on the
+# uplink wearing the appliance's address — including traffic that was
+# never going anywhere, because it was addressed to the appliance
+# itself. A DHCP DISCOVER from a testnet client is addressed to
+# 255.255.255.255 (it has no address yet, and neither has it learned
+# ours); with the two allow rules below missing it was masqueraded and
+# broadcast onto the corporate network, arriving on the far side as
+#
+#     10.99.82.1.68 > 255.255.255.255.67
+#
+# while this box's own dnsmasq — correctly bound, correctly contained —
+# never saw the packet at all. A policy called "storm shield" was
+# pumping testnet broadcast into the office. Copy this ordering.
+
+count lan_total
+
+# --- 1. traffic addressed to THIS BOX is delivered to this box ---
+# DHCP first, and by port rather than by address: a client with no
+# lease cannot address us, so DISCOVER and REBIND arrive as broadcast.
+allow if pkt.proto == udp and pkt.dst_port == 67
+# ...and everything aimed at the gateway address itself: DNS, NTP, the
+# CLI over ssh. `allow` is terminal, so these never reach masquerade.
+allow if pkt.dst_ip == 10.99.82.1
+
+# --- 2. the testnet's own noise stays inside the testnet ---
+# The wan block above kills the office firehose coming in. This is the
+# same rule facing the other way, and it is the half that stops us
+# being the storm: mDNS/SSDP/LLMNR, limited and directed broadcast, and
+# NetBIOS, none of which is routable and all of which would otherwise
+# be masqueraded onto the uplink one frame at a time.
+drop if pkt.dst_ip in 224.0.0.0/4
+drop if pkt.dst_ip == 255.255.255.255
+drop if pkt.dst_ip == 10.99.82.255
+drop if pkt.proto == udp
+       and (pkt.dst_port == 137 or pkt.dst_port == 138)
+
+# --- 3. only what is left is egress ---
 # Testnet egress: hide every inside address behind the wan IP.
 count lan_out
 masquerade

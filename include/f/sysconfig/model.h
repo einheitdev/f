@@ -72,6 +72,11 @@ struct Interface {
   AddressMode mode = AddressMode::kUnconfigured;
   /// CIDR, e.g. "10.10.0.1/24". Only meaningful when mode is kStatic.
   std::string address;
+  /// Optional static IPv6 CIDR, e.g. "fd00:10:10::1/64". Only a zone
+  /// whose stance is `ra` may carry one: it is the prefix we
+  /// advertise, so it exists to be handed out. On an `off` zone it is
+  /// a contradiction and is refused rather than ignored.
+  std::string address6;
   /// Optional default gateway for a static interface.
   std::string gateway;
   /// The zone this interface belongs to. An interface belongs to
@@ -89,11 +94,30 @@ struct Interface {
 /// routes around the v4 firewall entirely while appearing to work, so
 /// the stance is stated per zone rather than inherited from whatever
 /// the upstream broadcasts.
+///
+/// The stance is a statement about *both directions*. `off` is not
+/// "we do not send RAs" — that would leave the interesting direction
+/// unstated, and the interesting direction is inbound.
 enum class Ipv6Stance {
-  /// No v6 on this zone. The safe default.
+  /// No v6 on this zone, in either direction. An RA arriving here is
+  /// counted and refused; nothing autoconfigures; no v6 is forwarded.
+  /// The safe default.
   kOff,
-  /// We are the router: we send the RAs here.
+  /// We are the router on this zone: we send the RAs, and we still
+  /// take orders from nobody else's. Requires a v6 prefix on one of
+  /// the zone's interfaces — there is nothing to advertise without
+  /// one, and an RA config with no prefix is a stance that generates
+  /// a config line and delivers nothing.
   kRouterAdvertise,
+  /// Full dual stack: accept upstream RAs, forward v6, filter it like
+  /// v4. **Refused today** — see validate.h SC030. The datapath cannot
+  /// classify an ICMPv6 error as `related`, so `Packet Too Big` cannot
+  /// reach a host in the zone; IPv6 routers never fragment, so PMTU
+  /// discovery is the only mechanism there is and a path with a
+  /// smaller MTU anywhere along it fails completely. It presents as
+  /// "the network is slow", which is the failure this whole model
+  /// exists to refuse. Representable so the refusal can name it.
+  kFull,
 };
 
 /// A named grouping of interfaces. Owned by the system config; FWL
@@ -143,9 +167,44 @@ struct DnsForwarder {
   /// Upstream resolvers. Empty means inherit the system resolver,
   /// which on a DHCP uplink is whatever the upstream handed us.
   std::vector<std::string> upstreams;
-  /// Reject answers that point into RFC1918 space (dnsmasq
-  /// `stop-dns-rebind`).
-  bool stop_dns_rebind = true;
+  /// Discard upstream answers that point into private address space
+  /// (dnsmasq `stop-dns-rebind`).
+  ///
+  /// **Off by default, deliberately.** This appliance sits inside an
+  /// office or a plant, and inside an office every internal name — the
+  /// file server, the git server, the printer — is private-addressed
+  /// *by definition*. Turning this on makes every one of them resolve
+  /// to an empty answer with no error code, visible only as
+  /// `possible DNS-rebind attack detected` in a journal the operator
+  /// has no reason to be reading. The protection is real, but it
+  /// defends a browser against a hostile *public* zone, and it cannot
+  /// tell that zone apart from the company intranet.
+  ///
+  /// Turn it on together with `rebind_ok`, which names the internal
+  /// domains that are allowed to answer privately.
+  bool stop_dns_rebind = false;
+  /// Domains exempt from rebind protection (dnsmasq
+  /// `rebind-domain-ok=/<d>/`). Meaningless unless
+  /// `stop_dns_rebind` is set, and validated as such.
+  std::vector<std::string> rebind_ok;
+};
+
+/// NTP: a client on the uplink, and optionally a server for a zone.
+///
+/// Both halves are one entry because they are one daemon and one
+/// answer to "where does this box get the time". The `zone` binding
+/// governs only the server half; the client half has no placement,
+/// because a client is outbound and needs none.
+struct NtpService {
+  ServiceBinding bind;
+  /// Upstream time sources. Empty means this box learns the time
+  /// from nowhere, which is a state `show time` names rather than a
+  /// clock that merely happens to be wrong.
+  std::vector<std::string> upstreams;
+  /// Whether to answer NTP queries from the bound zone. False leaves
+  /// the server port closed entirely — the same structural
+  /// containment as the DHCP gate, and the reason it is opt-in.
+  bool serve = true;
 };
 
 /// The whole model.
@@ -154,6 +213,7 @@ struct SystemConfig {
   std::vector<Interface> interfaces;
   std::vector<DhcpServer> dhcp;
   std::vector<DnsForwarder> dns;
+  std::vector<NtpService> ntp;
 
   /// Interfaces belonging to `zone`, in declaration order. This is the
   /// single derivation from zone to devices; every backend goes
@@ -175,8 +235,30 @@ struct SystemConfig {
   /// True when any DHCP server is bound to `zone`.
   auto ZoneServesDhcp(const std::string& zone) const -> bool;
 
-  /// True when any service at all is bound to `zone`.
+  /// True when a DNS forwarder is bound to `zone`.
+  auto ZoneServesDns(const std::string& zone) const -> bool;
+
+  /// True when `zone` carries a service dnsmasq provides. This is
+  /// the predicate the dnsmasq interface list derives from, and it
+  /// is deliberately narrower than `ZoneHasService`: an NTP server
+  /// places chrony in a zone, not dnsmasq, and conflating the two
+  /// would open a dnsmasq socket on a segment nobody asked it to
+  /// answer on.
+  auto ZoneHasDnsmasqService(const std::string& zone) const -> bool;
+
+  /// True when any service at all is bound to `zone`. Used to decide
+  /// whether an empty zone is a mistake, where every service counts.
   auto ZoneHasService(const std::string& zone) const -> bool;
+
+  /// The stance of the zone `iface` belongs to. An interface in no
+  /// zone gets `kOff`: an unzoned port carries no policy, so the only
+  /// safe reading of it is the safe one.
+  auto StanceOf(const Interface& iface) const -> Ipv6Stance;
+
+  /// True when any zone asks for v6 to move through the box. When no
+  /// zone does, v6 forwarding is turned off globally rather than left
+  /// at whatever the distribution shipped.
+  auto AnyZoneWantsIpv6() const -> bool;
 };
 
 /// Severity of a diagnostic.

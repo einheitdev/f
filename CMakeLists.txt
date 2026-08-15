@@ -127,14 +127,18 @@ endif()
 # ============================================================================
 add_library(libf-sysconfig STATIC
   src/sysconfig/artifact.cc
+  src/sysconfig/chrony.cc
   src/sysconfig/dnsmasq.cc
   src/sysconfig/edit.cc
+  src/sysconfig/ipv6.cc
   src/sysconfig/model.cc
   src/sysconfig/net.cc
   src/sysconfig/networkd.cc
+  src/sysconfig/observe.cc
   src/sysconfig/parse.cc
   src/sysconfig/service_status.cc
   src/sysconfig/sysctl.cc
+  src/sysconfig/storage.cc
   src/sysconfig/validate.cc
 )
 
@@ -144,6 +148,29 @@ target_include_directories(libf-sysconfig PUBLIC
 
 target_link_libraries(libf-sysconfig PUBLIC
   yaml-cpp::yaml-cpp
+)
+
+# ============================================================================
+# Lease / device visibility
+#
+# Observed state, not configuration: what dnsmasq handed out, when each
+# device first appeared, and the join of the two with the model. Kept
+# apart from libf-sysconfig because the model is what we declare and
+# this is what actually turned up.
+# ============================================================================
+add_library(libf-lease STATIC
+  src/lease/journal.cc
+  src/lease/lease.cc
+  src/lease/view.cc
+)
+
+target_include_directories(libf-lease PUBLIC
+  ${PROJECT_SOURCE_DIR}/include
+)
+
+target_link_libraries(libf-lease PUBLIC
+  libf-sysconfig
+  nlohmann_json::nlohmann_json
 )
 
 # ============================================================================
@@ -168,6 +195,7 @@ target_include_directories(libf-engine PUBLIC
 )
 
 target_link_libraries(libf-engine PUBLIC
+  libf-sysconfig
   ${BPF_LIB}
   nlohmann_json::nlohmann_json
   cppzmq
@@ -322,6 +350,7 @@ install(FILES
   deploy/systemd/einheit-f-ui.service
   deploy/systemd/f-firstboot.service
   deploy/systemd/f-dnsmasq.service
+  deploy/systemd/f-chrony.service
   deploy/systemd/f-confd.service
   DESTINATION lib/systemd/system
 )

@@ -1,0 +1,23 @@
+# The other half of a storm shield: our own segment's broadcast must
+# not be masqueraded onto the uplink one frame at a time.
+name: "lan: testnet directed broadcast never reaches the office"
+source_fw: |
+  zone wan = [wan0]
+  zone lan = [lan0]
+  @xdp(lan)
+  allow if pkt.proto == udp and pkt.dst_port == 67
+  allow if pkt.dst_ip == 10.99.82.1
+  drop if pkt.dst_ip in 224.0.0.0/4
+  drop if pkt.dst_ip == 255.255.255.255
+  drop if pkt.dst_ip == 10.99.82.255
+  masquerade
+  redirect to wan
+ingress_zone: lan
+state:
+  nat:
+    masq_ip: "203.0.113.7"
+test_packet:
+  builder: udp(src_ip="10.99.82.40", dst_ip="10.99.82.255", src_port=17500, dst_port=17500)
+expected:
+  compiles: true
+  bpf_action: drop

@@ -20,6 +20,8 @@
 #include "einheit/cli/render/terminal_caps.h"
 #include "einheit/cli/render/theme.h"
 #include "einheit/cli/shell.h"
+#include "f/lease/journal.h"
+#include "f/lease/lease.h"
 
 namespace {
 
@@ -41,6 +43,7 @@ auto main(int argc, char** argv) -> int {
   app.allow_extras();
 
   std::string color = "auto";
+  std::string format = "table";
   bool ascii = false;
   int width = 0;
   std::string pin_path = "/sys/fs/bpf/f";
@@ -51,9 +54,15 @@ auto main(int argc, char** argv) -> int {
   std::string confd_socket = "ipc:///run/f/confd.sock";
   std::string networkd_dir = "/etc/systemd/network";
   std::string sysctl_dir = "/etc/sysctl.d";
+  std::string lease_file = f::lease::kLeaseFilePath;
+  std::string device_journal = f::lease::kJournalPath;
   bool locked = false;
 
   app.add_option("--color", color, "always|never|auto");
+  app.add_option("--format", format,
+                 "table|json|yaml|set — machine-readable output for "
+                 "scripts and for pasting somewhere that has no "
+                 "80-column terminal");
   app.add_flag("--ascii", ascii, "Force ASCII borders");
   app.add_option("--width", width,
                  "Override detected width");
@@ -75,6 +84,10 @@ auto main(int argc, char** argv) -> int {
   app.add_option("--confd-socket", confd_socket,
                  "f-confd control socket (owns the commit-confirm "
                  "revert timer)");
+  app.add_option("--lease-file", lease_file,
+                 "dnsmasq's lease database");
+  app.add_option("--device-journal", device_journal,
+                 "Where device arrival history is recorded");
   app.add_flag("--locked", locked,
                "Restricted mode — no shell escapes");
 
@@ -106,6 +119,8 @@ auto main(int argc, char** argv) -> int {
   tcfg.networkd_dir = networkd_dir;
   tcfg.sysctl_dir = sysctl_dir;
   tcfg.confd_socket = confd_socket;
+  tcfg.lease_file = lease_file;
+  tcfg.device_journal = device_journal;
   auto tx_result = adapters::fw::NewFLocalTransport(tcfg);
   if (!tx_result) {
     std::cerr << std::format("transport: {}\n",
@@ -119,10 +134,26 @@ auto main(int argc, char** argv) -> int {
     return 1;
   }
 
+  using cli::render::OutputFormat;
+  auto out_format = OutputFormat::Table;
+  if (format == "json") {
+    out_format = OutputFormat::Json;
+  } else if (format == "yaml") {
+    out_format = OutputFormat::Yaml;
+  } else if (format == "set") {
+    out_format = OutputFormat::Set;
+  } else if (format != "table") {
+    std::cerr << std::format(
+        "unknown --format '{}': expected table, json, yaml or set\n",
+        format);
+    return 1;
+  }
+
   cli::shell::Shell s;
   s.tx = std::move(tx);
   s.caps = caps;
   s.locked = locked;
+  s.format = out_format;
   s.theme = cli::render::PickTheme(caps, false);
 
   // On the appliance, every SSH session is admin.

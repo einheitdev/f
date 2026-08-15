@@ -389,11 +389,19 @@ TEST_F(FwAdapterTest, NewCommandsRegistered) {
   }
 }
 
-TEST_F(FwAdapterTest, EventTopicsEmpty) {
-  auto cmds = adapter_->Commands();
-  for (const auto& c : cmds) {
+TEST_F(FwAdapterTest, OnlyLeasesDeclaresAWatchTopic) {
+  // `watch <cmd>` refuses when the adapter declares no topic for the
+  // command, which is the only thing standing between the operator
+  // and a watch that renders a blank screen forever. So the set of
+  // declared topics has to be exactly the set with a live source.
+  for (const auto& c : adapter_->Commands()) {
     auto topics = adapter_->EventTopicsFor(c);
-    EXPECT_TRUE(topics.empty());
+    if (c.wire_command == "show_leases") {
+      ASSERT_EQ(topics.size(), 1U) << c.path;
+      EXPECT_EQ(topics[0], "leases");
+    } else {
+      EXPECT_TRUE(topics.empty()) << c.path;
+    }
   }
 }
 

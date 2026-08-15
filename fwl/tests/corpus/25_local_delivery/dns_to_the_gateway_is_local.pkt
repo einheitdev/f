@@ -1,0 +1,22 @@
+# Anything aimed at the appliance's own address is for the appliance.
+name: "lan: DNS to the gateway address is delivered locally"
+source_fw: |
+  zone wan = [wan0]
+  zone lan = [lan0]
+  @xdp(lan)
+  allow if pkt.proto == udp and pkt.dst_port == 67
+  allow if pkt.dst_ip == 10.99.82.1
+  drop if pkt.dst_ip in 224.0.0.0/4
+  drop if pkt.dst_ip == 255.255.255.255
+  drop if pkt.dst_ip == 10.99.82.255
+  masquerade
+  redirect to wan
+ingress_zone: lan
+state:
+  nat:
+    masq_ip: "203.0.113.7"
+test_packet:
+  builder: udp(src_ip="10.99.82.40", dst_ip="10.99.82.1", src_port=51000, dst_port=53)
+expected:
+  compiles: true
+  bpf_action: allow

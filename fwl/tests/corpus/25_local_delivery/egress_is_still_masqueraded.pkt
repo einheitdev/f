@@ -1,0 +1,27 @@
+# ...and the local-delivery rules must not cost the gateway its job.
+name: "lan: ordinary egress is still masqueraded and redirected"
+source_fw: |
+  zone wan = [wan0]
+  zone lan = [lan0]
+  @xdp(lan)
+  allow if pkt.proto == udp and pkt.dst_port == 67
+  allow if pkt.dst_ip == 10.99.82.1
+  drop if pkt.dst_ip in 224.0.0.0/4
+  drop if pkt.dst_ip == 255.255.255.255
+  drop if pkt.dst_ip == 10.99.82.255
+  masquerade
+  redirect to wan
+ingress_zone: lan
+state:
+  nat:
+    masq_ip: "203.0.113.7"
+test_packet:
+  builder: tcp(src_ip="10.99.82.40", dst_ip="93.184.216.34", src_port=51002, dst_port=443, syn=true)
+expected:
+  compiles: true
+  bpf_action: redirect
+  redirect_zone: wan
+  output_packet:
+    src_ip: "203.0.113.7"
+    dst_ip: "93.184.216.34"
+    src_port: 51002

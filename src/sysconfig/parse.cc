@@ -105,11 +105,17 @@ class Parser {
           z.ipv6 = Ipv6Stance::kOff;
         } else if (v6 == "ra") {
           z.ipv6 = Ipv6Stance::kRouterAdvertise;
+        } else if (v6 == "full") {
+          // Parsed, then refused by name in Validate (SC030). An
+          // unknown-key error would tell the operator the word does
+          // not exist; the real answer is that it exists and does not
+          // work yet, and why.
+          z.ipv6 = Ipv6Stance::kFull;
         } else {
           Err("SC103", SpanOf(body["ipv6"]),
               std::format("zone '{}': unknown ipv6 stance '{}'",
                           z.name, v6),
-              "expected 'off' or 'ra'");
+              "expected 'off', 'ra' or 'full'");
         }
       } else if (body && !body.IsNull()) {
         Err("SC102", SpanOf(body),
@@ -139,9 +145,10 @@ class Parser {
         cfg->interfaces.push_back(iface);
         continue;
       }
-      RequireMapKeys(
-          body, {"mac", "path", "address", "gateway", "zone"},
-          std::format("interface '{}'", iface.name));
+      RequireMapKeys(body,
+                     {"mac", "path", "address", "address6",
+                      "gateway", "zone"},
+                     std::format("interface '{}'", iface.name));
 
       auto mac = Str(body, "mac");
       auto path = Str(body, "path");
@@ -166,6 +173,7 @@ class Parser {
         iface.mode = AddressMode::kStatic;
         iface.address = addr;
       }
+      iface.address6 = Str(body, "address6");
       iface.gateway = Str(body, "gateway");
       iface.zone = Str(body, "zone");
       cfg->interfaces.push_back(iface);
@@ -180,9 +188,10 @@ class Parser {
           "services must be a map of service kind -> list");
       return;
     }
-    RequireMapKeys(n, {"dhcp", "dns"}, "services");
+    RequireMapKeys(n, {"dhcp", "dns", "ntp"}, "services");
     ParseDhcp(n["dhcp"], cfg);
     ParseDns(n["dns"], cfg);
+    ParseNtp(n["ntp"], cfg);
   }
 
   /// A service body is a map. Note what is *not* in the allowed key
@@ -264,6 +273,32 @@ class Parser {
     }
   }
 
+  auto ParseNtp(const YAML::Node& n, SystemConfig* cfg) -> void {
+    if (!n) return;
+    if (!n.IsSequence()) {
+      Err("SC102", SpanOf(n), "services.ntp must be a list");
+      return;
+    }
+    for (const auto& item : n) {
+      NtpService s;
+      s.bind.span = SpanOf(item);
+      if (!item.IsMap()) {
+        Err("SC102", SpanOf(item),
+            "each services.ntp entry must be a map");
+        continue;
+      }
+      RequireMapKeys(item, {"zone", "upstream", "serve"},
+                     "services.ntp entry");
+      s.bind.zone = Str(item, "zone");
+      if (item["zone"]) s.bind.span = SpanOf(item["zone"]);
+      for (const auto& u : item["upstream"]) {
+        s.upstreams.push_back(u.as<std::string>(""));
+      }
+      if (item["serve"]) s.serve = item["serve"].as<bool>(true);
+      cfg->ntp.push_back(s);
+    }
+  }
+
   auto ParseDns(const YAML::Node& n, SystemConfig* cfg) -> void {
     if (!n) return;
     if (!n.IsSequence()) {
@@ -278,7 +313,9 @@ class Parser {
             "each services.dns entry must be a map");
         continue;
       }
-      RequireMapKeys(item, {"zone", "upstream", "stop_dns_rebind"},
+      RequireMapKeys(item,
+                     {"zone", "upstream", "stop_dns_rebind",
+                      "rebind_ok"},
                      "services.dns entry");
       d.bind.zone = Str(item, "zone");
       if (item["zone"]) d.bind.span = SpanOf(item["zone"]);
@@ -287,7 +324,10 @@ class Parser {
       }
       if (item["stop_dns_rebind"]) {
         d.stop_dns_rebind =
-            item["stop_dns_rebind"].as<bool>(true);
+            item["stop_dns_rebind"].as<bool>(false);
+      }
+      for (const auto& r : item["rebind_ok"]) {
+        d.rebind_ok.push_back(r.as<std::string>(""));
       }
       cfg->dns.push_back(d);
     }

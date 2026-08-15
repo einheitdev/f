@@ -7,6 +7,7 @@
 #ifndef INCLUDE_F_SYSCONFIG_NET_H_
 #define INCLUDE_F_SYSCONFIG_NET_H_
 
+#include <array>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -42,6 +43,22 @@ auto FormatIpv4(std::uint32_t a) -> std::string;
 
 /// True when the two prefixes share any address.
 auto PrefixesOverlap(const Prefix4& a, const Prefix4& b) -> bool;
+
+/// An IPv6 prefix: the 16 address bytes plus a length.
+struct Prefix6 {
+  std::array<std::uint8_t, 16> addr{};
+  /// Prefix length, 0..128.
+  int bits = 0;
+
+  /// The network address with the host bits cleared, rendered in
+  /// compressed form, e.g. "fd00:10:10::".
+  auto NetworkString() const -> std::string;
+};
+
+/// Parse "<v6 address>/<len>". Rejects a bare address: a prefix
+/// without a length is a prefix somebody has to guess at, and this
+/// one is handed to clients.
+auto ParseCidr6(const std::string& s) -> std::optional<Prefix6>;
 
 /// Parse a duration like "12h", "30m", "600s", "600" into seconds.
 auto ParseSeconds(const std::string& s) -> std::optional<std::uint32_t>;

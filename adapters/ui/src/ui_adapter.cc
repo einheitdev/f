@@ -400,10 +400,27 @@ class FwUiAdapter final : public ui::ProductUiAdapter {
       auto zones = QueryDaemon(cfg_.fd_socket, f::Cmd::kGetZones);
       auto nat = QueryDaemon(cfg_.fd_socket, f::Cmd::kGetNat);
       auto ct = QueryDaemon(cfg_.fd_socket, f::Cmd::kGetConntrack);
+      // How many interfaces are actually being filtered, summed from
+      // the per-zone `attached_count` the daemon derives from the
+      // kernel — NOT from how many NICs the box has, and not from how
+      // many zone programs the manifest listed. Both of those read
+      // healthy on a box whose bundle attached to nothing, which is
+      // the state this card exists to make visible: a four-port
+      // gateway with zero XDP attachments used to render
+      // "interfaces: 4" under a heading that says "firewall".
+      size_t attached = 0;
+      if (zones.is_array()) {
+        for (const auto& z : zones) {
+          attached += z.value("attached_count", 0);
+        }
+      }
       json data = {
           {"daemon", status},
           {"maps_available", maps_open_},
           {"iface_count", ifaces.size()},
+          {"attached_count", attached},
+          {"datapath_armed", attached > 0},
+          {"datapath_semantic", attached > 0 ? "good" : "bad"},
           {"has_firewall", false},
           {"zone_count", zones.is_array() ? zones.size() : 0},
           {"conntrack_count", ct.is_array() ? ct.size() : 0},

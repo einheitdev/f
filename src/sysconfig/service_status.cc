@@ -5,14 +5,18 @@
 
 #include <sys/wait.h>
 
+#include <algorithm>
 #include <array>
 #include <cstdio>
 #include <format>
 #include <set>
 #include <string>
 #include <utility>
+#include <vector>
 
+#include "f/sysconfig/chrony.h"
 #include "f/sysconfig/dnsmasq.h"
+#include "f/sysconfig/observe.h"
 
 namespace f::sysconfig {
 namespace {
@@ -48,6 +52,48 @@ auto Format(const std::string& tmpl, const std::string& unit)
 }
 
 }  // namespace
+
+auto ServiceStatus::MissingInterfaces() const
+    -> std::vector<std::string> {
+  std::vector<std::string> missing;
+  if (observed.availability != BindingAvailability::kObserved) {
+    return missing;
+  }
+  for (const auto& want : interfaces) {
+    if (std::find(observed.interfaces.begin(),
+                  observed.interfaces.end(),
+                  want) == observed.interfaces.end()) {
+      missing.push_back(want);
+    }
+  }
+  return missing;
+}
+
+auto ServiceStatus::Mismatched() const -> bool {
+  if (!expected) return false;
+  if (state != ServiceState::kRunning) return false;
+  return !MissingInterfaces().empty();
+}
+
+auto ServiceStatus::MismatchDetail() const -> std::string {
+  if (!Mismatched()) return "";
+  std::string want;
+  for (const auto& n : MissingInterfaces()) {
+    want += (want.empty() ? "" : ", ") + n;
+  }
+  std::string have;
+  for (const auto& l : observed.listeners) {
+    have += (have.empty() ? "" : ", ") + l.Format();
+  }
+  if (have.empty()) have = "nothing at all";
+  return std::format(
+      "systemd says this unit is running, and it is — but the model "
+      "binds it to {} and the kernel shows it listening on {}. It is "
+      "running and answering nobody on {}. The usual cause is a "
+      "generated file naming an interface that does not exist yet: "
+      "check `show system` for a pending rename.",
+      want, have, want);
+}
 
 auto ServiceStateName(ServiceState s) -> std::string {
   switch (s) {
@@ -114,6 +160,137 @@ auto ClassifyState(const std::string& active_state, bool expected,
   return ServiceState::kUnknown;
 }
 
+namespace {
+
+/// Ask systemd about one unit and classify what it says. Shared so
+/// that a second service cannot accidentally get a laxer reading of
+/// "healthy" than the first.
+auto Probe(const ServiceProbe& probe, ServiceStatus* out) -> void {
+  auto [rc, active] = RunCapture(Format(probe.is_active_cmd,
+                                        out->unit));
+  (void)rc;
+  int restarts = 0;
+  auto [rrc, restart_text] =
+      RunCapture(Format(probe.restarts_cmd, out->unit));
+  (void)rrc;
+  try {
+    auto trimmed = Trim(restart_text);
+    if (!trimmed.empty()) restarts = std::stoi(trimmed);
+  } catch (...) {
+    restarts = 0;
+  }
+  auto [src, result] = RunCapture(Format(probe.result_cmd,
+                                         out->unit));
+  (void)src;
+  auto [lsrc, load_state] =
+      RunCapture(Format(probe.load_state_cmd, out->unit));
+  (void)lsrc;
+  out->state = ClassifyState(active, out->expected, restarts, result,
+                             load_state);
+
+  if (out->state == ServiceState::kNotInstalled) {
+    out->detail = std::format(
+        "the model binds a service to {}, but {} is not installed "
+        "on this box",
+        out->zones.empty() ? "a zone" : out->zones.front(),
+        out->unit);
+    return;
+  }
+  if (out->state != ServiceState::kFailed &&
+      out->state != ServiceState::kRestarting &&
+      out->state != ServiceState::kStopped &&
+      out->state != ServiceState::kUnknown) {
+    return;
+  }
+  auto [lrc, log] = RunCapture(Format(probe.log_cmd, out->unit));
+  (void)lrc;
+  out->detail = Trim(log);
+  if (out->state == ServiceState::kRestarting) {
+    auto how = restarts > 0
+                   ? std::format("failed and restarted {} time(s)",
+                                 restarts)
+                   : std::string("failed on start and is retrying");
+    out->detail = std::format("{}{}{}", how,
+                              out->detail.empty() ? "" : ": ",
+                              out->detail);
+  }
+  if (out->detail.empty()) {
+    out->detail =
+        out->state == ServiceState::kUnknown
+            ? "systemd did not answer; state is unknown, which is "
+              "not the same as healthy"
+            : "no log output — the unit was never started";
+  }
+}
+
+/// Ask the kernel where this unit is actually listening.
+///
+/// Deliberately a second question, asked of a second source. Deriving
+/// it from the model would make the answer agree with the config by
+/// construction, which is the defect this exists to close: a status
+/// column that cannot disagree with the thing it is reporting on is
+/// not a report.
+auto ObserveBinding(const ServiceProbe& probe, const PortTable& ports,
+                    ServiceStatus* out) -> void {
+  if (out->state == ServiceState::kNotInstalled ||
+      out->state == ServiceState::kNotConfigured) {
+    out->observed.availability = BindingAvailability::kNoProcess;
+    out->observed.detail =
+        "the unit is not running, so it holds no sockets";
+    return;
+  }
+  auto [rc, pid_text] =
+      RunCapture(Format(probe.main_pid_cmd, out->unit));
+  (void)rc;
+  int pid = 0;
+  try {
+    auto trimmed = Trim(pid_text);
+    if (!trimmed.empty()) pid = std::stoi(trimmed);
+  } catch (...) {
+    pid = 0;
+  }
+  out->observed = ObserveListeners(pid, probe.listeners);
+  ResolveListenerInterfaces(ports, &out->observed);
+}
+
+/// The time service, which is a service like any other and must not
+/// be allowed to be silently absent — every timestamp on the box is
+/// stated in what it does or fails to do.
+auto ChronyStatus(const SystemConfig& cfg, const ServiceProbe& probe,
+                  const PortTable& ports) -> ServiceStatus {
+  ServiceStatus s;
+  s.unit = "f-chrony.service";
+  auto plan = PlanChrony(cfg);
+  s.expected = plan.needed;
+  s.zones = plan.served_zones;
+  // Interface names, not bind addresses: the column this feeds is
+  // compared against observed sockets resolved to ports, and comparing
+  // two different kinds of string would manufacture a mismatch on
+  // every box. A client-only chrony serves no zone and expects
+  // nothing, which is the containment stated as an empty list.
+  {
+    std::set<std::string> names;
+    for (const auto& z : plan.served_zones) {
+      for (const auto& n : cfg.InterfaceNamesInZone(z)) {
+        names.insert(n);
+      }
+    }
+    s.interfaces.assign(names.begin(), names.end());
+  }
+  s.name = plan.serves ? "ntp client+server (chrony)"
+                       : "ntp client (chrony)";
+  // Probed even when the model does not expect it. A chronyd running
+  // that nothing asked for is `running (not in the config)` — a box
+  // quietly taking its time from a source the model never named — and
+  // skipping the probe would render that as `unknown`, which is a
+  // fault state and would hide a real one behind it.
+  Probe(probe, &s);
+  ObserveBinding(probe, ports, &s);
+  return s;
+}
+
+}  // namespace
+
 auto QueryServices(const SystemConfig& cfg,
                    const ServiceProbe& probe)
     -> std::vector<ServiceStatus> {
@@ -138,66 +315,15 @@ auto QueryServices(const SystemConfig& cfg,
   if (kinds.empty()) kinds = "dhcp/dns";
   dnsmasq.name = std::format("{} (dnsmasq)", kinds);
 
-  auto [rc, active] =
-      RunCapture(Format(probe.is_active_cmd, dnsmasq.unit));
-  // `systemctl is-active` exits non-zero for anything but active, so
-  // the exit code carries no information the output does not.
-  (void)rc;
-  int restarts = 0;
-  auto [rrc, restart_text] =
-      RunCapture(Format(probe.restarts_cmd, dnsmasq.unit));
-  (void)rrc;
-  try {
-    auto trimmed = Trim(restart_text);
-    if (!trimmed.empty()) restarts = std::stoi(trimmed);
-  } catch (...) {
-    restarts = 0;
-  }
-  auto [src, result] =
-      RunCapture(Format(probe.result_cmd, dnsmasq.unit));
-  (void)src;
-  auto [lsrc, load_state] =
-      RunCapture(Format(probe.load_state_cmd, dnsmasq.unit));
-  (void)lsrc;
-  dnsmasq.state = ClassifyState(active, dnsmasq.expected, restarts,
-                                result, load_state);
+  Probe(probe, &dnsmasq);
 
-  if (dnsmasq.state == ServiceState::kNotInstalled) {
-    dnsmasq.detail = std::format(
-        "the model binds a service to {}, but {} is not installed "
-        "on this box",
-        dnsmasq.zones.empty() ? "a zone" : dnsmasq.zones.front(),
-        dnsmasq.unit);
-  } else if (dnsmasq.state == ServiceState::kFailed ||
-             dnsmasq.state == ServiceState::kRestarting ||
-             dnsmasq.state == ServiceState::kStopped ||
-             dnsmasq.state == ServiceState::kUnknown) {
-    auto [lrc, log] = RunCapture(Format(probe.log_cmd, dnsmasq.unit));
-    (void)lrc;
-    dnsmasq.detail = Trim(log);
-    if (dnsmasq.state == ServiceState::kRestarting) {
-      // systemd flags Result before it increments NRestarts, so the
-      // count is legitimately zero on the first failed start.
-      auto how = restarts > 0
-                     ? std::format("failed and restarted {} time(s)",
-                                   restarts)
-                     : std::string("failed on start and is "
-                                   "retrying");
-      dnsmasq.detail =
-          std::format("{}{}{}", how,
-                      dnsmasq.detail.empty() ? "" : ": ",
-                      dnsmasq.detail);
-    }
-    if (dnsmasq.detail.empty()) {
-      dnsmasq.detail =
-          dnsmasq.state == ServiceState::kUnknown
-              ? "systemd did not answer; state is unknown, which is "
-                "not the same as healthy"
-              : "no log output — the unit was never started";
-    }
-  }
+  // The port table is read once and shared: both services resolve
+  // their listening addresses through the same view of the hardware,
+  // so they cannot disagree about which port an address is on.
+  auto ports = ObservePorts(probe.ports);
+  ObserveBinding(probe, ports, &dnsmasq);
 
-  return {dnsmasq};
+  return {dnsmasq, ChronyStatus(cfg, probe, ports)};
 }
 
 }  // namespace f::sysconfig

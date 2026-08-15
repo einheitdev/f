@@ -60,14 +60,43 @@ auto SystemConfig::ZoneServesDhcp(const std::string& zone) const
                      });
 }
 
-auto SystemConfig::ZoneHasService(const std::string& zone) const
+auto SystemConfig::ZoneServesDns(const std::string& zone) const
     -> bool {
   if (zone.empty()) return false;
-  if (ZoneServesDhcp(zone)) return true;
   return std::any_of(dns.begin(), dns.end(),
                      [&](const DnsForwarder& d) {
                        return d.bind.zone == zone;
                      });
+}
+
+auto SystemConfig::ZoneHasDnsmasqService(
+    const std::string& zone) const -> bool {
+  return ZoneServesDhcp(zone) || ZoneServesDns(zone);
+}
+
+auto SystemConfig::ZoneHasService(const std::string& zone) const
+    -> bool {
+  if (zone.empty()) return false;
+  if (ZoneHasDnsmasqService(zone)) return true;
+  // Only a serving NTP entry places anything in a zone. A client-only
+  // entry has no placement at all, so counting it here would bring
+  // dnsmasq up on a zone nobody asked to be served.
+  return std::any_of(ntp.begin(), ntp.end(),
+                     [&](const NtpService& n) {
+                       return n.serve && n.bind.zone == zone;
+                     });
+}
+
+auto SystemConfig::StanceOf(const Interface& iface) const
+    -> Ipv6Stance {
+  const auto* z = FindZone(iface.zone);
+  return z != nullptr ? z->ipv6 : Ipv6Stance::kOff;
+}
+
+auto SystemConfig::AnyZoneWantsIpv6() const -> bool {
+  return std::any_of(zones.begin(), zones.end(), [](const Zone& z) {
+    return z.ipv6 != Ipv6Stance::kOff;
+  });
 }
 
 auto Diagnostic::Format() const -> std::string {
@@ -115,6 +144,8 @@ auto Ipv6StanceName(Ipv6Stance s) -> std::string {
   switch (s) {
     case Ipv6Stance::kRouterAdvertise:
       return "ra";
+    case Ipv6Stance::kFull:
+      return "full";
     case Ipv6Stance::kOff:
       break;
   }

@@ -1392,13 +1392,19 @@ zone wan = [wan0]
 zone lan = [lan0, lan1]
 
 @xdp(lan)
+allow if pkt.proto == udp and pkt.dst_port == 67   # DHCP, to us
+allow if pkt.dst_ip == 10.0.0.1                    # our own address
 masquerade
 redirect to wan
 
 @xdp(wan)
-redirect to lan if conntrack(pkt).state == established
+redirect to lan if conntrack(pkt).state in [established, related]
 drop
 ```
+
+**`masquerade` + `redirect` swallows traffic addressed to the box itself.** Both are unconditional, so anything reaching them is source-NATed and emitted on the other port — including packets that were never going anywhere, because their destination was the appliance. The case that finds this is DHCP: a client with no lease addresses its DISCOVER to `255.255.255.255`, since it has neither an address of its own nor yours. Without a terminal `allow` ahead of the rewrite the request is masqueraded onto the uplink and arrives on the far side as `<gateway>.68 > 255.255.255.255.67`, while the appliance's own DHCP server — correctly bound, correctly contained — never sees it. `allow` is terminal, so a rule that matches it never reaches `masquerade`.
+
+The same reasoning covers the segment's own broadcast and multicast (`224.0.0.0/4`, `255.255.255.255`, the directed broadcast, NetBIOS): none of it is routable, and all of it would otherwise be masqueraded onto the uplink one frame at a time. `fwl/examples/storm_shield.fw` is the worked example.
 
 ```
 # Port forward TCP/80 on the WAN address to an internal web server.
