@@ -354,6 +354,27 @@ def _emit_bundle_dir(program: ast.Program, bundle_dir: Path,
       "masquerades": emitter._program_masquerades(zp, program.helpers),
     })
 
+  # The TC clsact egress conntrack tracker (v0.4 § 6.9). One object for
+  # the whole bundle — what it does is a property of the box, not of a
+  # policy — compiled and reported exactly like a zone object, because
+  # the failure it must not have is the one zone objects already had: a
+  # `null` here and a load that says "ok".
+  egress_meta = None
+  e_src = emitter.EGRESS_TRACKER_SOURCE
+  if e_src in files:
+    e_obj = e_src.replace(".bpf.c", ".bpf.o")
+    try:
+      result = bpf_runner.compile_c(files[e_src], work_dir=bundle_dir)
+      result.obj_path.replace(bundle_dir / e_obj)
+      e_compiled = True
+    except (bpf_runner.BpfUnavailable, subprocess.CalledProcessError):
+      e_compiled = False
+    egress_meta = {
+      "source": e_src,
+      "object": e_obj if e_compiled else None,
+      "program": emitter.EGRESS_TRACKER_PROG,
+    }
+
   manifest = {
     "version": "0.4",
     # Declared zones AND the implicit zone of a simple `@xdp(eth0)`
@@ -375,6 +396,12 @@ def _emit_bundle_dir(program: ast.Program, bundle_dir: Path,
     # is removed before the load. Taken from _MAP_KINDS so the decision
     # lives in one place and reaches the daemon without being restated.
     "persistent_maps": list(emitter.persistent_map_names()),
+    # Present only when this policy reads conntrack at all. `fd`
+    # attaches it to every interface the bundle attaches XDP to, and a
+    # bundle that declares one and cannot attach it is a failed load —
+    # see LoadZoneBundle. A bundle compiled before this field existed
+    # has no tracker, and fd says so rather than assuming one.
+    "egress_tracker": egress_meta,
   }
   (bundle_dir / "manifest.json").write_text(
     json.dumps(manifest, indent=2), encoding="utf-8"

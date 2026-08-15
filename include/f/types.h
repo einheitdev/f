@@ -188,6 +188,39 @@ enum FwlRouteStat : uint32_t {
   kFwlRouteStatSlots = 6,
 };
 
+/// Slots in the shared `fwl_egress_stats` per-CPU array, numbered by
+/// the FWL emitter's egress-tracker header.
+///
+/// The tracker runs at the TC clsact egress hook and answers one
+/// question per packet: did this box ORIGINATE this flow? XDP conntrack
+/// only ever sees ingress, so without it a reply to the box's own DNS
+/// query reads NEW and `default drop` eats it (measured: l12_01).
+enum FwlEgressStat : uint32_t {
+  /// Packets at the hook. The denominator; without it the rows below
+  /// cannot be told from an idle interface.
+  kFwlEgressStatSeen = 0,
+  /// No socket on the skb: this box FORWARDED the packet rather than
+  /// sent it. Deliberately not tracked — creating an entry for a
+  /// forwarded flow would admit its replies, which is a policy change
+  /// made by a component whose job is to observe.
+  kFwlEgressStatNotLocal = 1,
+  /// Locally originated but outside what v0.4 conntrack keys: not
+  /// IPv4, a non-first fragment, or a protocol other than TCP/UDP/ICMP.
+  kFwlEgressStatUntracked = 2,
+  /// A conntrack entry created — one flow this box started.
+  kFwlEgressStatTracked = 3,
+  /// An existing entry re-stamped, in either direction. This is what
+  /// keeps the occupancy cost at one entry per originated flow: a reply
+  /// the box sends to a client refreshes the entry that client's own
+  /// query created instead of adding its reverse.
+  kFwlEgressStatRefreshed = 4,
+  /// The insert failed — conntrack is at its cap. The packet still goes
+  /// out and its reply will be dropped, so this is the one slot here
+  /// that is an error rather than an accounting row.
+  kFwlEgressStatRefused = 5,
+  kFwlEgressStatSlots = 6,
+};
+
 // Per-zone masquerade config (`fwl_nat_cfg`, slot 0). `masq_addr` is the
 // network-byte-order source the XDP masquerade action rewrites to.
 struct FwlNatCfg {

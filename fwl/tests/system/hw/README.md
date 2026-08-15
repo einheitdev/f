@@ -79,7 +79,7 @@ The lint is the free half: a conditional that cannot fail yet emits a PASS is fo
 enp1s0f0 (sender, no XDP) ==EX2300==> enp1s0f1 (zone t, XDP + sniffer)
 ```
 
-For the routed scenarios (`l2_02` acceptance leg, `l2_03`, `l11_04` acceptance leg, `l12_01`) the same three ports carry a real gateway, with both far hosts hanging off the one trunk port:
+For the routed scenarios (`l2_02` acceptance leg, `l2_03`, `l11_04` acceptance leg, `l12_01`, `l12_02`) the same three ports carry a real gateway, with both far hosts hanging off the one trunk port:
 
 ```
   netns fguest  10.99.21.5        (macvlan on f0, untagged -> vlan 801)
@@ -119,13 +119,16 @@ Every script restores the operator smoke policy (`/etc/f/rules.fw`) on exit, so 
 - `sendmany.py` — batch AF_PACKET sender using `fwl.pkt` builders.
 - `sniff.py` — receiving-port witness; JSON tallies by flow key.
 - `realsock.py` — the acceptance witness: a real listening socket and a real client, both on ordinary non-promiscuous stacks. The server reports the PEER address of each accepted connection, so one object proves the far side took the bytes AND that the source was translated; neither is evidence without the other.
-- `tc_egress_probe.bpf.c` — a measurement for `l12_01`, not a product component: counts IPv4 packets at a TC egress hook, to establish what such a hook can and cannot see.
+- `dnsprobe.py` — a real DNS responder and a real DNS client, for `l12_02`. Not `dig`: the point of that scenario is the ANSWER, an address only the far-side responder can produce, and a tool that prints `status: NOERROR` invites an assertion a cached or locally-synthesised answer satisfies just as well.
+- `tc_egress_probe.bpf.c` — the measurement that decided the A4 design, kept because it is the evidence and not the product: it counts IPv4 packets at a TC egress hook, and established that such a hook sees 5/5 of what the local stack sends and 0 of 13 frames the XDP datapath forwards out the same port. The product tracker is `fwl_egress.bpf.c`, emitted into every conntrack-reading bundle by `fwl` (FWL_V04_SPEC.md § 6.9).
 - `ringlog.py` — consumes the pinned `fwl_log_events` ring buffer. Decodes with `fwl.log_abi` (the same layout the .pkt oracle reads), validates each record's ABI header, and resolves `zone_id` to a zone name through the running bundle's `manifest.json["zone_ids"]`. Exits 3 if it ever rejected a record.
 - `sendraw.py` — deliberately ugly frames the builders cannot make: fragments, IP options, truncated L4, QinQ, and (`icmperr`) a real RFC 1191 ICMP error carrying a next-hop MTU and the embedded header of the datagram that provoked it.
 - `l1_*.sh` — one script per test-plan row.
 - `run_l1.sh` — runs every `l1_*` script, prints a summary table.
 - `natsoak_*` — the NAT/masquerade soak (policy, traffic generator, per-sample wire probe, sampler, report). See below.
 - `run_l11.sh` — the ceiling probes. None FAILs by design any more.
+- `run_l12.sh` — the two runnable `l12_*` scenarios (~10 min). `l12_03` is excluded because it reboots the rig; run it from ksys by hand, like `l3_03`.
+- `l12_*.sh` — flows the appliance itself originates. `l12_01` is the mechanism (an egress hook creates the conntrack entry XDP never could, and refuses to create one for anything the box merely forwarded); `l12_02` is the consequence, and the only user-visible proof there is — a client resolving a name through the box's own forwarder. Neither FAILs by design; `l12_01` used to, as the reproduction of finding A4, and now asserts the behaviour that replaced it.
 
 ### Ceiling probes (`l10_*`, `l11_*`) — read the evidence, not the code
 

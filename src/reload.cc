@@ -255,6 +255,14 @@ auto ApplyBundle(Engine& e, std::string_view bundle_dir)
       for (int idx : op.ifindexes) {
         if (!covered.contains(idx)) {
           DetachXdp(idx);
+          // Both attach points come off together. The new tracker was
+          // attached to the interfaces the new bundle covers, so this
+          // one still carries the OLD bundle's filter — a tracker with
+          // no bundle behind it, writing conntrack entries that the
+          // policy which would have read them is no longer on. The
+          // qdisc goes with it when this daemon is the one that made
+          // it; the old tracker's own record is what says so.
+          RemoveEgressFrom(idx, e.zone_bundle.egress);
         }
       }
     }
@@ -272,6 +280,15 @@ auto ApplyBundle(Engine& e, std::string_view bundle_dir)
     // and the status section would report it — the map is FLOW-lifetime
     // and its pin is adopted, so the numbers would look plausible.
     AttachNatMgr(e);
+    // Same reason, second attach point. Left out, `e.egress.stats_fd`
+    // still pointed into the object CloseZoneBundle had just closed:
+    // every egress counter in `fctl status` read 0 for the rest of the
+    // process's life and EgressMgr::Report could never fire, so the one
+    // failure this whole feature exists to surface — a refused insert
+    // because conntrack is full — was permanently silent after the
+    // first reload. The manager's own doc comment said it was called
+    // from both places; it was not.
+    AttachEgressMgr(e, dir.string());
     // Re-derive the tracked interface list from the bundle that is
     // now attached. Leaving it stale made `fctl status` describe the
     // boot-time topology forever, and gave EngineStop the wrong set

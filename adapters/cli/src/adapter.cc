@@ -331,6 +331,67 @@ auto RenderShowStatus(const Response& resp,
       row("route_ttl_expired", std::to_string(ttl), Semantic::Info);
     }
   }
+  // Flows the BOX ITSELF starts. Rendered whenever the policy asks a
+  // conntrack question at all — including when the answer is "no
+  // tracker" — because that is the state in which the appliance's own
+  // DNS, NTP and updates are dropped by its own policy, and every other
+  // line on this box reads healthy while it is true.
+  if (j.contains("egress") &&
+      (j["egress"].value("tracker_declared", false) ||
+       j["egress"].value("bundle_predates_tracker", false))) {
+    auto& eg = j["egress"];
+    if (eg.value("enabled", false)) {
+      auto ifaces = eg.value("interfaces", json::array());
+      std::string names;
+      for (const auto& n : ifaces) {
+        if (!names.empty()) names += ",";
+        names += n.get<std::string>();
+      }
+      auto attached = eg.value("attached", uint32_t{0});
+      if (attached < ifaces.size()) {
+        // The daemon attached to more ports than the kernel now
+        // carries: somebody removed a filter behind it. Reported as the
+        // failure it is, because on those ports the box's own flows are
+        // untracked again.
+        row("own_flows_tracked",
+            std::format("{} of {} ports lost the egress hook — the "
+                        "box's own flows are untracked there",
+                        ifaces.size() - attached, ifaces.size()),
+            Semantic::Bad);
+      } else {
+        row("own_flows_tracked",
+            std::format("{} flows on {}",
+                        jstr(eg["tracked"]), names),
+            Semantic::Good);
+      }
+      auto refused = eg.value("refused", uint64_t{0});
+      if (refused > 0) {
+        // The one way this can stop working, and it looks like nothing:
+        // conntrack full, the query still goes out, the reply still
+        // arrives, and `default drop` eats it.
+        row("own_flows_untracked",
+            std::format("{} (conntrack full; their replies WILL be "
+                        "dropped)", refused),
+            Semantic::Bad);
+      }
+    } else if (eg.value("bundle_predates_tracker", false)) {
+      // The honest wording for the one thing an old manifest cannot
+      // answer. It carries `conntrack` whether the policy reads the
+      // state or merely masquerades, so claiming the box's DNS is
+      // being dropped would be a false red on every healthy NAT gateway
+      // — and a red row an operator learns to ignore is worse than no
+      // row.
+      row("own_flows_tracked",
+          "unknown — this bundle predates egress tracking; if its "
+          "policy reads conntrack(pkt).state its own DNS, NTP and "
+          "update replies are being dropped (recompile to find out)",
+          Semantic::Warn);
+    } else {
+      row("own_flows_tracked",
+          "no — this bundle declares a tracker and none is attached",
+          Semantic::Bad);
+    }
+  }
   if (j.contains("slow_path")) {
     auto& sp = j["slow_path"];
     if (sp.contains("events")) {

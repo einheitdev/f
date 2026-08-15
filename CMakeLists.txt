@@ -183,8 +183,10 @@ add_library(libf-engine STATIC
   src/reload.cc
   src/slow_path.cc
   src/components.cc
+  src/egress_mgr.cc
   src/nat_mgr.cc
   src/route_mgr.cc
+  src/tc_egress.cc
   src/watcher.cc
 )
 

@@ -1170,6 +1170,131 @@ bundle; `manifest.json` is the machine-readable copy.
 - **One ring buffer per zone.** The shared ring is correct; splitting
   it moves multiplexing into every consumer and buys nothing.
 
+### 6.9 Egress conntrack tracking — flows the box originates
+
+Conntrack in v0.4 is built by the XDP programs, and XDP only ever sees
+INGRESS. A flow the appliance itself starts therefore creates no
+conntrack entry at all: the DNS query its forwarder sends upstream, the
+NTP exchange that sets its clock, the package update it fetches. Each
+one leaves through the local stack, which no XDP program is attached
+to. Its reply arrives on the WAN port, is looked up, reads `new`, and a
+`default drop` policy — the one this whole section teaches — eats it.
+
+Measured on hardware before the fix
+(`fwl/tests/system/hw/l12_01_box_originated_flows.sh`): the box sent 5
+UDP requests from its own WAN address, the datapath counter recorded 5
+replies arriving at the port, 0 survived, conntrack went 0 -> 0. A
+policy drop, not an empty wire. **A firewall that cannot resolve a name
+or set its own clock is not deployable**, so this is not an edge case
+of the language; it is the language's default policy being unusable on
+the box that runs it.
+
+#### The mechanism
+
+Every bundle whose policy reads `conntrack(pkt).state` anywhere also
+carries **one** extra object, `fwl_egress.bpf.c`, holding a single
+`SEC("tc")` program. `fd` attaches it at the **clsact egress** hook of
+every interface the bundle attaches XDP to — those are exactly the
+ports on which a reply to a locally-originated flow would be judged.
+
+Per packet it:
+
+1. returns immediately unless `skb->sk` is set. A packet the local
+   stack SENT carries the socket that sent it; a packet this box merely
+   FORWARDED has none. This gate is what keeps the tracker an observer:
+   without it, a forwarded flow would get an entry and its replies
+   would be admitted, which is a policy change made by a component that
+   has no business making one;
+2. parses IPv4 / first fragment / TCP, UDP or ICMP, and builds the
+   5-tuple exactly as the XDP prelude does (ICMP keyed on ports 0);
+3. probes conntrack in **both** directions. A hit is refreshed
+   (`last_seen_ns`, `packets`), not replaced;
+4. only on a double miss inserts the forward tuple with state
+   `established`, via `BPF_NOEXIST`.
+
+An 802.1Q tag is skipped exactly as the prelude skips it, so the key is
+built from the same inner header on a tagged segment as on an untagged
+one; and every protocol other than TCP and UDP is keyed on ports 0,
+again exactly as the prelude keys it, so a box-originated GRE or IPsec
+flow is tracked rather than left for the two sides to disagree about.
+
+Step 3 is what bounds the cost. A reply the box sends to a client that
+queried it is egress traffic too, and its forward key is the reverse of
+the entry the client's own query already created at ingress; probing
+one direction would insert a second entry for every served flow and
+double conntrack's fill rate. With both, the table grows by **exactly
+one entry per flow the box originates**, and by nothing for the flows
+it serves or forwards.
+
+#### Why the qdisc layer
+
+Measured, not argued. The same hook saw 5/5 of what the local stack
+sent and **0 of 13** frames the XDP datapath forwarded out the same
+port, because `bpf_redirect_map()` leaves through `ndo_xdp_xmit`, below
+the qdisc layer entirely. It therefore covers precisely the gap and
+costs the forwarding fast path nothing — it cannot even see it.
+
+#### Rejected alternative
+
+`bpf_sk_lookup_udp()` from XDP would need no second copy of the state
+at all: ask the kernel's own socket table whether an arriving packet
+belongs to a socket this box has open. It is refuted by measurement.
+The lookup can only tell a reply from an unsolicited arrival when the
+socket carries a **peer**, and a real DNS forwarder's upstream sockets
+do not: dnsmasq's were unconnected 2/2 on the bench. Admitting on an
+unconnected match would open every bound port to the WAN.
+
+#### Visibility
+
+`fwl_egress_stats` is a bundle-wide per-CPU array with six slots:
+`seen`, `not_local`, `untracked`, `tracked`, `refreshed`, `refused`.
+It is `MapScope.SHARED` and `MapLifetime.POLICY` — the entries the
+tracker creates are flow-keyed and inherited across a reload; the tally
+of how they got there is not.
+
+`refused` is the one that matters. It means an insert failed, which in
+practice means conntrack is at its cap: the query still goes out, the
+reply still arrives, and `default drop` eats it — the original symptom,
+restored, by a mechanism working exactly as designed. `fd` logs an
+error naming the count whenever it moves, and `fctl status`'s `egress`
+section reports it alongside a **live** count of the interfaces that
+carry the filter right now.
+
+#### Manifest
+
+```json
+"egress_tracker": {
+  "source": "fwl_egress.bpf.c",
+  "object": "fwl_egress.bpf.o",
+  "program": "fwl_egress_ct"
+}
+```
+
+**Known residual.** A locally-originated datagram large enough to be
+fragmented loses `skb->sk` on the fragments (`ip_copy_metadata` does not
+carry it), so such a flow is counted `not_local` and goes untracked. It
+is narrow — DNS keeps itself under the MTU and TCP does not fragment —
+and it is recorded rather than worked around because the workaround
+(tracking socketless packets) is the policy change the gate exists to
+prevent.
+
+`null` means this policy reads no conntrack and needs no tracker. The
+field being **absent** means something different — a bundle compiled
+before the tracker existed — and `fd` warns about that case, because a
+box running one looks healthy from every other line while dropping the
+replies to its own DNS.
+
+#### Failure policy
+
+A bundle that declares a tracker and cannot attach it is a **failed
+load**, on the same grounds as a bundle attached to zero interfaces:
+loading is not attaching, and a second attach point must never report
+success having attached to nothing. An attach that fails on any one of
+the interfaces is rolled back rather than left partial — every one of
+them demonstrably exists, since XDP just attached to it, so there is no
+benign reason for a strict subset and a strict subset is a box whose
+DNS works through one port and not another.
+
 ### Examples
 
 ```

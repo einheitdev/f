@@ -471,6 +471,43 @@ auto AttachRouteMgr(Engine& e) -> void {
   e.route.CheckForwarding(redirects);
 }
 
+auto AttachEgressMgr(Engine& e, std::string_view bundle_dir) -> void {
+  e.egress.stats_fd = e.zone_bundle.egress.stats_fd;
+  // Attachment, not loading. The tracker's object can be perfectly
+  // loaded and on no interface at all, and that box's DNS is broken —
+  // this is the same distinction the datapath's own "1 zone program(s)"
+  // line failed to make.
+  e.egress.enabled = e.zone_bundle.egress.Attached();
+  e.egress.interfaces = e.zone_bundle.egress.interfaces;
+  e.egress.ifindexes = e.zone_bundle.egress.ifindexes;
+  e.egress.prog_id = e.zone_bundle.egress.prog_id;
+  // From the manifest — the compiler's own answer — not from the map's
+  // presence. Every NAT bundle carries `conntrack` whether or not its
+  // policy ever reads the state, so `conntrack_fd >= 0` said yes for a
+  // masquerade-only policy and produced a red status row and an ERROR
+  // per load on a box with nothing wrong with it.
+  e.egress.tracker_declared = BundleDeclaresEgressTracker(bundle_dir);
+  e.egress.bundle_predates_tracker =
+      !ManifestHasEgressField(bundle_dir);
+  // POLICY-lifetime map, so the pin is discarded on a reload and the
+  // counters restart from zero; the watermark has to restart with them
+  // or the first refusals after a reload sit under the old mark and are
+  // never logged.
+  e.egress.reported_refusals = 0;
+  if (e.egress.tracker_declared && !e.egress.enabled) {
+    // Should be unreachable — a declared tracker that will not attach
+    // fails the load — so this is a belt against a future path that
+    // forgets that, not a routine condition. Nothing else about such a
+    // box would look wrong: the firewall filters, every counter climbs,
+    // and its own DNS resolves nothing.
+    spdlog::error(
+        "This bundle declares an egress conntrack tracker and none is "
+        "attached, so flows this box ORIGINATES (DNS forwarding, NTP, "
+        "updates) create no conntrack entry and their replies read "
+        "NEW.");
+  }
+}
+
 auto AttachNatMgr(Engine& e) -> void {
   e.nat.map_fd = e.zone_bundle.nat_fd;
   e.nat.stats_fd = e.zone_bundle.nat_stats_fd;
@@ -597,6 +634,7 @@ auto EngineInit(Engine& e,
     }
     AttachNatMgr(e);
     AttachRouteMgr(e);
+    AttachEgressMgr(e, current_dir);
     // Record the attached interfaces for status reporting.
     for (const auto& prog : e.zone_bundle.programs) {
       for (int idx : prog.ifindexes) {
@@ -863,6 +901,10 @@ auto EngineRun(Engine& e, std::stop_token stop)
     // counted by the datapath and are invisible everywhere
     // else, so this is where they become a log line.
     e.route.Report();
+    // Same reason, one hook over: an insert the egress tracker
+    // could not make is a flow of this box's own whose reply
+    // this policy will drop, and it has no other symptom.
+    e.egress.Report();
   }
 
   spdlog::info("Engine stopping.");
@@ -1042,6 +1084,12 @@ auto GetFullState(const Engine& e) -> nlohmann::json {
   // — a frame addressed to the wrong MAC is still on the cable — so
   // this section is the only place the difference is written down.
   j["route"] = e.route.GetState();
+  // Whether flows the BOX ITSELF starts are tracked. Without the hook
+  // this section reports, `conntrack(pkt).state` answers NEW for the
+  // reply to the appliance's own DNS query and `default drop` eats it
+  // — a box that filters perfectly and cannot resolve a name, with
+  // every counter climbing and nothing anywhere saying why (l12_01).
+  j["egress"] = e.egress.GetState();
 
   // Slow path stats.
   j["slow_path"] = {

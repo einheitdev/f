@@ -19,6 +19,7 @@
 
 #include "f/bpf_loader.h"
 #include "f/conntrack_mgr.h"
+#include "f/egress_mgr.h"
 #include "f/error.h"
 #include "f/iface_mgr.h"
 #include "f/nat_mgr.h"
@@ -75,6 +76,7 @@ struct Engine {
   ConntrackMgr conntrack;
   NatMgr nat;
   RouteMgr route;
+  EgressMgr egress;
 
   // Current firewall config.
   FwConfig current_config{};
@@ -155,6 +157,13 @@ auto AttachNatMgr(Engine& e) -> void;
 
 /// Point RouteMgr at the loaded bundle's routing tally.
 auto AttachRouteMgr(Engine& e) -> void;
+
+/// Point EgressMgr at the loaded bundle's egress tracker.
+///
+/// Called from the same two places for the same reason: a manager left
+/// holding the previous bundle's `fwl_egress_stats` fd reports numbers
+/// that look right about a hook that is no longer there.
+auto AttachEgressMgr(Engine& e, std::string_view bundle_dir) -> void;
 
 /// Open pinned BPF maps (for f-api read access).
 auto OpenPinnedMaps(std::string_view pin_path)

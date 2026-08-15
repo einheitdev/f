@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# The appliance cannot use its own network (finding A4), measured — and
-# the design fork it opens, measured rather than argued.
+# The appliance can use its own network (finding A4, closed).
 #
 # The finding
 # -----------
@@ -8,31 +7,28 @@
 # originates — the DNS query the forwarder sends upstream, the NTP
 # exchange that sets its clock, the update it fetches — leaves through
 # the local stack, which no XDP program is attached to. No conntrack
-# entry is created. The reply arrives on the WAN port, reads NEW, and
-# `default drop` eats it. That kills DNS forwarding, which is the entire
-# purpose of the DNS service, and NTP, and every update path.
+# entry was created, the reply arrived on the WAN port, read NEW, and
+# `default drop` ate it. Measured here on 2026-08-14: 5 requests out of
+# the box's own WAN address, 5 replies at the port by datapath counter,
+# 0 survived, conntrack 0 -> 0.
 #
-# The fork
-# --------
-# Track egress too (a TC hook), or special-case locally-originated
-# flows, or something better. Two candidate mechanisms are measured
-# here, because both rest on claims about kernel behaviour that are
-# cheaper to test than to reason about:
+# The fix
+# -------
+# A TC clsact egress hook, attached by `fd` to every interface the
+# bundle attaches XDP to, which creates one conntrack entry per flow
+# this box starts. This scenario asserts the behaviour that REPLACED the
+# failure, and each of the three claims the design rests on:
 #
-#   1. A TC egress hook. The claim: it sees every packet the local stack
-#      sends AND NONE of the traffic the XDP datapath forwards, because
-#      bpf_redirect_map() leaves through ndo_xdp_xmit and never enters
-#      the qdisc layer. If true, an egress conntrack tracker covers
-#      exactly the gap and costs nothing on the forwarding fast path. If
-#      false, it double-counts every forwarded packet.
-#
-#   2. bpf_sk_lookup_udp() from XDP — "does this packet belong to a
-#      socket this box has open?", answered from the kernel's own socket
-#      table with no second copy of the state. The claim to test is
-#      whether it can DISTINGUISH a reply to a flow we originated from
-#      an unsolicited packet to a port we happen to listen on. It can
-#      only do that when the socket carries a peer, so the question is
-#      whether a real DNS forwarder connects its upstream socket.
+#   1. the box's own flow now gets its replies, and gets them because a
+#      conntrack entry exists — not because the policy grew permissive;
+#   2. the hook does NOT track what the box merely FORWARDS. A packet
+#      the local stack sent carries the socket that sent it; a forwarded
+#      one has none. Without that gate the tracker would admit the
+#      replies of every forwarded flow — a policy change made by a
+#      component whose job is to observe;
+#   3. the entry is a 5-tuple, so an unsolicited packet to the same port
+#      from anywhere else is still dropped. A fix that opened the port
+#      would pass claim 1 and be far worse than the bug.
 #
 # Prepared to be re-runnable by the operator; it changes nothing
 # permanently and restores the smoke policy on exit.
@@ -48,13 +44,12 @@ LAN_ADDR=10.99.21.1
 WAN_ADDR=10.99.200.2
 GUEST=10.99.21.5
 SERVER=10.99.200.9
+INTRUDER=10.99.200.77
 UDP_PORT=9953
 FWD_SAVED=""
 
 cleanup() {
   [ -n "$FWD_SAVED" ] && echo "$FWD_SAVED" > /proc/sys/net/ipv4/ip_forward
-  tc qdisc del dev "$WAN_IF" clsact 2>/dev/null || true
-  rm -f /sys/fs/bpf/tc/globals/fwl_probe_counts 2>/dev/null || true
   pkill -f 'realsock.py server' 2>/dev/null || true
   ip addr del "$LAN_ADDR/24" dev "$LAN_IF" 2>/dev/null || true
   ip addr del "$WAN_ADDR/24" dev "$WAN_IF" 2>/dev/null || true
@@ -67,7 +62,7 @@ ip addr add "$WAN_ADDR/24" dev "$WAN_IF" 2>/dev/null || true
 
 # The realistic office WAN policy: stateful return path, nothing else.
 # This is the policy the deployment needs, written the way the handbook
-# now says to write it.
+# now says to write it. `default drop` is what ate the replies.
 FW=$(mktemp --suffix=.fw)
 cat > "$FW" <<EOF
 zone lan = [$LAN_IF]
@@ -97,7 +92,42 @@ ping -c1 -W2 -I "$WAN_IF" "$SERVER" >/dev/null 2>&1 || true
 ping -c1 -W2 -I "$LAN_IF" "$GUEST" >/dev/null 2>&1 || true
 
 # ---------------------------------------------------------------------
-# 1. Reproduce the finding: the BOX's own flow gets no reply.
+# 0. The tracker is attached, and to the ports the datapath is on.
+#
+# Asked first and asked of the DAEMON, because every assertion below
+# would also pass on a box where `default drop` had quietly gone
+# missing. The interface count is what says the hook is in the path;
+# "an object loaded" says nothing about it, which is the whole reason
+# the XDP path has a rule against reporting success attached to
+# nothing.
+# ---------------------------------------------------------------------
+log "=== is the egress tracker actually attached? ==="
+# The LIVE count, not the daemon's record of what it attached: `fctl
+# status` asks the kernel per interface, exactly as it does for
+# `xdp_attached`. A filter removed behind the daemon's back has to read
+# as removed, or this assertion is bookkeeping wearing a measurement's
+# clothes.
+EG_IFACES=$(hw::egress attached)
+XDP_IFACES=$(fctl status 2>/dev/null | $PY -c "
+import json, sys
+try:
+  d = json.load(sys.stdin)['interfaces']['interfaces']
+  print(sum(1 for i in d if i.get('xdp_attached')))
+except Exception:
+  print(-1)
+")
+log "egress tracker on $EG_IFACES interface(s); XDP on $XDP_IFACES"
+assert_eq "the egress tracker is attached to every interface the \
+datapath is on" "$EG_IFACES" "$XDP_IFACES"
+assert_eq "...and that is more than none" \
+  "$([ "$EG_IFACES" -ge 1 ] && echo 1 || echo 0)" 1
+
+EG_TRACKED_0=$(hw::egress tracked)
+CT_BEFORE=$(hw::ct entries)
+
+# ---------------------------------------------------------------------
+# 1. The behaviour that replaced the failure: the BOX's own flow gets
+#    its replies back.
 # ---------------------------------------------------------------------
 log "=== the box's own outbound flow ==="
 hw::in fserver $PY -c "
@@ -115,7 +145,6 @@ for _ in range(5):
 SRV_PID=$!
 sleep 1
 
-CT_BEFORE=$(hw::ct entries)
 BOX_OUT=$($PY -c "
 import socket, sys
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -133,108 +162,232 @@ print(got)
 ")
 wait $SRV_PID 2>/dev/null || true
 CT_AFTER=$(hw::ct entries)
+EG_TRACKED_1=$(hw::egress tracked)
 
 log "the box sent 5 UDP requests from its own WAN address and got \
 back $BOX_OUT"
-log "conntrack entries before/after: $CT_BEFORE / $CT_AFTER"
-assert_eq "REPRODUCED: not one reply to the box's own flow survived \
-'default drop'" "$BOX_OUT" 0
-assert_eq "...and conntrack created no entry for it (XDP sees ingress \
-only)" "$CT_AFTER" "$CT_BEFORE"
-# Vacuity guard: the replies really did arrive at the WAN port. Without
-# this the claim above could pass on a server that never answered.
-assert_eq "the replies DID arrive at the wan port (so this is a policy \
-drop, not an empty wire)" \
+log "conntrack entries before/after: $CT_BEFORE / $CT_AFTER; \
+egress tracked $EG_TRACKED_0 -> $EG_TRACKED_1"
+# The exact value, not a lower bound: this is the measurement that used
+# to read 0, and "at least one got through" would pass on a box that
+# lost four out of five.
+assert_eq "every reply to the box's own flow survives 'default drop'" \
+  "$BOX_OUT" 5
+# Vacuity guard, kept from the failing version: the replies really did
+# arrive at the WAN port. Without it the claim above could pass on a
+# server that never answered.
+assert_eq "the replies DID arrive at the wan port (so this is not an \
+empty wire)" \
   "$([ "$(hw::counter wan_udp)" -ge 5 ] && echo 1 || echo 0)" 1
+# ...and WHY they survived. A conntrack entry now exists for a flow no
+# XDP program ever saw the start of, which is the entire mechanism.
+# Without this the same PASS would be produced by a policy that had
+# quietly stopped dropping.
+assert_eq "...because the egress hook created a conntrack entry for a \
+flow XDP never saw start" \
+  "$([ "$EG_TRACKED_1" -gt "$EG_TRACKED_0" ] && echo 1 || echo 0)" 1
+# One entry per originated flow. The socket is reused across all five
+# requests, so five requests are one flow, and a tracker that probed
+# only one direction of the 5-tuple would have inserted more.
+assert_eq "one conntrack entry for the one flow, not one per packet" \
+  "$((CT_AFTER - CT_BEFORE))" 1
 
 # ---------------------------------------------------------------------
-# 2. Candidate 1: what a TC egress hook can see.
-# ---------------------------------------------------------------------
-log "=== what a TC egress hook sees ==="
-if ! clang -O2 -g -target bpf \
-    -I/usr/include/aarch64-linux-gnu -I/usr/include/x86_64-linux-gnu \
-    -c "$HERE/tc_egress_probe.bpf.c" -o /tmp/tc_probe.o \
-    2>/tmp/tc_probe.err; then
-  fail "could not build the egress probe: $(tail -3 /tmp/tc_probe.err)"
-else
-  rm -f /sys/fs/bpf/tc/globals/fwl_probe_counts 2>/dev/null || true
-  tc qdisc del dev "$WAN_IF" clsact 2>/dev/null || true
-  tc qdisc add dev "$WAN_IF" clsact 2>/dev/null || true
-  if tc filter add dev "$WAN_IF" egress bpf da obj /tmp/tc_probe.o \
-      sec tc 2>/tmp/tc_attach.err; then
-    PROBE_MAP=$(find /sys/fs/bpf -name fwl_probe_counts 2>/dev/null \
-      | head -1)
-    if [ -z "$PROBE_MAP" ]; then
-      fail "probe counter map not found under bpffs"
-    else
-      probe_total() {
-        bpftool map dump pinned "$PROBE_MAP" 2>/dev/null | $PY -c "
-import json, sys
-t = 0
-for e in json.load(sys.stdin):
-  v = e.get('values')
-  t += sum(x['value'] for x in v) if v else e.get('value', 0)
-print(t)
-"
-      }
-      T0=$(probe_total)
-      # (a) traffic the LOCAL STACK sends out this port.
-      ping -c5 -W1 -i 0.2 -I "$WAN_IF" "$SERVER" >/dev/null 2>&1 || true
-      sleep 0.5
-      T1=$(probe_total)
-      # (b) traffic the XDP datapath FORWARDS out this port. The guest
-      # is behind the lan zone, so every one of these frames leaves via
-      # bpf_redirect_map() on WAN_IF.
-      GUEST_0=$(hw::counter guest_out)
-      hw::client fguest "$SERVER" 9 3 1 >/dev/null 2>&1 || true
-      hw::in fguest ping -c10 -W1 -i 0.2 "$SERVER" >/dev/null 2>&1 || true
-      sleep 0.5
-      T2=$(probe_total)
-      GUEST_1=$(hw::counter guest_out)
-      log "egress probe: locally-originated burst +$((T1 - T0)), \
-XDP-forwarded burst +$((T2 - T1)) (datapath forwarded \
-$((GUEST_1 - GUEST_0)) frames in that window)"
-      assert_eq "an egress hook DOES see what the local stack sends" \
-        "$([ $((T1 - T0)) -ge 5 ] && echo 1 || echo 0)" 1
-      # Vacuity guard: the second burst must really have crossed the
-      # datapath, or "the hook saw none of it" is a claim about an
-      # empty wire.
-      assert_eq "the XDP datapath really did forward in that window" \
-        "$([ $((GUEST_1 - GUEST_0)) -ge 10 ] && echo 1 || echo 0)" 1
-      # The load-bearing half of the recommendation. A redirect leaves
-      # via ndo_xdp_xmit, below the qdisc layer, so the hook is free of
-      # the forwarding fast path entirely.
-      assert_eq "and does NOT see what XDP redirects (so it costs the \
-fast path nothing)" \
-        "$([ $((T2 - T1)) -le 2 ] && echo 1 || echo 0)" 1
-    fi
-  else
-    fail "could not attach the egress probe: \
-$(tail -2 /tmp/tc_attach.err)"
-  fi
-fi
-
-# ---------------------------------------------------------------------
-# 3. Candidate 2: can the kernel's socket table answer instead?
+# 2. The control that makes the fix a fix rather than an opening.
 #
-# bpf_sk_lookup_udp() from XDP needs no second copy of the state at
-# all. It can only distinguish "a reply to a flow we originated" from
-# "an unsolicited packet to a port we listen on" when the socket
-# carries a PEER — an unconnected server socket matches any source. So
-# the question that decides the candidate is whether a real DNS
-# forwarder connects its upstream socket.
+# The entry is an exact 5-tuple. Someone else sending to the same port
+# on the same box must still be dropped — including from the same
+# segment, which is the strongest form of the question this bench can
+# ask. A fix that admitted on "the port is open" would pass every
+# assertion above and be far worse than the bug it closed.
 # ---------------------------------------------------------------------
-log "=== can the socket table tell a reply from an arrival? ==="
-CONNECTED=$($PY -c "
+log "=== does it open the port to anyone else? ==="
+# A second source address on the far host rather than a second netns:
+# the bench has ONE trunk port, so a second VLAN-802 subinterface on it
+# is not a thing the kernel will make. It costs nothing here — the
+# entry is keyed on the 5-TUPLE, so what has to differ is the source
+# address or the source port, and both are exercised below. The
+# sharper of the two is the second: the identical host, the identical
+# destination port, one different source port.
+hw::in fserver ip addr add "$INTRUDER/24" dev "vl${WAN_VLAN}fserver" \
+  2>/dev/null || true
+# A listener on the box, so "nothing answered" cannot be mistaken for
+# "the firewall dropped it": the socket exists and is bound.
+$PY -c "
+import socket
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.bind(('$WAN_ADDR', $UDP_PORT))
+s.settimeout(8)
+n = 0
+try:
+  while True:
+    d, a = s.recvfrom(2048)
+    n += 1
+    s.sendto(b'ack', a)
+except socket.timeout:
+  pass
+print(n)
+" > /tmp/l12-intruder-rx &
+LSN_PID=$!
+sleep 1
+WAN_UDP_0=$(hw::counter wan_udp)
+INTRUDER_GOT=$(hw::in fserver $PY -c "
+import socket
+got = 0
+# (a) a different source ADDRESS on the same segment.
+a = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+a.bind(('$INTRUDER', 0))
+a.settimeout(1)
+# (b) the SAME source address the tracked flow used, one different
+#     source port. Everything an 'is this port open' check could look
+#     at is identical.
+b = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+b.bind(('$SERVER', 0))
+b.settimeout(1)
+for s in (a, b):
+  for i in range(5):
+    s.sendto(b'unsolicited', ('$WAN_ADDR', $UDP_PORT))
+    try:
+      s.recv(2048)
+      got += 1
+    except socket.timeout:
+      pass
+print(got)
+")
+wait $LSN_PID 2>/dev/null || true
+BOX_RX=$(cat /tmp/l12-intruder-rx 2>/dev/null || echo -1)
+WAN_UDP_1=$(hw::counter wan_udp)
+log "unsolicited: sender got $INTRUDER_GOT answers, the box's socket \
+saw $BOX_RX datagrams, wan_udp +$((WAN_UDP_1 - WAN_UDP_0))"
+assert_eq "an unsolicited packet to a bound port is still dropped \
+before any socket, from a new address AND from the tracked flow's own \
+address on a new port" "$BOX_RX" 0
+assert_eq "...so the sender hears nothing" "$INTRUDER_GOT" 0
+# Vacuity guard: the frames were on the cable. Without this the two
+# assertions above are satisfied by a bench that sent nothing.
+assert_eq "those frames DID reach the wan port (a policy drop, not an \
+empty wire)" \
+  "$([ $((WAN_UDP_1 - WAN_UDP_0)) -ge 10 ] && echo 1 || echo 0)" 1
+rm -f /tmp/l12-intruder-rx
+
+# ---------------------------------------------------------------------
+# 3. The discriminator, measured: a FORWARDED packet is not tracked.
+#
+# The gate is `skb->sk`: locally-originated packets carry the socket
+# that sent them, forwarded ones do not. Reaching the qdisc layer with
+# a forwarded packet at all needs the kernel forwarding path (XDP's
+# bpf_redirect_map leaves below the qdisc entirely, which is the other
+# half of why this hook is free), so this leg deploys a policy that
+# PASSES the guest's traffic to the stack and lets ip_forward route it.
+# ---------------------------------------------------------------------
+log "=== does it track what the box merely FORWARDS? ==="
+FW2=$(mktemp --suffix=.fw)
+cat > "$FW2" <<EOF
+zone lan = [$LAN_IF]
+zone wanz = [$WAN_IF]
+
+@xdp(lan)
+
+count lan_seen
+allow
+
+@xdp(wanz)
+
+count wan_seen
+count wan_udp if pkt.proto == udp
+allow if conntrack(pkt).state in [established, related]
+default drop
+EOF
+hw::deploy l12-01b "$FW2"
+# Same host names, deliberately: hw::host_up deletes the namespace
+# first, and the bench has ONE trunk port, so a second VLAN-802
+# subinterface on it does not exist to be made.
+hw::host_up fserver "$PARENT" "$WAN_VLAN" "$SERVER/24"
+hw::host_up fguest "$PARENT" none "$GUEST/24" "$LAN_ADDR"
+ping -c1 -W2 -I "$WAN_IF" "$SERVER" >/dev/null 2>&1 || true
+ping -c1 -W2 -I "$LAN_IF" "$GUEST" >/dev/null 2>&1 || true
+
+EG_SEEN_0=$(hw::egress seen)
+EG_NOTLOCAL_0=$(hw::egress not_local)
+EG_TRACKED_0=$(hw::egress tracked)
+# The guest talks THROUGH the box: XDP_PASS on lan, ip_forward routes
+# it out wanz, and it therefore crosses the clsact egress hook.
+hw::in fguest $PY -c "
+import socket
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.settimeout(0.4)
+for i in range(10):
+  s.sendto(b'fwd%d' % i, ('$SERVER', $UDP_PORT))
+" >/dev/null 2>&1 || true
+sleep 1
+EG_SEEN_1=$(hw::egress seen)
+EG_NOTLOCAL_1=$(hw::egress not_local)
+EG_TRACKED_1=$(hw::egress tracked)
+log "forwarded burst: hook saw +$((EG_SEEN_1 - EG_SEEN_0)), of which \
++$((EG_NOTLOCAL_1 - EG_NOTLOCAL_0)) had no socket; tracked \
++$((EG_TRACKED_1 - EG_TRACKED_0))"
+# Vacuity guard first: the hook has to have SEEN the burst, or "it
+# tracked none of it" is a claim about an empty wire — which is exactly
+# how a passing test would hide a gate that rejects everything.
+assert_eq "the hook DID see the forwarded burst at the qdisc layer" \
+  "$([ $((EG_SEEN_1 - EG_SEEN_0)) -ge 10 ] && echo 1 || echo 0)" 1
+assert_eq "...and classified it as not-locally-originated" \
+  "$([ $((EG_NOTLOCAL_1 - EG_NOTLOCAL_0)) -ge 10 ] && echo 1 || echo 0)" 1
+assert_eq "so it tracked NONE of it — a forwarded flow's replies are \
+still the policy's business, not the tracker's" \
+  "$((EG_TRACKED_1 - EG_TRACKED_0))" 0
+
+# And the same hook still tracks what this box sends, under this same
+# policy — the positive half of the same measurement, so a gate that
+# had simply stopped tracking everything cannot pass this section.
+EG_TRACKED_2=$(hw::egress tracked)
+# A 5-tuple this box has not used yet. The warm-up ping above already
+# created the ICMP entry for (box, server, 0, 0), and conntrack is
+# FLOW-lifetime so it survived the redeploy: re-pinging refreshes that
+# entry rather than creating one, and this assertion read 0 for a hook
+# that was working perfectly. "Tracked" counts NEW flows, so the probe
+# has to be a new flow.
+$PY -c "
 import socket
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 s.bind(('$WAN_ADDR', 0))
-s.connect(('$SERVER', $UDP_PORT))
-print(1 if s.getpeername() else 0)
-")
-assert_eq "a CONNECTED udp socket carries a peer (so sk_lookup could \
-discriminate)" "$CONNECTED" 1
+s.sendto(b'fresh', ('$SERVER', 9999))
+" >/dev/null 2>&1 || true
+sleep 0.7
+EG_TRACKED_3=$(hw::egress tracked)
+log "the box's own fresh flow: tracked +$((EG_TRACKED_3 - EG_TRACKED_2))"
+assert_eq "the box's OWN traffic is still tracked under the same \
+policy (so the gate is not simply off)" \
+  "$((EG_TRACKED_3 - EG_TRACKED_2))" 1
 
+# ---------------------------------------------------------------------
+# 4. What it costs the conntrack table.
+#
+# Recorded rather than judged: the shape of the curve is l11_06's
+# subject, and a second scenario asserting a number about it would be
+# two tests of one thing.
+# ---------------------------------------------------------------------
+log "=== the accounting question ==="
+record "conntrack is the binding constraint: a masquerading policy \
+that also reads conntrack creates TWO entries per ONE nat mapping, and \
+both tables cap at 65536 (l11_02). Egress tracking adds ONE entry per \
+flow the BOX originates, and only those — the hook probes both \
+directions before creating anything, so a reply the box sends to a \
+client refreshes that client's own entry instead of adding its \
+reverse. Entries now: $(hw::ct entries), timeout $(hw::ct timeout_s)s; \
+tracked $(hw::egress tracked), refreshed $(hw::egress refreshed), \
+refused $(hw::egress refused)."
+# The one way this feature can fail silently: conntrack at its cap, the
+# insert refused, the query still going out and its reply still dropped.
+# Zero here is a real claim about this run, not a placeholder.
+assert_eq "no insert was refused (a refusal is a flow whose reply this \
+policy WILL drop)" "$(hw::egress refused)" 0
+
+# ---------------------------------------------------------------------
+# 5. Why it is this hook and not the other candidate. Kept as a record
+#    because it is the evidence the design decision rests on, and it
+#    stays true only as long as dnsmasq behaves this way.
+# ---------------------------------------------------------------------
 if command -v dnsmasq >/dev/null 2>&1; then
   cat > /tmp/l12-dnsmasq.conf <<EOF
 port=5354
@@ -246,8 +399,6 @@ EOF
   dnsmasq --conf-file=/tmp/l12-dnsmasq.conf \
     --pid-file=/run/l12-dnsmasq.pid 2>/dev/null || true
   sleep 1
-  # Fire a query it must forward upstream, then look at the socket it
-  # used while the query is in flight.
   ($PY -c "
 import socket
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -262,29 +413,19 @@ except Exception:
   sleep 0.4
   UNCONN=$(ss -unap 2>/dev/null | grep dnsmasq | grep -c '0\.0\.0\.0:\*')
   TOTAL=$(ss -unap 2>/dev/null | grep -c dnsmasq)
-  log "dnsmasq udp sockets: $TOTAL, of which unconnected: $UNCONN"
   if [ "$TOTAL" -gt 0 ] && [ "$UNCONN" -eq "$TOTAL" ]; then
-    record "MEASURED: dnsmasq's upstream sockets carry NO peer, so \
-sk_lookup cannot tell its replies from unsolicited packets to the same \
-port — candidate 2 is refuted for the case that matters most"
+    record "the refuted alternative still refutes: dnsmasq's upstream \
+sockets carry NO peer ($UNCONN of $TOTAL), so bpf_sk_lookup_udp from \
+XDP cannot tell its replies from unsolicited packets to the same port \
+— admitting on an unconnected match would open every bound port"
   else
-    log "NOTE: dnsmasq had $((TOTAL - UNCONN)) connected socket(s); \
-re-read the sk_lookup option against that"
+    record "dnsmasq had $((TOTAL - UNCONN)) connected socket(s) of \
+$TOTAL; the sk_lookup option is worth re-reading against that"
   fi
   [ -f /run/l12-dnsmasq.pid ] && kill "$(cat /run/l12-dnsmasq.pid)" \
     2>/dev/null
   rm -f /tmp/l12-dnsmasq.conf
 else
-  log "NOTE: dnsmasq is not installed here; the sk_lookup measurement \
-needs it (it is the DNS forwarder the appliance ships)"
+  record "dnsmasq is not installed here, so the sk_lookup measurement \
+did not run this time"
 fi
-
-# ---------------------------------------------------------------------
-# 4. What it would cost the conntrack table.
-# ---------------------------------------------------------------------
-log "=== the accounting question ==="
-log "conntrack is already the binding constraint: a masquerading policy \
-that reads conntrack creates TWO entries per ONE nat mapping, and both \
-tables cap at 65536 (l11_02). Tracking egress adds one entry per flow \
-the BOX originates. Entries now: $(hw::ct entries), \
-cap timeout $(hw::ct timeout_s)s."

@@ -159,6 +159,22 @@ _MAP_KINDS: tuple[_MapKind, ...] = (
     ),
   ),
   _MapKind(
+    r"fwl_egress_stats", MapScope.SHARED,
+    "counts what the ONE egress tracker did at the qdisc layer. The "
+    "tracker is a single object attached to every interface the bundle "
+    "attaches XDP to, so a per-zone copy would have no zone to belong "
+    "to; slots are numbered by the emitter's own header, so a slot "
+    "means the same event whatever the policy",
+    lifetime=MapLifetime.POLICY,
+    lifetime_why=(
+      "a counter, like every other one here: a number carried over "
+      "from a policy that is no longer running is attributed to flows "
+      "it never tracked. The conntrack entries the tracker created "
+      "are FLOW and ARE inherited; the tally of how they got there "
+      "is not"
+    ),
+  ),
+  _MapKind(
     r"fwl_route_stats", MapScope.SHARED,
     "counts what the ONE routing table under this box did to forwarded "
     "frames. Routing is a property of the host, not of a zone, so a "
@@ -3915,9 +3931,308 @@ def emit_bundle(program: ast.Program) -> dict[str, str]:
       zp, pinned_shared=True, force_nat=bundle_nat,
       helpers=program.helpers,
     )
+  # The egress tracker is part of the bundle's map graph, not an extra
+  # beside it: it declares the same pinned `conntrack`. Emitting it here
+  # is what puts it through `_check_bundle_pinned_maps` below, so a
+  # conntrack declaration that ever drifted between the zone objects
+  # and the tracker fails the COMPILE instead of failing libbpf's pin
+  # reuse at load with nothing but "Invalid argument".
+  if bundle_needs_egress_tracker(program):
+    # A zone called `fwl_egress` would compile to the same filename and
+    # the tracker would silently replace it in this dict — the zone's
+    # object would then be built from the tracker's source, carry no
+    # `fwl_prog`, and fail the load with a message about the wrong
+    # thing. A reserved name is a compile error, like a zone_id
+    # collision, and for the same reason.
+    clash = [
+      zp.zone_name for zp in program.programs
+      if f"{zp.zone_name}.bpf.c" == EGRESS_TRACKER_SOURCE
+    ]
+    if clash:
+      raise _codegen_error(
+        f"zone '{clash[0]}' collides with the bundle's egress "
+        f"conntrack tracker, which is emitted as "
+        f"'{EGRESS_TRACKER_SOURCE}' (v0.4 § 6.9). Rename the zone."
+      )
+    files[EGRESS_TRACKER_SOURCE] = emit_egress_tracker()
   _check_bundle_pinned_maps(files)
   files["fwl_shared.h"] = _emit_shared_header(program)
   return files
+
+
+# The filename of the bundle's egress tracker, in the bundle directory
+# and in the manifest. One per bundle, not one per zone: what it does is
+# a property of the box, not of a policy.
+EGRESS_TRACKER_SOURCE = "fwl_egress.bpf.c"
+
+# The entry program's name; `fd` resolves it by name in the object.
+EGRESS_TRACKER_PROG = "fwl_egress_ct"
+
+
+_EGRESS_STATS_DECL = """\
+#define FWL_EGRESS_STAT_SEEN       0
+#define FWL_EGRESS_STAT_NOT_LOCAL  1
+#define FWL_EGRESS_STAT_UNTRACKED  2
+#define FWL_EGRESS_STAT_TRACKED    3
+#define FWL_EGRESS_STAT_REFRESHED  4
+#define FWL_EGRESS_STAT_REFUSED    5
+#define FWL_EGRESS_STAT_SLOTS      6
+
+struct {
+  __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+  __uint(max_entries, FWL_EGRESS_STAT_SLOTS);
+  __type(key, __u32);
+  __type(value, __u64);
+  __uint(pinning, LIBBPF_PIN_BY_NAME);
+} fwl_egress_stats SEC(".maps");
+
+static __always_inline void fwl_egress_bump(__u32 slot) {
+  __u64 *c = bpf_map_lookup_elem(&fwl_egress_stats, &slot);
+  if (c) *c += 1;
+}
+"""
+
+
+# The whole tracker. Deliberately policy-independent: it asks one
+# question about each packet ("did this box originate this flow?") and
+# writes one kind of answer, so there is nothing in it a rule could
+# change and nothing to recompile when a rule does.
+_EGRESS_TRACKER_BODY = """\
+// <linux/pkt_cls.h> drags in headers that do not compile under
+// `clang -target bpf` on every distro. TC_ACT_OK is 0 and has been
+// since the classifier API existed.
+#define FWL_TC_ACT_OK 0
+
+#ifndef ETH_P_8021Q
+#define ETH_P_8021Q 0x8100
+#endif
+#ifndef ETH_P_8021AD
+#define ETH_P_8021AD 0x88A8
+#endif
+
+// Flows the BOX ITSELF originates (v0.4 § 6.9).
+//
+// XDP conntrack only ever sees INGRESS. The DNS query the forwarder
+// sends upstream, the NTP exchange that sets the clock, the update it
+// fetches — each leaves through the local stack, which no XDP program
+// is attached to, so no entry is created; the reply arrives on the WAN
+// port, reads NEW, and `default drop` eats it. Measured on the rig
+// before this existed (l12_01): 5 requests out, 5 replies at the port
+// by datapath counter, 0 survived, conntrack 0 -> 0. That kills DNS
+// forwarding, which is the entire purpose of the DNS service, and NTP,
+// and every update path.
+//
+// The qdisc layer is where the gap is exactly covered, and the reason
+// is measured rather than assumed: this hook sees 5/5 of what the local
+// stack sends and 0 of 13 frames the XDP datapath forwarded out the
+// same port, because bpf_redirect_map() leaves through ndo_xdp_xmit,
+// below the qdisc entirely. So the forwarding fast path pays nothing
+// for this and cannot be double-counted by it.
+//
+// The alternative — bpf_sk_lookup_udp() from XDP, with no second copy
+// of the state at all — was refuted the same way: it can only tell a
+// reply from an unsolicited arrival when the socket carries a peer, and
+// dnsmasq's upstream sockets are unconnected 2/2. Admitting on an
+// unconnected match would open every bound port to the WAN.
+SEC("tc")
+int fwl_egress_ct(struct __sk_buff *skb) {
+  fwl_egress_bump(FWL_EGRESS_STAT_SEEN);
+
+  // The discriminator, and the whole reason this hook does not change
+  // what the firewall forwards. A packet the LOCAL STACK sent carries
+  // the socket that sent it; a packet this box merely FORWARDED (the
+  // XDP_PASS path plus ip_forward, or the NO_NEIGH fallback) has none.
+  // Without this test the tracker would create an entry for every
+  // forwarded flow and quietly admit its replies — a policy change,
+  // made by a component whose job is to observe.
+  if (skb->sk == NULL) {
+    fwl_egress_bump(FWL_EGRESS_STAT_NOT_LOCAL);
+    return FWL_TC_ACT_OK;
+  }
+
+  void *data = (void *)(long)skb->data;
+  void *data_end = (void *)(long)skb->data_end;
+  struct ethhdr *eth = data;
+  if ((void *)(eth + 1) > data_end) {
+    fwl_egress_bump(FWL_EGRESS_STAT_UNTRACKED);
+    return FWL_TC_ACT_OK;
+  }
+  // 802.1Q, skipped exactly as the XDP prelude skips it. The prelude
+  // advances L3 past the tag and keys conntrack on the INNER header, so
+  // a tracker that rejected every tagged frame would leave every
+  // box-originated flow on a VLAN zone untracked — while the daemon
+  // logged an attach and the CLI rendered a healthy row. (A tag the
+  // NIC inserts is not in the data at this hook and needs nothing: the
+  // EtherType here is already the inner one.)
+  __u16 h_proto = eth->h_proto;
+  void *l3 = (void *)(eth + 1);
+  if (h_proto == bpf_htons(ETH_P_8021Q) ||
+      h_proto == bpf_htons(ETH_P_8021AD)) {
+    struct fwl_vlanhdr *vh = l3;
+    if ((void *)(vh + 1) > data_end) {
+      fwl_egress_bump(FWL_EGRESS_STAT_UNTRACKED);
+      return FWL_TC_ACT_OK;
+    }
+    h_proto = vh->inner_proto;
+    l3 = (void *)(vh + 1);
+  }
+  // v0.4 conntrack is IPv4-only, so a v6 flow the box originates is
+  // still not tracked. Counted here rather than ignored: the row is
+  // what says so.
+  if (h_proto != bpf_htons(ETH_P_IP)) {
+    fwl_egress_bump(FWL_EGRESS_STAT_UNTRACKED);
+    return FWL_TC_ACT_OK;
+  }
+  struct iphdr *ip = l3;
+  if ((void *)(ip + 1) > data_end) {
+    fwl_egress_bump(FWL_EGRESS_STAT_UNTRACKED);
+    return FWL_TC_ACT_OK;
+  }
+  // A non-first fragment carries no L4 header; keying it on ports 0
+  // would make it a different flow from its own first fragment.
+  if ((bpf_ntohs(ip->frag_off) & 0x1FFF) != 0) {
+    fwl_egress_bump(FWL_EGRESS_STAT_UNTRACKED);
+    return FWL_TC_ACT_OK;
+  }
+  __u32 hlen = ip->ihl * 4;
+  if (hlen < sizeof(struct iphdr)) {
+    fwl_egress_bump(FWL_EGRESS_STAT_UNTRACKED);
+    return FWL_TC_ACT_OK;
+  }
+  __u8 proto = ip->protocol;
+  // ICMP is keyed on ports 0, exactly as the XDP prelude keys it and as
+  // fwl_snat_egress installs it, so the box's own ping hears back.
+  //
+  // ONE variable-offset pointer and ONE bounds check for both TCP and
+  // UDP, because the ports sit at the same two offsets in each (which
+  // is the only reason fwl_inner_l4 serves both) and both headers are
+  // at least these 8 bytes long. Written as two branches with a
+  // `struct tcphdr *` and a `struct udphdr *`, clang common-subexpresses
+  // the two `(void *)ip + hlen` computations and the UDP read inherits
+  // the TCP branch's range: the verifier rejects it with "R2 offset is
+  // outside of the packet". Caught by loading it, not by reading it.
+  //
+  // Every other protocol is keyed on ports 0, which is not a
+  // concession: it is what the XDP prelude does. It parses ports for
+  // TCP and UDP and leaves `src_port`/`dst_port` at 0 for everything
+  // else, so a box-originated GRE or IPsec flow HAS a key on the
+  // ingress side — and refusing to write it here would leave the two
+  // disagreeing about a tuple they both compute.
+  __u16 sport = 0, dport = 0;
+  if (proto == IPPROTO_TCP || proto == IPPROTO_UDP) {
+    struct fwl_inner_l4 *l4 = (void *)ip + hlen;
+    if ((void *)(l4 + 1) > data_end) {
+      fwl_egress_bump(FWL_EGRESS_STAT_UNTRACKED);
+      return FWL_TC_ACT_OK;
+    }
+    sport = bpf_ntohs(l4->source);
+    dport = bpf_ntohs(l4->dest);
+  }
+
+  // BOTH directions are probed before anything is created, which is
+  // what keeps the occupancy cost at one entry per flow the box
+  // genuinely originates. A reply the box sends to a LAN client is
+  // egress traffic too, and its forward key is the REVERSE of the entry
+  // the client's own query already created on ingress: probing one
+  // direction only would insert a second entry for every served flow
+  // and double conntrack's fill rate — in a table that is already the
+  // binding constraint at two entries per NAT mapping.
+  struct fwl_conn_key fwd = {
+    .src_addr = ip->saddr, .dst_addr = ip->daddr,
+    .src_port = sport, .dst_port = dport, .proto = proto,
+  };
+  struct fwl_conn_key rev = {
+    .src_addr = ip->daddr, .dst_addr = ip->saddr,
+    .src_port = dport, .dst_port = sport, .proto = proto,
+  };
+  __u64 now = bpf_ktime_get_ns();
+  struct fwl_conn_value *v = bpf_map_lookup_elem(&conntrack, &fwd);
+  if (!v) v = bpf_map_lookup_elem(&conntrack, &rev);
+  if (v) {
+    // Refresh, never re-create. The GC ages on last_seen_ns, so an
+    // entry whose traffic is mostly OUTBOUND (a long upload, a held DNS
+    // socket) has to be stamped from here as well or it is collected
+    // out from under a live flow.
+    v->last_seen_ns = now;
+    v->packets += 1;
+    fwl_egress_bump(FWL_EGRESS_STAT_REFRESHED);
+    return FWL_TC_ACT_OK;
+  }
+  struct fwl_conn_value nv = {
+    .last_seen_ns = now, .packets = 1, .state = 1,
+  };
+  if (bpf_map_update_elem(&conntrack, &fwd, &nv, BPF_NOEXIST) != 0) {
+    // Almost always the table at its cap, and this is the failure that
+    // has no other symptom: the packet still goes out, the reply still
+    // arrives, and `default drop` eats it. "DNS stopped resolving" with
+    // every counter climbing. fd turns this slot into a log line.
+    fwl_egress_bump(FWL_EGRESS_STAT_REFUSED);
+    return FWL_TC_ACT_OK;
+  }
+  fwl_egress_bump(FWL_EGRESS_STAT_TRACKED);
+  return FWL_TC_ACT_OK;
+}
+
+char _license[] SEC("license") = "GPL";
+"""
+
+
+def emit_egress_tracker() -> str:
+  """The bundle's TC clsact egress conntrack tracker (v0.4 § 6.9).
+
+  One object per bundle, attached by `fd` to every interface the
+  bundle's XDP programs are attached to. It creates a conntrack entry
+  for each flow this box ORIGINATES, so the reply reads ESTABLISHED at
+  XDP ingress instead of NEW.
+
+  The `conntrack` declaration is `_CONNTRACK_DECL` itself, not a copy of
+  it: this object and every zone object must present libbpf with a
+  byte-identical definition of the pinned map or the second load fails
+  with -EINVAL and no detail. Two hand-written declarations of the same
+  map is precisely the drift this shares its way out of.
+  """
+  src = (
+    f"{_HEADER}\n"
+    f"{_maybe_pin(_CONNTRACK_DECL, True)}\n"
+    f"{_EGRESS_STATS_DECL}\n"
+    f"{_EGRESS_TRACKER_BODY}"
+  )
+  # The same invariant every zone source runs, on the one object that is
+  # not a zone: each map here must have a row in `_MAP_KINDS` and must
+  # carry the pinning its scope demands. A tracker that quietly got its
+  # OWN copy of `conntrack` would write entries no XDP program can read
+  # — the feature failing in exactly the silent way it exists to close.
+  _check_map_scopes(src, MapNames(zone="fwl_egress"))
+  return src
+
+
+def bundle_needs_egress_tracker(program: ast.Program) -> bool:
+  """True when this bundle's policy reads conntrack anywhere.
+
+  The tracker exists to make `conntrack(pkt).state` answer correctly for
+  a flow the box started. A unit that never asks the question has no
+  conntrack map to write into and needs no tracker — emitting one would
+  pin a map nothing reads, which the daemon would then have to reconcile
+  against a bundle that does not declare it.
+
+  Helpers are searched as well as zone bodies, and that is not an
+  embellishment: `_emit_zone_source` decides `uses_ct` over the zone
+  PLUS its reachable helpers, so a policy whose only conntrack read
+  lives in a `def` emits the lookup, pins the map, and drops NEW — and
+  asking the zone bodies alone answered "no tracker needed" for it. The
+  daemon then reported it as a bundle compiled before the hook existed
+  and told the operator to recompile, which produced the identical
+  bundle. Two answers to one question, in two places, is how the map
+  scope defect got in three times; ask it the way the emitter asks it.
+  """
+  helpers = program.helpers or []
+  for zp in program.programs:
+    units = [zp] + [
+      _synth_unit(zp, h) for h in _reachable_helpers(zp, helpers)
+    ]
+    if any(_program_uses_conntrack(u) for u in units):
+      return True
+  return False
 
 
 def shared_pinned_map_names(files: dict[str, str]) -> list[str]:

@@ -822,12 +822,22 @@ auto BundlePinnedDeclarations(const std::string& bundle_dir,
   } catch (const std::exception&) {
     return declared;
   }
+  // Every object in the bundle, not only the zone programs. The egress
+  // tracker declares the same pinned `conntrack` map, so a
+  // reconciliation that could not see it would be reasoning about a
+  // strict subset of what the load is about to reuse.
+  std::vector<std::string> objects;
   for (const auto& p : manifest.value("programs", json::array())) {
-    if (p.value("object", json()).is_null()) {
-      continue;
+    if (!p.value("object", json()).is_null()) {
+      objects.push_back(p.at("object").get<std::string>());
     }
-    std::string obj_path =
-        (dir / p.at("object").get<std::string>()).string();
+  }
+  auto egress = manifest.value("egress_tracker", json());
+  if (egress.is_object() && egress.value("object", json()).is_string()) {
+    objects.push_back(egress["object"].get<std::string>());
+  }
+  for (const auto& object : objects) {
+    std::string obj_path = (dir / object).string();
     LIBBPF_OPTS(bpf_object_open_opts, open_opts);
     open_opts.pin_root_path = pin_root.c_str();
     struct bpf_object* obj =
@@ -995,6 +1005,15 @@ auto CloseZoneBundle(ZoneBundleHandles& handles) -> void {
       bpf_object__close(obj);
     }
   }
+  // Closed, not detached — the same contract as the zone objects above.
+  // On a hot reload the incoming tracker has already replaced this
+  // filter in place (one fixed handle/priority), so detaching here
+  // would tear down the NEW one and leave the box's own flows
+  // untracked with a load that said "ok".
+  CloseEgressTracker(handles.egress);
+  handles.egress.ifindexes.clear();
+  handles.egress.interfaces.clear();
+  handles.egress.created_qdisc.clear();
   handles.objs.clear();
   handles.programs.clear();
   handles.conntrack_fd = -1;
@@ -1495,6 +1514,83 @@ auto LoadZoneBundle(std::string_view bundle_dir,
                     bundle_dir, handles.programs.size(), Join(bare)));
   }
 
+  // The second attach point (v0.4 § 6.9), through the same machinery
+  // and the same rollback as the first — deliberately, because a second
+  // lifecycle of its own is where this project's silent defects have
+  // come from. It goes on exactly the interfaces the datapath just
+  // attached to: those are the ports on which a reply to a flow this
+  // box originated would be judged, so those are the ports whose egress
+  // has to be tracked.
+  //
+  // Failing the whole load when it cannot attach is the deliberate
+  // trade. A box that filters correctly and cannot resolve a name is
+  // not a working appliance, and the alternative — carry on and log —
+  // is precisely "report success having attached to nothing".
+  if (BundleDeclaresEgressTracker(bundle_dir)) {
+    std::vector<EgressTarget> targets;
+    // Deduplicated: there is one egress chain per interface whatever
+    // the zone list says, so an interface named by two zone programs
+    // must not be attached to twice — that would put the same ifindex
+    // in `created_qdisc` twice and report a port count nobody can
+    // reconcile with `ip link`.
+    std::set<int> seen_ifindex;
+    for (const auto& p : handles.programs) {
+      for (int idx : p.ifindexes) {
+        if (!seen_ifindex.insert(idx).second) {
+          continue;
+        }
+        char nm[IF_NAMESIZE] = {};
+        if_indextoname(static_cast<unsigned int>(idx), nm);
+        targets.push_back(EgressTarget{idx, nm});
+      }
+    }
+    auto tracker = AttachEgressTracker(
+        bundle_dir, pin_root, targets,
+        replace != nullptr ? &replace->egress : nullptr);
+    if (!tracker) {
+      return bail(tracker.error().code, tracker.error().message);
+    }
+    handles.egress = *tracker;
+  } else {
+    // This bundle wants NO tracker — either its policy asks no
+    // conntrack question, or it predates the hook. Either way an egress
+    // filter left on these interfaces by the bundle being replaced (or
+    // by a previous incarnation of this daemon that was killed) is now
+    // a tracker with no bundle behind it: still attached, still writing
+    // conntrack entries, and nothing left that will ever detach it —
+    // CloseZoneBundle deliberately detaches nothing, and ApplyBundle
+    // only touches interfaces the new bundle stops covering. That is
+    // the l8_05 shape, one hook over, so it is closed here rather than
+    // described.
+    for (const auto& p : handles.programs) {
+      for (int idx : p.ifindexes) {
+        if (EgressFilterPresent(idx)) {
+          spdlog::info(
+              "removing the egress conntrack tracker from ifindex {}: "
+              "this bundle declares none", idx);
+          DetachEgressOn(idx);
+        }
+      }
+    }
+    // The upgrade case is a THIRD state and has to be said out loud
+    // once: an `fd` running a bundle staged by an older `fwl` looks
+    // identical to a correctly-tracking box from every counter and
+    // every status line. What cannot be said from an old manifest is
+    // whether that policy reads conntrack STATE — a masquerade-only
+    // policy carries the map without ever asking — so the warning says
+    // what is actually known and no more.
+    if (!ManifestHasEgressField(bundle_dir)) {
+      spdlog::warn(
+          "bundle {} was compiled before egress conntrack tracking "
+          "existed. If its policy reads conntrack(pkt).state, then "
+          "flows this box ORIGINATES (DNS forwarding, NTP, updates) "
+          "create no entry, their replies read NEW, and a default-drop "
+          "policy will drop them. Recompiling the policy answers it "
+          "either way.",
+          bundle_dir);
+    }
+  }
+
   return handles;
 }
 
@@ -1522,6 +1618,12 @@ auto IsMultiZoneBundle(std::string_view bundle_dir) -> bool {
 }
 
 auto DetachZoneBundle(const ZoneBundleHandles& handles) -> void {
+  // Both attach points, in one call. `EngineStop` walks the bundle and
+  // not the boot-time interface list precisely because a stale list
+  // left XDP programs running with no daemon behind them (l8_05); an
+  // egress filter left behind the same way would keep writing conntrack
+  // entries that nothing ages.
+  DetachEgressTracker(handles.egress);
   for (const auto& prog : handles.programs) {
     for (int ifindex : prog.ifindexes) {
       int err = bpf_xdp_detach(ifindex, 0, nullptr);
