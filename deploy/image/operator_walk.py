@@ -149,7 +149,24 @@ def start_upstream_dns():
     stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
 
 
-def take_a_lease(walk, phase):
+LEASE_SCRIPT = """#!/bin/sh
+# udhcpc's configuration script. Without one the client completes the
+# whole exchange, prints `lease of X obtained`, and configures
+# nothing — which is how this bench first reported "the client ended
+# up with no address" about a DHCP server that had just leased it one.
+case "$1" in
+  bound|renew)
+    ip addr flush dev "$interface"
+    ip addr add "$ip/$mask" dev "$interface"
+    [ -n "$router" ] && ip route add default via "$router" dev \
+      "$interface"
+    ;;
+esac
+exit 0
+"""
+
+
+def take_a_lease(walk, phase, out):
   """Drop the inside host's static address and take a DHCP lease.
 
   The operator's own first test of a new bench segment, and the one
@@ -158,20 +175,36 @@ def take_a_lease(walk, phase):
   client's DISCOVER to the uplink address and broadcasts it onto the
   office network rather than answering it.
 
+  A REAL client, not a hand-built packet: `busybox udhcpc` does the
+  four-way exchange against the appliance's own dnsmasq, and the
+  address it ends up holding is what the rest of this phase runs from.
+
   Returns:
     The address the client ended up with, or "".
   """
+  script = Path(out) / "udhcpc.script"
+  script.write_text(LEASE_SCRIPT)
+  script.chmod(0o755)
   vm.ns_run(vm.LEFT_NS, f"ip addr flush dev {vm.LEFT_VETH}n")
   proc = subprocess.run(
     ["sudo", "ip", "netns", "exec", vm.LEFT_NS,
      "busybox", "udhcpc", "-i", f"{vm.LEFT_VETH}n", "-n", "-q",
-     "-t", "8", "-T", "5", "-s", "/bin/true", "-f"],
+     "-t", "8", "-T", "5", "-s", str(script), "-f"],
     capture_output=True, text=True, timeout=180, check=False)
   walk.fact(phase, "udhcpc", (proc.stdout + proc.stderr).strip())
   got = vm.ns_run(vm.LEFT_NS, f"ip -4 -br addr show {vm.LEFT_VETH}n")
   for word in got.stdout.split():
     if word.startswith("10.10.1."):
       return word.split("/")[0]
+  # The lease and the interface are two facts and this bench needs
+  # both, so a lease the client obtained and did not apply is reported
+  # as what it is rather than as a DHCP failure.
+  if "lease of" in proc.stdout + proc.stderr:
+    walk.friction(
+      phase, "the client leased an address and did not configure it",
+      "udhcpc reported `lease of ... obtained` and the interface has "
+      "no address; that is this bench's configuration script, not the "
+      "appliance.")
   return ""
 
 
@@ -409,10 +442,10 @@ def start_bound_services(walk, key, phase):
   cli(walk, key, phase, "show services")
 
 
-def phase_traffic(walk, key, phase="traffic"):
+def phase_traffic(walk, key, out, phase="traffic"):
   """A client on the inside: a lease, a name, and the far side."""
   start_bound_services(walk, key, phase)
-  lease = take_a_lease(walk, phase)
+  lease = take_a_lease(walk, phase, out)
   walk.check(phase, "client-gets-an-address",
              lease.startswith("10.10.1."),
              f"the inside client's own DHCP client ended up with "
@@ -479,7 +512,17 @@ def phase_reboot(out, walk, proc, key):
   Returns:
     The (proc, key) pair to carry on with, or (None, key).
   """
+  # The boot id, before and after. Without it this phase can pass
+  # without a reboot: `systemctl reboot` returns immediately, sshd
+  # keeps answering for the seconds it takes the box to go down, and
+  # `wait_for_ssh` would happily run its command against the machine
+  # that has not rebooted yet. Every check below would then be about
+  # the state the previous phase left, which is the reading this walk
+  # exists to rule out.
+  _, before_id, _ = box(walk, key, "reboot",
+                        "cat /proc/sys/kernel/random/boot_id")
   box(walk, key, "reboot", "systemctl reboot", timeout=30)
+  time.sleep(20)
   try:
     up = vm.wait_for_ssh(timeout=fw.BOOT_TIMEOUT, proc=proc, key=key)
   except RuntimeError as exc:
@@ -490,6 +533,14 @@ def phase_reboot(out, walk, proc, key):
                f"the box never ran a command over ssh ({up})")
     return None, key
   walk.check("reboot", "comes-back", True, "the box answers again")
+  _, after_id, _ = box(walk, key, "reboot",
+                       "cat /proc/sys/kernel/random/boot_id")
+  walk.check("reboot", "really-rebooted",
+             bool(before_id.strip()) and
+             after_id.strip() != before_id.strip(),
+             f"boot id {before_id.strip()[:8]} -> "
+             f"{after_id.strip()[:8]}; the same one would mean this "
+             f"phase measured the previous phase's box")
   state = wait_for_unit(walk, key, "reboot", "fd.service")
   walk.check("reboot", "fd-armed-after-cold-boot", state == "active",
              f"fd.service is {state}")
@@ -678,7 +729,7 @@ def main(argv=None):
     if want("policy"):
       phase_policy(walk, key)
     if want("traffic"):
-      phase_traffic(walk, key)
+      phase_traffic(walk, key, out)
     if want("restart"):
       phase_restart(walk, key)
     if want("reboot"):

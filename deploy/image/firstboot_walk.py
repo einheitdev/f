@@ -36,18 +36,26 @@ check there is paired with a control that must still pass: the box
 answers ssh, holds its addresses, and replies on the very wire that
 carries nothing across.
 
-WHAT THIS CURRENTLY FINDS, so that a red run is not read as a broken
-harness. As of 2026-08-15 boots 3 and 4 end with two red checks each,
-and both are real: `fd` refuses exactly as designed and attaches
-nothing, and the box forwards anyway. `f-sysconf apply` writes
-`net.ipv4.ip_forward = 1` at provisioning time, `systemd-sysctl`
-reapplies it every boot, and with connected routes on both zones the
-Linux stack carries what XDP is no longer there to stop — including
-the unsolicited inbound connection the healthy box refuses with zero
-frames on the inside wire. The daemon is fail-closed; the appliance is
-not. Recorded in context/image-boot-2026-08-15.md rather than asserted
-away here: a check that expected the current behaviour would make the
-defect the specification.
+WHAT THIS FOUND, AND WHAT CLOSED IT. On 2026-08-15 boots 3 and 4 each
+ended with two red checks, and both were real: `fd` refused exactly as
+designed and attached nothing, and the box forwarded anyway.
+`f-sysconf apply` wrote `net.ipv4.ip_forward = 1` at provisioning time,
+`systemd-sysctl` reapplied it every boot, and with connected routes on
+both zones the Linux stack carried what XDP was no longer there to stop
+— including the unsolicited inbound connection the healthy box refuses
+with zero frames on the inside wire. The daemon was fail-closed; the
+appliance was not.
+
+They were left red rather than asserted away, because a check that
+expects the current behaviour makes the defect the specification. The
+operator decided it the other way on the same day: a box that does not
+forward is a visible fault, a box that forwards unfiltered is an
+invisible one. `fd` owns the knob now and raises it only while a bundle
+is in the packet path, so those four checks are expected GREEN, and
+`forwarding-closed` beside them says the kernel agrees with the daemon
+rather than merely that no traffic happened to move. The gateway phase
+carries the other half — `forwarding-open`, which fails if fail-closed
+has become fail-never.
 
 Usage:
   deploy/image/firstboot_walk.py --rootfs DIR --out DIR
@@ -400,6 +408,31 @@ def warm_neighbours(key, walk, phase):
                        f"ip neigh | grep -c REACHABLE")
   return walk.fact(phase, "neighbours_resolved",
                    out if rc == 0 else "none")
+def check_forwarding_closed(key, walk, phase):
+  """The kernel agrees with the daemon: this box is not routing.
+
+  Beside `wire_probe`, not instead of it, and the pair is the point.
+  `wire_probe` measures what crossed; this measures the knob that
+  decides whether anything CAN. A run in which nothing crossed because
+  the far host was down and one in which nothing crossed because the
+  box refuses to route look identical on the wire, and the first is
+  the reading this project keeps having to rule out.
+  """
+  _, fwd, _ = sh(key, "cat /proc/sys/net/ipv4/ip_forward")
+  walk.check(phase, "forwarding-closed", fwd.strip() == "0",
+             f"net.ipv4.ip_forward = {fwd.strip()} on a box with no "
+             f"f program in the packet path")
+  _, why, _ = sh(key, "journalctl --no-pager | grep 'forwarding:' "
+                      "| tail -1")
+  # Loudness is half the operator decision. A box that has stopped
+  # forwarding must say why, in the journal and in `fctl status`; here
+  # only the journal can be asked, because `fctl status` needs a
+  # daemon and this is the phase in which there is not one.
+  walk.check(phase, "forwarding-says-why",
+             "forwarding:" in why and "0" in why,
+             why.strip()[:200] or "(nothing said why)")
+
+
 def wire_probe(walk, phase, expect_forward):
   """Put the same traffic through the box and report what happened.
 
@@ -568,6 +601,18 @@ def phase_gateway(out, walk, ports):
   walk.fact("gateway", "addresses", addrs)
   _, fwd, _ = sh(key, "cat /proc/sys/net/ipv4/ip_forward")
   walk.fact("gateway", "ip_forward", fwd)
+  # Fail-closed must not have become fail-never. A healthy box that
+  # has just provisioned itself and come up has to forward with
+  # nobody typing anything, and this is the only check in the file
+  # that would go red if the knob were simply left at 0.
+  walk.check("gateway", "forwarding-open", fwd.strip() == "1",
+             f"net.ipv4.ip_forward = {fwd.strip()} on a box whose "
+             f"datapath is armed; nobody intervened")
+  _, why, _ = sh(key, "journalctl -u fd.service --no-pager "
+                      "| grep 'forwarding:' | tail -1")
+  walk.check("gateway", "forwarding-says-who-raised-it",
+             "datapath armed" in why,
+             why.strip()[:160] or "(fd never said it raised it)")
   warm_neighbours(key, walk, "gateway")
   wire_probe(walk, "gateway", expect_forward=True)
   vm.shutdown(proc, key)
@@ -632,6 +677,7 @@ def phase_corrupt(out, walk):
              rc == 0 and attached.strip() == "0",
              f"{attached.strip()} interface(s) carry an XDP program; "
              f"one intact object loaded would be half a firewall")
+  check_forwarding_closed(key, walk, "corrupt")
   warm_neighbours(key, walk, "corrupt")
   wire_probe(walk, "corrupt", expect_forward=False)
   vm.shutdown(proc, key)
@@ -712,6 +758,7 @@ def phase_broken(out, walk):
              rc == 0 and attached.strip() == "0",
              f"{attached.strip()} interface(s) carry an XDP program")
 
+  check_forwarding_closed(key, walk, "broken")
   warm_neighbours(key, walk, "broken")
   wire_probe(walk, "broken", expect_forward=False)
   vm.shutdown(proc, key)
