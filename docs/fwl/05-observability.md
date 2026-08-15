@@ -42,6 +42,8 @@ Four states are kept apart on purpose, because three of them used to render as t
 
 This verb is not the one that used to be here. The v0.1 `show counters` and `show firewall rules` addressed the single-program firewall, whose `counters` map is not the one your policy writes to; on a v0.4 box they printed "no counters active" and "no rules loaded" beside counters that were moving. `show firewall rules` is still gone — the bundle carries no per-zone rule metadata — and `clear counters` with it.
 
+**The same answer on the web UI.** `http://<box>:7542/counters` renders the same table, in the same words, from the same daemon command — a second consumer of one answer, not a second reader of the map. The four states above are four visibly different pages there too; that is asserted rather than assumed (`tests/system/test_ui_counters.py` compares them). The `/policy` page beside it reports what `fd` has **loaded**: each zone's interfaces, the XDP mode measured on them, its redirect and masquerade behaviour, and the counters that zone's loaded policy declares. It does not list rules, and it says so on the page — the daemon holds compiled objects, and there is nothing in the bundle it could be asked for a rule with.
+
 ## Counters as evidence
 
 The counters worth having are the ones that let you tell two indistinguishable situations apart. A quiet segment and a broken capture look identical on a screen that only shows what got through.

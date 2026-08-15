@@ -1,6 +1,11 @@
 /// @file einheit_f_ui.cc
-/// @brief f firewall appliance web UI. Reads BPF maps
-///        directly, serves dashboard + rules + counters.
+/// @brief f firewall appliance web UI.
+///
+/// It does NOT read BPF maps — this comment said it did, and that was
+/// the whole defect: the pages that opened pinned maps in process
+/// opened names no v0.4 bundle pins and were blank on every box ever
+/// deployed. Every page here asks `fd` over the control socket, which
+/// is why this binary needs no capability of any kind.
 
 #include <cstdlib>
 #include <format>

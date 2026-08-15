@@ -63,22 +63,6 @@ auto ParseTableRow(std::string_view line, CounterSlot* out) -> bool {
   return true;
 }
 
-auto AvailabilityFromName(std::string_view s) -> CounterAvailability {
-  if (s == "read") return CounterAvailability::kRead;
-  if (s == "none_declared") return CounterAvailability::kNoneDeclared;
-  if (s == "table_unreadable") {
-    return CounterAvailability::kTableUnreadable;
-  }
-  if (s == "map_missing") return CounterAvailability::kMapMissing;
-  if (s == "bound_unreadable") {
-    return CounterAvailability::kBoundUnreadable;
-  }
-  if (s == "table_map_mismatch") {
-    return CounterAvailability::kTableMapMismatch;
-  }
-  return CounterAvailability::kUnknown;
-}
-
 }  // namespace
 
 auto CounterAvailabilityName(CounterAvailability a) -> std::string_view {
@@ -95,6 +79,37 @@ auto CounterAvailabilityName(CounterAvailability a) -> std::string_view {
     case CounterAvailability::kUnknown: return "unknown";
   }
   return "unknown";
+}
+
+auto CounterAvailabilityFromName(std::string_view s)
+    -> CounterAvailability {
+  if (s == "read") return CounterAvailability::kRead;
+  if (s == "none_declared") return CounterAvailability::kNoneDeclared;
+  if (s == "table_unreadable") {
+    return CounterAvailability::kTableUnreadable;
+  }
+  if (s == "map_missing") return CounterAvailability::kMapMissing;
+  if (s == "bound_unreadable") {
+    return CounterAvailability::kBoundUnreadable;
+  }
+  if (s == "table_map_mismatch") {
+    return CounterAvailability::kTableMapMismatch;
+  }
+  return CounterAvailability::kUnknown;
+}
+
+auto CounterStateWord(CounterAvailability a) -> std::string_view {
+  switch (a) {
+    case CounterAvailability::kRead: return "read";
+    case CounterAvailability::kNoneDeclared:
+      return "no count statements";
+    case CounterAvailability::kTableUnreadable: return "names unknown";
+    case CounterAvailability::kMapMissing: return "no counter map";
+    case CounterAvailability::kBoundUnreadable: return "size unknown";
+    case CounterAvailability::kTableMapMismatch: return "stale table";
+    case CounterAvailability::kUnknown: return "unknown state";
+  }
+  return "unknown state";
 }
 
 auto CounterLookupName(CounterLookup l) -> std::string_view {
@@ -302,7 +317,7 @@ auto ZoneCountersFromJson(const nlohmann::json& j)
     if (!zj.is_object()) continue;
     ZoneCounters z;
     z.zone = zj.value("zone", std::string{});
-    z.availability = AvailabilityFromName(
+    z.availability = CounterAvailabilityFromName(
         zj.value("availability", std::string{}));
     z.detail = zj.value("detail", std::string{});
     z.map_slots = zj.value("map_slots", 0U);

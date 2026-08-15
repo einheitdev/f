@@ -23,6 +23,8 @@
 #include "einheit/cli/render/table.h"
 #include "einheit/cli/schema.h"
 
+#include "f/counters.h"
+
 namespace einheit::adapters::fw {
 
 namespace {
@@ -581,18 +583,16 @@ auto RenderShowConntrack(const Response& resp,
 /// below, beside the renderers that established the rule.
 auto Prose(Renderer& renderer) -> std::ostream&;
 
-/// One sentence for a zone whose counters are not simply readable.
+/// One word for a zone whose counters are not simply readable.
 ///
-/// The vocabulary is fd's, mapped here rather than passed through, so
-/// a token this build has no sentence for reads as an unknown state
-/// instead of being printed raw at the operator.
+/// The vocabulary is fd's, mapped rather than passed through, so a
+/// token this build has no word for reads as an unknown state instead
+/// of being printed raw at the operator. The mapping itself lives in
+/// `f/counters.h` because the web UI renders the same states and the
+/// two surfaces must not drift into two vocabularies for one fact.
 auto CounterStateWord(const std::string& availability) -> std::string {
-  if (availability == "none_declared") return "no count statements";
-  if (availability == "table_unreadable") return "names unknown";
-  if (availability == "map_missing") return "no counter map";
-  if (availability == "bound_unreadable") return "size unknown";
-  if (availability == "table_map_mismatch") return "stale table";
-  return "unknown state";
+  return std::string(::f::CounterStateWord(
+      ::f::CounterAvailabilityFromName(availability)));
 }
 
 /// `show counters` — the loaded policy's named `count` statements.

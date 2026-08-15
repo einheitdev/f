@@ -98,6 +98,21 @@ enum class CounterAvailability : uint8_t {
 /// asserts on.
 auto CounterAvailabilityName(CounterAvailability a) -> std::string_view;
 
+/// The inverse. A token this build has no state for is `kUnknown`,
+/// never a fallback to one of the states that has a meaning.
+auto CounterAvailabilityFromName(std::string_view s)
+    -> CounterAvailability;
+
+/// The operator's word for `a` — what the CLI table and the web page
+/// both print.
+///
+/// One definition rather than one per surface. The four kinds of empty
+/// only stay four for an operator if the two surfaces spell them the
+/// same way; two copies of this mapping drift, and the drift shows up
+/// as a box that says "names unknown" in the terminal and something
+/// else on the screen for the same zone in the same second.
+auto CounterStateWord(CounterAvailability a) -> std::string_view;
+
 /// One named counter as it was found.
 struct CounterReading {
   std::string name;
