@@ -20,7 +20,7 @@ Each of those edits `/etc/f/system.yaml` and applies it. `set interface zone` on
 
 ## The policy
 
-Write `/etc/f/gateway.fw`, substituting your bench's own gateway address and directed broadcast:
+Write it to **`/etc/f/rules.fw`**, substituting your bench's own gateway address and directed broadcast. That path is not a suggestion: `reload firewall` compiles the CLI's `--source`, which defaults to `/etc/f/rules.fw`, and fd's own watcher reads `watch.source` in `/etc/f/fd.yaml`, which is the same file. A policy written under any other name is a file nothing compiles — and `reload firewall` will answer success, for having reloaded the policy that was already running. If you want it somewhere else, change both of those settings and not just one.
 
 ```
 zone wan = [wan0]
@@ -56,7 +56,24 @@ Load it:
 $ einheit-f reload firewall
 ```
 
+`fd` compiles and attaches on the thread that answers this command, so on a slow box or with a large policy it will not reply until it has finished. If you get `no answer in 180s`, that is not "fd is broken" and it is not "nothing happened": run `show policy`, which reports what fd has in the packet path beside the file on disk, before you do anything else — and in particular before `rollback`.
+
 After that, the everyday changes have verbs — `einheit-f show policy lan` numbers the statements, `set rule` adds one where it can still match, `no rule` takes one out. See [reference/cli.md](../reference/cli.md#the-policy). The whole-file version above is what you write once, because the *ordering* below is the part that has to be deliberate.
+
+## Turn the services on
+
+If you bound DHCP or DNS to the zone with `set dhcp` / `set dns`, check that something is actually serving them:
+
+```
+$ einheit-f show services
+```
+
+`STOPPED — the unit was never started` means exactly that. The service verbs edit the model and regenerate the config; the units are enabled once, at provisioning time, and a service bound after that has to be started by hand:
+
+```
+$ sudo systemctl enable --now f-dnsmasq
+$ einheit-f show services   # ANSWERS ON should now name the zone's port
+```
 
 ## Check it worked
 
