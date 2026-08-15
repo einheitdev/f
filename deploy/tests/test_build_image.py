@@ -119,3 +119,57 @@ def test_the_libraries_the_binaries_need_are_in_the_package_list():
   assert not unaccounted, (
     "these binaries need libraries no package in PACKAGES provides, "
     f"so the image will not run them: {unaccounted}")
+class FakeWget:
+  """Stand in for `wget`, answering per invocation.
+
+  The preflight's whole job is to tell three situations apart, and
+  they differ only in which invocation of one command succeeds.
+  """
+  def __init__(self, plain_ok, inet4_ok):
+    # `plain_ok` is the IPv6 answer: the preflight asks about IPv6
+    # explicitly rather than about whatever wget picks by default.
+    self.inet6_ok = plain_ok
+    self.inet4_ok = inet4_ok
+    self.calls = []
+  def __call__(self, argv, check=False, **kwargs):
+    self.calls.append(list(argv))
+    ok = self.inet4_ok if "-4" in argv else self.inet6_ok
+    return subprocess.CompletedProcess(argv, 0 if ok else 4)
+def test_a_mirror_reachable_over_ipv6_needs_no_help(
+    monkeypatch, tmp_path):
+  fake = FakeWget(plain_ok=True, inet4_ok=True)
+  monkeypatch.setattr(build_image.subprocess, "run", fake)
+  env = build_image.mirror_preflight("http://example/debian", "trixie",
+                                     tmp_path)
+  assert env == {}
+  # One probe, and no wgetrc left behind on a machine that did not
+  # need one.
+  assert len(fake.calls) == 1
+  assert "-6" in fake.calls[0]
+  assert not (tmp_path / "wgetrc-inet4").exists()
+def test_an_ipv6_only_hang_is_turned_into_ipv4(monkeypatch, tmp_path):
+  # The measured case: wget over IPv6 never returns, `wget -4`
+  # returns in 0.3 s, and debootstrap would have hung for as long as
+  # you were willing to let it.
+  fake = FakeWget(plain_ok=False, inet4_ok=True)
+  monkeypatch.setattr(build_image.subprocess, "run", fake)
+  env = build_image.mirror_preflight("http://example/debian", "trixie",
+                                     tmp_path)
+  wgetrc = tmp_path / "wgetrc-inet4"
+  assert env == {"WGETRC": str(wgetrc)}
+  assert "inet4_only = on" in wgetrc.read_text()
+def test_an_unreachable_mirror_stops_the_build_rather_than_hanging(
+    monkeypatch, tmp_path):
+  # The point of the whole function. A build that cannot fetch its
+  # mirror must say so in seconds, naming the mirror and the flag that
+  # changes it — not print `I: Retrieving InRelease` and go quiet.
+  fake = FakeWget(plain_ok=False, inet4_ok=False)
+  monkeypatch.setattr(build_image.subprocess, "run", fake)
+  import pytest
+  with pytest.raises(FileNotFoundError) as excinfo:
+    build_image.mirror_preflight("http://example/debian", "trixie",
+                                 tmp_path)
+  message = str(excinfo.value)
+  assert "http://example/debian" in message
+  assert "--mirror" in message
+  assert "hang" in message

@@ -93,23 +93,102 @@ def run(argv, **kwargs):
   print("+ " + " ".join(str(a) for a in argv), flush=True)
   return subprocess.run([str(a) for a in argv], check=True, **kwargs)
 DEFAULT_MIRROR = "http://deb.debian.org/debian"
-def debootstrap(rootfs, suite, arch, mirror=DEFAULT_MIRROR):
+def mirror_preflight(mirror, suite, workdir):
+  """Prove the mirror is fetchable the way debootstrap will fetch it.
+
+  This exists because the failure it catches has no symptom. debootstrap
+  fetches with `wget`, which has no happy-eyeballs fallback: it resolves
+  deb.debian.org to a Fastly anycast address, picks the AAAA, and if
+  that POP is unreachable over IPv6 it sits in `Connecting to ...:80`
+  until its timeout — per file, for hundreds of files. The build prints
+  one line, `I: Retrieving InRelease`, and then nothing at all, for as
+  long as you are willing to wait. Measured on this workstation:
+  `wget <mirror>/dists/trixie/InRelease` never returns, `wget -4` on the
+  same URL returns in 0.3 s, and `curl` returns because curl DOES have
+  the fallback — so every hand-check an operator is likely to run says
+  the network is fine.
+
+  It was known and it was not handled: the note above this function said
+  the only way past it was "a mirror this build had no way to name",
+  which is a workaround performed by hand, once, by whoever hit it.
+
+  Args:
+    mirror: The Debian mirror URL.
+    suite: The suite whose InRelease is fetched as the probe.
+    workdir: Where a generated wgetrc may be written.
+
+  Returns:
+    A dict of environment overrides for the debootstrap call — empty
+    when plain wget works.
+
+  Raises:
+    FileNotFoundError: If the mirror cannot be fetched either way. The
+      message names the mirror and the --mirror flag, because at that
+      point the build genuinely cannot proceed and a hang is the one
+      answer that helps nobody.
+  """
+  url = f"{mirror}/dists/{suite}/InRelease"
+
+  def probe(family):
+    """Fetch the probe URL over one address family only."""
+    return subprocess.run(
+      ["wget", family, "--timeout=15", "--tries=1", "-q", "-O",
+       os.devnull, url], check=False).returncode == 0
+
+  # The question is "does IPv6 work to this mirror", and it has to be
+  # asked THAT way. Probing the default path asks something weaker —
+  # "did wget happen to pick a working address this time" — and on an
+  # anycast mirror it picks per connection, so a probe that passes is
+  # no promise about the next four hundred fetches. Measured on this
+  # workstation: the InRelease probe over the default path succeeded,
+  # and the very next fetch in the same run, of Packages.xz, hung.
+  if probe("-6"):
+    return {}
+  print(f"note: wget cannot fetch {url} over IPv6.")
+  if not probe("-4"):
+    raise FileNotFoundError(
+      f"cannot fetch {url} with wget over IPv4 or IPv6. debootstrap "
+      f"uses wget and would hang here rather than fail, so the build "
+      f"stops instead. Check the network, or name a reachable mirror "
+      f"with --mirror.")
+  # IPv4 works and IPv6 does not. Forced for the WHOLE bootstrap and
+  # not merely for the fetch that failed, because the failure is per
+  # connection: debootstrap makes hundreds, and any one of them
+  # picking an unreachable POP hangs the build with no output.
+  # debootstrap takes no flag for this and wget reads WGETRC, so that
+  # is the seam. Written into the build's own working directory rather
+  # than the user's ~/.wgetrc: this is a property of one build, not of
+  # the machine.
+  wgetrc = Path(workdir) / "wgetrc-inet4"
+  wgetrc.parent.mkdir(parents=True, exist_ok=True)
+  wgetrc.write_text("inet4_only = on\n")
+  print(f"note: it works over IPv4 only, so this build forces IPv4 "
+        f"for debootstrap via {wgetrc}. Without this the bootstrap "
+        f"hangs with no output rather than failing.")
+  return {"WGETRC": str(wgetrc)}
+
+
+def debootstrap(rootfs, suite, arch, mirror=DEFAULT_MIRROR,
+                workdir=None):
   """Create the base rootfs, unless one is already there.
 
-  `mirror` is an argument because the default is not always
-  reachable. debootstrap fetches with `wget`, which has no happy-eyeballs
-  fallback: it resolves deb.debian.org to a Fastly anycast address,
-  picks the AAAA, and if that POP is unreachable over IPv6 it sits in
-  `Connecting to ...:80` until its timeout, per package. On the
-  workstation this image was first built on that is exactly what
-  happened, and the only way past it was a mirror this build had no
-  way to name.
+  `mirror` is an argument because the default is not always reachable;
+  see `mirror_preflight` for the failure that makes it necessary and
+  for what this does about it before spending half an hour.
   """
   if (rootfs / "usr/bin").is_dir():
     print(f"rootfs already at {rootfs}, reusing")
     return
-  run(["sudo", "debootstrap", f"--arch={arch}", "--foreign",
-       "--include=" + ",".join(PACKAGES), suite, rootfs, mirror])
+  env = mirror_preflight(mirror, suite, workdir or rootfs.parent)
+  # `sudo env K=V` rather than `--preserve-env`: sudo scrubs the
+  # environment by default, and a variable that silently did not
+  # arrive would put the hang back with the fix apparently applied.
+  prefix = ["sudo"]
+  if env:
+    prefix += ["env"] + [f"{k}={v}" for k, v in env.items()]
+  run(prefix + ["debootstrap", f"--arch={arch}", "--foreign",
+                "--include=" + ",".join(PACKAGES), suite, rootfs,
+                mirror])
   qemu = Path("/usr/bin/qemu-aarch64-static")
   if arch == "arm64" and qemu.exists():
     run(["sudo", "cp", qemu, rootfs / "usr/bin/"])
@@ -207,7 +286,7 @@ def build(build_dir, out_dir, suite, arch, skip_bootstrap=False,
           f"not have it")
 
   if not skip_bootstrap:
-    debootstrap(rootfs, suite, arch, mirror)
+    debootstrap(rootfs, suite, arch, mirror, workdir=out_dir)
 
   actions = f_install.stage(manifest, build_dir, REPO, rootfs,
                             remove_stale=True, with_pip=False)
