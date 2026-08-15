@@ -270,8 +270,33 @@ auto GatherInterfaces() -> json {
   return ifaces;
 }
 
+/// How long to wait for fd, per command.
+///
+/// Three seconds is right for a question — fd answers those from
+/// memory — and wrong by two orders of magnitude for `reload`, which
+/// is the one command whose work is unbounded: fd runs `fwl compile`
+/// and then loads and attaches BPF objects, synchronously, on the
+/// same thread that serves this socket. It cannot answer while it is
+/// working.
+///
+/// Measured on a booted image: `reload firewall` returned `fd did not
+/// answer: recv timeout` while the reload was SUCCEEDING, and
+/// `fctl status` half a minute later showed both zones attached and
+/// the masquerade seeded. An operator reading that message has been
+/// told their firewall is broken about a change that took, and the
+/// documented next move for a commit fd did not apply is `rollback`
+/// — which would undo it.
+///
+/// A compile is clang on whatever CPU the box has. Under emulation it
+/// is tens of seconds; on the product board with a large policy it is
+/// seconds. The timeout has to bound the pathological case, not the
+/// median one.
+constexpr int kFdTimeoutMs = 3000;
+constexpr int kFdReloadTimeoutMs = 180000;
+
 auto SendRawToFd(zmq::socket_t& sock, uint8_t cmd,
-                 const std::string& payload = "")
+                 const std::string& payload = "",
+                 int recv_timeout_ms = kFdTimeoutMs)
     -> std::expected<std::string, std::string> {
   std::string msg;
   msg += static_cast<char>(static_cast<uint8_t>(cmd));
@@ -281,9 +306,24 @@ auto SendRawToFd(zmq::socket_t& sock, uint8_t cmd,
   if (!sock.send(req, zmq::send_flags::none)) {
     return std::unexpected("send failed");
   }
+  sock.set(zmq::sockopt::rcvtimeo, recv_timeout_ms);
   zmq::message_t reply;
-  if (!sock.recv(reply, zmq::recv_flags::none)) {
-    return std::unexpected("recv timeout");
+  bool got = static_cast<bool>(
+      sock.recv(reply, zmq::recv_flags::none));
+  sock.set(zmq::sockopt::rcvtimeo, kFdTimeoutMs);
+  if (!got) {
+    // Not "fd did not answer". The request is still on fd's queue and
+    // the work it names may be finishing right now, so the message has
+    // to leave the operator somewhere they can act: LOOK, do not
+    // assume, and above all do not roll back a change that took.
+    return std::unexpected(std::format(
+        "no answer in {}s. fd is single-threaded and cannot reply "
+        "while it compiles or loads a policy, so this may be a reload "
+        "still running rather than a daemon that has stopped. Check "
+        "`show status` and `show policy` before doing anything else — "
+        "in particular before `rollback`, which would undo a change "
+        "that succeeded.",
+        recv_timeout_ms / 1000));
   }
   return std::string(
       static_cast<char*>(reply.data()), reply.size());
@@ -1017,8 +1057,13 @@ class FLocalTransport final
       return out;
     }
     std::expected<std::string, std::string> resp;
+    // The reload is the one command that runs a compiler. Everything
+    // else is a question fd answers from memory.
+    const int timeout_ms =
+        cmd == fd_cmd::kReloadProg ? kFdReloadTimeoutMs
+                                   : kFdTimeoutMs;
     try {
-      resp = SendRawToFd(*zmq_sock_, cmd, payload);
+      resp = SendRawToFd(*zmq_sock_, cmd, payload, timeout_ms);
     } catch (const zmq::error_t& e) {
       resp = std::unexpected(e.what());
     }
@@ -1214,12 +1259,32 @@ class FLocalTransport final
       // Leave the session open: the snapshots are the only way back to
       // the previous policy, and the operator needs `rollback` to
       // still work after a commit that did not take.
-      return MakeErr(req.id, "not_applied",
-          std::format(
-              "saved to {}, but the running policy is UNCHANGED: {}",
-              cfg_.fw_source, reload.error),
-          "fix the cause and run `reload firewall`, or `rollback` to "
-          "restore the previous configuration");
+      // "UNCHANGED" is a claim, and for one class of failure it is a
+      // FALSE one. fd refusing a bundle leaves the running policy
+      // intact and this wording is exact; fd not ANSWERING says
+      // nothing at all about whether it applied, because the reason
+      // it cannot answer is that it is busy applying. Measured on a
+      // booted image: this line appeared, and the reload had
+      // succeeded. Telling an operator their change did not take,
+      // and pointing them at `rollback`, is how a change that worked
+      // gets undone.
+      const bool unknown = reload.error.starts_with("no answer in");
+      const std::string what =
+          unknown
+              ? std::format("saved to {}, and whether fd loaded it is "
+                            "UNKNOWN: {}",
+                            cfg_.fw_source, reload.error)
+              : std::format("saved to {}, but the running policy is "
+                            "UNCHANGED: {}",
+                            cfg_.fw_source, reload.error);
+      return MakeErr(req.id,
+          unknown ? "outcome_unknown" : "not_applied", what,
+          unknown
+              ? "run `show policy` first — it reports what fd has in "
+                "the packet path beside the file on disk. Do NOT "
+                "`rollback` until you have: the change may have taken."
+              : "fix the cause and run `reload firewall`, or "
+                "`rollback` to restore the previous configuration");
     }
 
     json result = {
@@ -1930,12 +1995,26 @@ class FLocalTransport final
 
     auto reload = AskFd(fd_cmd::kReloadProg);
     if (!reload.ok) {
-      return MakeErr(req.id, "not_applied",
-          std::format(
-              "saved to {}, but the running policy is UNCHANGED: {}",
-              path, reload.error),
-          "fix the cause and run `reload firewall`; the edit is on "
-          "disk and will be loaded at the next start");
+      // Same distinction as `commit`, one verb over: a refusal is a
+      // fact about the running policy, a timeout is the absence of
+      // one.
+      const bool unknown = reload.error.starts_with("no answer in");
+      const std::string what =
+          unknown
+              ? std::format("saved to {}, and whether fd loaded it is "
+                            "UNKNOWN: {}",
+                            path, reload.error)
+              : std::format("saved to {}, but the running policy is "
+                            "UNCHANGED: {}",
+                            path, reload.error);
+      return MakeErr(req.id,
+          unknown ? "outcome_unknown" : "not_applied", what,
+          unknown
+              ? "run `show policy` — it reports what fd has in the "
+                "packet path beside the file on disk, which is the "
+                "only thing that answers this"
+              : "fix the cause and run `reload firewall`; the edit is "
+                "on disk and will be loaded at the next start");
     }
     (*out)["activated"] = true;
     (*out)["mechanism"] = "fd hot-reload";
