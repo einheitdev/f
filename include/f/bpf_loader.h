@@ -15,6 +15,7 @@
 #include "f/bpf_error.h"
 #include "f/counters.h"
 #include "f/error.h"
+#include "f/rules.h"
 #include "f/tc_egress.h"
 
 // libbpf handle; opaque here so the header stays libbpf-free.
@@ -101,6 +102,18 @@ struct ZoneProgramHandle {
   /// one that is. The table and the descriptor come from one load or
   /// neither does.
   CounterTable counters;
+  /// This zone's rules as the compiler wrote them into the manifest,
+  /// captured in the SAME call, from the SAME parsed manifest, that
+  /// opened the object above.
+  ///
+  /// Same rule as the counter table and for the same reason. A
+  /// consumer that re-read the bundle directory to list the rules
+  /// would be describing whatever policy is on disk now beside a
+  /// program loaded from an earlier one — and the two look identical
+  /// on the screen. `RuleAvailability::kNotEmitted` is what a bundle
+  /// compiled before this metadata existed produces, so an old bundle
+  /// reads as "cannot say" and never as "no rules".
+  ZoneRules rules;
 };
 
 /// Result of loading a multi-zone bundle: one entry per @xdp block.
@@ -149,6 +162,11 @@ struct ZoneBundleHandles {
   /// tracker existed. See f/tc_egress.h for why the second attach point
   /// exists and why it is at the qdisc layer.
   EgressTracker egress;
+  /// The identity of the policy TEXT this bundle was compiled from,
+  /// taken from the same manifest read as everything else above. It is
+  /// what lets a box answer "is the `.fw` on disk the one I am
+  /// running" with a fact rather than a hope.
+  PolicySource policy_source;
 };
 
 /// Load every zone program in a `fwl compile --bundle` directory.

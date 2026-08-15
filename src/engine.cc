@@ -343,6 +343,23 @@ auto HandleRequest(Engine& e, const std::string& req_str)
       }
       return ZoneCountersToJson(zones).dump();
     }
+    case Cmd::kGetFwlRules: {
+      // What this box is enforcing, zone by zone, in policy order.
+      // Every rule below was captured by the load that put the program
+      // in the packet path — from the manifest read in that same call,
+      // not from the bundle directory as it stands now. A policy
+      // recompiled since the load leaves this answer alone, which is
+      // the whole point: it describes the packet path, and the source
+      // digest beside it is what tells an operator the two have parted
+      // company.
+      std::vector<ZoneRules> zones;
+      zones.reserve(e.zone_bundle.programs.size());
+      for (const auto& p : e.zone_bundle.programs) {
+        zones.push_back(p.rules);
+      }
+      return ZoneRulesToJson(zones, e.zone_bundle.policy_source)
+          .dump();
+    }
     default:
       return R"({"error":"unknown command"})";
   }

@@ -92,6 +92,27 @@ auto CountersSummary(const FdAnswer& answer) -> nlohmann::json;
 auto PolicyView(const FdAnswer& zones, const FdAnswer& counters)
     -> nlohmann::json;
 
+/// The rules of the loaded policy, zone by zone, in policy order.
+///
+/// `answer` is fd's reply to opcode 13. Every rule in it was written
+/// into the bundle manifest by the compiler and captured by the load
+/// that put the programs in the packet path — the same discipline the
+/// counter table follows, and for the same reason: a rule table
+/// re-derived from the bundle directory would describe whatever is on
+/// disk now beside a program loaded from something else.
+///
+/// Every zone gets a section whatever its availability, and the five
+/// states get five different words. `not_emitted` — a bundle compiled
+/// before this metadata existed — is the one that matters across an
+/// upgrade: rendered as "no rules" it would show a working firewall
+/// as an empty one.
+///
+/// There is no position column and no counter column. The `no rule`
+/// positions belong to the SOURCE statements, which are numbered
+/// differently, and pairing a rule with a counter by position is the
+/// defect the retired rule surface shipped.
+auto PolicyRulesView(const FdAnswer& answer) -> nlohmann::json;
+
 /// The two policy-wide facts a per-zone table cannot carry: whether
 /// connections are tracked, and whether the flows the BOX ITSELF
 /// starts are tracked with them.

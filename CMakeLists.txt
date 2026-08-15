@@ -213,6 +213,34 @@ target_link_libraries(libf-counters PUBLIC
 )
 
 # ============================================================================
+# The loaded policy's rules
+#
+# The per-zone rule metadata the compiler wrote into manifest.json,
+# the availability states that keep "no rules" apart from "cannot
+# ask", and the wire shape both consumers read. No libbpf here either:
+# the CLI and the UI link this to READ fd's answer with the vocabulary
+# fd produced it with, and neither of them ever opens a bundle
+# directory — a rule table re-derived from the disk is a claim about
+# the disk.
+#
+# SHA-256 rides along because the drift verdict is the same question
+# asked of a file: the compiler records the digest of the policy text,
+# and a consumer takes the digest of what is on disk now.
+# ============================================================================
+add_library(libf-rules STATIC
+  src/rules.cc
+  src/sha256.cc
+)
+
+target_include_directories(libf-rules PUBLIC
+  ${PROJECT_SOURCE_DIR}/include
+)
+
+target_link_libraries(libf-rules PUBLIC
+  nlohmann_json::nlohmann_json
+)
+
+# ============================================================================
 # Engine library (BPF + ZMQ, no HTTP)
 # ============================================================================
 add_library(libf-engine STATIC
@@ -235,6 +263,7 @@ target_include_directories(libf-engine PUBLIC
 
 target_link_libraries(libf-engine PUBLIC
   libf-counters
+  libf-rules
   libf-sysconfig
   ${BPF_LIB}
   nlohmann_json::nlohmann_json

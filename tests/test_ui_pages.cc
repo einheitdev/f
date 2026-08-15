@@ -195,10 +195,37 @@ TEST(PolicyPage, ZonesAndTheirCountedNamesReachTheHtml) {
   EXPECT_NE(html.find("lan"), std::string::npos);
 }
 
-TEST(PolicyPage, TheRuleGapIsStatedOnThePageItself) {
-  // A page that shows zones and no rules, with nothing saying why,
-  // reads as a policy that has no rules in it. The sentence is part of
-  // the page, not part of a commit message.
+/// fd's opcode-13 reply for one zone with one guarded drop rule.
+auto RulesBody(const std::string& zone, const std::string& avail,
+               json rules, json def = nullptr) -> json {
+  return {{"zones", json::array({json{
+               {"zone", zone},
+               {"availability", avail},
+               {"detail", ""},
+               {"rules", std::move(rules)},
+               {"default", std::move(def)},
+               {"stage_boundaries", json::array()}}})},
+          {"source",
+           {{"known", true},
+            {"name", "office.fw"},
+            {"path", "/etc/f/office.fw"},
+            {"sha256", std::string(64, 'a')},
+            {"bytes", 42}}}};
+}
+
+auto Rule(const std::string& action, const std::string& match,
+          bool guarded) -> json {
+  return {{"log_rule_index", 0}, {"line", 5},   {"action", action},
+          {"match", match},      {"text", ""},  {"rate_limit", ""},
+          {"guarded", guarded},  {"terminal", true},
+          {"renderable", true}};
+}
+
+TEST(PolicyPage, TheRulesAreOnThePageNow) {
+  // The card this replaces said the rules could not be shown, and it
+  // was true: the bundle carried no rule metadata. It does now, and a
+  // page that still explained the gap would be documenting a hole
+  // that has been filled.
   auto html = RenderFragment(
       "fw/policy",
       json{{"answered", true},
@@ -206,9 +233,80 @@ TEST(PolicyPage, TheRuleGapIsStatedOnThePageItself) {
            {"zone_count", 0},
            {"zones", json::array()},
            {"empty_text", "nothing loaded"},
-           {"features", json::array()}});
-  EXPECT_NE(html.find("does not list the rules"), std::string::npos);
-  EXPECT_NE(html.find("show policy"), std::string::npos);
+           {"features", json::array()},
+           {"rules",
+            PolicyRulesView(Ok(RulesBody(
+                "edge", "listed",
+                json::array({Rule("drop",
+                                  "pkt.proto == tcp and "
+                                  "pkt.dst_port == 22",
+                                  true)}),
+                json{{"action", "drop"}, {"line", 9},
+                     {"stated", true}})))}});
+  EXPECT_NE(html.find("pkt.dst_port == 22"), std::string::npos);
+  EXPECT_NE(html.find("edge"), std::string::npos);
+  EXPECT_NE(html.find("default drop"), std::string::npos);
+  // The digest of the text this policy was compiled from, on the page,
+  // so it can be checked against the file without leaving the screen.
+  EXPECT_NE(html.find("office.fw"), std::string::npos);
+}
+
+TEST(PolicyPage, TheFiveRuleStatesRenderAsFiveDifferentPages) {
+  // The whole reason fd distinguishes them. A page that drew a bundle
+  // with no rule metadata the same way as a policy with no rules would
+  // show a working firewall as an empty one on every box upgraded
+  // across this change.
+  auto page = [](const std::string& avail) {
+    return RenderFragment(
+        "fw/policy_rules",
+        json{{"rules", PolicyRulesView(Ok(RulesBody(
+                           "edge", avail, json::array())))}});
+  };
+  std::vector<std::string> pages = {
+      page("listed"), page("none_declared"), page("function_form"),
+      page("not_emitted"), page("something_new")};
+  for (size_t i = 0; i < pages.size(); ++i) {
+    for (size_t j = i + 1; j < pages.size(); ++j) {
+      EXPECT_NE(pages[i], pages[j])
+          << "two rule states render identically";
+    }
+  }
+}
+
+TEST(PolicyPage, AnUnaskableDaemonIsNotAPolicyWithNoRules) {
+  FdAnswer down;
+  down.ok = false;
+  down.error = "fd is not running";
+  auto html = RenderFragment(
+      "fw/policy_rules", json{{"rules", PolicyRulesView(down)}});
+  EXPECT_NE(html.find("fd is not running"), std::string::npos);
+  // No table at all — an empty one is a claim that there is nothing
+  // to show.
+  EXPECT_EQ(html.find("<table"), std::string::npos);
+}
+
+TEST(PolicyPage, AnUnguardedRuleSaysSoRatherThanShowingABlank) {
+  auto html = RenderFragment(
+      "fw/policy_rules",
+      json{{"rules",
+            PolicyRulesView(Ok(RulesBody(
+                "edge", "listed",
+                json::array({Rule("drop", "", false)}))))}});
+  // "matches everything" and "we have no match to show" must not be
+  // the same empty cell.
+  EXPECT_NE(html.find("every packet"), std::string::npos);
+  EXPECT_NE(html.find("stops here"), std::string::npos);
+}
+
+TEST(PolicyPage, AnUnstatedDefaultNamesTheFallThrough) {
+  auto html = RenderFragment(
+      "fw/policy_rules",
+      json{{"rules",
+            PolicyRulesView(Ok(RulesBody(
+                "edge", "listed", json::array({Rule("drop", "", true)}),
+                json{{"action", "allow"}, {"line", 0},
+                     {"stated", false}})))}});
+  EXPECT_NE(html.find("falls through to ALLOW"), std::string::npos);
 }
 
 TEST(DashboardPage, TheCountersRowIsAMeasurementAndSaysWhichKind) {

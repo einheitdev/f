@@ -739,7 +739,14 @@ implicit zone whose name is the `@xdp` argument.
   root resolves the pinned maps to one kernel map each. `fwl compile
   --bundle <dir>` emits the per-zone sources, objects, a shared header,
   and a `manifest.json` describing zones, objects, redirect topology,
-  and the pinned maps.
+  the pinned maps, each zone's RULES in policy order, and the identity
+  (path, name, SHA-256) of the policy text the bundle was compiled
+  from. The rule metadata and the source digest exist so a box can
+  answer "what am I enforcing right now" without reading a file: the
+  loader captures both in the same call that opens the objects, and
+  serves them over the control socket. A zone whose policy is a Tier 2
+  function has no rule list and its entry says so — `"form":
+  "function"` — rather than reporting an empty one.
 
 #### Compile errors
 

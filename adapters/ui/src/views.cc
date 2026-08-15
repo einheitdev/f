@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "f/counters.h"
+#include "f/rules.h"
 
 namespace einheit::adapters::fw {
 namespace {
@@ -309,6 +310,125 @@ auto PolicyView(const FdAnswer& zones, const FdAnswer& counters)
   }
   out["zone_count"] = decorated.size();
   out["zones"] = std::move(decorated);
+  out["empty_text"] =
+      "fd has no zone programs loaded — nothing of the policy is in "
+      "the packet path";
+  return out;
+}
+
+auto PolicyRulesView(const FdAnswer& answer) -> json {
+  json out;
+  out["zones"] = json::array();
+  out["zone_count"] = 0;
+  out["rule_count"] = 0;
+  out["source"] = {{"known", false}, {"text", ""}};
+  if (!answer.ok) {
+    out["answered"] = false;
+    out["unavailable"] =
+        "cannot read the loaded policy's rules from fd: " +
+        answer.error;
+    return out;
+  }
+  if (!HasZonesArray(answer.body)) {
+    out["answered"] = false;
+    out["unavailable"] =
+        "fd answered the rule query with a payload carrying no "
+        "zones — this box's fd is not the one this UI expects. Check "
+        "that fd and einheit-f-ui are from the same build.";
+    return out;
+  }
+  out["answered"] = true;
+  out["unavailable"] = "";
+
+  auto src = ::f::PolicySourceFromJson(answer.body);
+  out["source"] = {
+      {"known", src.known},
+      {"name", src.name},
+      {"path", src.path},
+      // Enough of the digest to recognise, all of it to compare. The
+      // full value is on the page so an operator can check it against
+      // `sha256sum` on the file without leaving the screen.
+      {"sha256", src.sha256},
+      {"text",
+       src.known
+           ? std::format(
+                 "compiled from {} (sha256 {}). `einheit-f show "
+                 "policy` compares that against the file on disk; "
+                 "this page reads no files.",
+                 src.name.empty() ? src.path : src.name, src.sha256)
+           : std::string(
+                 "the loaded bundle records no policy source, so "
+                 "nothing here can say which file it was compiled "
+                 "from — recompile the policy to record one")}};
+
+  std::size_t total = 0;
+  json zones = json::array();
+  for (const auto& z : ::f::ZoneRulesFromJson(answer.body)) {
+    json rows = json::array();
+    for (const auto& r : z.rules) {
+      std::string match;
+      const char* match_semantic = "dim";
+      if (!r.guarded) {
+        match = ::f::UnguardedMatchWord(r.terminal);
+        match_semantic = r.terminal ? kWarn : "dim";
+      } else if (!r.renderable) {
+        match = "(a guard this build cannot render)";
+        match_semantic = kBad;
+      } else {
+        match = r.match;
+        match_semantic = "";
+      }
+      rows.push_back({
+          {"action", r.action},
+          {"match", match},
+          {"match_semantic", match_semantic},
+          {"rate_limit", r.rate_limit},
+          {"terminal", r.terminal},
+          {"line", r.line},
+      });
+    }
+    total += rows.size();
+    json def = nullptr;
+    if (z.default_action.known) {
+      def = {{"action", z.default_action.action},
+             {"stated", z.default_action.stated},
+             {"text",
+              z.default_action.stated
+                  ? std::format("default {}", z.default_action.action)
+                  : std::format(
+                        "default {} — no `default` line; the block "
+                        "falls through to ALLOW",
+                        z.default_action.action)},
+             {"semantic",
+              z.default_action.stated ? kInfo : kWarn}};
+    }
+    // A zone whose rules cannot be given still occupies a section,
+    // with its own word for why. Vanishing from the page is how a box
+    // that cannot describe its policy comes to look like a box with
+    // no policy.
+    zones.push_back({
+        {"zone", z.zone},
+        {"availability",
+         std::string(::f::RuleAvailabilityName(z.availability))},
+        {"state_word",
+         std::string(::f::RuleStateWord(z.availability))},
+        {"state_semantic",
+         z.availability == ::f::RuleAvailability::kListed ? kGood
+         : z.availability == ::f::RuleAvailability::kNoneDeclared
+             ? kInfo
+         : z.availability == ::f::RuleAvailability::kFunctionForm
+             ? kInfo
+             : kBad},
+        {"has_rows", !rows.empty()},
+        {"row_count", rows.size()},
+        {"detail", z.detail},
+        {"rows", rows},
+        {"default", def},
+    });
+  }
+  out["zone_count"] = zones.size();
+  out["rule_count"] = total;
+  out["zones"] = std::move(zones);
   out["empty_text"] =
       "fd has no zone programs loaded — nothing of the policy is in "
       "the packet path";

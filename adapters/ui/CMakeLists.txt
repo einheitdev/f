@@ -13,6 +13,7 @@ target_include_directories(einheit_ui_adapter_fw_views PUBLIC
 
 target_link_libraries(einheit_ui_adapter_fw_views PUBLIC
   libf-counters
+  libf-rules
   nlohmann_json::nlohmann_json
 )
 
