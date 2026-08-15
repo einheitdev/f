@@ -57,6 +57,14 @@ struct Activation {
   std::vector<std::string> networkd_changed;
   /// True when the generated dnsmasq artifact changed.
   bool dnsmasq_changed = false;
+  /// True when the model binds DHCP or DNS to at least one zone.
+  ///
+  /// Without it, an inactive `f-dnsmasq` cannot be read: on a box that
+  /// serves neither it is correct and expected, and on a box whose
+  /// operator has just bound a DHCP range to a zone it means the
+  /// service they asked for is being served by nobody. Those are
+  /// opposite facts and the report used to give them the same words.
+  bool serves_dhcp_or_dns = false;
 };
 
 /// Makes written artifacts take effect. Returns a description of what

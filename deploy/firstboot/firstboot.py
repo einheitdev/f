@@ -496,9 +496,13 @@ class Firstboot:
       f"{', '.join(units)}",
       "" if bound else
       "No zone binds dhcp, dns or ntp, so neither f-dnsmasq nor "
-      "f-chrony is enabled. Their units are installed; binding a "
-      "service in system.yaml and running `apply system` is what "
-      "turns them on.")
+      "f-chrony is enabled. Their units are installed. Binding a "
+      "service later — `set dhcp`, `set dns`, or editing "
+      "system.yaml and applying it — writes the config and does NOT "
+      "start the unit: this step is the only thing in the system "
+      "that enables one, and it runs once. After binding a service, "
+      "`systemctl enable --now f-dnsmasq` (or f-chrony), then "
+      "`einheit-f show services` to check ANSWERS ON.")
 
   def unit_state(self, unit):
     """What systemd says this unit is actually doing.

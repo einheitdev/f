@@ -152,12 +152,37 @@ auto DefaultActivator() -> Activator {
       }
       if (state == "active") {
         report += "f-dnsmasq restarted (active)";
-      } else if (state == "inactive") {
+      } else if (state == "inactive" && !act.serves_dhcp_or_dns) {
         // Legitimate on a box that serves neither DHCP nor DNS: the
         // config was written and nothing is running to read it. Said
         // plainly, because "restarted" implies something is serving.
         report += "f-dnsmasq config written, unit not running "
                   "(inactive)";
+      } else if (state == "inactive") {
+        // NOT legitimate, and until now it read identically to the
+        // case above. This model binds DHCP or DNS to a zone and
+        // nothing is serving it.
+        //
+        // `try-restart` is a no-op on a unit that was never started,
+        // and nothing else enables one: `systemctl enable --now`
+        // occurs in deploy/firstboot/firstboot.py and nowhere else in
+        // this tree, so the units are planned once at provisioning
+        // time from whatever the model bound THEN. A service bound
+        // afterwards — with `set dhcp`, with `set dns`, or by editing
+        // the file — is started by nobody, and firstboot's own
+        // parting message says that binding a service and running
+        // `apply system` is what turns them on. It is not.
+        //
+        // Naming the command is the interim. Closing it properly is a
+        // decision rather than a patch: either these verbs plan units
+        // the way firstboot does, or this apply enables them, or
+        // there is a verb. See the deployment walk of 2026-08-15.
+        report +=
+            "f-dnsmasq config written and the unit is NOT RUNNING, so "
+            "the DHCP/DNS this configuration binds is being served by "
+            "nobody. Nothing here enables it: `sudo systemctl enable "
+            "--now f-dnsmasq`, then `show services` to check ANSWERS "
+            "ON";
       } else {
         report += std::format(
             "f-dnsmasq config written but the unit is '{}' — it is "
@@ -339,6 +364,8 @@ auto SystemBackend::Apply(const cc::Candidate& candidate)
 
   Activation activation;
   activation.networkd_changed = net->changed;
+  activation.serves_dhcp_or_dns =
+      !parsed->dhcp.empty() || !parsed->dns.empty();
   if (sysctl->changed) {
     activation.networkd_changed.push_back(sysctl->unit.path);
   }
