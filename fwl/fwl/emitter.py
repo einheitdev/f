@@ -31,10 +31,27 @@ class MapScope(enum.Enum):
     bundle-wide by construction: keyed by a flow tuple, holding one
     unit-wide setting, or sized from a constant.
 
-  PRIVATE — the map's size, or the meaning of its indices, comes from
-    ONE zone's analysis. Two zones must never land on one kernel map,
-    so the name carries the zone (or the map is never pinned at all
-    and the object boundary isolates it).
+  PRIVATE — two zones must never land on one kernel map, so the name
+    carries the zone (or the map is never pinned at all and the object
+    boundary isolates it). There are two grounds for that, and only the
+    first was known when this enum was written:
+
+      * the map's size, or the meaning of its indices, comes from ONE
+        zone's analysis, so sharing it would make two zones report each
+        other's numbers (fwl_counters, fwl_log_sample, fwl_rl_map_N,
+        fwl_geoip_N);
+      * the map CANNOT be shared through bpffs at all, whatever its
+        contents mean. `fwl_devmap_<dest>` is the case: the kernel sets
+        BPF_F_RDONLY_PROG inside `dev_map_alloc` and libbpf's pin-reuse
+        check compares an object's declared `map_flags` (0) against the
+        pinned map's reported flags (128), which can never agree — so
+        the SECOND object to declare a pinned devmap fails to load.
+
+    The question the enum answers is the same in both cases — may two
+    zone objects of one bundle land on one kernel map? — so the second
+    ground did not need a third value. It needed the answer to stop
+    being derived from "are the contents bundle-wide", which is a
+    different question and is what put the devmap in SHARED.
 
   There is no third value and no default. A map that reaches the
   generated source without a scope is a hard compile error, because
@@ -213,18 +230,31 @@ _MAP_KINDS: tuple[_MapKind, ...] = (
     ),
   ),
   _MapKind(
-    r"fwl_devmap_\w+", MapScope.SHARED,
-    "named for its DESTINATION zone, so every zone redirecting there "
-    "must resolve to the same devmap (v0.4 § 6.3)",
+    r"fwl_devmap_\w+", MapScope.PRIVATE,
+    "never pinned, because a devmap CANNOT be reused through a pin: "
+    "the kernel forces BPF_F_RDONLY_PROG in dev_map_alloc (so the "
+    "verifier cannot let a program write through a devmap lookup) "
+    "while the object declares map_flags 0, and libbpf's pin-reuse "
+    "check compares the two — 0 against 128, which never agrees. So "
+    "the SECOND zone object to declare a pinned fwl_devmap_<dest> "
+    "fails to load, which is every gateway with two inside zones "
+    "behind one uplink. Declaring the flag does not help either: "
+    "DEV_CREATE_FLAG_MASK excludes it and creation returns -EINVAL. "
+    "Nothing is lost by dropping the pin: `fd` populates each "
+    "object's OWN copy from the manifest's redirects_to, so the "
+    "copies hold identical ifindexes without ever being one map "
+    "(v0.4 § 6.3)",
     lifetime=MapLifetime.POLICY,
     lifetime_why=(
-      "holds ifindexes the daemon resolves from THIS bundle's "
-      "manifest at every load. A zone interface that is not up yet is "
-      "skipped rather than written (interfaces may appear after "
-      "boot), so an adopted entry would survive un-overwritten and "
-      "redirect packets out of an interface the new policy never "
-      "named — the one stale-state failure here that misdirects "
-      "traffic instead of miscounting it"
+      "never pinned, so nothing of it reaches bpffs to be adopted — "
+      "and that costs nothing, because the daemon writes every slot "
+      "from THIS bundle's manifest at every load. The stale-state "
+      "failure this row used to guard against (an adopted entry "
+      "surviving un-overwritten, because a zone interface that is not "
+      "up yet is skipped rather than written, and redirecting packets "
+      "out of an interface the new policy never named) is now "
+      "unreachable rather than defended: an unpinned map dies with "
+      "the object that held it"
     ),
   ),
   _MapKind(
@@ -3290,13 +3320,21 @@ def _emit_devmaps(zones: list[str], pinned: bool) -> str:
 
   The daemon populates each devmap at load time with the destination
   zone's interface ifindex(es). The BPF program calls
-  bpf_redirect_map(&fwl_devmap_<zone>, 0, 0) (v0.4 § 6.3). In a
-  multi-zone bundle the devmaps are pinned by name so the daemon can
-  populate them once and every zone program sees the same map.
+  bpf_redirect_map(&fwl_devmap_<zone>, 0, 0) (v0.4 § 6.3).
+
+  A devmap is NEVER pinned, in a bundle or out of one — `_MAP_KINDS`
+  classifies it PRIVATE for that reason and `_check_map_scopes`
+  enforces it. Every zone object that redirects to `<dest>` declares
+  `fwl_devmap_<dest>`, so pinning by name made the SECOND such object
+  fail to load: the kernel forces BPF_F_RDONLY_PROG in dev_map_alloc
+  and libbpf's pin-reuse check compares that against the declared
+  map_flags of 0. `fd` fills each object's own copy from the manifest
+  (`FindMap(obj, "fwl_devmap_" + dest)` in the per-zone load loop), so
+  the copies agree without ever being one map.
+
+  `pinned` therefore governs only `_ROUTE_DECL`, the bundle-wide
+  routing tally emitted alongside them, which IS shared.
   """
-  pin = (
-    "\n  __uint(pinning, LIBBPF_PIN_BY_NAME);" if pinned else ""
-  )
   blocks: list[str] = []
   for z in zones:
     blocks.append(f"""\
@@ -3304,7 +3342,7 @@ struct {{
   __uint(type, BPF_MAP_TYPE_DEVMAP);
   __type(key, __u32);
   __type(value, __u32);
-  __uint(max_entries, 64);{pin}
+  __uint(max_entries, 64);
 }} fwl_devmap_{z} SEC(".maps");
 """)
   if blocks:

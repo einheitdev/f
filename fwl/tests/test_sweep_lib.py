@@ -291,3 +291,37 @@ def test_every_weak_witness_scenario_justifies_itself():
        scen.witness_note:
       unjustified.append(name)
   assert unjustified == []
+
+# --- planting into a file, and getting back out of it ------------------
+
+def test_two_edits_to_one_file_both_come_back_out(tmp_path):
+  """A plant must not outlive its own run, whatever its shape.
+
+  Found by running the sweep. `l2_08`'s plant is two FileSubs on one
+  file — the devmap's map-scope row and the devmap's declaration — and
+  the two shared one backup path: the second step copied the
+  ALREADY-PATCHED text over the first step's pristine copy, so the LIFO
+  restore put the half-planted file back and every later scenario
+  compiled against it. The sweep saw it (l2_08's baseline run could not
+  compile at all, reported `unrunnable`) and could not say why, which is
+  the same class of blindness the sweep exists to remove.
+
+  Asserted on the state that matters: the file after __exit__ is the
+  file before __enter__, byte for byte.
+  """
+  vacuity = pytest.importorskip('vacuity_sweep')
+  target = tmp_path / 'emitter.py'
+  original = 'alpha = 1\nbeta = 2\ngamma = 3\n'
+  target.write_text(original)
+  plant = sweep_lib.Plant(
+      ident='two-edits', defect='d',
+      steps=(sweep_lib.FileSub(path=str(target), find='alpha = 1',
+                               repl='alpha = 99'),
+             sweep_lib.FileSub(path=str(target), find='gamma = 3',
+                               repl='gamma = 77')))
+  with vacuity.PlantedEnv(plant) as env:
+    planted = target.read_text()
+    assert 'alpha = 99' in planted and 'gamma = 77' in planted
+    assert all(step['applied'] for step in env.applied)
+  assert target.read_text() == original
+  assert list(tmp_path.glob('*.sweepbak*')) == []

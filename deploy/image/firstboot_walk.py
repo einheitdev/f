@@ -494,13 +494,18 @@ def provision_document(ports):
   would look like a policy result.
 
   TWO zones, and the management port shares the inside one rather than
-  holding a third. That is not tidiness. `render_policy` gives every
-  non-uplink zone `masquerade` + `redirect to <uplink>`, so a third
-  zone means two zones declaring `fwl_devmap_wan`, and no such bundle
-  loads: the kernel forces BPF_F_RDONLY_PROG onto every devmap in
-  `dev_map_alloc` and rejects it at creation, so libbpf's pin-reuse
-  check compares 0 against 128 and refuses. Measured on the box; see
-  the open finding in context/image-boot-2026-08-15.md.
+  holding a third — a property of this bench (three NICs, one of them
+  the management path) and no longer of the product. `render_policy`
+  gives every non-uplink zone `masquerade` + `redirect to <uplink>`,
+  so a third zone means two zones declaring `fwl_devmap_wan`, and
+  while devmaps were pinned by name no such bundle loaded: the kernel
+  forces BPF_F_RDONLY_PROG in `dev_map_alloc`, so libbpf's pin-reuse
+  check compared the declared 0 against the pinned 128 and refused.
+  Devmaps are not pinned any more, and a three-zone gateway loads,
+  attaches and forwards from both inside zones
+  (`fwl/tests/system/three_zone_gateway_netns.py`). Giving this walk a
+  fourth NIC and a third zone is the remaining piece, and it is a
+  change to `vm.py`, not to the firewall.
   """
   by_mac = {mac: name for name, mac in ports.items()}
   return {

@@ -334,6 +334,31 @@ TEST(DecidePinFateTest, UndeclaredPersistentPinIsDroppedNotHoarded) {
             PinVerdict::kDiscard);
 }
 
+TEST(DecidePinFateTest, ADevmapPinLeftByAnOlderBundleIsSweptAway) {
+  // The upgrade path for the devmap reclassification, and the only
+  // thing on the daemon side that change touches.
+  //
+  // Until it, `fwl_devmap_<dest>` carried LIBBPF_PIN_BY_NAME, so a box
+  // that ran any redirecting policy has one in bpffs. A devmap cannot
+  // be reused from a pin at all — the kernel forces BPF_F_RDONLY_PROG
+  // in dev_map_alloc and libbpf's reuse check compares that against
+  // the object's declared map_flags of 0 — which is why the emitter
+  // stopped pinning them, and why the second inside zone of a gateway
+  // could not load. Bundles compiled since declare no such pin, so
+  // `declared` is null here, and the pin has to GO rather than be left
+  // to accumulate: it holds ifindexes of a policy that is no longer
+  // running, and nothing will ever overwrite it.
+  //
+  // Both paths, because a devmap pin outlives a process restart just
+  // as it outlives a reload.
+  auto have = SomeShape();
+  for (auto policy : {PinPolicy::kColdBoot, PinPolicy::kReload}) {
+    EXPECT_EQ(DecidePinFate("fwl_devmap_wan", kPersistent, nullptr,
+                            have, policy),
+              PinVerdict::kDiscard);
+  }
+}
+
 TEST(DecidePinFateTest, AnUnknownNameIsDiscarded) {
   // The sweep is an allowlist of what survives, not a blocklist of
   // what goes. A map added to the emitter and forgotten here is

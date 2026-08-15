@@ -17,7 +17,9 @@
 # tests/system/hw/l2_03_masquerade.sh. Bringing that witness down here
 # would need addresses on lan0/wan0 in the root namespace plus
 # ip_forward, and is worth doing: it would make the routed path
-# CI-testable, which today it is not.
+# CI-testable, which today it is not. DONE — three_zone_gateway_netns.py
+# in this directory is that witness, with real non-promiscuous sockets
+# either side and ip_forward=0 as its control.
 #
 #   ns lansrc                 root ns                    ns wandst
 #   --------                  -------                    --------
@@ -50,6 +52,10 @@ cleanup(){
   ip link del lan0 2>/dev/null; ip link del wan0 2>/dev/null
   ip netns del lansrc 2>/dev/null; ip netns del wandst 2>/dev/null
   rm -rf "$PIN" "$WORK" 2>/dev/null
+  # The devmaps are no longer pinned (the kernel's BPF_F_RDONLY_PROG
+  # makes a devmap pin unreusable, so the second zone object of a
+  # bundle could not load); a run from before that change may still
+  # have left one at the bpffs root.
   rm -f /sys/fs/bpf/fwl_devmap_wan /sys/fs/bpf/fwl_devmap_lan \
         /sys/fs/bpf/fwl_nat /sys/fs/bpf/fwl_nat_cfg /sys/fs/bpf/conntrack \
         2>/dev/null
@@ -103,8 +109,8 @@ ip netns exec lansrc ip link set dev lan0p xdpdrv obj "$WORK/xp.bpf.o" \
   obj "$WORK/xp.bpf.o" sec xdp || { fail "xdp_pass lan0p"; exit 1; }
 
 # --- 3. Cold-boot fd against the bundle ---------------------------
-"$FD" run --bundle-dir "$BUNDLE" --pin-path "$PIN" --socket "$SOCK" \
-  -i lan0 -l debug > "$WORK/fd.log" 2>&1 &
+"$FD" --bundle-dir "$BUNDLE" --pin-path "$PIN" --socket "$SOCK" \
+  -l debug run > "$WORK/fd.log" 2>&1 &
 FDPID=$!
 ok=0; for _ in $(seq 1 20); do
   ip link show lan0 | grep -q xdp && ip link show wan0 | grep -q xdp \

@@ -112,7 +112,16 @@ class PlantedEnv:
       self.applied.append({'step': step_no, 'kind': step.kind,
                            'applied': False, 'detail': 'no such file'})
       return
-    backup = step.path + '.sweepbak'
+    # One backup PER STEP, not per file. Two FileSubs on one file used
+    # to share `<path>.sweepbak`: the second overwrote the first's copy
+    # with the already-patched text, and the LIFO restore then put THAT
+    # back and left the file half-planted for every scenario after it.
+    # Found by running the sweep — l2_08's plant is two edits to
+    # emitter.py, and its baseline run failed to compile at all, which
+    # the sweep correctly reported as `unrunnable` and could not
+    # explain. A plant that outlives its own run is the same class as a
+    # test that cannot fail.
+    backup = '%s.sweepbak.%s' % (step.path, step_no)
     shutil.copy2(step.path, backup)
     with open(step.path) as fh:
       text = fh.read()
@@ -166,7 +175,10 @@ for ns in $(ip netns list 2>/dev/null | awk '{print $1}'); do
   case "$ns" in fguest|fserver|f*) ip netns del "$ns" 2>/dev/null || true;; esac
 done
 for dev in $(ip -o link show | awk -F': ' '{print $2}' | cut -d@ -f1); do
-  case "$dev" in mv*|vl*) ip link del "$dev" 2>/dev/null || true;; esac
+  # mv*/vl* are hw::host_up's macvlan and 802.1Q far hosts; fz3b is
+  # l2_08's veth zone, whose root-side end stays behind if that
+  # scenario dies before its own cleanup.
+  case "$dev" in mv*|vl*|fz3b*) ip link del "$dev" 2>/dev/null || true;; esac
 done
 for f in %(ifaces)s; do
   ip addr flush dev "$f" 2>/dev/null || true

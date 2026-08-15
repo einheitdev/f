@@ -773,6 +773,10 @@ switch chip's FDB/MAC learning picks the physical egress port.
 `redirect` does not open a conntrack entry in v0.4 (NAT-driven flow
 creation is Phase 5).
 
+**A devmap is never pinned**, and every zone object that redirects to `<dest>` therefore carries its own copy of `fwl_devmap_<dest>`, which the daemon fills from that object's own `redirects_to`. This is not a choice: a devmap **cannot** be reused from a bpffs pin. The kernel sets `BPF_F_RDONLY_PROG` inside `dev_map_alloc` — so the verifier cannot let a program write through a devmap lookup — while the object declares `map_flags 0`, and libbpf's pin-reuse check compares the two (0 against 128, which can never agree). Under the old bundle-global pin the SECOND zone object to declare `fwl_devmap_<dest>` failed to load with `couldn't reuse pinned map ...: parameter mismatch`, which made a gateway with two inside zones behind one uplink unloadable — the shape `deploy/firstboot` generates for every box with more than two ports. Declaring the flag in the emitter does not work either: `DEV_CREATE_FLAG_MASK` excludes it and map creation returns `-EINVAL`. Per-object copies cost nothing, because the contents are re-derived from the manifest at every load rather than carried between them.
+
+In the map registry (`emitter._MAP_KINDS`) this is `MapScope.PRIVATE` with no zone-qualified name — the same shape as `fwl_scratch` and `fwl_stages`, where the object boundary does the isolating — and `MapLifetime.POLICY`, which is now a statement that nothing of it reaches bpffs to be adopted rather than a rule about what may be. The two axes stay orthogonal: PRIVATE here is not "the contents belong to one zone" (they do not — every copy holds the same ifindexes) but "two zone objects must not land on one kernel map", which is the question `MapScope` actually asks.
+
 **`f` routes.** A redirect is not only an egress decision, it is a
 next-hop decision, and the two are not the same question. Through v0.4
 the emitted code was one `bpf_redirect_map()`, which forwards the frame

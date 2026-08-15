@@ -81,10 +81,38 @@ def test_daemon_derived_maps_are_not_inherited():
   daemon skips a zone interface that is not up yet rather than writing
   it, so an adopted devmap entry survives un-overwritten and redirects
   packets out of an interface the new policy never named.
+
+  For the devmap that hazard is now unreachable rather than defended
+  against — it is never pinned, so nothing of it reaches bpffs to be
+  adopted (see `test_a_devmap_is_never_pinned`). The lifetime answer is
+  the same either way, and it is asserted here for both because a
+  future change that pinned devmaps again must not also quietly make
+  them inheritable.
   """
   for name in ("fwl_nat_cfg", "fwl_devmap_wan"):
     assert emitter._map_kind(name).lifetime is emitter.MapLifetime.POLICY
     assert name not in emitter.persistent_map_names()
+
+
+def test_a_devmap_is_never_pinned():
+  """The other axis, and the reason it had to move.
+
+  A devmap is named for its DESTINATION zone, so every zone redirecting
+  there declares the same name — which reads like bundle-wide state and
+  is why the row said SHARED. It cannot be shared through bpffs at all:
+  the kernel sets BPF_F_RDONLY_PROG inside `dev_map_alloc` and libbpf's
+  pin-reuse check compares that against the object's declared
+  `map_flags` of 0, so the SECOND object to declare a pinned
+  `fwl_devmap_<dest>` fails to load with "parameter mismatch". That is
+  every gateway with two inside zones behind one uplink.
+
+  PRIVATE with no zone-qualified name is the same shape as fwl_scratch
+  and fwl_stages: the object boundary isolates it, and `fd` fills each
+  object's own copy from the manifest.
+  """
+  kind = emitter._map_kind("fwl_devmap_wan")
+  assert kind.scope is emitter.MapScope.PRIVATE
+  assert kind.private_name is None
 
 
 def test_log_ring_is_not_inherited():
@@ -155,14 +183,19 @@ def test_shared_pinned_maps_is_read_off_the_bundle(tmp_path):
   """And the neighbouring field states what the bundle really pins.
 
   `shared_pinned_maps` used to be the literal `["conntrack"]` for every
-  bundle: wrong for one that pins fwl_nat or a devmap as well, and
-  wrong for one whose policy never reads conntrack at all. Next to a
-  correct `persistent_maps` an incorrect neighbour is worse than none.
+  bundle: wrong for one that pins fwl_nat as well, and wrong for one
+  whose policy never reads conntrack at all. Next to a correct
+  `persistent_maps` an incorrect neighbour is worse than none.
+
+  It is also what the devmap reclassification had to change here: the
+  devmap is no longer pinned, so a manifest that still claimed it would
+  send `fd` reconciling bpffs against a name nothing will ever create.
   """
   from fwl import analyzer, cli, parser
   # Two zones, one redirecting into the other: pins conntrack (both
-  # read it), fwl_devmap_b and the routing tally every redirect now
-  # carries, and pins no NAT map.
+  # read it) and the routing tally every redirect now carries, and pins
+  # no NAT map. `fwl_devmap_b` is declared by zone a's object and is
+  # deliberately NOT here — it is never pinned.
   source = (
     "zone a = [e0]\n"
     "zone b = [e1]\n"
@@ -182,8 +215,12 @@ def test_shared_pinned_maps_is_read_off_the_bundle(tmp_path):
   # pins its own tally bundle-wide. A bundle whose policy asks no
   # conntrack question carries neither — asserted separately.
   assert manifest["shared_pinned_maps"] == [
-    "conntrack", "fwl_devmap_b", "fwl_egress_stats", "fwl_route_stats"
+    "conntrack", "fwl_egress_stats", "fwl_route_stats"
   ]
+  # The devmap really is in the bundle: the field is describing what is
+  # PINNED, not what is declared, so its absence has to be checked
+  # against a bundle that has one.
+  assert 'fwl_devmap_b SEC(".maps")' in (bundle / "a.bpf.c").read_text()
 
 
 def test_the_daemon_fallback_list_has_not_drifted():

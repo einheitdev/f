@@ -49,7 +49,9 @@ cleanup() {
   ip netns del lansrc 2>/dev/null
   ip netns del wandst 2>/dev/null
   rm -rf "$PIN" "$WORK" 2>/dev/null
-  # PIN_BY_NAME maps self-pin at the bpffs root; clear them too.
+  # PIN_BY_NAME maps self-pin at the bpffs root; clear them too. The
+  # devmaps are no longer among them, but a run from before that change
+  # may have left one behind.
   rm -f /sys/fs/bpf/fwl_devmap_wan /sys/fs/bpf/fwl_devmap_lan \
         /sys/fs/bpf/conntrack 2>/dev/null
 }
@@ -129,8 +131,8 @@ ip netns exec wandst ip link set dev wan0p xdpdrv \
 # fwl_devmap_wan with wan0's ifindex, attaches from_lan->lan0 and
 # from_wan->wan0. No bpftool, no manual devmap poke.
 log "starting fd (cold-boot multi-zone)..."
-"$FD" run --bundle-dir "$BUNDLE" --pin-path "$PIN" \
-  --socket "$SOCK" -i lan0 -l debug > "$WORK/fd.log" 2>&1 &
+"$FD" --bundle-dir "$BUNDLE" --pin-path "$PIN" \
+  --socket "$SOCK" -l debug run > "$WORK/fd.log" 2>&1 &
 FDPID=$!
 
 # Wait for fd to attach (poll for the XDP program on lan0).
@@ -149,12 +151,19 @@ grep -iE "zone|devmap|loaded|attach" "$WORK/fd.log" \
   | sed 's/^/[fd-test]   /'
 
 # Confirm fd (not the test) populated the redirect devmap.
-DEVMAP=/sys/fs/bpf/fwl_devmap_wan
-if [ -e "$DEVMAP" ]; then
-  val=$(bpftool map lookup pinned "$DEVMAP" key 0 0 0 0 2>/dev/null)
-  log "fwl_devmap_wan[0] = $val"
+#
+# There is no pin to look at: a devmap is never pinned, because the
+# kernel forces BPF_F_RDONLY_PROG in dev_map_alloc and libbpf's
+# pin-reuse check then refuses the second zone object that declares
+# fwl_devmap_<dest>. fd fills each object's OWN copy, so the daemon's
+# own line naming the destination and the interface count is what says
+# it happened — and the frame crossing, below, is what proves it.
+if grep -qE "zone 'lan' devmap -> 'wan' \\([1-9][0-9]* ifaces\\)" \
+     "$WORK/fd.log"; then
+  log "fd populated lan's devmap for zone wan"
 else
-  log "note: fwl_devmap_wan not at bpffs root (pinned under $PIN)"
+  fail "fd never reported populating lan's devmap for zone wan"
+  grep -i devmap "$WORK/fd.log" | sed 's/^/[fd-test]   /'
 fi
 
 # --- 4. Capture on wan0p, send TCP/80 from lansrc -------------------

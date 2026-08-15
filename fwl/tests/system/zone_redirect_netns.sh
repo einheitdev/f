@@ -37,7 +37,10 @@ cleanup() {
   ip netns del wandst 2>/dev/null
   rm -rf "$PIN" "$WORK" 2>/dev/null
   # PIN_BY_NAME maps self-pin at the bpffs root; clear them too.
-  rm -f /sys/fs/bpf/fwl_devmap_wan /sys/fs/bpf/conntrack 2>/dev/null
+  # A devmap is not one of them any more, but a run from before
+  # that change may have left one behind.
+  rm -f /sys/fs/bpf/fwl_devmap_wan /sys/fs/bpf/conntrack \
+        /sys/fs/bpf/fwl_route_stats 2>/dev/null
 }
 trap cleanup EXIT
 cleanup  # idempotent: clear any prior run
@@ -93,24 +96,34 @@ WAN_IFINDEX=$(cat /sys/class/net/wan0/ifindex)
 log "wan0 ifindex=$WAN_IFINDEX"
 
 # --- 3. Load the program, populate the devmap, attach ---------------
-# The devmap carries LIBBPF_PIN_BY_NAME, so it self-pins at the bpffs
-# root (/sys/fs/bpf/fwl_devmap_wan) during load — exactly the bpffs
-# pinning the multi-zone bundle relies on to share maps across zone
-# programs. The XDP program is pinned under $PIN.
+# The devmap does NOT self-pin. It used to carry LIBBPF_PIN_BY_NAME,
+# and that is exactly what could not work: the kernel forces
+# BPF_F_RDONLY_PROG inside dev_map_alloc, libbpf's pin-reuse check
+# compares the pinned map's flags (128) against the object's declared
+# map_flags (0), and the SECOND zone object of a bundle to declare
+# fwl_devmap_<dest> failed to load. fd fills each object's own copy
+# instead (see three_zone_gateway_netns.py). This test loads by hand
+# and has no fd, so it addresses the map by ID — the loaded program
+# holds a reference to it, which is all a devmap ever needs.
 bpftool prog loadall "$WORK/lan.bpf.o" "$PIN" \
   || { fail "bpftool loadall"; exit 1; }
 log "pinned program:"; ls "$PIN"
 
-DEVMAP=/sys/fs/bpf/fwl_devmap_wan
-[ -e "$DEVMAP" ] || { fail "devmap pin not found at $DEVMAP"; exit 1; }
+DEVMAP_ID=$(bpftool -j map show 2>/dev/null | python3 -c "
+import json, sys
+ids = [m['id'] for m in json.load(sys.stdin)
+       if m.get('name') == 'fwl_devmap_wan']
+print(ids[-1] if ids else '')
+")
+[ -n "$DEVMAP_ID" ] || { fail "no fwl_devmap_wan map after load"; exit 1; }
 
 # devmap value is a __u32 ifindex (4 bytes, little-endian).
 b0=$(( WAN_IFINDEX & 0xff )); b1=$(( (WAN_IFINDEX>>8) & 0xff ))
 b2=$(( (WAN_IFINDEX>>16) & 0xff )); b3=$(( (WAN_IFINDEX>>24) & 0xff ))
-bpftool map update pinned "$DEVMAP" \
+bpftool map update id "$DEVMAP_ID" \
   key 0 0 0 0 value "$b0" "$b1" "$b2" "$b3" \
   || { fail "devmap update"; exit 1; }
-log "fwl_devmap_wan[0] = wan0 ($WAN_IFINDEX)"
+log "fwl_devmap_wan[0] = wan0 ($WAN_IFINDEX), map id $DEVMAP_ID"
 
 # Native XDP: firewall on lan0, dummy pass on wan0p (veth redirect
 # target needs XDP on the receiving peer for ndo_xdp_xmit).

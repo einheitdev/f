@@ -40,6 +40,38 @@ from sweep_lib import UnitDropIn
 PIN = '/sys/fs/bpf/f'
 RECV_IF = os.environ.get('RECV_IF', 'enp1s0f1')
 WAN_IF = os.environ.get('WAN_IF', 'enp1s0f2')
+# The compiler as it is installed on the rig. Planting into the EMITTER
+# is a last resort — every other plant here edits a policy, a unit or a
+# config — but the l2_08 defect lives in a map-scope decision and there
+# is nowhere else to put it. FileSub backs the file up and restores it,
+# and hw::restore_smoke recompiles /etc/f/rules.fw from the EXIT trap of
+# every scenario, so a plant cannot outlive its run.
+EMITTER_PY = '/opt/fwl/fwl/emitter.py'
+
+# "The edit was made" and "the defect is present" are different claims,
+# so this verification asks the COMPILER rather than the file: it emits
+# a two-inside-zone bundle and requires a devmap to come out carrying
+# LIBBPF_PIN_BY_NAME. Grepping emitter.py for that string would pass
+# unplanted — it appears in `_maybe_pin`, in `_check_map_scopes` and in
+# three error messages. It also catches a HALF-applied plant: restoring
+# the pin without also restoring MapScope.SHARED makes emit_bundle raise
+# (a PRIVATE map with no zone-qualified name may not be pinned), which
+# is the guard working rather than the defect reproduced, and the plant
+# is then reported unrunnable instead of being mistaken for a verdict.
+DEVMAP_PIN_VERIFY = r'''python3 - <<'PYEOF'
+import re, sys
+sys.path[:0] = ['/opt/fwl', '/opt/fwl-deps']
+from fwl import analyzer, emitter, parser
+src = ("zone a = [e0]\nzone b = [e1]\nzone w = [e2]\n"
+       "@xdp(a)\nredirect to w\n@xdp(b)\nredirect to w\n@xdp(w)\nallow\n")
+files = emitter.emit_bundle(analyzer.analyze(parser.parse(src)))
+rx = re.compile(r'struct\s*\{([^{}]*)\}\s*(\w+)\s*SEC\("\.maps"\);')
+sys.exit(0 if any(
+    name.startswith('fwl_devmap_') and 'LIBBPF_PIN_BY_NAME' in body
+    for text in files.values() if isinstance(text, str)
+    for body, name in rx.findall(text)) else 1)
+PYEOF
+'''
 
 # A stand-in compiler for the l3_06 plant. fd's watcher runs whatever
 # `watch.fwl` names, so pointing it here makes every commit — including
@@ -332,6 +364,72 @@ SCENARIOS = {s.name: s for s in [
                       find='redirect to wan if pkt.src_ip == 10.99.33.5',
                       repl='allow if pkt.src_ip == 10.99.33.5')])],
        timeout_s=300),
+
+    _s('l2_08_three_zone_gateway',
+       'two inside zones behind ONE uplink load, attach and forward — '
+       'the shape firstboot generates for any box with more than two '
+       'ports, and the shape that could not be loaded at all',
+       # Plant order matters: `sweep_scenario` runs `plants[0]` and no
+       # other, so the FIRST plant is the one the sweep actually asks.
+       # It is the forwarding one on purpose. `devmap-pinned-again`
+       # stops the bundle loading, so the scenario dies in hw::deploy
+       # and none of its twenty-odd wire assertions is exercised — red,
+       # but red via abort, which says nothing about whether those
+       # assertions can go red. This plant leaves the bundle loading
+       # and attaching and breaks only what reaches the far side, which
+       # is the rule this file states at the top.
+       [_p('second-zone-redirects-nowhere',
+           'zone inb redirects into the OTHER inside zone instead of '
+           'the uplink. The bundle still loads and attaches, so every '
+           'wire assertion is reached and has to answer. It takes BOTH '
+           'zones down, not one, and the reason is worth recording: '
+           '`fwl_nat_cfg` is ONE bundle-wide slot, written once per '
+           'masquerading zone, so redirecting inb somewhere else made '
+           'it resolve 10.99.31.1 and overwrite the 10.99.210.2 zone '
+           'ina had just written. Measured in fd\'s own journal',
+           # Matches the address whether it is still spelled as the
+           # script's shell variable (preflight reads the script) or
+           # already expanded (the plant rewrites the file the compiler
+           # is handed).
+           [PolicySub(tag='l2-08', regex=True,
+                      find=r'^redirect to wanz if pkt\.src_ip == '
+                           r'(?:\$GUEST_B|10\.99\.32\.5)$',
+                      repl='redirect to ina if pkt.src_ip == 10.99.32.5')],
+           residual='a devmap silently holding the WRONG ifindex '
+                    'cannot be planted from the bench: the daemon '
+                    'derives it from the manifest, so reaching it '
+                    'needs a mutated fd'),
+        _p('devmap-pinned-again',
+           'the devmap goes back to being a bundle-global pin. The '
+           'kernel forces BPF_F_RDONLY_PROG in dev_map_alloc, so '
+           'libbpf\'s pin-reuse check compares the object\'s declared '
+           'map_flags of 0 against the pinned map\'s 128 and refuses; '
+           'the SECOND inside zone object fails to load and the '
+           'bundle never attaches. This is the original defect '
+           'restored, in the one place it lived',
+           [FileSub(path=EMITTER_PY,
+                    find="    r\"fwl_devmap_\\w+\", MapScope.PRIVATE,",
+                    repl="    r\"fwl_devmap_\\w+\", MapScope.SHARED,"),
+            FileSub(path=EMITTER_PY,
+                    find='  __uint(max_entries, 64);\n'
+                         '}} fwl_devmap_{z} SEC(".maps");',
+                    repl='  __uint(max_entries, 64);\n'
+                         '  __uint(pinning, LIBBPF_PIN_BY_NAME);\n'
+                         '}} fwl_devmap_{z} SEC(".maps");')],
+           # Both halves are needed and neither alone plants the
+           # defect: restoring the pin without the classification
+           # fails `_check_map_scopes` at COMPILE time (a PRIVATE map
+           # with no zone-qualified name may not carry
+           # LIBBPF_PIN_BY_NAME), which is the guard working rather
+           # than the defect reproduced.
+           verify=DEVMAP_PIN_VERIFY,
+           residual='NOT RUN BY THE SWEEP — only plants[0] is. Run by '
+                    'hand on 2026-08-15 and DISCRIMINATING (red via '
+                    'abort, fd refusing the bundle with libbpf\'s '
+                    '"map_flags 0 vs 128" in the journal). It kills '
+                    'the LOAD, so it never reaches the forwarding '
+                    'assertions; the first plant does the opposite')],
+       timeout_s=600),
 
     # ---------------- Layer 3: the daemon lifecycle ----------------
     _s('l3_01_hot_reload',

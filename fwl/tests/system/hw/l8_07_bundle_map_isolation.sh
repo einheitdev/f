@@ -4,7 +4,7 @@
 # Every zone object in a bundle is loaded under ONE bpffs pin root, so
 # a map carrying LIBBPF_PIN_BY_NAME resolves by NAME to a single kernel
 # map shared by every zone. That is correct for state which is
-# bundle-global by construction (conntrack, fwl_nat, the devmaps) and
+# bundle-global by construction (conntrack, fwl_nat, the tallies) and
 # wrong for state whose size and index meaning come from one zone's
 # own analysis (counters, log-sample accumulators). Sharing the latter
 # breaks in two ways, and only one of them is loud:

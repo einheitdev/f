@@ -320,10 +320,34 @@ class TestDeclaredScopes:
 
   def test_cross_zone_state_is_shared(self):
     for base in ("conntrack", "fwl_nat", "fwl_nat_cfg",
-                 "fwl_log_events", "fwl_devmap_wan"):
+                 "fwl_log_events"):
       kind = emitter._map_kind(base)
       assert kind is not None
       assert kind.scope is emitter.MapScope.SHARED
+
+  def test_a_devmap_is_private_because_it_cannot_be_shared(self):
+    """The one row where the two questions come apart.
+
+    A devmap's CONTENTS are bundle-wide — every zone redirecting to
+    `<dest>` wants the same ifindexes — and that is why the row said
+    SHARED. But MapScope answers a narrower question: may two zone
+    objects land on one kernel map? For a devmap the kernel says no.
+    `dev_map_alloc` forces BPF_F_RDONLY_PROG, libbpf's pin-reuse check
+    compares the pinned map's flags (128) against the object's declared
+    `map_flags` (0), and the second object to declare a pinned
+    `fwl_devmap_<dest>` fails to load — which is every gateway with two
+    inside zones behind one uplink. Declaring the flag fails earlier
+    still: DEV_CREATE_FLAG_MASK excludes it and creation returns
+    -EINVAL.
+
+    So it is PRIVATE with no zone-qualified name, like fwl_scratch: the
+    object boundary isolates it, and `fd` fills each object's own copy
+    from the manifest's `redirects_to`.
+    """
+    kind = emitter._map_kind("fwl_devmap_wan")
+    assert kind is not None
+    assert kind.scope is emitter.MapScope.PRIVATE
+    assert kind.private_name is None
 
   def test_every_kind_states_why(self):
     # The rationale is the part a reader checks a new map against.

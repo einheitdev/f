@@ -786,15 +786,18 @@ def render_policy(model, uplink_zone=None,
   port, which is a narrow hole with a name — and it closes the day the
   egress hook lands and host-originated flows get tracked.
 
-  KNOWN LIMIT, measured and not fixed: with `uplink_zone` named and
-  more than one other zone, every one of them gets `redirect to
-  <uplink>` and so declares `fwl_devmap_<uplink>`, and no such bundle
-  loads. The kernel forces BPF_F_RDONLY_PROG onto every devmap in
-  `dev_map_alloc` and rejects it at creation, so libbpf's pin-reuse
-  check compares the declared 0 against the pinned 128 and refuses
-  with "parameter mismatch". A box provisioned that way comes up with
-  `fd` in auto-restart. Two zones are fine; three are not. See
-  context/image-boot-2026-08-15.md in the f-rig workspace.
+  A multi-zone gateway used to be unloadable, and this is where it was
+  generated: with `uplink_zone` named and more than one other zone,
+  every one of them gets `redirect to <uplink>` and so declares
+  `fwl_devmap_<uplink>`. While devmaps were pinned by name the SECOND
+  such object failed to load — the kernel forces BPF_F_RDONLY_PROG in
+  `dev_map_alloc`, so libbpf's pin-reuse check compared the object's
+  declared 0 against the pinned map's 128 and refused with "parameter
+  mismatch" — and a box provisioned that way came up with `fd` in
+  auto-restart. Devmaps are no longer pinned (FWL_V04_SPEC.md 6.3);
+  `fd` fills each object's own copy. Three zones load, attach and
+  forward, proved on the wire by
+  `fwl/tests/system/three_zone_gateway_netns.py`.
 
   Args:
     model: The parsed system.yaml.

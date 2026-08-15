@@ -151,12 +151,21 @@ def test_a_redirect_through_a_helper_reaches_the_manifest(tmp_path):
     "def w(pkt):\n"
     "  allow\n"
   )
-  manifest = _manifest(source, tmp_path)
+  program = analyzer.analyze(parser.parse(source))
+  bundle = tmp_path / "bundle"
+  cli._emit_bundle_dir(program, bundle)
+  manifest = json.loads((bundle / "manifest.json").read_text())
   by_zone = {p["zone"]: p["redirects_to"] for p in manifest["programs"]}
   assert by_zone["lan"] == ["wan"]
-  # And the devmap it names is really in the bundle, so the manifest is
-  # describing the object rather than agreeing with itself.
-  assert "fwl_devmap_wan" in manifest["shared_pinned_maps"]
+  # And the devmap it names is really in the object, so the manifest is
+  # describing what was compiled rather than agreeing with itself. Read
+  # off the generated source and not off `shared_pinned_maps`: a devmap
+  # is never pinned (it cannot be — the kernel forces BPF_F_RDONLY_PROG
+  # and libbpf's pin reuse then refuses the second object that declares
+  # it), so the pin list is the wrong witness for "the map exists".
+  assert 'fwl_devmap_wan SEC(".maps")' in (bundle / "lan.bpf.c").read_text()
+  assert not any(n.startswith("fwl_devmap_")
+                 for n in manifest["shared_pinned_maps"])
 
 
 def test_conntrack_is_absent_when_nothing_needs_it(tmp_path):

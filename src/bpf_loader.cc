@@ -917,8 +917,13 @@ auto LoadZoneBundle(std::string_view bundle_dir,
                     bundle_dir, attachable.size(), Join(wanted)));
   }
 
-  // Common pin root so LIBBPF_PIN_BY_NAME maps (conntrack, devmaps)
-  // resolve to one kernel map across every zone object. Fails without
+  // Common pin root so LIBBPF_PIN_BY_NAME maps (conntrack, fwl_nat,
+  // the tallies) resolve to one kernel map across every zone object.
+  // NOT the devmaps: a devmap cannot be reused from a pin at all (the
+  // kernel forces BPF_F_RDONLY_PROG in dev_map_alloc and libbpf
+  // compares that against the object's declared map_flags of 0), so
+  // the compiler leaves them unpinned and each object gets its own —
+  // populated below, per object, from the manifest. Fails without
   // privileges (bpffs is root-owned) — surface that as a load error
   // rather than an exception.
   std::string pin_root_str(pin_root);
@@ -1147,6 +1152,15 @@ auto LoadZoneBundle(std::string_view bundle_dir,
 
     // Populate each redirect destination's devmap with that zone's
     // egress ifindexes (key i -> ifindex of the i-th interface).
+    //
+    // THIS object's copy, and that is the whole reason devmaps are not
+    // pinned. Two inside zones redirecting to one uplink both declare
+    // `fwl_devmap_<uplink>`; under a bundle-global pin the second one
+    // failed to load ("parameter mismatch", map_flags 0 vs 128 — the
+    // kernel forces BPF_F_RDONLY_PROG in dev_map_alloc and libbpf's
+    // reuse check compares it), which is every gateway with more than
+    // one inside zone. This loop already fills each object separately,
+    // so the copies agree without ever being one map.
     for (const auto& dest : p.value("redirects_to", json::array())) {
       std::string dest_zone = dest.get<std::string>();
       // A destination the plan does not know is a manifest naming a

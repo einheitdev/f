@@ -22,8 +22,12 @@
 #   do the CONTENTS still mean anything under the next policy? Only
 #     flow-keyed state does — conntrack and fwl_nat, keyed by a tuple
 #     no policy defines. Counters, log-sample accumulators, geoip
-#     tries, rate-limit buckets, devmaps and the log ring are all
-#     numbered, sized or populated by one compilation.
+#     tries, rate-limit buckets and the log ring are all numbered,
+#     sized or populated by one compilation. (A devmap is populated by
+#     one compilation too, and no longer reaches this question at all:
+#     it is never pinned, because the kernel's forced
+#     BPF_F_RDONLY_PROG makes a devmap pin unreusable. A pin left by
+#     an older bundle is still discarded here.)
 #
 #   does the DEFINITION still match what the incoming bundle declares?
 #     Adopting without checking would put the -EINVAL back through the
