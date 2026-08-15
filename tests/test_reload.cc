@@ -1,9 +1,10 @@
 /// @file test_reload.cc
 /// @brief Unit tests for the reload pipeline.
 ///
-/// Covers deterministic pieces: manifest/rules.json parsing,
-/// subprocess envelope handling. Full end-to-end reload against
-/// a live BPF engine is covered in the integration test.
+/// Covers deterministic pieces: manifest parsing, the multi-zone
+/// routing signal, and subprocess envelope handling. Full end-to-end
+/// reload against a live BPF engine is covered in the integration
+/// test.
 
 #include <gtest/gtest.h>
 
@@ -28,11 +29,9 @@ auto WriteFile(const fs::path& p, std::string_view body) -> void {
 }
 
 auto MakeBundleDir(const fs::path& base,
-                   const json& manifest,
-                   const json& rules) -> fs::path {
+                   const json& manifest) -> fs::path {
   auto dir = base / "bundle";
   WriteFile(dir / "manifest.json", manifest.dump());
-  WriteFile(dir / "rules.json", rules.dump());
   return dir;
 }
 
@@ -69,10 +68,7 @@ TEST(ReloadApplyBundle, MissingVersionInManifest) {
   auto tmp = fs::temp_directory_path()
            / "fwl_reload_test_no_version";
   fs::remove_all(tmp);
-  auto dir = MakeBundleDir(tmp,
-      json{{"has_program", false}},
-      json{{"rules", json::array()},
-           {"default_action", 0}});
+  auto dir = MakeBundleDir(tmp, json{{"programs", json::array()}});
   Engine e;
   auto res = ApplyBundle(e, dir.string());
   EXPECT_FALSE(res);
@@ -81,57 +77,31 @@ TEST(ReloadApplyBundle, MissingVersionInManifest) {
   fs::remove_all(tmp);
 }
 
-TEST(ReloadApplyBundle, MissingRulesJsonFails) {
+TEST(ReloadApplyBundle, AManifestWithNoProgramsIsRefused) {
+  // `fwl compile --bundle` cannot write this: the grammar is
+  // `program : zone_decl* function_def* xdp_block+`, so every bundle
+  // names at least one @xdp program. A manifest without one came from
+  // somewhere else, and what used to happen here was that ApplyBundle
+  // fell through to the v0.1 rules.json/ApplyConfig tail and reported
+  // success with `rules_installed: 0`. It refuses now, by name, and
+  // says the running policy is untouched.
   auto tmp = fs::temp_directory_path()
-           / "fwl_reload_test_no_rules";
+           / "fwl_reload_test_no_programs";
   fs::remove_all(tmp);
-  fs::create_directories(tmp);
-  WriteFile(tmp / "manifest.json",
-            json{{"version", "v1"}}.dump());
+  auto dir = MakeBundleDir(tmp, json{{"version", "20260414T000000Z"},
+                                     {"programs", json::array()}});
   Engine e;
-  auto res = ApplyBundle(e, tmp.string());
-  EXPECT_FALSE(res);
-  EXPECT_EQ(res.error().code,
-            ReloadError::kRulesInvalid);
-  fs::remove_all(tmp);
-}
-
-TEST(ReloadApplyBundle, ParsesRulesAndVersion) {
-  // With no BPF loaded, ApplyConfig tolerates bad update_elem
-  // calls and returns the count of successful inserts (0 here).
-  // This lets us validate rules.json parsing + version flow
-  // without needing a live kernel.
-  auto tmp = fs::temp_directory_path()
-           / "fwl_reload_test_parse_ok";
-  fs::remove_all(tmp);
-  auto dir = MakeBundleDir(tmp,
-      json{{"version", "20260414T000000Z"}},
-      json{{"default_action", 0},
-           {"rules", json::array({
-              json{{"type", "exact"},
-                   {"key", json{{"dst_port", 8080},
-                                {"proto", 6}}},
-                   {"value", json{{"action", 0}}}},
-              // CIDR entry — skipped by current apply path.
-              json{{"type", "cidr"},
-                   {"field", "src_net"},
-                   {"addr", 0x0A000000u},
-                   {"prefix", 8},
-                   {"value", json{{"action", 0}}}},
-           })}});
-
-  Engine e;  // uninitialized; no real BPF
   auto res = ApplyBundle(e, dir.string());
-  ASSERT_TRUE(res);
-  EXPECT_EQ(res->version, "20260414T000000Z");
-  // Update_elem failed silently; installed stays at 0.
-  EXPECT_EQ(res->rules_installed, 0u);
-  EXPECT_FALSE(res->program_updated);
+  ASSERT_FALSE(res);
+  EXPECT_EQ(res.error().code, ReloadError::kManifestInvalid);
+  EXPECT_NE(res.error().message.find("no @xdp programs"),
+            std::string::npos)
+      << res.error().message;
   fs::remove_all(tmp);
 }
 
-// v0.4 § 6.2: the routing signal ApplyBundle/EngineInit use to send a
-// bundle to LoadZoneBundle (multi-zone) vs the single-program path.
+// v0.4 § 6.2: the routing signal ApplyBundle and EngineInit use to
+// decide whether a directory holds a loadable bundle at all.
 TEST(ZoneBundleRouting, MultiZoneManifestDetected) {
   auto tmp = fs::temp_directory_path() / "fwl_multizone_detect";
   fs::remove_all(tmp);
@@ -149,10 +119,14 @@ TEST(ZoneBundleRouting, MultiZoneManifestDetected) {
   fs::remove_all(tmp);
 }
 
-TEST(ZoneBundleRouting, SingleProgramManifestNotMultiZone) {
+TEST(ZoneBundleRouting, AV01ManifestIsNotABundle) {
   auto tmp = fs::temp_directory_path() / "fwl_singleprog_detect";
   fs::remove_all(tmp);
-  // The legacy single-program manifest has no zones/programs arrays.
+  // A v0.1 manifest, as staged on boxes deployed before v0.4. It named
+  // one `main.bpf.o` and no zones. It is not a bundle, and the answer
+  // is now terminal rather than a route into a second loader: EngineInit
+  // refuses to start on it and ApplyBundle leaves the running policy
+  // alone.
   json manifest = {
       {"version", "20260414T000000Z"},
       {"has_program", true},

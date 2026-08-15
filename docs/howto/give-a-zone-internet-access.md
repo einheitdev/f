@@ -63,8 +63,10 @@ After that, the everyday changes have verbs — `einheit-f show policy lan` numb
 ```
 $ einheit-f show zones      # both ports attached, and in which XDP mode
 $ einheit-f show nat        # translations appear as traffic flows
-$ einheit-f show counters   # rule hit counts move
+$ einheit-f show conntrack  # flows appear as the bench opens them
 ```
+
+There is no counter view. `count` writes into `fwl_counters_<zone>` and no verb reads it — see [5. Observability](../fwl/05-observability.md).
 
 From a bench machine, resolve a name and fetch something. Then look at it from this side:
 

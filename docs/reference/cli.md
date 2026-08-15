@@ -102,15 +102,11 @@ NTP has no verb yet; see the gaps at the bottom of this page.
 | Command | |
 |---|---|
 | `show status` | Daemon status, uptime, attach state. |
-| `show firewall` | Program overview. |
-| `show firewall rules` | Per-rule detail with hit counts. |
-| `show counters` | Named counters from the BPF program. |
 | `show zones` | Zones, their interfaces, attach state and XDP mode. |
 | `show nat` | Active translations and the masquerade source. |
 | `show conntrack` | Connection-tracking table entries. |
 | `show interfaces` | Interfaces, addresses, counters. |
 | `reload firewall` | Recompile the policy and hot-reload it. A policy that does not compile is never loaded. |
-| `clear counters` | Reset per-rule counters. |
 | `show log` | Recent daemon log entries. |
 | `logs [--follow]` | Daemon logs from the journal. |
 
@@ -150,7 +146,7 @@ Three things about these are decisions rather than details.
 
 **A forward is one edit, not two.** `dnat` rewrites the destination and falls through; `redirect` is what emits the frame into the inside zone. A `redirect` whose guard is wider than its `dnat`'s sends untranslated frames inside, so the pair is always written together with one guard, character for character. The inside zone is derived from `system.yaml` — the model knows which segment an address is in, so you are not asked and cannot get it wrong.
 
-`show policy` reads the file on disk. That is the source, not necessarily what is loaded; `show firewall` and `show zones` report what `fd` has attached, and the page says so under every listing.
+`show policy` reads the file on disk. That is the source, not necessarily what is loaded; `show zones` reports what `fd` has attached, and the page says so under every listing.
 
 For anything these verbs cannot express — a helper, a rate limit, a chain, a condition with an `or` in it — the language is [fwl/](../fwl/README.md) and the file is still a file. The verbs are the changes you make weekly, not a front end for the language.
 
@@ -196,7 +192,7 @@ Recorded here because a reader looking for one of these should find out it does 
 - **NTP has no verb.** `services.ntp` — the upstreams and whether the box answers NTP for a zone — is the one service block still edited with an editor. `show time` reads it; nothing writes it.
 - **`gateway:` and `address6:` have no verb.** A default route on a static interface and the v6 prefix a `ra` zone advertises are both editor-only. `set zone <name> ra` is therefore refused on a zone with no v6 prefix (`SC031`) and there is no verb that adds one — the message is correct and the way out of it is the file.
 - **`set rule` covers a conjunction and nothing else.** Every term it takes is `and`-ed together. An `or`, a rate limit, a helper, a chain, a `log`, a `count`, a conntrack state or a rule at a chosen position all need the language and the file. This is a deliberate boundary, not a stub: `set rule` is for the changes that happen weekly.
-- **`show firewall rules` is not zone-scoped.** The bundle does not yet carry per-zone rule metadata, so rules are listed flat even when the policy has several zones. `show policy` *is* zone-scoped, but it reads the source rather than the loaded program.
+- **Nothing reads the loaded program's counters.** `count` in a policy compiles to a slot in that zone's `fwl_counters_<zone>` map, and no verb prints it; `bpftool map dump pinned /sys/fs/bpf/f/fwl_counters_<zone>` is the only way, and it gives slot numbers rather than the names you wrote. Four verbs used to sit here — `show firewall`, `show firewall rules`, `show counters`, `clear counters` — and every one of them addressed the v0.1 single-program datapath instead: a separate `counters` map, keyed by match tier rather than by rule, that no v0.4 bundle has. On a real box `show firewall` printed a fixed `default_action drop / active_table 0 / conntrack disabled / rule_count 0` regardless of the policy, and the other three were refused by the daemon. They are removed rather than left answering. `show policy` reads the source and is zone-scoped; `show zones` reads the loaded bundle.
 - **`no rule` on one half of a port forward is allowed.** It names the survivor in a warning — a `redirect` without its `dnat` sends untranslated frames into the inside zone — but it does not refuse. Use `no forward` for the pair.
 - **The UI has no view for `show leases`, `show device`, `show ipv6`, `show time`, `show storage`, `show policy`, or a pending confirm window.** Those exist only on the CLI.
 - **An unrecognised `--option` becomes a command token.** The CLI accepts extra arguments so that command words can reach the shell, so `einheit-f --no-such-flag show system` reports `no matching command` rather than an unknown option.

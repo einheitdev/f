@@ -1,5 +1,7 @@
 # f — eBPF Firewall Design
 
+> **This document describes the v0.1 design, and roughly half of it no longer exists.** The single-program datapath it is written around — `bpf/fw.bpf.c`, the `rules_a`/`rules_b`/`cidr_a`/`cidr_b` A/B tables, the `[4B LE length][payload]` Unix-socket protocol, `kApplyConfig` and its siblings, the `/api/v1/...` REST surface and the ring-buffer slow path — was removed on `f-appliance` once it was established that no deployed box could reach any of it except by losing its bundle, and that losing its bundle produced a firewall that allowed everything. It is kept because the reasoning behind the parts that survived (the component pattern, the shared-types discipline, the zero-loss XDP swap) is written down here and nowhere else. For what the daemon does today, read `CLAUDE.md`, `include/f/bpf_loader.h` and `docs/`.
+
 ## Overview
 
 `f` is a data-plane eBPF firewall managed by a userspace daemon (`fd`).

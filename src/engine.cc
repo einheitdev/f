@@ -60,21 +60,6 @@ auto CurrentTimeS() -> uint64_t {
           .count());
 }
 
-auto ResolveIfindex(std::string_view name) -> int {
-  return static_cast<int>(
-      if_nametoindex(std::string(name).c_str()));
-}
-
-auto FlushMap(int map_fd) -> void {
-  char key[256];
-  char next_key[256];
-  while (bpf_map_get_next_key(
-             map_fd, nullptr, next_key) == 0) {
-    std::memcpy(key, next_key, sizeof(key));
-    bpf_map_delete_elem(map_fd, key);
-  }
-}
-
 auto ProtoName(uint8_t proto) -> std::string {
   switch (proto) {
     case 1: return "icmp";
@@ -125,29 +110,6 @@ auto XdpMode(int ifindex) -> std::string {
   }
 }
 
-// What the daemon says when a handler is asked about the v0.1
-// single-program datapath and that datapath is not loaded.
-//
-// `rules_a`/`rules_b`, `config` and `counters` belong to
-// bpf/fw.bpf.c. Every v0.4 deployment is a bundle: EngineInit takes
-// the multi-zone branch, never assigns `e.bpf`, and every descriptor
-// in it stays at its -1 default. The handlers below then read a
-// descriptor nothing ever opened and answered "no rules loaded",
-// "no counters active", "cleared 0" — success, on a box whose
-// `fwl_counters_<zone>` map is counting every frame on the wire.
-// An empty answer from a datapath that was never asked is the same
-// defect as a wrong number: it is confident and it is not about
-// anything.
-constexpr const char* kNoLegacyDatapath =
-    "this daemon is running a v0.4 zone bundle, which has no "
-    "single-program rule table and no `counters` map — the per-zone "
-    "counters live in fwl_counters_<zone>; read them with "
-    "`fctl status` or `f show status`";
-
-auto NoLegacyDatapath() -> std::string {
-  return json({{"error", kNoLegacyDatapath}}).dump();
-}
-
 auto HandleRequest(Engine& e, const std::string& req_str)
     -> std::string {
   if (req_str.empty()) {
@@ -165,211 +127,6 @@ auto HandleRequest(Engine& e, const std::string& req_str)
                     std::memory_order_release);
       return R"({"ok":true})";
     }
-    case Cmd::kApplyConfig: {
-      if (req_str.size() <= 1) {
-        return R"({"error":"missing config payload"})";
-      }
-      // ApplyConfig writes into `e.bpf.rules_a_fd` / `config_fd`.
-      // With no single-program datapath those are -1, every
-      // bpf_map_update_elem fails EBADF, the loop's `continue`
-      // swallows it and the reply is `{"rules_installed":0}` with no
-      // error — a 200 from `PUT /api/v1/rules` for a write that
-      // reached nothing. Refuse instead of counting to zero.
-      if (e.bpf.rules_a_fd < 0 || e.bpf.config_fd < 0) {
-        return NoLegacyDatapath();
-      }
-      try {
-        auto j = json::parse(
-            req_str.begin() + 1, req_str.end());
-        ConfigMsg msg{};
-        msg.default_action =
-            j.value("default_action", 1);
-        msg.conntrack_enabled =
-            j.value("conntrack_enabled", 0);
-        msg.conntrack_timeout_s =
-            j.value("conntrack_timeout_s", 300);
-        auto& rules_arr = j["rules"];
-        msg.rule_count =
-            static_cast<uint32_t>(rules_arr.size());
-
-        std::vector<std::byte> rule_data;
-        for (const auto& r : rules_arr) {
-          RuleKey key{};
-          key.src_addr = r.value("src_addr", 0u);
-          key.dst_addr = r.value("dst_addr", 0u);
-          key.src_port = r.value("src_port", 0);
-          key.dst_port = r.value("dst_port", 0);
-          key.proto = r.value("proto", 0);
-          RuleValue val{};
-          val.action = r.value("action", 0);
-          val.rate_pps = r.value("rate_pps", 0u);
-          auto* kp = reinterpret_cast<
-              const std::byte*>(&key);
-          rule_data.insert(
-              rule_data.end(), kp, kp + sizeof(key));
-          auto* vp = reinterpret_cast<
-              const std::byte*>(&val);
-          rule_data.insert(
-              rule_data.end(), vp, vp + sizeof(val));
-        }
-        auto res = ApplyConfig(e, msg, rule_data);
-        if (res) {
-          return json({{"rules_installed", *res}}).dump();
-        }
-        return json({{"error",
-            res.error().message}}).dump();
-      } catch (const std::exception& ex) {
-        return json({{"error", ex.what()}}).dump();
-      }
-    }
-    case Cmd::kGetFirewall: {
-      json j;
-      j["default_action"] =
-          e.current_config.default_action == 0
-              ? "drop" : "allow";
-      j["active_table"] = e.current_config.active_table;
-      j["conntrack"] =
-          e.current_config.conntrack_enabled != 0;
-      auto status = GetStatus(e);
-      j["rule_count"] = status.rule_count;
-      return j.dump();
-    }
-    case Cmd::kGetRules: {
-      // No single-program datapath, no single-program rule table.
-      // The old answer was `[]`, which the CLI renders as "no rules
-      // loaded" — a statement about the operator's policy, made by a
-      // handler that never looked at it.
-      if (e.bpf.rules_a_fd < 0 && e.bpf.rules_b_fd < 0) {
-        return NoLegacyDatapath();
-      }
-      auto rules_res = GetRules(e);
-      if (!rules_res) {
-        return json({{"error",
-            rules_res.error().message}}).dump();
-      }
-      json arr = json::array();
-      uint32_t idx = 0;
-      for (const auto& [key, val] : *rules_res) {
-        // No `packets`/`bytes` here, and that is the fix rather than
-        // a gap in it. This handler used to report `counters[idx]`
-        // beside the rule at iteration position `idx`, but
-        // bpf/fw.bpf.c never keys `counters` by a rule index: it
-        // increments `counters[0]` for every packet it sees and
-        // `counters[k+1]` for the MATCH TIER k (0 = full 5-tuple,
-        // 1 = wildcard source port, ...). So rule 0 carried the
-        // total-traffic count, rules 1..5 carried per-tier counts
-        // aggregated over whichever rules matched at that tier, and
-        // every rule from the sixth on read zero. Nine numbers, each
-        // beside the wrong rule, each looking authoritative.
-        //
-        // There is no per-rule count in this datapath to report, so
-        // reporting none is the honest answer; `kGetCounters` gives
-        // the tier counters under their own ids, which is what they
-        // are.
-        char src[INET_ADDRSTRLEN], dst[INET_ADDRSTRLEN];
-        inet_ntop(AF_INET, &key.src_addr, src,
-                  sizeof(src));
-        inet_ntop(AF_INET, &key.dst_addr, dst,
-                  sizeof(dst));
-        std::string action_str =
-            val.action == 0 ? "drop"
-            : val.action == 1 ? "allow"
-            : "rate-limit";
-        std::string proto_str =
-            key.proto == 0 ? "any"
-            : key.proto == 1 ? "icmp"
-            : key.proto == 6 ? "tcp"
-            : key.proto == 17 ? "udp"
-            : std::to_string(key.proto);
-        std::string action_sem =
-            action_str == "allow" ? "good"
-            : action_str == "drop" ? "bad"
-            : "warn";
-        arr.push_back({
-            {"idx", idx},
-            {"src", std::string(src)},
-            {"dst", std::string(dst)},
-            {"src_port", key.src_port},
-            {"dst_port", key.dst_port},
-            {"proto", proto_str},
-            {"action", action_str},
-            {"action_semantic", action_sem},
-        });
-        idx++;
-      }
-      return arr.dump();
-    }
-    case Cmd::kGetCounters: {
-      // The bound comes from the map. A literal 256 here against a
-      // map declared with 10000 slots hid every counter from 256 up:
-      // it accrued packets and bytes that no status and no counters
-      // request could surface. Deriving it is what stops the two
-      // disagreeing again — there is one number now and the kernel
-      // owns it.
-      uint32_t slots = CountersMapSlots(e.bpf.counters_fd);
-      if (slots == 0) {
-        return NoLegacyDatapath();
-      }
-      int ncpus = libbpf_num_possible_cpus();
-      if (ncpus < 1) ncpus = 1;
-      json arr = json::array();
-      for (uint32_t i = 0; i < slots; i++) {
-        std::vector<RuleCounter> per_cpu(ncpus);
-        if (bpf_map_lookup_elem(
-                e.bpf.counters_fd, &i,
-                per_cpu.data()) != 0) {
-          // Every in-range lookup on a per-CPU array succeeds, so
-          // this is an anomaly, not the end of the map. Breaking
-          // here is what truncation looks like from the inside;
-          // say so and keep reading.
-          spdlog::warn(
-              "counters: slot {} of {} could not be read: {}",
-              i, slots, std::strerror(errno));
-          continue;
-        }
-        uint64_t pkts = 0, bytes = 0;
-        for (int c = 0; c < ncpus; c++) {
-          pkts += per_cpu[c].packets;
-          bytes += per_cpu[c].bytes;
-        }
-        if (pkts == 0 && bytes == 0) continue;
-        arr.push_back({
-            {"id", i}, {"packets", pkts},
-            {"bytes", bytes},
-        });
-      }
-      return arr.dump();
-    }
-    case Cmd::kClearCounters: {
-      uint32_t slots = CountersMapSlots(e.bpf.counters_fd);
-      if (slots == 0) {
-        return NoLegacyDatapath();
-      }
-      int ncpus = libbpf_num_possible_cpus();
-      if (ncpus < 1) ncpus = 1;
-      std::vector<RuleCounter> zeros(ncpus);
-      uint32_t cleared = 0;
-      uint32_t failed = 0;
-      for (uint32_t i = 0; i < slots; i++) {
-        if (bpf_map_update_elem(
-                e.bpf.counters_fd, &i, zeros.data(),
-                BPF_ANY) != 0) {
-          failed++;
-          continue;
-        }
-        cleared++;
-      }
-      // A partial clear reported as `{"cleared": N}` is an operator
-      // told the counters are zero while some of them are not. If
-      // any slot kept its value, that is the answer.
-      if (failed > 0) {
-        return json({{"error",
-            std::format("cleared {} of {} counter slots; {} could "
-                        "not be written",
-                        cleared, slots, failed)}}).dump();
-      }
-      return json({{"cleared", cleared}}).dump();
-    }
     case Cmd::kReloadProg: {
       // Recompile the configured source and hot-swap it. On any
       // failure (compile error, invalid bundle) ReloadFromSource
@@ -382,7 +139,6 @@ auto HandleRequest(Engine& e, const std::string& req_str)
       return json({
           {"status", "reloaded"},
           {"version", r->version},
-          {"rules_installed", r->rules_installed},
           {"program_updated", r->program_updated},
       }).dump();
     }
@@ -527,18 +283,6 @@ auto HandleRequest(Engine& e, const std::string& req_str)
 
 }  // namespace
 
-auto CountersMapSlots(int counters_fd) -> uint32_t {
-  if (counters_fd < 0) return 0;
-  struct bpf_map_info info = {};
-  uint32_t len = sizeof(info);
-  if (bpf_obj_get_info_by_fd(counters_fd, &info, &len) != 0) {
-    // A descriptor we hold and cannot describe. Returning a guessed
-    // bound here is how the 256 got in; the callers report it.
-    return 0;
-  }
-  return info.max_entries;
-}
-
 auto HandleControlRequest(Engine& e, const std::string& req)
     -> std::string {
   return HandleRequest(e, req);
@@ -637,7 +381,6 @@ auto AttachNatMgr(Engine& e) -> void {
 
 auto EngineInit(Engine& e,
                 std::string_view sock_addr,
-                std::span<const std::string> ifaces,
                 std::string_view pin_path,
                 std::string_view bundle_dir)
     -> std::expected<void, Error<EngineError>> {
@@ -646,21 +389,39 @@ auto EngineInit(Engine& e,
   e.start_time_s = CurrentTimeS();
   e.state.store(EngineState::kStarting);
 
-  // v0.4 § 6.2 cold-boot: when the operator has staged a *multi-zone*
-  // bundle at <bundle_dir>/current, load every zone program and attach
-  // them per-zone from the manifest's interface lists. This is the
-  // multi-program analogue of the single-program path below; the
-  // per-zone objects carry their policy compiled in and share the
-  // bpffs-pinned conntrack map, so there is no single fw.bpf.o to pin
-  // or attach.
+  // v0.4 § 6.2 cold-boot: load every zone program in the bundle staged
+  // at <bundle_dir>/current and attach them per-zone from the
+  // manifest's interface lists. The per-zone objects carry their policy
+  // compiled in and share the bpffs-pinned conntrack map.
+  //
+  // There is no other branch. A second one used to sit below this,
+  // loading the v0.1 `fw.bpf.o` when no bundle was staged, and what it
+  // produced was a running daemon enforcing a policy nobody wrote:
+  // `default_action = ALLOW`, attached, READY, and green in every view
+  // the operator has. Refusing here is the same rule the zero-attach
+  // check applies one level down — the daemon does not come up unless
+  // the configured policy is in the packet path.
   std::string current_dir;
   if (!bundle_dir.empty()) {
     current_dir =
         (std::filesystem::path(bundle_dir) / "current").string();
   }
-  bool multi_zone =
-      !current_dir.empty() && IsMultiZoneBundle(current_dir);
-  if (multi_zone) {
+  if (current_dir.empty()) {
+    return MakeError(EngineError::kInvalidConfig,
+        "no bundle directory configured: fd loads its policy from "
+        "<bundle-dir>/current and has nothing else to load. Set "
+        "--bundle-dir (default /usr/share/f/compiled).");
+  }
+  if (!IsMultiZoneBundle(current_dir)) {
+    return MakeError(EngineError::kBpfLoadFailed,
+        std::format(
+            "{} is not a compiled bundle: no manifest.json, or one "
+            "naming no @xdp programs. Compile the policy with `fwl "
+            "compile <src> --bundle <dir>` and point `current` at it. "
+            "Refusing to start rather than run a policy nobody wrote.",
+            current_dir));
+  }
+  {
     spdlog::info("Cold-boot: loading multi-zone bundle from {}...",
                  current_dir);
     // A pin outlives the process that made it. bpffs holds a reference,
@@ -749,66 +510,6 @@ auto EngineInit(Engine& e,
                  e.zone_bundle.programs.size(), e.ifaces.count);
   }
 
-  // Load BPF program. When the operator has staged a bundle at
-  // <bundle_dir>/current, the cold-boot path picks it up; otherwise
-  // we fall back to the built-in search list.
-  if (!multi_zone) {
-  spdlog::info("Loading BPF program...");
-  auto bpf_res = LoadProgram(bundle_dir);
-  if (!bpf_res) {
-    return MakeError(EngineError::kBpfLoadFailed,
-        bpf_res.error().message);
-  }
-  e.bpf = *bpf_res;
-  spdlog::info("BPF program loaded.");
-
-  // Pin maps.
-  auto pin_res = PinMaps(e.bpf, e.pin_path);
-  if (!pin_res) {
-    spdlog::warn("Pin maps failed: {} — continuing.",
-                 pin_res.error().message);
-  } else {
-    // Make pinned maps world-readable for the CLI and UI.
-    auto bpffs = std::filesystem::path(e.pin_path)
-                     .parent_path();
-    chmod(bpffs.c_str(), 0755);
-    chmod(e.pin_path.c_str(), 0755);
-    for (const auto& entry :
-         std::filesystem::directory_iterator(e.pin_path)) {
-      chmod(entry.path().c_str(), 0644);
-    }
-    spdlog::info("Maps pinned to {}.", e.pin_path);
-  }
-
-  // Populate components with map fds.
-  e.rules.rules_a_fd = e.bpf.rules_a_fd;
-  e.rules.rules_b_fd = e.bpf.rules_b_fd;
-  e.rules.config_fd = e.bpf.config_fd;
-  e.rules.counters_fd = e.bpf.counters_fd;
-  e.conntrack.map_fd = e.bpf.conntrack_fd;
-
-  // Attach to interfaces.
-  for (const auto& name : ifaces) {
-    int idx = ResolveIfindex(name);
-    if (idx == 0) {
-      spdlog::warn("Interface {} not found.", name);
-      continue;
-    }
-    auto att_res = AttachXdp(e.bpf, idx);
-    if (!att_res) {
-      spdlog::error("Attach {} failed: {}",
-                    name, att_res.error().message);
-      continue;
-    }
-    auto& entry = e.ifaces.interfaces[e.ifaces.count];
-    entry.ifindex = idx;
-    std::strncpy(entry.name, name.c_str(),
-                 sizeof(entry.name) - 1);
-    e.ifaces.count++;
-    spdlog::info("XDP attached to {} (ifindex={}).",
-                 name, idx);
-  }
-  }  // end single-program path (!multi_zone)
 
   // ZMQ control socket.
   try {
@@ -916,16 +617,15 @@ auto EngineRun(Engine& e, std::stop_token stop)
                     e.ifaces.count));
   }
 
-  // Start slow path thread if ring buffer available.
-  if (e.bpf.events_fd >= 0) {
-    if (SlowPathInit(
-            e.slow_path, e.bpf.events_fd, e.bpf)) {
-      e.slow_path_thread = std::jthread(
-          [&e](std::stop_token st) {
-            SlowPathRun(e.slow_path, st);
-          });
-    }
-  }
+  // The v0.1 ring-buffer slow path started here, gated on
+  // `e.bpf.events_fd`, which only the single-program loader ever set —
+  // so on every bundle deployment it never started, and `fctl status`
+  // reported `slow_path: {events: 0, allowed: 0, denied: 0}` as if it
+  // had. It is gone with the datapath that fed it. The bundle's own
+  // ring buffer is `fwl_log_events`, a different mechanism with a
+  // different ABI, and nothing consumes it yet — which the
+  // observability page says rather than implying otherwise with a
+  // counter that is structurally zero.
 
   while (!stop.stop_requested() &&
          e.state.load(std::memory_order_acquire) !=
@@ -1004,13 +704,6 @@ auto EngineRun(Engine& e, std::stop_token stop)
 
 auto EngineStop(Engine& e) -> void {
   WatcherStop(e.watcher);
-  // Stop slow path.
-  if (e.slow_path_thread.joinable()) {
-    e.slow_path_thread.request_stop();
-    e.slow_path_thread.join();
-  }
-  SlowPathStop(e.slow_path);
-
   spdlog::info("Detaching XDP.");
   // Detach what is actually attached, not what was attached at
   // startup. `e.ifaces` is populated once in EngineInit; a reload
@@ -1023,10 +716,6 @@ auto EngineStop(Engine& e) -> void {
   // tests/system/hw/l8_05_stale_ifaces.sh.
   if (!e.zone_bundle.programs.empty()) {
     DetachZoneBundle(e.zone_bundle);
-  } else {
-    for (uint32_t i = 0; i < e.ifaces.count; i++) {
-      DetachXdp(e.ifaces.interfaces[i].ifindex);
-    }
   }
   e.ctrl_socket.reset();
   e.zmq_ctx.reset();
@@ -1038,100 +727,6 @@ auto EngineStop(Engine& e) -> void {
   spdlog::info("Engine stopped.");
 }
 
-auto ApplyConfig(Engine& e, const ConfigMsg& msg,
-                 std::span<const std::byte> rule_data)
-    -> std::expected<uint32_t, Error<EngineError>> {
-  uint8_t standby =
-      e.rules.active_table == 0 ? 1 : 0;
-  int rules_fd = standby == 0
-                     ? e.bpf.rules_a_fd
-                     : e.bpf.rules_b_fd;
-  FlushMap(rules_fd);
-
-  size_t entry_size = sizeof(RuleKey) + sizeof(RuleValue);
-  uint32_t inserted = 0;
-  for (uint32_t i = 0; i < msg.rule_count; i++) {
-    size_t off = i * entry_size;
-    if (off + entry_size > rule_data.size()) {
-      break;
-    }
-    RuleKey key;
-    RuleValue val;
-    std::memcpy(&key, rule_data.data() + off,
-                sizeof(key));
-    std::memcpy(&val,
-                rule_data.data() + off + sizeof(key),
-                sizeof(val));
-    int err = bpf_map_update_elem(
-        rules_fd, &key, &val, BPF_ANY);
-    if (err) {
-      continue;
-    }
-    inserted++;
-  }
-
-  e.rules.active_table = standby;
-  e.current_config.active_table = standby;
-  e.current_config.default_action = msg.default_action;
-  e.current_config.conntrack_enabled =
-      msg.conntrack_enabled;
-  e.current_config.conntrack_timeout_s =
-      msg.conntrack_timeout_s;
-  e.conntrack.enabled = msg.conntrack_enabled != 0;
-  e.conntrack.timeout_s = msg.conntrack_timeout_s;
-
-  uint32_t cfg_key = 0;
-  bpf_map_update_elem(e.bpf.config_fd, &cfg_key,
-                      &e.current_config, BPF_ANY);
-  spdlog::info("Applied {} rules, table={}.",
-               inserted, standby);
-  return inserted;
-}
-
-auto GetRules(const Engine& e)
-    -> std::expected<
-        std::vector<std::pair<RuleKey, RuleValue>>,
-        Error<EngineError>> {
-  int map_fd = e.rules.active_table == 0
-                   ? e.bpf.rules_a_fd
-                   : e.bpf.rules_b_fd;
-  std::vector<std::pair<RuleKey, RuleValue>> rules;
-  if (map_fd < 0) return rules;
-  RuleKey key{}, next{};
-  RuleValue val{};
-  while (bpf_map_get_next_key(
-             map_fd, &key, &next) == 0) {
-    if (bpf_map_lookup_elem(
-            map_fd, &next, &val) == 0) {
-      rules.emplace_back(next, val);
-    }
-    key = next;
-  }
-  return rules;
-}
-
-auto GetStatus(const Engine& e) -> StatusResponse {
-  StatusResponse s{};
-  s.pid = static_cast<uint32_t>(getpid());
-  s.uptime_s = CurrentTimeS() - e.start_time_s;
-  s.active_table = e.rules.active_table;
-  s.iface_count = e.ifaces.count;
-  int map_fd = e.rules.active_table == 0
-                   ? e.bpf.rules_a_fd
-                   : e.bpf.rules_b_fd;
-  if (map_fd >= 0) {
-    uint32_t count = 0;
-    RuleKey key{}, next{};
-    while (bpf_map_get_next_key(
-               map_fd, &key, &next) == 0) {
-      count++;
-      key = next;
-    }
-    s.rule_count = count;
-  }
-  return s;
-}
-
 auto GetFullState(const Engine& e) -> nlohmann::json {
   json j;
 
@@ -1140,7 +735,16 @@ auto GetFullState(const Engine& e) -> nlohmann::json {
   j["uptime_s"] = CurrentTimeS() - e.start_time_s;
 
   // Each component reports its own state.
-  j["rules"] = e.rules.GetState();
+  //
+  // There is no `rules` section. It came from `RuleTable::GetState()`,
+  // which walked `rules_a`/`rules_b` and reported the total counter —
+  // maps that only the v0.1 single-program datapath ever had. On every
+  // bundle box it answered `{"active_table":"A","count":0,"rules":[]}`
+  // and the CLI rendered `active_table A` / `rule_count 0` beside a
+  // policy with dozens of rules in it. A section that is structurally
+  // empty is not a smaller truth than the real one; it is a different
+  // claim, and it is false. `show zones` and `show policy` are where
+  // the loaded policy is reported.
   j["interfaces"] = e.ifaces.GetState();
   j["conntrack"] = e.conntrack.GetState();
   // The NAT table had no section here at all, which is why a map with
@@ -1161,45 +765,7 @@ auto GetFullState(const Engine& e) -> nlohmann::json {
   // every counter climbing and nothing anywhere saying why (l12_01).
   j["egress"] = e.egress.GetState();
 
-  // Slow path stats.
-  j["slow_path"] = {
-      {"events", e.slow_path.events_received},
-      {"allowed", e.slow_path.connections_allowed},
-      {"denied", e.slow_path.connections_denied},
-  };
-
   return j;
-}
-
-auto OpenPinnedMaps(std::string_view pin_path)
-    -> std::expected<BpfHandles, Error<BpfError>> {
-  std::string base(pin_path);
-  BpfHandles h;
-
-  struct MapOpen {
-    int* fd;
-    const char* name;
-  };
-  MapOpen maps[] = {
-      {&h.rules_a_fd, "rules_a"},
-      {&h.rules_b_fd, "rules_b"},
-      {&h.cidr_a_fd, "cidr_a"},
-      {&h.cidr_b_fd, "cidr_b"},
-      {&h.conntrack_fd, "conntrack"},
-      {&h.counters_fd, "counters"},
-      {&h.config_fd, "config"},
-  };
-
-  for (auto& m : maps) {
-    std::string path = base + "/" + m.name;
-    *m.fd = bpf_obj_get(path.c_str());
-    if (*m.fd < 0) {
-      return MakeError(BpfError::kMapLookupFailed,
-          std::format("bpf_obj_get {} failed: {}",
-                      path, strerror(errno)));
-    }
-  }
-  return h;
 }
 
 }  // namespace f

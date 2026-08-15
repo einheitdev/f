@@ -12,12 +12,15 @@
 namespace einheit::adapters::fw {
 
 /// Configuration for the f UI adapter.
+///
+/// No pin path: every page reads the daemon over `fd_socket`. The
+/// adapter used to open the pinned maps itself, which is how it came to
+/// carry its own copy of the v0.1 per-rule-counter defect, unreached by
+/// the fix on the daemon side.
 struct FwUiConfig {
-  /// bpffs pin path where fd pins its maps.
-  std::string pin_path = "/sys/fs/bpf/f";
   /// Raw ZMQ IPC endpoint for fd's control socket.
   std::string fd_socket = "ipc:///run/f/control.sock";
-  /// Counter sampling interval in milliseconds.
+  /// Live-view sampling interval in milliseconds.
   int sample_interval_ms = 1000;
 };
 

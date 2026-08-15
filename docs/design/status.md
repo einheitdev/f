@@ -1,5 +1,7 @@
 # f — Current State
 
+> **Snapshot from 2026-04-14, kept as a record rather than maintained.** Much of what it lists as working is gone: `bpf/fw.bpf.c`, `libf-api`, the `f-api` daemon, the slow path, and the cold-boot fallback whose consequences the "Known gaps" section below guessed at and understated. `f-appliance` removed all of it after measuring what the fallback did on a real box — it came up ALLOWING everything while reporting success. `docs/` is the current documentation set; this page is history.
+
 Snapshot of what exists in the repo today (2026-04-14). Companion to `doc/design.md` and `doc/fwl.md`, which describe the vision. This doc describes reality.
 
 ## What f is today

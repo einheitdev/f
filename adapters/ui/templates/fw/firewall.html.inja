@@ -1,6 +1,0 @@
-<section class="card">
-  <h2 class="card-title">firewall rules</h2>
-  <div class="card-body" id="rules-table">
-    {% include "fw/rules_table" %}
-  </div>
-</section>

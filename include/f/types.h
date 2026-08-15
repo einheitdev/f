@@ -28,12 +28,6 @@ typedef __u64 uint64_t;
 #ifdef __cplusplus
 namespace f {
 
-enum class Action : uint8_t {
-  kDrop = 0,
-  kAllow = 1,
-  kRateLimit = 2,
-};
-
 enum class Proto : uint8_t {
   kAny = 0,
   kIcmp = 1,
@@ -42,12 +36,6 @@ enum class Proto : uint8_t {
 };
 
 #else
-
-enum Action {
-  ACTION_DROP = 0,
-  ACTION_ALLOW = 1,
-  ACTION_RATE_LIMIT = 2,
-};
 
 enum Proto {
   PROTO_ANY = 0,
@@ -61,35 +49,6 @@ enum Proto {
 // ============================================================================
 // Shared structs — identical layout in C and C++.
 // ============================================================================
-
-/// LPM trie key for CIDR matching.
-struct LpmKey {
-  uint32_t prefixlen;
-  uint32_t addr;
-};
-
-/// Exact-match rule key (5-tuple).
-struct RuleKey {
-  uint32_t src_addr;
-  uint32_t dst_addr;
-  uint16_t src_port;
-  uint16_t dst_port;
-  uint8_t proto;
-  uint8_t pad[3];
-};
-
-/// Rule action and parameters.
-struct RuleValue {
-  uint8_t action;
-  uint8_t pad[3];
-  uint32_t rate_pps;
-};
-
-/// Per-rule packet/byte counters (per-CPU array element).
-struct RuleCounter {
-  uint64_t packets;
-  uint64_t bytes;
-};
 
 /// Connection tracking key.
 struct ConnKey {
@@ -227,46 +186,12 @@ struct FwlNatCfg {
   uint32_t masq_addr;
 };
 
-/// Global firewall config (array map, 1 entry).
-struct FwConfig {
-  uint8_t default_action;
-  uint8_t active_table;
-  uint8_t conntrack_enabled;
-  uint8_t pad;
-  uint32_t conntrack_timeout_s;
-};
-
-// ============================================================================
-// Ring buffer event — XDP → slow path.
-// ============================================================================
-
-#ifdef __cplusplus
-enum class EventType : uint8_t {
-  kNewConn = 1,
-  kRateExceeded = 2,
-  kUnknownProto = 3,
-};
-#else
-enum EventType {
-  EVENT_NEW_CONN = 1,
-  EVENT_RATE_EXCEEDED = 2,
-  EVENT_UNKNOWN_PROTO = 3,
-};
-#endif
-
-/// Fixed-size event sent from XDP to userspace.
-struct Event {
-  uint8_t type;
-  uint8_t proto;
-  uint16_t src_port;
-  uint16_t dst_port;
-  uint16_t pkt_len;
-  uint32_t src_addr;
-  uint32_t dst_addr;
-  uint64_t timestamp_ns;
-  // First 64 bytes of L4+ payload for inspection.
-  uint8_t payload[64];
-};
+// `LpmKey`, `RuleKey`, `RuleValue`, `RuleCounter`, `FwConfig`, `Action`,
+// `Event` and `EventType` were here. They described the map and ring
+// ABI of `bpf/fw.bpf.c`, the v0.1 single-program datapath, and went
+// with it. Everything left is the ABI of what the FWL emitter actually
+// generates, so a layout change here is a real compiler/daemon
+// disagreement rather than a rule about a program nothing loads.
 
 #ifdef __cplusplus
 }  // namespace f

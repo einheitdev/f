@@ -20,52 +20,25 @@ struct bpf_object;
 
 namespace f {
 
-/// File descriptors for all BPF maps and the program.
-struct BpfHandles {
-  int prog_fd = -1;
-  int rules_a_fd = -1;
-  int rules_b_fd = -1;
-  int cidr_a_fd = -1;
-  int cidr_b_fd = -1;
-  int conntrack_fd = -1;
-  int counters_fd = -1;
-  int config_fd = -1;
-  int events_fd = -1;
-};
-
-/// Load the BPF program and return map file descriptors.
-///
-/// `bundle_dir` is the parent of the `current` symlink the
-/// reload pipeline maintains (`/usr/share/f/compiled` by default).
-/// When set, `<bundle_dir>/current/main.bpf.o` is tried first;
-/// otherwise the loader falls back to the built-in fw.bpf.o
-/// search paths. Empty string disables the bundle path entirely
-/// (used by tests that want the v0.1 search behaviour).
-auto LoadProgram(std::string_view bundle_dir = "")
-    -> std::expected<BpfHandles, Error<BpfError>>;
-
-/// Load a single XDP program from a specific object path. Used by the
-/// hot-reload path to stage a new program before atomically swapping
-/// it in. Unlike LoadProgram this ignores the cold-boot search list and
-/// keeps its own bpf_object alive (close it via UnloadProgram), so the
-/// running program is untouched until the swap succeeds.
-auto LoadProgramFromPath(std::string_view obj_path)
-    -> std::expected<BpfHandles, Error<BpfError>>;
-
-/// Close the bpf_object a prior LoadProgramFromPath opened for `h`
-/// (looked up by prog_fd). No-op when `h` was not produced by
-/// LoadProgramFromPath.
-auto UnloadProgram(const BpfHandles& h) -> void;
-
-/// Resolve which BPF object the loader will pick, without
-/// actually opening it. Returns the empty string when nothing on
-/// the search list exists. Exposed for unit tests; the live
-/// loader uses the same logic.
-auto ResolveBpfObjPath(std::string_view bundle_dir) -> std::string;
-
-/// Attach the XDP program to an interface.
-auto AttachXdp(const BpfHandles& h, int ifindex)
-    -> std::expected<void, Error<BpfError>>;
+// There was a second datapath here: `LoadProgram`, `BpfHandles` and a
+// search list ending in `/usr/lib/f/fw.bpf.o`, loading the v0.1
+// single-program `bpf/fw.bpf.c` when no multi-zone bundle was staged.
+// It is gone, and the whole point of removing it rather than repairing
+// it is what it did when it ran. Measured on deb-03 against master
+// `dc0b0fc`: with `current` moved aside, `fd` loaded
+// `/usr/lib/f/fw.bpf.o`, attached it to a real NIC in native mode,
+// reported READY to systemd, and passed every packet — because
+// `LoadProgram` seeded the config map with `default_action = kAllow`
+// so that the daemon "would not lock itself out before rules are
+// configured". A firewall whose fallback is ALLOW is worse than a
+// firewall that will not start: `systemctl status` said active,
+// `show zones` said attached, and nothing anywhere said the policy on
+// that box was not the operator's.
+//
+// A bundle that cannot be loaded is now a daemon that refuses to run.
+// That is the same rule the zero-interface fix established one level
+// down (BUGLOG #43): there is no configuration in which "up, and not
+// enforcing the configured policy" is the correct outcome.
 
 /// Detach the XDP program from an interface.
 auto DetachXdp(int ifindex)
@@ -77,15 +50,6 @@ auto DetachXdp(int ifindex)
 /// to attach without the replace constraint. The zero-drop hot-reload
 /// primitive used by ApplyBundle's single-program swap.
 auto ReplaceXdp(int ifindex, int new_prog_fd, int old_prog_fd)
-    -> std::expected<void, Error<BpfError>>;
-
-/// Pin all maps to bpffs for persistence across restarts.
-auto PinMaps(const BpfHandles& h,
-             std::string_view pin_path)
-    -> std::expected<void, Error<BpfError>>;
-
-/// Remove pinned maps from bpffs.
-auto UnpinMaps(std::string_view pin_path)
     -> std::expected<void, Error<BpfError>>;
 
 // --- v0.4 § 6.2 multi-zone bundle loading ---------------------------
@@ -151,8 +115,8 @@ struct ZoneBundleHandles {
 /// exist on the host is skipped with a warning (interfaces may appear
 /// after boot), not treated as a fatal error.
 ///
-/// This is the multi-program analogue of LoadProgram + AttachXdp; the
-/// per-program load/attach/devmap mechanism is exercised end-to-end by
+/// This is the only way a policy is loaded; the per-program
+/// load/attach/devmap mechanism is exercised end-to-end by
 /// tests/system/zone_redirect_netns.sh.
 ///
 /// `replace`: a previously loaded bundle whose programs are still

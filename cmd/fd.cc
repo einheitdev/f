@@ -29,20 +29,6 @@ void SignalHandler(int) {
   g_interrupted.store(true, std::memory_order_release);
 }
 
-auto ParseInterfaces(const std::string& s)
-    -> std::vector<std::string> {
-  std::vector<std::string> out;
-  size_t start = 0;
-  while (start < s.size()) {
-    size_t end = s.find(',', start);
-    if (end == std::string::npos) end = s.size();
-    auto t = s.substr(start, end - start);
-    if (!t.empty()) out.push_back(t);
-    start = end + 1;
-  }
-  return out;
-}
-
 /// File-watcher settings from the `watch:` config block.
 struct WatchConfig {
   bool enabled = false;
@@ -53,13 +39,12 @@ struct WatchConfig {
 };
 
 auto RunEngine(const std::string& sock_addr,
-               const std::vector<std::string>& ifaces,
                const std::string& pin_path,
                const std::string& bundle_dir,
                const WatchConfig& watch) -> int {
   f::Engine engine;
   auto res = f::EngineInit(
-      engine, sock_addr, ifaces, pin_path, bundle_dir);
+      engine, sock_addr, pin_path, bundle_dir);
   if (!res) {
     spdlog::error("Init failed: {}",
                   res.error().message);
@@ -125,20 +110,24 @@ auto RunEngine(const std::string& sock_addr,
 }  // namespace
 
 auto LoadConfig(const std::string& path,
-                std::string& interfaces,
                 std::string& socket_addr,
                 std::string& pin_path,
                 std::string& log_level,
                 WatchConfig& watch) -> bool {
   try {
     auto cfg = YAML::LoadFile(path);
-    if (cfg["interfaces"]) {
-      std::string ifaces;
-      for (const auto& n : cfg["interfaces"]) {
-        if (!ifaces.empty()) ifaces += ',';
-        ifaces += n.as<std::string>();
-      }
-      if (!ifaces.empty()) interfaces = ifaces;
+    // `interfaces:` was the v0.1 attach list, and it is refused rather
+    // than ignored. Every interface `fd` attaches to now comes from the
+    // bundle manifest's zones, so a box whose fd.yaml still names ports
+    // is a box whose operator believes he chose them. Naming the key is
+    // the only way he finds out he did not.
+    if (cfg["interfaces"] && cfg["interfaces"].size() > 0) {
+      spdlog::warn(
+          "{}: `interfaces:` is no longer read. fd attaches to the "
+          "interfaces the bundle's zones name; declare them in "
+          "/etc/f/system.yaml and in the policy's `zone` lines. "
+          "Remove the key to silence this.",
+          path);
     }
     if (cfg["socket"]) {
       socket_addr = cfg["socket"].as<std::string>();
@@ -187,7 +176,6 @@ int main(int argc, char** argv) {
   app.fallthrough();
 
   std::string config_file;
-  std::string interfaces;
   std::string socket_addr =
       "ipc:///run/f/control.sock";
   std::string pin_path = "/sys/fs/bpf/f";
@@ -196,15 +184,13 @@ int main(int argc, char** argv) {
 
   auto* opt_config = app.add_option("-c,--config", config_file,
                                     "YAML config file");
-  auto* opt_ifaces = app.add_option("-i,--interfaces", interfaces,
-                                    "Comma-separated NIC list");
   auto* opt_socket = app.add_option("-s,--socket", socket_addr,
                                     "ZMQ IPC control address");
   auto* opt_pin = app.add_option("--pin-path", pin_path,
                                  "BPF map pin directory");
   app.add_option("--bundle-dir", bundle_dir,
-                 "Compiled-bundle root; <dir>/current/main.bpf.o "
-                 "is loaded at startup when present");
+                 "Compiled-bundle root; <dir>/current must hold a "
+                 "compiled bundle or fd refuses to start");
   auto* opt_log = app.add_option("-l,--log-level", log_level,
                                  "Log level")
                       ->check(CLI::IsMember({"trace", "debug",
@@ -225,20 +211,18 @@ int main(int argc, char** argv) {
   // netns system tests running against a rig with /etc/f/fd.yaml.)
   WatchConfig watch;
   {
-    std::string cfg_ifaces = interfaces;
     std::string cfg_socket = socket_addr;
     std::string cfg_pin = pin_path;
     std::string cfg_log = log_level;
     bool loaded = false;
     if (!config_file.empty()) {
-      loaded = LoadConfig(config_file, cfg_ifaces, cfg_socket,
+      loaded = LoadConfig(config_file, cfg_socket,
                           cfg_pin, cfg_log, watch);
     } else if (std::ifstream("/etc/f/fd.yaml").good()) {
-      loaded = LoadConfig("/etc/f/fd.yaml", cfg_ifaces, cfg_socket,
+      loaded = LoadConfig("/etc/f/fd.yaml", cfg_socket,
                           cfg_pin, cfg_log, watch);
     }
     if (loaded) {
-      if (opt_ifaces->count() == 0) interfaces = cfg_ifaces;
       if (opt_socket->count() == 0) socket_addr = cfg_socket;
       if (opt_pin->count() == 0) pin_path = cfg_pin;
       if (opt_log->count() == 0) log_level = cfg_log;
@@ -261,7 +245,6 @@ int main(int argc, char** argv) {
     return 1;
   }
 
-  auto ifaces = ParseInterfaces(interfaces);
   auto* sub = app.get_subcommands().front();
 
   if (sub->get_name() == "start") {
@@ -271,16 +254,14 @@ int main(int argc, char** argv) {
     }
     f::WritePidFile(f::kEnginePidPath);
     chmod(f::kEnginePidPath, 0644);
-    int rc = RunEngine(socket_addr, ifaces, pin_path, bundle_dir,
-                       watch);
+    int rc = RunEngine(socket_addr, pin_path, bundle_dir, watch);
     f::RemovePidFile(f::kEnginePidPath);
     return rc;
   }
 
   // "run" — foreground.
   f::WritePidFile(f::kEnginePidPath);
-  int rc = RunEngine(socket_addr, ifaces, pin_path, bundle_dir,
-                     watch);
+  int rc = RunEngine(socket_addr, pin_path, bundle_dir, watch);
   f::RemovePidFile(f::kEnginePidPath);
   return rc;
 }

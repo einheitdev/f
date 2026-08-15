@@ -8,7 +8,6 @@
 #include <cstdint>
 #include <expected>
 #include <memory>
-#include <span>
 #include <stop_token>
 #include <string>
 #include <thread>
@@ -25,8 +24,6 @@
 #include "f/nat_mgr.h"
 #include "f/route_mgr.h"
 #include "f/protocol.h"
-#include "f/rule_table.h"
-#include "f/slow_path.h"
 #include "f/types.h"
 #include "f/watcher.h"
 
@@ -58,32 +55,23 @@ struct Engine {
   std::unique_ptr<zmq::context_t> zmq_ctx;
   std::unique_ptr<zmq::socket_t> ctrl_socket;
 
-  // BPF handles (single-program path).
-  BpfHandles bpf;
-
-  // v0.4 § 6.2: handles for a loaded multi-zone bundle. Empty on the
-  // single-program path; populated when EngineInit cold-boots a
-  // multi-zone bundle or ApplyBundle hot-loads one. Kept so a later
-  // reload can detach the per-zone programs before re-attaching.
+  // v0.4 § 6.2: handles for the loaded multi-zone bundle, populated
+  // when EngineInit cold-boots one or ApplyBundle hot-loads one. Kept
+  // so a later reload can detach the per-zone programs before
+  // re-attaching. There is no other kind of loaded policy: the v0.1
+  // single-program `BpfHandles` that used to sit beside this is gone
+  // (see bpf_loader.h for what it did when it ran).
   ZoneBundleHandles zone_bundle;
 
   // Pin path for BPF maps.
   std::string pin_path = "/sys/fs/bpf/f";
 
   // Components — each owns its state.
-  RuleTable rules;
   IfaceMgr ifaces;
   ConntrackMgr conntrack;
   NatMgr nat;
   RouteMgr route;
   EgressMgr egress;
-
-  // Current firewall config.
-  FwConfig current_config{};
-
-  // Slow path.
-  SlowPath slow_path;
-  std::jthread slow_path_thread;
 
   // Source file-watcher / hot-reload state (ReloadFromSource reads
   // source_path, compiled_dir, fwl_path from here).
@@ -102,18 +90,20 @@ auto ReadPidFile(const char* path) -> int;
 auto RemovePidFile(const char* path) -> void;
 auto IsProcessRunning(int pid) -> bool;
 
-/// Initialize the engine: load BPF, attach XDP, pin maps,
-/// bind ZMQ control socket.
+/// Initialize the engine: load the staged bundle, attach XDP per zone,
+/// bind the ZMQ control socket.
 ///
-/// `bundle_dir` is the parent of the `current` symlink the
-/// reload pipeline maintains. When a freshly-compiled bundle
-/// is staged there, `fd` cold-boots into it directly; otherwise
-/// it falls back to the built-in `fw.bpf.o` search paths.
+/// `bundle_dir` is the parent of the `current` symlink the reload
+/// pipeline maintains; `<bundle_dir>/current` must hold a compiled
+/// bundle. There is no fallback. A missing, unreadable or non-bundle
+/// `current` is an error and the daemon does not start — a box that
+/// cannot load the operator's policy must not come up claiming to be a
+/// firewall, and the fallback that used to be here came up ALLOWING
+/// everything.
 auto EngineInit(Engine& e,
                 std::string_view sock_addr,
-                std::span<const std::string> ifaces,
                 std::string_view pin_path,
-                std::string_view bundle_dir = "")
+                std::string_view bundle_dir)
     -> std::expected<void, Error<EngineError>>;
 
 /// Run the engine ZMQ control loop (blocks until stop).
@@ -133,42 +123,8 @@ auto EngineRun(Engine& e, std::stop_token stop)
 auto HandleControlRequest(Engine& e, const std::string& req)
     -> std::string;
 
-/// How many slots the per-CPU `counters` array actually has, read
-/// from the map itself; 0 when there is no map or it cannot be
-/// interrogated.
-///
-/// The bound belongs to the map, not to the reader. `src/engine.cc`
-/// carried a literal 256 while `bpf/fw.bpf.c` declared
-/// `max_entries = 10000`, two numbers in two files with nothing tying
-/// them together, and every slot from 256 up accrued packets that no
-/// counters request could show and no clear could zero.
-auto CountersMapSlots(int counters_fd) -> uint32_t;
-
 /// Stop the engine: detach XDP, cleanup ZMQ.
 auto EngineStop(Engine& e) -> void;
-
-/// Replace the full rule set (A/B swap).
-auto ApplyConfig(Engine& e, const ConfigMsg& msg,
-                 std::span<const std::byte> rule_data)
-    -> std::expected<uint32_t, Error<EngineError>>;
-
-// GetCounters(e, rule_count) was here: it read `counters[0 ..
-// rule_count)` and called the result "aggregated per-rule counters".
-// bpf/fw.bpf.c keys that map by MATCH TIER, so those were never
-// per-rule numbers and the signature said they were. It had no
-// callers anywhere in the tree; it is removed rather than left as a
-// correctly-named-looking trap for the next reader. `kGetCounters`
-// reports the same slots under their own ids, which is what they are.
-
-/// Read current rule set from active table.
-auto GetRules(const Engine& e)
-    -> std::expected<
-        std::vector<std::pair<RuleKey, RuleValue>>,
-        Error<EngineError>>;
-
-/// Read engine status.
-auto GetStatus(const Engine& e)
-    -> StatusResponse;
 
 /// Aggregate state from all components.
 auto GetFullState(const Engine& e)
@@ -191,10 +147,6 @@ auto AttachRouteMgr(Engine& e) -> void;
 /// holding the previous bundle's `fwl_egress_stats` fd reports numbers
 /// that look right about a hook that is no longer there.
 auto AttachEgressMgr(Engine& e, std::string_view bundle_dir) -> void;
-
-/// Open pinned BPF maps (for f-api read access).
-auto OpenPinnedMaps(std::string_view pin_path)
-    -> std::expected<BpfHandles, Error<BpfError>>;
 
 }  // namespace f
 

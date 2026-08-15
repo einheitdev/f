@@ -70,11 +70,19 @@ IFACE=$(ip -o link show | grep -v lo: | grep -v docker \
   | awk -F': ' '{print $2}' | head -1)
 echo "Interface: $IFACE"
 
-# Ensure fd is running.
+# Ensure fd is running. `-i <iface>` is gone with the v0.1 attach
+# list: fd attaches to the interfaces the staged bundle's zones name,
+# and refuses to start without a bundle at all. This test therefore
+# needs a box with `/usr/share/f/compiled/current` already staged.
 if ! pgrep -f "fd.*run" > /dev/null 2>&1; then
-  echo "Starting fd on $IFACE..."
-  nohup fd -i "$IFACE" run > /tmp/fd-test.log 2>&1 &
+  echo "Starting fd..."
+  nohup fd run > /tmp/fd-test.log 2>&1 &
   sleep 3
+fi
+if ! pgrep -f "fd.*run" > /dev/null 2>&1; then
+  echo "fd did not start; is a bundle staged under" \
+       "/usr/share/f/compiled/current? See /tmp/fd-test.log" >&2
+  exit 1
 fi
 
 echo ""
@@ -92,45 +100,31 @@ assert_contains "$OUT" "pid" \
   "show status reports pid"
 assert_contains "$OUT" "uptime" \
   "show status reports uptime"
-assert_contains "$OUT" "available" \
-  "show status reports maps available"
 assert_contains "$OUT" "interfaces" \
   "show status reports interface count"
 
 echo ""
-echo "--- show firewall ---"
-OUT=$(einheit-f --ascii --color never show firewall 2>&1)
-assert_contains "$OUT" "default_action" \
-  "show firewall reports default action"
-assert_contains "$OUT" "active_table" \
-  "show firewall reports active table"
-assert_contains "$OUT" "rule_count" \
-  "show firewall reports rule count"
+echo "--- the v0.1 verbs are gone, not empty ---"
+# `show firewall`, `show firewall rules`, `show counters` and
+# `clear counters` addressed the single-program datapath. The first
+# answered a fabrication from an FwConfig nothing wrote; the rest were
+# refused by fd. They must not be registered, and the CLI must say so
+# by name rather than printing an empty table.
+for gone in "show firewall" "show firewall rules" "show counters" \
+            "clear counters"; do
+  # shellcheck disable=SC2086
+  if einheit-f --ascii --color never $gone > /dev/null 2>&1; then
+    assert_contains "registered" "gone" \
+      "\`$gone\` still answers; it has no datapath to ask"
+  else
+    assert_contains "gone" "gone" "\`$gone\` is not a command"
+  fi
+done
 
 echo ""
-echo "--- show firewall rules (empty) ---"
-OUT=$(einheit-f --ascii --color never show firewall rules 2>&1)
-assert_contains "$OUT" "no rules" \
-  "show firewall rules reports no rules when empty"
-
-echo ""
-echo "--- show counters with traffic ---"
-# Generate traffic to populate counters.
-ping -c 5 -W 1 127.0.0.1 > /dev/null 2>&1 || true
-ping -c 5 -W 1 "$(hostname -I | awk '{print $1}')" > /dev/null 2>&1 || true
-sleep 1
-OUT_AFTER=$(einheit-f --ascii --color never show counters 2>&1)
-# Counter output should contain numeric data (packets
-# column) or "no counters" if XDP isn't counting on this
-# interface. Either is valid — the command must not crash.
-assert_exit_zero "show counters exits cleanly" \
-  einheit-f --ascii show counters
-
-echo ""
-echo "--- clear counters ---"
-OUT=$(einheit-f --ascii --color never clear counters 2>&1)
-assert_contains "$OUT" "cleared" \
-  "clear counters reports cleared count"
+echo "--- show zones is where the loaded policy is ---"
+assert_exit_zero "show zones exits cleanly" \
+  einheit-f --ascii show zones
 
 echo ""
 echo "--- set editor ---"
@@ -164,13 +158,11 @@ assert_contains "$OUT" "$IFACE" \
 
 echo ""
 echo "--- failure mode: recovery after fd restart ---"
-nohup fd -i "$IFACE" run > /tmp/fd-test.log 2>&1 &
+nohup fd run > /tmp/fd-test.log 2>&1 &
 sleep 3
 OUT=$(einheit-f --ascii --color never show status 2>&1)
 assert_contains "$OUT" "pid" \
   "show status recovers after fd restart"
-assert_contains "$OUT" "available" \
-  "maps available after fd restart"
 
 echo ""
 echo "=================================="

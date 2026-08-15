@@ -1,14 +1,11 @@
 /// @file test_bpf_loader.cc
-/// @brief Cold-boot bundle auto-load tests for the BPF loader.
+/// @brief Bundle manifest, pin reconciliation and attach-plan tests.
 ///
-/// `LoadProgram(bundle_dir)` resolves which `.bpf.o` to open in
-/// a fixed precedence order:
-///   1. `<bundle_dir>/current/main.bpf.o` (operator-staged)
-///   2. v0.1 fall-back list: `fw.bpf.o`, `build/fw.bpf.o`,
-///      `../bpf/fw.bpf.o`, `/usr/lib/f/fw.bpf.o`.
-///
-/// These tests exercise the resolver only — the live BPF load
-/// path needs CAP_BPF and is covered by test_xdp.cc.
+/// Four `ResolveBpfObjPath` tests were here, pinning the v0.1
+/// cold-boot search list (`fw.bpf.o`, `build/fw.bpf.o`,
+/// `../bpf/fw.bpf.o`, `/usr/lib/f/fw.bpf.o`) that `LoadProgram`
+/// consulted when no bundle was staged. That list is gone; the shared
+/// fixture below outlived it and the multi-zone tests still use it.
 
 #include <gtest/gtest.h>
 
@@ -53,61 +50,6 @@ class BpfLoaderResolverTest : public ::testing::Test {
 
   fs::path scratch_;
 };
-
-TEST_F(BpfLoaderResolverTest, EmptyBundleDirFallsBackToFwBpfO) {
-  // No bundle_dir, no fall-back files in cwd → empty result.
-  // The resolver must not invent a path.
-  auto picked = ResolveBpfObjPath("");
-  // `fw.bpf.o` doesn't exist in the test cwd — expect empty.
-  // (If a build artefact happens to exist, this asserts it was
-  // selected; either way, the bundle path was never reached.)
-  EXPECT_TRUE(
-      picked.empty()
-      || picked == "fw.bpf.o"
-      || picked == "build/fw.bpf.o"
-      || picked == "../bpf/fw.bpf.o"
-      || picked == "/usr/lib/f/fw.bpf.o");
-}
-
-TEST_F(BpfLoaderResolverTest, BundleCurrentSymlinkTakesPrecedence) {
-  // Stage a fake bundle at <scratch>/current/main.bpf.o.
-  auto current = scratch_ / "current" / "main.bpf.o";
-  Touch(current);
-
-  auto picked = ResolveBpfObjPath(scratch_.string());
-  EXPECT_EQ(picked, current.string());
-}
-
-TEST_F(BpfLoaderResolverTest, BundleMissingFallsBackToFwBpfO) {
-  // bundle_dir given but `current/main.bpf.o` doesn't exist.
-  // Resolver must skip cleanly (no crash) and consult fall-back
-  // entries — none of which exist in the test scratch dir, so
-  // the result is empty unless a build artefact happens to be in
-  // cwd (in which case the resolver picked correctly).
-  auto picked = ResolveBpfObjPath(scratch_.string());
-  EXPECT_NE(picked, (scratch_ / "current" / "main.bpf.o").string())
-      << "fall-back path must NOT be the bundle's missing entry";
-}
-
-TEST_F(BpfLoaderResolverTest, BundleSymlinkFollowed) {
-  // Real-world layout: `current` is a symlink into a versioned
-  // sub-directory the reload pipeline maintains. Resolver must
-  // follow it.
-  auto versioned =
-      scratch_ / "v-12345" / "main.bpf.o";
-  Touch(versioned);
-  auto link = scratch_ / "current";
-  std::error_code ec;
-  fs::create_directory_symlink(scratch_ / "v-12345", link, ec);
-  ASSERT_FALSE(ec) << ec.message();
-
-  auto picked = ResolveBpfObjPath(scratch_.string());
-  // The resolver yields the symlink path (libbpf will follow it
-  // when opening). Either the symlink path or the canonical
-  // versioned path is acceptable; we lock the symlink form here
-  // so a future canonicalisation change is a deliberate choice.
-  EXPECT_EQ(picked, (link / "main.bpf.o").string());
-}
 
 // --- geoip.json bundle parsing (v0.4 hardware-validation gap) -------
 

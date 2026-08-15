@@ -1,6 +1,0 @@
-<section class="card">
-  <h2 class="card-title">counters</h2>
-  <div class="card-body" id="counters-table">
-    {% include "fw/counters_table" %}
-  </div>
-</section>

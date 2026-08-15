@@ -9,7 +9,6 @@ UI="${FT_UI:-$HOME/f-appliance/f/build/einheit-f-ui}"
 BUNDLE="${FT_BUNDLE:-$HOME/fwtest/bundle}"
 PORT=7542
 SOCK=ipc:///tmp/fdtest.sock
-PIN=/sys/fs/bpf/ftest
 
 fail() { echo "FAIL: $*"; pkill -f "einheit-f-ui --socket" 2>/dev/null; bash "$here/lib/gw_topo.sh" down; exit 1; }
 
@@ -30,7 +29,7 @@ sleep 0.3
 pkill -f "einheit-f-ui --socket" 2>/dev/null; sleep 0.5
 # Fully detach (setsid + closed stdin/out) so the server never holds a
 # parent pipe open — otherwise an SSH-invoked run hangs on the child.
-setsid "$UI" --socket "$SOCK" --pin-path "$PIN" --port "$PORT" \
+setsid "$UI" --socket "$SOCK" --port "$PORT" \
   </dev/null >/tmp/ui.log 2>&1 &
 trap 'pkill -f "einheit-f-ui --socket $SOCK" 2>/dev/null' EXIT
 # Wait for the server to accept connections.

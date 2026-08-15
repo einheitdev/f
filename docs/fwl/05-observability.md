@@ -27,7 +27,7 @@ default allow
 
 Both of those are useful; the mistake is writing the second and reading it as the first. Put the total at the top of the block.
 
-Counters are read back with `einheit-f show counters`, and per-rule hit counts with `einheit-f show firewall rules`.
+**Nothing on the box reads these back yet, and that is a real gap rather than a phrasing.** `count` compiles to a slot in the zone's own `fwl_counters_<zone>` map, and the only thing that can print one today is `sudo bpftool map dump pinned /sys/fs/bpf/f/fwl_counters_<zone>`, which gives you slot numbers and no names. There were two verbs here — `show counters` and `show firewall rules` — and both addressed a different datapath: the v0.1 single-program firewall, whose `counters` map is not the one your policy writes to. On a v0.4 box they printed "no counters active" and "no rules loaded" beside counters that were moving. They are gone rather than left saying that. A verb that reads `fwl_counters_<zone>` and resolves the slot numbers against the bundle's manifest is the thing that has to be built.
 
 ## Counters as evidence
 

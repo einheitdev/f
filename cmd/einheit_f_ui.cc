@@ -23,7 +23,6 @@ auto main(int argc, char** argv) -> int {
       "einheit-f-ui — f firewall web dashboard"};
   std::string bind = "0.0.0.0";
   uint16_t port = 7542;
-  std::string pin_path = "/sys/fs/bpf/f";
   std::string fd_socket = "ipc:///run/f/control.sock";
   int sample_ms = 1000;
   std::string templates_dir;
@@ -32,12 +31,10 @@ auto main(int argc, char** argv) -> int {
 
   app.add_option("--bind", bind, "Bind address");
   app.add_option("--port", port, "TCP port");
-  app.add_option("--pin-path", pin_path,
-                 "BPF map pin directory");
   app.add_option("--socket", fd_socket,
                  "fd control socket endpoint");
   app.add_option("--sample-ms", sample_ms,
-                 "Counter sampling interval (ms)");
+                 "Live-view sampling interval (ms)");
   app.add_option("--templates", templates_dir,
                  "Override templates root");
   app.add_option("--assets", assets_dir,
@@ -52,7 +49,6 @@ auto main(int argc, char** argv) -> int {
   }
 
   einheit::adapters::fw::FwUiConfig ucfg;
-  ucfg.pin_path = pin_path;
   ucfg.fd_socket = fd_socket;
   ucfg.sample_interval_ms = sample_ms;
   auto adapter =

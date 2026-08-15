@@ -40,6 +40,17 @@ assert_http_ok() {
   fi
 }
 
+assert_http_status() {
+  local url="$1" want="$2" label="$3"
+  local code
+  code=$(curl -s -o /dev/null -w "%{http_code}" "$url" 2>/dev/null)
+  if [ "$code" = "$want" ]; then
+    pass "$label (HTTP $code)"
+  else
+    fail "$label (HTTP $code, expected $want)"
+  fi
+}
+
 assert_body_contains() {
   local url="$1" pattern="$2" label="$3"
   local body
@@ -113,16 +124,16 @@ assert_body_contains "$BASE/interfaces" "$IFACE" \
   "interfaces page lists $IFACE"
 
 echo ""
-echo "--- firewall ---"
-assert_http_ok "$BASE/firewall" \
-  "GET /firewall returns 200"
-assert_body_contains "$BASE/firewall" "rules" \
-  "firewall page contains rules section"
-
-echo ""
-echo "--- counters ---"
-assert_http_ok "$BASE/counters" \
-  "GET /counters returns 200"
+echo "--- the v0.1 pages are gone, not empty ---"
+# /firewall and /counters read the pinned v0.1 maps in-process. No v0.4
+# bundle pins those names, so OpenPinnedMaps failed on every deployed
+# box and the two pages rendered "no rules loaded" and "no counters
+# active" forever, beside a policy whose real per-zone counters were
+# moving. A 404 is the honest answer; a 200 with an empty table is not.
+assert_http_status "$BASE/firewall" 404 \
+  "GET /firewall is gone rather than empty"
+assert_http_status "$BASE/counters" 404 \
+  "GET /counters is gone rather than empty"
 
 echo ""
 echo "--- HTMX fragments ---"
@@ -130,8 +141,8 @@ assert_htmx_fragment "$BASE/" "status" \
   "dashboard HTMX fragment renders status section"
 assert_htmx_fragment "$BASE/interfaces" "$IFACE" \
   "interfaces HTMX fragment lists NIC"
-assert_htmx_fragment "$BASE/firewall" "rules" \
-  "firewall HTMX fragment renders rules section"
+assert_htmx_fragment "$BASE/zones" "zone" \
+  "zones HTMX fragment renders the zone table"
 
 echo ""
 echo "--- failure mode: fd stopped ---"

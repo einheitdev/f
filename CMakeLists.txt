@@ -104,12 +104,13 @@ message(STATUS "libbpf headers: ${BPF_INCLUDE_DIR}")
 # FetchContent dependencies + BPF compile rules
 # ============================================================================
 include("cmake/deps.cmake")
-include("cmake/bpf.cmake")
 
-# ============================================================================
-# BPF program
-# ============================================================================
-add_bpf_object(fw bpf/fw.bpf.c)
+# No BPF program is built here. `fwl compile --bundle` emits one
+# `<zone>.bpf.o` per @xdp block and compiles them with clang at policy
+# time; the daemon loads what it finds under `<bundle-dir>/current`.
+# `bpf/fw.bpf.c` and cmake/bpf.cmake built a second, unrelated XDP
+# program that `fd` fell back to when no bundle was staged — see
+# include/f/bpf_loader.h for what that fallback did on a real box.
 
 # ============================================================================
 # yaml-cpp (system, for config file parsing)
@@ -197,7 +198,6 @@ add_library(libf-engine STATIC
   src/config.cc
   src/engine.cc
   src/reload.cc
-  src/slow_path.cc
   src/components.cc
   src/egress_mgr.cc
   src/nat_mgr.cc
@@ -209,7 +209,6 @@ add_library(libf-engine STATIC
 target_include_directories(libf-engine PUBLIC
   ${PROJECT_SOURCE_DIR}/include
   ${BPF_INCLUDE_DIR}
-  ${CMAKE_BINARY_DIR}
 )
 
 target_link_libraries(libf-engine PUBLIC
@@ -219,30 +218,6 @@ target_link_libraries(libf-engine PUBLIC
   cppzmq
   spdlog::spdlog
   yaml-cpp::yaml-cpp
-  pthread
-)
-
-add_dependencies(libf-engine fw_skel)
-
-# ============================================================================
-# API library (Crow + pinned map reads, no BPF loading)
-# ============================================================================
-add_library(libf-api STATIC
-  src/api.cc
-  src/html.cc
-)
-
-target_include_directories(libf-api PUBLIC
-  ${PROJECT_SOURCE_DIR}/include
-  ${BPF_INCLUDE_DIR}
-)
-
-target_link_libraries(libf-api PUBLIC
-  ${BPF_LIB}
-  Crow::Crow
-  nlohmann_json::nlohmann_json
-  cppzmq
-  spdlog::spdlog
   pthread
 )
 
@@ -320,13 +295,6 @@ target_link_libraries(fctl PRIVATE
   libf-engine CLI11::CLI11)
 
 # ============================================================================
-# f-api — web dashboard daemon
-# ============================================================================
-add_executable(f-api cmd/f_api.cc)
-target_link_libraries(f-api PRIVATE
-  libf-api libf-engine CLI11::CLI11)
-
-# ============================================================================
 # f CLI adapter
 # ============================================================================
 add_subdirectory(adapters/cli)
@@ -366,7 +334,7 @@ target_compile_definitions(einheit-f-ui PRIVATE
 #   deploy/f_install.py stage --build-dir build-aarch64 --root <rootfs>
 #   deploy/f_install.py verify
 # ============================================================================
-install(TARGETS fd fctl f-sysconf f-confd einheit-f einheit-f-ui f-api
+install(TARGETS fd fctl f-sysconf f-confd einheit-f einheit-f-ui
   RUNTIME DESTINATION bin
 )
 install(FILES deploy/fd.yaml

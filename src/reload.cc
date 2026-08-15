@@ -156,34 +156,6 @@ auto RunCompiler(std::string_view fwl_path,
   return stdout_buf;
 }
 
-namespace {
-
-/// Atomically swap XDP on every attached interface from
-/// `old_prog_fd` to `new_prog_fd`. On first failure, roll
-/// back any interfaces that already flipped.
-auto SwapXdpEverywhere(Engine& e,
-                       int old_prog_fd,
-                       int new_prog_fd)
-    -> std::expected<void, Error<ReloadError>> {
-  std::vector<int> flipped;
-  for (uint32_t i = 0; i < e.ifaces.count; i++) {
-    int ifindex = e.ifaces.interfaces[i].ifindex;
-    auto r = ReplaceXdp(ifindex, new_prog_fd, old_prog_fd);
-    if (!r) {
-      // Roll back any interfaces already on the new prog.
-      for (int done : flipped) {
-        ReplaceXdp(done, old_prog_fd, new_prog_fd);
-      }
-      return MakeError(ReloadError::kApplyFailed,
-                       r.error().message);
-    }
-    flipped.push_back(ifindex);
-  }
-  return {};
-}
-
-}  // namespace
-
 auto ApplyBundle(Engine& e, std::string_view bundle_dir)
     -> std::expected<ReloadResult, Error<ReloadError>> {
   std::filesystem::path dir(bundle_dir);
@@ -308,7 +280,6 @@ auto ApplyBundle(Engine& e, std::string_view bundle_dir)
     }
     ReloadResult out{};
     out.version = manifest["version"].get<std::string>();
-    out.rules_installed = 0;
     out.program_updated = true;
     // The interface count is the one that answers "is the new policy
     // in the packet path". A program count on its own read the same
@@ -319,100 +290,21 @@ auto ApplyBundle(Engine& e, std::string_view bundle_dir)
     return out;
   }
 
-  // Read rules.json.
-  auto rules_txt = ReadFileAll(dir / "rules.json");
-  if (!rules_txt) {
-    return MakeError(ReloadError::kRulesInvalid,
-                     rules_txt.error());
-  }
-  json rules;
-  try {
-    rules = json::parse(*rules_txt);
-  } catch (const std::exception& ex) {
-    return MakeError(ReloadError::kRulesInvalid,
-                     std::format("parse rules: {}",
-                                 ex.what()));
-  }
-
-  // Translate to ConfigMsg + rule_data blob.
-  ConfigMsg msg{};
-  msg.default_action = rules.value("default_action", 1);
-  msg.conntrack_enabled = rules.value("conntrack_enabled", 0);
-  msg.conntrack_timeout_s =
-      rules.value("conntrack_timeout_s", 300);
-
-  std::vector<std::byte> rule_data;
-  uint32_t count = 0;
-  if (rules.contains("rules") && rules["rules"].is_array()) {
-    for (const auto& r : rules["rules"]) {
-      // Only exact entries are applied here; CIDR entries are
-      // deferred until LPM-map loading lands in the engine.
-      if (r.value("type", std::string()) != "exact") {
-        continue;
-      }
-      const auto& k = r["key"];
-      const auto& v = r["value"];
-      RuleKey key{};
-      key.src_addr = k.value("src_addr", 0u);
-      key.dst_addr = k.value("dst_addr", 0u);
-      key.src_port = k.value("src_port", 0);
-      key.dst_port = k.value("dst_port", 0);
-      key.proto = k.value("proto", 0);
-      RuleValue val{};
-      val.action = v.value("action", 0);
-      val.rate_pps = v.value("rate_pps", 0u);
-      auto* kp = reinterpret_cast<const std::byte*>(&key);
-      rule_data.insert(rule_data.end(), kp, kp + sizeof(key));
-      auto* vp = reinterpret_cast<const std::byte*>(&val);
-      rule_data.insert(rule_data.end(), vp, vp + sizeof(val));
-      count++;
-    }
-  }
-  msg.rule_count = count;
-
-  auto res = ApplyConfig(e, msg, rule_data);
-  if (!res) {
-    return MakeError(ReloadError::kApplyFailed,
-                     res.error().message);
-  }
-
-  ReloadResult out{};
-  out.version = manifest["version"].get<std::string>();
-  out.rules_installed = *res;
-  out.program_updated = false;
-
-  // If the bundle includes a compiled BPF program, hot-swap it.
-  if (manifest.value("has_program", false)
-      && manifest.contains("program")) {
-    std::string rel = manifest["program"].value(
-        "path", std::string("main.bpf.o"));
-    auto obj_path = (dir / rel).string();
-
-    auto new_bpf = LoadProgramFromPath(obj_path);
-    if (!new_bpf) {
-      return MakeError(
-          ReloadError::kApplyFailed,
-          std::format("load {}: {}", obj_path,
-                      new_bpf.error().message));
-    }
-
-    auto swap = SwapXdpEverywhere(
-        e, e.bpf.prog_fd, new_bpf->prog_fd);
-    if (!swap) {
-      UnloadProgram(*new_bpf);
-      return std::unexpected(swap.error());
-    }
-
-    // Succeeded: release the old program, promote the new
-    // handles to the engine. Note that pinned maps on the
-    // filesystem may now be out of sync with the active
-    // program — coordinating that is a future decision.
-    UnloadProgram(e.bpf);
-    e.bpf = *new_bpf;
-    out.program_updated = true;
-  }
-
-  return out;
+  // There is no other kind of bundle. What followed here read
+  // `rules.json` into a ConfigMsg, called ApplyConfig and hot-swapped a
+  // `main.bpf.o` — the v0.1 single-program apply. `fwl compile
+  // --bundle` writes neither file: the grammar requires at least one
+  // `@xdp` block (`program : zone_decl* function_def* xdp_block+`), so
+  // `programs` is never empty and IsMultiZoneBundle is never false for
+  // anything the compiler produces. Reaching here means the manifest
+  // came from somewhere else.
+  return MakeError(
+      ReloadError::kManifestInvalid,
+      std::format(
+          "{} has a manifest with no @xdp programs in it. Every bundle "
+          "`fwl compile --bundle` writes names at least one; this one "
+          "was not written by it. The running policy is untouched.",
+          dir.string()));
 }
 
 auto ReloadFromSource(Engine& e)
@@ -482,9 +374,7 @@ auto ReloadFromSource(Engine& e)
     spdlog::warn("reload: could not remove {}", f);
   }
 
-  spdlog::info(
-      "reload: ok version={} rules_installed={}",
-      applied->version, applied->rules_installed);
+  spdlog::info("reload: ok version={}", applied->version);
   return applied;
 }
 

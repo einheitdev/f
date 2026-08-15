@@ -8,6 +8,7 @@ deploy it, which is the bug that produced this file.
 """
 
 import os
+import shutil
 import stat
 import subprocess
 from pathlib import Path
@@ -42,6 +43,46 @@ def _fake_build_dir(tmp_path, manifest, omit=()):
     target.write_text(f"#!/bin/sh\necho {item.id}\n")
     target.chmod(0o755)
   return build
+def _repo_without(tmp_path, missing):
+  """A stand-in repo root whose entries are symlinks to the real one.
+
+  `missing` is a repo-relative path left out of it. Used to simulate a
+  source that is not there without touching the checkout. Symlinks
+  rather than copies because the real trees (ui/, adapters/) are large
+  and the installer only reads them.
+
+  Args:
+    tmp_path: pytest temporary directory.
+    missing: Repo-relative path to omit, e.g. "deploy/networkd".
+
+  Returns:
+    The path to the stand-in repo root.
+  """
+  missing = Path(missing)
+  # Inside a stand-in workspace, because two manifest sources are
+  # `../ui/...` — the sibling einheit-ui checkout.
+  workspace = tmp_path / "ws"
+  workspace.mkdir()
+  for sibling in REPO.parent.iterdir():
+    if sibling != REPO:
+      (workspace / sibling.name).symlink_to(sibling)
+  fake = workspace / REPO.name
+  fake.mkdir()
+  for entry in REPO.iterdir():
+    if entry.name != missing.parts[0]:
+      (fake / entry.name).symlink_to(entry)
+  # Rebuild only the branch that has to lose something.
+  cursor_real, cursor_fake = REPO, fake
+  for i, part in enumerate(missing.parts):
+    cursor_real = cursor_real / part
+    cursor_fake = cursor_fake / part
+    if i == len(missing.parts) - 1:
+      break
+    cursor_fake.mkdir()
+    for entry in cursor_real.iterdir():
+      if entry.name != missing.parts[i + 1]:
+        (cursor_fake / entry.name).symlink_to(entry)
+  return fake
 def _finding(report, item_id):
   """The single finding for one manifest id."""
   matches = [f for f in report.findings if f.item.id == item_id]
@@ -144,16 +185,23 @@ def report_of(manifest, root):
   return f_install.verify(manifest, root=root)
 def test_optional_missing_is_degraded_not_incomplete(tmp_path,
                                                      manifest):
-  """f-api is not there, and the box still works."""
+  """The reference networkd units are not there, and the box works.
+
+  This used to be written against `f-api`, which was the deployable
+  set's only optional binary until the v0.1 REST surface it served was
+  removed. Any `requirement: optional` item exercises the same
+  machinery; what it must not do is turn a working box into
+  INCOMPLETE.
+  """
   build = _fake_build_dir(tmp_path, manifest)
   root = tmp_path / "root"
   f_install.stage(manifest, build, REPO, root, with_pip=False)
   _complete_a_staged_root(root)
   assert report_of(manifest, root).verdict is Verdict.COMPLETE
-  (root / "usr/local/bin/f-api").unlink()
+  shutil.rmtree(root / "usr/local/share/f/networkd")
   report = report_of(manifest, root)
   assert report.verdict is Verdict.DEGRADED
-  assert _finding(report, "f-api").state is State.MISSING
+  assert _finding(report, "networkd-examples").state is State.MISSING
 def _complete_a_staged_root(root):
   """Stand in for the pieces `stage --no-pip` leaves out."""
   fwl = root / "usr/local/bin/fwl"
@@ -210,11 +258,13 @@ def test_a_missing_required_source_writes_nothing(tmp_path, manifest):
 def test_a_missing_optional_source_is_reported_and_skipped(
     tmp_path, manifest):
   """The box still gets built; the gap is named."""
-  build = _fake_build_dir(tmp_path, manifest, omit=("f-api",))
+  build = _fake_build_dir(tmp_path, manifest)
+  repo = _repo_without(tmp_path, "deploy/networkd")
   root = tmp_path / "root"
-  actions = f_install.stage(manifest, build, REPO, root,
+  actions = f_install.stage(manifest, build, repo, root,
                             with_pip=False)
-  skipped = next(a for a in actions if a.item.id == "f-api")
+  skipped = next(a for a in actions
+                 if a.item.id == "networkd-examples")
   assert not skipped.done and "optional" in skipped.detail
   assert (root / "usr/local/bin/fd").exists()
 def test_stage_then_verify_is_complete(tmp_path, manifest):

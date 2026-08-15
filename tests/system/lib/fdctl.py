@@ -6,8 +6,12 @@ control socket and prints the daemon's JSON reply. Mirrors the raw wire
 protocol the CLI adapter's transport uses.
 
 Usage: fdctl.py <cmd-number> [socket]
-  cmd numbers: 2 counters, 3 status, 6 firewall, 7 rules,
+  cmd numbers: 3 status, 4 reload, 5 stop,
                9 zones, 10 nat, 11 conntrack
+
+  1, 2, 6, 7 and 8 are retired — they were the v0.1 single-program
+  control surface (apply-config, counters, firewall, rules,
+  clear-counters). fd answers them `unknown command`.
 """
 import sys
 import zmq

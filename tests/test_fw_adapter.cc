@@ -79,11 +79,10 @@ TEST_F(FwAdapterTest, CommandsRegistered) {
   std::vector<std::string> expected = {
       "show status",
       "show interfaces",
-      "show firewall",
-      "show firewall rules",
-      "show counters",
+      "show zones",
+      "show nat",
+      "show conntrack",
       "reload firewall",
-      "clear counters",
   };
   for (const auto& path : expected) {
     bool found = false;
@@ -94,6 +93,24 @@ TEST_F(FwAdapterTest, CommandsRegistered) {
       }
     }
     EXPECT_TRUE(found) << "missing command: " << path;
+  }
+}
+
+TEST_F(FwAdapterTest, TheV01VerbsAreGoneRatherThanEmpty) {
+  // `show firewall`, `show firewall rules`, `show counters` and
+  // `clear counters` addressed the single-program datapath. On a v0.4
+  // box the first answered a fixed fabrication (`default_action drop`,
+  // `active_table 0`, `conntrack disabled`, `rule_count 0`, from an
+  // `FwConfig` only the removed ApplyConfig ever wrote) and the other
+  // three were refused by fd. A verb that cannot answer is worse than
+  // no verb: the operator reaches for it first and is told something.
+  auto cmds = adapter_->Commands();
+  for (const auto& gone : {"show firewall", "show firewall rules",
+                           "show counters", "clear counters"}) {
+    for (const auto& c : cmds) {
+      EXPECT_NE(c.path, gone)
+          << gone << " is registered again; it has no datapath to ask";
+    }
   }
 }
 
@@ -124,7 +141,6 @@ TEST_F(FwAdapterTest, RenderShowStatusNoData) {
   }
   json data = {
       {"daemon", "not connected"},
-      {"maps_available", false},
       {"pin_path", "/sys/fs/bpf/f"},
   };
   auto resp = MakeResponse(data);
@@ -177,74 +193,11 @@ TEST_F(FwAdapterTest, RenderShowInterfacesWithData) {
             std::string::npos);
 }
 
-TEST_F(FwAdapterTest, RenderShowFirewall) {
-  auto cmds = adapter_->Commands();
-  cli::CommandSpec cmd;
-  for (const auto& c : cmds) {
-    if (c.wire_command == "show_firewall") {
-      cmd = c;
-      break;
-    }
-  }
-  json data = {
-      {"default_action", "allow"},
-      {"active_table", 0},
-      {"conntrack", false},
-      {"rule_count", 5},
-  };
-  auto resp = MakeResponse(data);
-  auto output = RenderToString(cmd, resp);
-  EXPECT_NE(output.find("allow"), std::string::npos);
-  EXPECT_NE(output.find("5"), std::string::npos);
-}
-
-TEST_F(FwAdapterTest, RenderShowFirewallRulesEmpty) {
-  auto cmds = adapter_->Commands();
-  cli::CommandSpec cmd;
-  for (const auto& c : cmds) {
-    if (c.wire_command == "show_firewall_rules") {
-      cmd = c;
-      break;
-    }
-  }
-  auto resp = MakeResponse(json::array());
-  auto output = RenderToString(cmd, resp);
-  EXPECT_NE(output.find("no rules loaded"),
-            std::string::npos);
-}
-
-TEST_F(FwAdapterTest, RenderShowFirewallRulesWithData) {
-  auto cmds = adapter_->Commands();
-  cli::CommandSpec cmd;
-  for (const auto& c : cmds) {
-    if (c.wire_command == "show_firewall_rules") {
-      cmd = c;
-      break;
-    }
-  }
-  json data = json::array({
-      {{"idx", 0},
-       {"src", "10.0.0.1"},
-       {"dst", "10.0.0.2"},
-       {"proto", "tcp"},
-       {"src_port", 0},
-       {"dst_port", 22},
-       {"action", "drop"},
-       {"packets", 42},
-       {"bytes", 1234}},
-  });
-  auto resp = MakeResponse(data);
-  auto output = RenderToString(cmd, resp);
-  EXPECT_NE(output.find("10.0.0.1"), std::string::npos);
-  EXPECT_NE(output.find("drop"), std::string::npos);
-  EXPECT_NE(output.find("42"), std::string::npos);
-}
-
 TEST_F(FwAdapterTest, RenderErrorResponse) {
   auto cmds = adapter_->Commands();
   cli::CommandSpec cmd;
   for (const auto& c : cmds) {
-    if (c.wire_command == "show_firewall") {
+    if (c.wire_command == "show_zones") {
       cmd = c;
       break;
     }
@@ -261,254 +214,6 @@ TEST_F(FwAdapterTest, RenderErrorResponse) {
   EXPECT_NE(output.find("no_maps"), std::string::npos);
   EXPECT_NE(output.find("BPF maps not available"),
             std::string::npos);
-}
-
-TEST_F(FwAdapterTest, RenderClearCounters) {
-  auto cmds = adapter_->Commands();
-  cli::CommandSpec cmd;
-  for (const auto& c : cmds) {
-    if (c.wire_command == "clear_counters") {
-      cmd = c;
-      break;
-    }
-  }
-  json data = {{"cleared", 256}};
-  auto resp = MakeResponse(data);
-  auto output = RenderToString(cmd, resp);
-  EXPECT_NE(output.find("cleared"), std::string::npos);
-  EXPECT_NE(output.find("256"), std::string::npos);
-}
-
-TEST_F(FwAdapterTest, RenderEdit) {
-  auto cmds = adapter_->Commands();
-  cli::CommandSpec cmd;
-  for (const auto& c : cmds) {
-    if (c.wire_command == "edit") {
-      cmd = c;
-      break;
-    }
-  }
-  ASSERT_FALSE(cmd.wire_command.empty());
-  json data = {
-      {"file", "/etc/f/rules.fw"},
-      {"changed", true},
-  };
-  auto resp = MakeResponse(data);
-  auto output = RenderToString(cmd, resp);
-  EXPECT_NE(output.find("rules.fw"), std::string::npos);
-  EXPECT_NE(output.find("yes"), std::string::npos);
-}
-
-TEST_F(FwAdapterTest, EditRequiresSession) {
-  for (const auto& c : adapter_->Commands()) {
-    if (c.wire_command == "edit") {
-      EXPECT_TRUE(c.requires_session);
-      EXPECT_EQ(c.role, cli::RoleGate::AdminOnly);
-      return;
-    }
-  }
-  FAIL() << "edit command not found";
-}
-
-TEST_F(FwAdapterTest, RenderSetEditor) {
-  auto cmds = adapter_->Commands();
-  cli::CommandSpec cmd;
-  for (const auto& c : cmds) {
-    if (c.wire_command == "set_editor") {
-      cmd = c;
-      break;
-    }
-  }
-  json data = {
-      {"editor", "nano"},
-      {"config", "/home/test/.config/einheit-f/config.yaml"},
-  };
-  auto resp = MakeResponse(data);
-  auto output = RenderToString(cmd, resp);
-  EXPECT_NE(output.find("nano"), std::string::npos);
-}
-
-TEST_F(FwAdapterTest, RenderShowLogEmpty) {
-  auto cmds = adapter_->Commands();
-  cli::CommandSpec cmd;
-  for (const auto& c : cmds) {
-    if (c.wire_command == "show_log") {
-      cmd = c;
-      break;
-    }
-  }
-  json data = {
-      {"source", "none"},
-      {"entries", json::array()},
-      {"message", "No log source available"},
-  };
-  auto resp = MakeResponse(data);
-  auto output = RenderToString(cmd, resp);
-  EXPECT_NE(output.find("No log source"),
-            std::string::npos);
-}
-
-TEST_F(FwAdapterTest, RenderShowLogWithEntries) {
-  auto cmds = adapter_->Commands();
-  cli::CommandSpec cmd;
-  for (const auto& c : cmds) {
-    if (c.wire_command == "show_log") {
-      cmd = c;
-      break;
-    }
-  }
-  json data = {
-      {"source", "journald"},
-      {"entries", {"2026-06-28 fd[1234]: Engine running",
-                   "2026-06-28 fd[1234]: Attached eth0"}},
-  };
-  auto resp = MakeResponse(data);
-  auto output = RenderToString(cmd, resp);
-  EXPECT_NE(output.find("Engine running"),
-            std::string::npos);
-  EXPECT_NE(output.find("Attached eth0"),
-            std::string::npos);
-}
-
-TEST_F(FwAdapterTest, NewCommandsRegistered) {
-  auto cmds = adapter_->Commands();
-  std::vector<std::string> expected = {
-      "show log",
-      "edit",
-      "set editor",
-  };
-  for (const auto& path : expected) {
-    bool found = false;
-    for (const auto& c : cmds) {
-      if (c.path == path) {
-        found = true;
-        break;
-      }
-    }
-    EXPECT_TRUE(found) << "missing command: " << path;
-  }
-}
-
-TEST_F(FwAdapterTest, OnlyLeasesDeclaresAWatchTopic) {
-  // `watch <cmd>` refuses when the adapter declares no topic for the
-  // command, which is the only thing standing between the operator
-  // and a watch that renders a blank screen forever. So the set of
-  // declared topics has to be exactly the set with a live source.
-  for (const auto& c : adapter_->Commands()) {
-    auto topics = adapter_->EventTopicsFor(c);
-    if (c.wire_command == "show_leases") {
-      ASSERT_EQ(topics.size(), 1U) << c.path;
-      EXPECT_EQ(topics[0], "leases");
-    } else {
-      EXPECT_TRUE(topics.empty()) << c.path;
-    }
-  }
-}
-
-// --- v0.4 renderers: zones / nat / conntrack -----------------------
-
-TEST_F(FwAdapterTest, V04CommandsRegistered) {
-  auto have = [&](const std::string& wc) {
-    for (const auto& c : adapter_->Commands()) {
-      if (c.wire_command == wc) return true;
-    }
-    return false;
-  };
-  EXPECT_TRUE(have("show_zones"));
-  EXPECT_TRUE(have("show_nat"));
-  EXPECT_TRUE(have("show_conntrack"));
-}
-
-TEST_F(FwAdapterTest, RenderShowZonesEmpty) {
-  const auto* cmd = FindCommand("show zones");
-  ASSERT_NE(cmd, nullptr);
-  auto output = RenderToString(*cmd, MakeResponse(json::array()));
-  EXPECT_NE(output.find("no zones"), std::string::npos);
-}
-
-TEST_F(FwAdapterTest, RenderShowZonesWithData) {
-  const auto* cmd = FindCommand("show zones");
-  ASSERT_NE(cmd, nullptr);
-  json data = json::array({
-      {{"zone", "lan"},
-       {"interfaces", json::array({"lan0"})},
-       {"attached", json::array({"lan0"})},
-       {"attached_count", 1},
-       {"redirects_to", json::array({"wan"})},
-       {"masquerades", true}},
-      {{"zone", "wan"},
-       {"interfaces", json::array({"wan0"})},
-       {"attached", json::array()},
-       {"attached_count", 0},
-       {"redirects_to", json::array({"lan"})},
-       {"masquerades", false}},
-  });
-  auto output = RenderToString(*cmd, MakeResponse(data));
-  EXPECT_NE(output.find("lan"), std::string::npos);
-  EXPECT_NE(output.find("wan"), std::string::npos);
-  // masquerades true renders "yes"; the WAN zone with no attach shows
-  // its interface list, not the attached list.
-  EXPECT_NE(output.find("yes"), std::string::npos);
-  EXPECT_NE(output.find("wan0"), std::string::npos);
-}
-
-TEST_F(FwAdapterTest, RenderShowNatEmpty) {
-  const auto* cmd = FindCommand("show nat");
-  ASSERT_NE(cmd, nullptr);
-  auto output =
-      RenderToString(*cmd, MakeResponse({{"translations",
-                                          json::array()}}));
-  EXPECT_NE(output.find("no active translations"),
-            std::string::npos);
-}
-
-TEST_F(FwAdapterTest, RenderShowNatWithData) {
-  const auto* cmd = FindCommand("show nat");
-  ASSERT_NE(cmd, nullptr);
-  json data = {
-      {"masq_source", "203.0.113.1"},
-      {"translations",
-       json::array({
-           {{"proto", "tcp"},
-            {"type", "dnat"},
-            {"orig_src", "203.0.113.9"},
-            {"orig_src_port", 80},
-            {"orig_dst", "203.0.113.1"},
-            {"orig_dst_port", 40000},
-            {"new_addr", "10.0.0.2"},
-            {"new_port", 40000}},
-       })},
-  };
-  auto output = RenderToString(*cmd, MakeResponse(data));
-  EXPECT_NE(output.find("203.0.113.1"), std::string::npos);
-  EXPECT_NE(output.find("10.0.0.2:40000"), std::string::npos);
-  EXPECT_NE(output.find("masquerade source"), std::string::npos);
-}
-
-TEST_F(FwAdapterTest, RenderShowConntrackEmpty) {
-  const auto* cmd = FindCommand("show conntrack");
-  ASSERT_NE(cmd, nullptr);
-  auto output = RenderToString(*cmd, MakeResponse(json::array()));
-  EXPECT_NE(output.find("no tracked connections"),
-            std::string::npos);
-}
-
-TEST_F(FwAdapterTest, RenderShowConntrackWithData) {
-  const auto* cmd = FindCommand("show conntrack");
-  ASSERT_NE(cmd, nullptr);
-  json data = json::array({
-      {{"proto", "tcp"},
-       {"src", "10.0.0.2"},
-       {"src_port", 51000},
-       {"dst", "10.0.0.1"},
-       {"dst_port", 22},
-       {"state", "established"},
-       {"packets", 7}},
-  });
-  auto output = RenderToString(*cmd, MakeResponse(data));
-  EXPECT_NE(output.find("10.0.0.2:51000"), std::string::npos);
-  EXPECT_NE(output.find("established"), std::string::npos);
-  EXPECT_NE(output.find("7"), std::string::npos);
 }
 
 }  // namespace

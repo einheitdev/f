@@ -34,7 +34,6 @@ foreach(test_source ${test_sources})
     )
   else()
     target_link_libraries(${test_name} PRIVATE
-      libf-api
       libf-engine
       GTest::gtest_main
     )

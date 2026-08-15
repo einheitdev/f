@@ -1,7 +1,20 @@
 /// @file ui_adapter.cc
-/// @brief f firewall UI adapter. Reads BPF maps directly,
-/// serves dashboard + rules + counters via HTMX, pushes
-/// live counter updates over WebSocket.
+/// @brief f firewall UI adapter. Serves dashboard, interfaces, zones,
+/// NAT and conntrack via HTMX and pushes live updates over WebSocket.
+///
+/// Everything on these pages comes from the daemon over the control
+/// socket. It used to open the pinned BPF maps in-process as well, and
+/// that half served the `/firewall` and `/counters` pages: it opened
+/// `rules_a`, `rules_b`, `cidr_a`, `cidr_b`, `conntrack`, `counters`
+/// and `config` — the v0.1 single-program map names, none of which a
+/// v0.4 bundle pins. So on every deployed box `OpenPinnedMaps` failed
+/// on its first name, `maps_open_` stayed false, `/firewall` rendered
+/// "no rules loaded", `/counters` rendered "no counters active", and
+/// the dashboard's maps badge was a red "unavailable" — measured on
+/// deb-03 against master `dc0b0fc`, on a box whose real
+/// `fwl_counters_testnet` was counting every frame on the wire. Those
+/// pages are gone rather than fixed: there was nothing behind them to
+/// fix, and an empty table is a claim.
 
 #include "adapters/fw/ui_adapter.h"
 
@@ -22,8 +35,6 @@
 #include <thread>
 #include <vector>
 
-#include <bpf/bpf.h>
-#include <bpf/libbpf.h>
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
 #include <zmq.hpp>
@@ -31,8 +42,7 @@
 #include "einheit/ui/route.h"
 #include "einheit/ui/stream.h"
 
-#include "f/bpf_loader.h"
-#include "f/engine.h"
+#include "f/protocol.h"
 #include "f/types.h"
 
 namespace einheit::adapters::fw {
@@ -105,25 +115,6 @@ auto GatherInterfaces() -> json {
   return out;
 }
 
-auto ActionStr(uint8_t action) -> std::string {
-  switch (static_cast<f::Action>(action)) {
-    case f::Action::kDrop: return "drop";
-    case f::Action::kAllow: return "allow";
-    case f::Action::kRateLimit: return "rate-limit";
-  }
-  return "unknown";
-}
-
-auto ProtoStr(uint8_t proto) -> std::string {
-  switch (static_cast<f::Proto>(proto)) {
-    case f::Proto::kAny: return "any";
-    case f::Proto::kIcmp: return "icmp";
-    case f::Proto::kTcp: return "tcp";
-    case f::Proto::kUdp: return "udp";
-  }
-  return std::to_string(proto);
-}
-
 auto ActionSemantic(const std::string& a)
     -> std::string {
   if (a == "allow") return "good";
@@ -135,55 +126,6 @@ auto StateSemantic(const std::string& s) -> std::string {
   if (s == "up") return "good";
   if (s == "down") return "bad";
   return "info";
-}
-
-auto ReadRules(const f::BpfHandles& maps) -> json {
-  uint32_t cfg_key = 0;
-  f::FwConfig fw_cfg{};
-  bpf_map_lookup_elem(maps.config_fd, &cfg_key, &fw_cfg);
-  int rules_fd = fw_cfg.active_table == 0
-                     ? maps.rules_a_fd
-                     : maps.rules_b_fd;
-  int ncpus = libbpf_num_possible_cpus();
-  if (ncpus < 1) ncpus = 1;
-
-  json rules = json::array();
-  f::RuleKey key{}, next{};
-  uint32_t idx = 0;
-  while (bpf_map_get_next_key(
-             rules_fd, &key, &next) == 0) {
-    f::RuleValue val{};
-    bpf_map_lookup_elem(rules_fd, &next, &val);
-    uint64_t pkts = 0, bytes = 0;
-    std::vector<f::RuleCounter> per_cpu(ncpus);
-    if (bpf_map_lookup_elem(
-            maps.counters_fd, &idx,
-            per_cpu.data()) == 0) {
-      for (int c = 0; c < ncpus; c++) {
-        pkts += per_cpu[c].packets;
-        bytes += per_cpu[c].bytes;
-      }
-    }
-    char src[INET_ADDRSTRLEN], dst[INET_ADDRSTRLEN];
-    inet_ntop(AF_INET, &next.src_addr, src, sizeof(src));
-    inet_ntop(AF_INET, &next.dst_addr, dst, sizeof(dst));
-    auto action = ActionStr(val.action);
-    rules.push_back({
-        {"idx", idx},
-        {"src", std::string(src)},
-        {"dst", std::string(dst)},
-        {"src_port", next.src_port},
-        {"dst_port", next.dst_port},
-        {"proto", ProtoStr(next.proto)},
-        {"action", action},
-        {"action_semantic", ActionSemantic(action)},
-        {"packets", pkts},
-        {"bytes", bytes},
-    });
-    key = next;
-    idx++;
-  }
-  return rules;
 }
 
 // What fd said, and whether it is an answer at all. A reply arriving
@@ -337,11 +279,8 @@ class FwUiAdapter final : public ui::ProductUiAdapter {
         {"/interfaces", "Interfaces", "interfaces",
          "network"},
         {"/zones", "Zones", "zones", "layers"},
-        {"/firewall", "Firewall", "firewall", "shield"},
         {"/nat", "NAT", "nat", "shuffle"},
         {"/conntrack", "Conntrack", "conntrack", "activity"},
-        {"/counters", "Counters", "counters",
-         "bar-chart-2"},
     };
   }
 
@@ -351,26 +290,8 @@ class FwUiAdapter final : public ui::ProductUiAdapter {
     auto* events = ctx.events;
     auto nav = Nav();
 
-    auto maps = f::OpenPinnedMaps(cfg_.pin_path);
-    if (maps) {
-      maps_ = *maps;
-      maps_open_ = true;
-    }
-
     StartSampler(events);
 
-    events->Bind(ui::TopicBinding{
-        .topic = "fw.rules",
-        .fragment = "fw/rules_table",
-        .swap_target = "rules-table",
-        .swap_strategy = "outerHTML",
-    });
-    events->Bind(ui::TopicBinding{
-        .topic = "fw.counters",
-        .fragment = "fw/counters_table",
-        .swap_target = "counters-table",
-        .swap_strategy = "outerHTML",
-    });
     // v0.4 live views: NAT translations, conntrack, zones.
     events->Bind(ui::TopicBinding{
         .topic = "fw.nat",
@@ -416,12 +337,10 @@ class FwUiAdapter final : public ui::ProductUiAdapter {
       }
       json data = {
           {"daemon", status},
-          {"maps_available", maps_open_},
           {"iface_count", ifaces.size()},
           {"attached_count", attached},
           {"datapath_armed", attached > 0},
           {"datapath_semantic", attached > 0 ? "good" : "bad"},
-          {"has_firewall", false},
           {"zone_count", zones.is_array() ? zones.size() : 0},
           {"conntrack_count", ct.is_array() ? ct.size() : 0},
           {"nat_count", 0},
@@ -435,29 +354,6 @@ class FwUiAdapter final : public ui::ProductUiAdapter {
           data["has_masq"] = true;
           data["masq_source"] =
               nat["masq_source"].get<std::string>();
-        }
-      }
-      if (maps_open_) {
-        uint32_t cfg_key = 0;
-        f::FwConfig fw_cfg{};
-        bpf_map_lookup_elem(
-            maps_.config_fd, &cfg_key, &fw_cfg);
-        auto action = fw_cfg.default_action == 0
-                          ? "drop" : "allow";
-        data["has_firewall"] = true;
-        data["default_action"] = action;
-        data["action_semantic"] =
-            ActionSemantic(action);
-        data["rule_count"] = 0;
-        f::RuleKey key{}, next{};
-        int rules_fd = fw_cfg.active_table == 0
-                           ? maps_.rules_a_fd
-                           : maps_.rules_b_fd;
-        while (bpf_map_get_next_key(
-                   rules_fd, &key, &next) == 0) {
-          data["rule_count"] =
-              data["rule_count"].get<int>() + 1;
-          key = next;
         }
       }
       ui::RenderArgs args;
@@ -503,34 +399,6 @@ class FwUiAdapter final : public ui::ProductUiAdapter {
           {"title", "Interfaces"},
           {"brand", "f firewall"},
           {"active", "interfaces"},
-          {"nav", ui::NavToJson(nav)},
-      };
-      auto r = ui::Render(*eng, req, args);
-      if (!r) {
-        return ui::RenderError(
-            *eng, req, 500, "render", r.error().message);
-      }
-      return std::move(*r);
-    });
-
-    // -- Firewall rules --
-    CROW_ROUTE(app, "/firewall")
-    ([eng, nav, this](const crow::request& req) {
-      json data;
-      if (maps_open_) {
-        data["rules"] = ReadRules(maps_);
-      } else {
-        data["rules"] = json::array();
-        data["error"] = "BPF maps not available";
-      }
-      ui::RenderArgs args;
-      args.fragment = "fw/firewall";
-      args.layout = "layout";
-      args.data = data;
-      args.meta = {
-          {"title", "Firewall Rules"},
-          {"brand", "f firewall"},
-          {"active", "firewall"},
           {"nav", ui::NavToJson(nav)},
       };
       auto r = ui::Render(*eng, req, args);
@@ -630,56 +498,10 @@ class FwUiAdapter final : public ui::ProductUiAdapter {
       return std::move(*r);
     });
 
-    // -- Counters --
-    CROW_ROUTE(app, "/counters")
-    ([eng, nav, this](const crow::request& req) {
-      json counters = json::array();
-      if (maps_open_) {
-        int ncpus = libbpf_num_possible_cpus();
-        if (ncpus < 1) ncpus = 1;
-        for (uint32_t i = 0; i < 256; i++) {
-          std::vector<f::RuleCounter> per_cpu(ncpus);
-          if (bpf_map_lookup_elem(
-                  maps_.counters_fd, &i,
-                  per_cpu.data()) != 0) {
-            break;
-          }
-          uint64_t pkts = 0, bytes = 0;
-          for (int c = 0; c < ncpus; c++) {
-            pkts += per_cpu[c].packets;
-            bytes += per_cpu[c].bytes;
-          }
-          if (pkts == 0 && bytes == 0) continue;
-          counters.push_back({
-              {"id", i},
-              {"packets", pkts},
-              {"bytes", bytes},
-          });
-        }
-      }
-      ui::RenderArgs args;
-      args.fragment = "fw/counters";
-      args.layout = "layout";
-      args.data = {{"counters", counters}};
-      args.meta = {
-          {"title", "Counters"},
-          {"brand", "f firewall"},
-          {"active", "counters"},
-          {"nav", ui::NavToJson(nav)},
-      };
-      auto r = ui::Render(*eng, req, args);
-      if (!r) {
-        return ui::RenderError(
-            *eng, req, 500, "render", r.error().message);
-      }
-      return std::move(*r);
-    });
   }
 
  private:
   FwUiConfig cfg_;
-  f::BpfHandles maps_{};
-  bool maps_open_ = false;
   std::atomic<bool> sampler_stop_{false};
   std::jthread sampler_;
 
@@ -718,32 +540,6 @@ class FwUiAdapter final : public ui::ProductUiAdapter {
             {{"conntrack", DecorateConntrack(ct.body)},
              {"conntrack_empty",
               UnavailableText(ct, "no tracked connections")}});
-        if (!maps_open_) continue;
-        auto rules = ReadRules(maps_);
-        events->Publish("fw.rules", {{"rules", rules}});
-        int ncpus = libbpf_num_possible_cpus();
-        if (ncpus < 1) ncpus = 1;
-        json counters = json::array();
-        for (uint32_t i = 0; i < 256; i++) {
-          std::vector<f::RuleCounter> per_cpu(ncpus);
-          if (bpf_map_lookup_elem(
-                  maps_.counters_fd, &i,
-                  per_cpu.data()) != 0) {
-            break;
-          }
-          uint64_t pkts = 0, bytes = 0;
-          for (int c = 0; c < ncpus; c++) {
-            pkts += per_cpu[c].packets;
-            bytes += per_cpu[c].bytes;
-          }
-          if (pkts == 0 && bytes == 0) continue;
-          counters.push_back({
-              {"id", i}, {"packets", pkts},
-              {"bytes", bytes},
-          });
-        }
-        events->Publish("fw.counters",
-                        {{"counters", counters}});
       }
     });
   }

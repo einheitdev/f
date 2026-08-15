@@ -14,16 +14,6 @@
 {% endif %}
             </td>
           </tr>
-          <tr>
-            <td>maps</td>
-            <td>
-{% if maps_available %}
-              <span class="badge badge-good">available</span>
-{% else %}
-              <span class="badge badge-bad">unavailable</span>
-{% endif %}
-            </td>
-          </tr>
 {% if existsIn(daemon, "uptime_s") %}
           <tr>
             <td>uptime</td>
@@ -56,18 +46,6 @@
           <tr>
             <td>datapath</td>
             <td>NOT armed — no interface has an XDP program attached; traffic is not being inspected</td>
-          </tr>
-{% endif %}
-{% if has_firewall %}
-          <tr>
-            <td>default action</td>
-            <td>
-              <span class="badge badge-{{ action_semantic }}">{{ default_action }}</span>
-            </td>
-          </tr>
-          <tr>
-            <td>rules loaded</td>
-            <td>{{ rule_count }}</td>
           </tr>
 {% endif %}
         </tbody>

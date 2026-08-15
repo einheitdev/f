@@ -216,24 +216,17 @@ auto RenderShowStatus(const Response& resp,
       row("daemon", "connected", Semantic::Good);
     }
   }
-  row("maps", j.value("maps_available", false)
-                  ? "available"
-                  : "unavailable",
-      j.value("maps_available", false) ? Semantic::Good
-                                       : Semantic::Bad);
+  // Three rows are gone from here and all three said the same thing on
+  // every box: `maps [FAIL] unavailable` (nothing ever set
+  // `maps_available` in this transport, so it read the default `false`
+  // and painted a permanent red), `active_table A` and `rule_count 0`
+  // (from `rules`, which fd derived from the v0.1 rule maps a bundle
+  // does not have). A red row that is always red teaches the operator
+  // to skip the column that exists to catch his eye. `show zones` is
+  // where the loaded policy is, and `show policy` is where its rules
+  // are.
   if (j.contains("pin_path")) {
     row("pin_path", j["pin_path"].get<std::string>());
-  }
-  if (j.contains("rules")) {
-    auto& r = j["rules"];
-    if (r.contains("active_table")) {
-      row("active_table", jstr(r["active_table"]));
-    }
-    if (r.contains("count")) {
-      row("rule_count", jstr(r["count"]));
-    } else if (r.contains("rule_count")) {
-      row("rule_count", jstr(r["rule_count"]));
-    }
   }
   if (j.contains("interfaces")) {
     auto& ifaces = j["interfaces"];
@@ -392,12 +385,6 @@ auto RenderShowStatus(const Response& resp,
           Semantic::Bad);
     }
   }
-  if (j.contains("slow_path")) {
-    auto& sp = j["slow_path"];
-    if (sp.contains("events")) {
-      row("events", jstr(sp["events"]));
-    }
-  }
   RenderFormatted(t, renderer);
 }
 
@@ -444,113 +431,6 @@ auto RenderShowInterfaces(const Response& resp,
             rx.empty() ? "0" : rx))},
         Cell{FormatBytes(std::stoull(
             tx.empty() ? "0" : tx))},
-    });
-  }
-  RenderFormatted(t, renderer);
-}
-
-auto RenderShowFirewall(const Response& resp,
-                        Renderer& renderer) -> void {
-  auto j = ParseData(resp);
-  Table t;
-  AddColumn(t, "FIELD", Align::Left, Priority::High);
-  AddColumn(t, "VALUE", Align::Left, Priority::High);
-
-  auto row = [&](const std::string& field,
-                 const std::string& val,
-                 Semantic sem = Semantic::Default) {
-    AddRow(t, {Cell{field, Semantic::Info},
-               Cell{val, sem}});
-  };
-
-  row("default_action",
-      j.value("default_action", "unknown"),
-      SemanticForAction(
-          j.value("default_action", "")));
-  row("active_table",
-      std::to_string(j.value("active_table", 0)));
-  row("conntrack",
-      j.value("conntrack", false) ? "enabled"
-                                  : "disabled");
-  row("rule_count",
-      std::to_string(j.value("rule_count", 0)));
-  RenderFormatted(t, renderer);
-}
-
-auto RenderShowFirewallRules(const Response& resp,
-                             Renderer& renderer) -> void {
-  auto j = ParseData(resp);
-  if (!j.is_array() || j.empty()) {
-    Table t;
-    AddColumn(t, "RULES");
-    AddRow(t, {Cell{"no rules loaded", Semantic::Dim}});
-    RenderFormatted(t, renderer);
-    return;
-  }
-  Table t;
-  AddColumn(t, "#", Align::Right, Priority::High);
-  AddColumn(t, "SRC", Align::Left, Priority::High);
-  AddColumn(t, "DST", Align::Left, Priority::High);
-  AddColumn(t, "PROTO", Align::Left, Priority::Medium);
-  AddColumn(t, "SPORT", Align::Right, Priority::Low);
-  AddColumn(t, "DPORT", Align::Right, Priority::Low);
-  AddColumn(t, "ACTION", Align::Left, Priority::High);
-  AddColumn(t, "PACKETS", Align::Right, Priority::High);
-  AddColumn(t, "BYTES", Align::Right, Priority::Medium);
-
-  for (const auto& r : j) {
-    auto action = r.value("action", "");
-    auto sp = r.value("src_port", 0);
-    auto dp = r.value("dst_port", 0);
-    // "-", not "0", when fd sends no per-rule count. The datapath
-    // behind these rules keys its counters by MATCH TIER, not by
-    // rule, so there is no per-rule number to show — and a defaulted
-    // 0 in this column is a claim that the rule matched nothing,
-    // which is exactly the kind of confident wrong number this
-    // column used to carry.
-    auto count_cell = [&](const char* key) -> Cell {
-      if (!r.contains(key)) return Cell{"-", Semantic::Dim};
-      return std::string(key) == "bytes"
-                 ? Cell{FormatBytes(r.value(key, 0ULL))}
-                 : Cell{std::to_string(r.value(key, 0ULL))};
-    };
-    AddRow(t, {
-        Cell{std::to_string(r.value("idx", 0)),
-             Semantic::Dim},
-        Cell{r.value("src", "0.0.0.0")},
-        Cell{r.value("dst", "0.0.0.0")},
-        Cell{r.value("proto", "any"), Semantic::Info},
-        Cell{sp == 0 ? "*" : std::to_string(sp)},
-        Cell{dp == 0 ? "*" : std::to_string(dp)},
-        Cell{action, SemanticForAction(action)},
-        count_cell("packets"),
-        count_cell("bytes"),
-    });
-  }
-  RenderFormatted(t, renderer);
-}
-
-auto RenderShowCounters(const Response& resp,
-                        Renderer& renderer) -> void {
-  auto j = ParseData(resp);
-  if (!j.is_array() || j.empty()) {
-    Table t;
-    AddColumn(t, "COUNTERS");
-    AddRow(t, {Cell{"no counters active", Semantic::Dim}});
-    RenderFormatted(t, renderer);
-    return;
-  }
-  Table t;
-  AddColumn(t, "ID", Align::Right, Priority::High);
-  AddColumn(t, "PACKETS", Align::Right, Priority::High);
-  AddColumn(t, "BYTES", Align::Right, Priority::High);
-
-  for (const auto& c : j) {
-    AddRow(t, {
-        Cell{std::to_string(c.value("id", 0)),
-             Semantic::Info},
-        Cell{std::to_string(c.value("packets", 0))},
-        Cell{FormatBytes(c.value("bytes", 0ULL))},
     });
   }
   RenderFormatted(t, renderer);
@@ -1263,10 +1143,6 @@ auto RenderSimpleOk(const Response& resp,
   std::string msg = "ok";
   if (j.contains("status")) {
     msg = j["status"].get<std::string>();
-  }
-  if (j.contains("cleared")) {
-    msg = std::format("cleared {} counter slots",
-                      j["cleared"].get<int>());
   }
   if (j.contains("reload")) {
     msg += " (" + j["reload"].get<std::string>() + ")";
@@ -2240,12 +2116,6 @@ class FwAdapter final : public cli::ProductAdapter {
              "Daemon status, uptime, attach state"),
         Show("interfaces", "show_interfaces",
              "Network interfaces, addresses, counters"),
-        Show("firewall", "show_firewall",
-             "Firewall program overview"),
-        Show("firewall rules", "show_firewall_rules",
-             "Per-rule detail with hit counts"),
-        Show("counters", "show_counters",
-             "Named counters from the BPF program"),
         Show("zones", "show_zones",
              "Zones, interfaces, redirect topology (v0.4)"),
         Show("nat", "show_nat",
@@ -2308,7 +2178,6 @@ class FwAdapter final : public cli::ProductAdapter {
         MakeSetLink(),
         MakeNoAddress(),
         MakeReload(),
-        MakeClearCounters(),
     };
   }
 
@@ -2326,12 +2195,6 @@ class FwAdapter final : public cli::ProductAdapter {
       RenderShowStatus(response, renderer);
     } else if (wc == "show_interfaces") {
       RenderShowInterfaces(response, renderer);
-    } else if (wc == "show_firewall") {
-      RenderShowFirewall(response, renderer);
-    } else if (wc == "show_firewall_rules") {
-      RenderShowFirewallRules(response, renderer);
-    } else if (wc == "show_counters") {
-      RenderShowCounters(response, renderer);
     } else if (wc == "show_zones") {
       RenderShowZones(response, renderer);
     } else if (wc == "show_nat") {
@@ -2394,8 +2257,7 @@ class FwAdapter final : public cli::ProductAdapter {
     } else if (wc == "configure" || wc == "commit" ||
                wc == "rollback" || wc == "show_config" ||
                wc == "show_diff" ||
-               wc == "reload_firewall" ||
-               wc == "clear_counters") {
+               wc == "reload_firewall") {
       RenderSimpleOk(response, renderer);
     }
   }
@@ -3105,14 +2967,6 @@ class FwAdapter final : public cli::ProductAdapter {
     return c;
   }
 
-  static auto MakeClearCounters() -> CommandSpec {
-    CommandSpec c;
-    c.path = "clear counters";
-    c.wire_command = "clear_counters";
-    c.help = "Reset all per-rule counters to zero";
-    c.role = RoleGate::OperatorOrAdmin;
-    return c;
-  }
 };
 
 }  // namespace

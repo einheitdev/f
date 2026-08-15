@@ -1,9 +1,11 @@
 # fd — firewall engine configuration
 #
-# Interfaces to attach XDP programs to. On the A733 carrier board
-# these are the KSZ9477S switch ports (lan0-lan3) and the SoM
-# uplink (eth0). On a generic box, list the relevant NICs.
-interfaces: []
+# There is no `interfaces:` key. fd attaches to the interfaces the
+# staged bundle's zones name, so the ports this box filters are decided
+# in /etc/f/system.yaml and in the policy's `zone` lines — one place,
+# not two. An older file that still carries the key gets a warning
+# naming it, because a list an operator wrote and fd ignores is worse
+# than no list at all.
 
 # ZMQ control socket for the CLI.
 socket: ipc:///run/f/control.sock

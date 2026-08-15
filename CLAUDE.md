@@ -22,7 +22,7 @@ ctest --preset default
 ./build/tests/test_types
 
 # Run a single GoogleTest case
-./build/tests/test_types --gtest_filter='TypesTest.RuleKey*'
+./build/tests/test_types --gtest_filter='TypesTest.ConnKey*'
 
 # FWL compiler (Python)
 cd fwl && pip install -e ".[dev]"
@@ -39,28 +39,24 @@ C++ uses `.clang-format` (Google style, 80-col) and `.clang-tidy` for static ana
 
 ## Architecture
 
-Two static libraries compose the system:
+**There is one datapath: the compiled bundle.** `fwl compile --bundle` emits one `<zone>.bpf.o` per `@xdp` block plus a `manifest.json`; `fd` loads `<bundle-dir>/current` and attaches each program to its zone's interfaces. A second, v0.1 single-program datapath (`bpf/fw.bpf.c`, `libf-api`, `f-api`, the `rules_a`/`counters`/`config` maps, the ring-buffer slow path, opcodes 1/2/6/7/8) sat beside it until `f-appliance` removed it — see `include/f/bpf_loader.h` for what its fallback did on a real box. **Nothing is loaded when no bundle is staged: `fd` refuses to start.**
 
-- **libf-engine** — BPF lifecycle, ZMQ control socket, map operations. No HTTP.
-- **libf-api** — Crow REST API, HTMX fragment serving. Reads pinned BPF maps; no BPF loading.
+- **libf-engine** — bundle lifecycle, ZMQ control socket, map operations. The only library the daemons share.
 
-Three executables link against them:
+Executables:
 
-- **fd** — main daemon (engine + optional API, epoll loop on main thread, Crow on separate thread)
-- **fctl** — CLI client, sends binary commands over Unix socket
-- **f-api** — standalone REST/web server (reads existing pinned maps via `OpenPinnedMaps()`)
+- **fd** — the daemon: loads and attaches the bundle, serves the ZMQ control socket, runs conntrack/NAT GC and the source watcher
+- **fctl** — minimal control client (status, stop); what you have left when the CLI is what is broken
+- **einheit-f** — the operator CLI; **einheit-f-ui** — the dashboard, which reads everything from `fd` over the control socket
+- **f-confd** — commit-confirmed revert timer; **f-sysconf** — `system.yaml` to networkd/dnsmasq/chrony
 
 ### Key design patterns
 
-**A/B table swapping**: Two sets of rule maps (rules_a/rules_b, cidr_a/cidr_b). New rules populate the standby table; a single-byte atomic flip in `FwConfig.active_table` activates them. Zero packet loss during updates.
+**Control protocol**: ZMQ REQ/REP at `ipc:///run/f/control.sock`. A request is `[1B Cmd][payload]`, the reply is JSON — see `include/f/protocol.h`, which also records which opcode numbers are retired and why they must not be reused.
 
-**Binary control protocol**: Unix socket at `/tmp/fd-control.sock`. Framing: `[4B LE length][payload]`. Flat struct serialization — see `include/f/protocol.h`.
+**Component pattern**: Stateful subsystems (IfaceMgr, ConntrackMgr, NatMgr, RouteMgr, EgressMgr) inherit `Component` with uniform `GetState()`/`SetState()` JSON interface. Each reports what it read from the kernel, never what the model implies.
 
-**Component pattern**: Stateful subsystems (RuleTable, IfaceMgr, ConntrackMgr) inherit `Component` with uniform `GetState()`/`SetState()` JSON interface.
-
-**Ring buffer slow path**: XDP emits events (new connections, rate exceeded) to a BPF ring buffer consumed by `SlowPath` in userspace.
-
-**Shared C/C++ types**: `include/f/types.h` compiles for both BPF (C) and userspace (C++23) via `#ifdef __cplusplus` guards. Explicit padding to prevent struct layout mismatches.
+**Shared types**: `include/f/types.h` holds the structs the daemon reads the emitter's maps through. A layout change there is a compiler/daemon disagreement; `tests/test_types.cc` pins the offsets.
 
 **Error handling**: `std::expected<T, Error<E>>` throughout — no exceptions on control paths.
 
@@ -68,17 +64,17 @@ Three executables link against them:
 
 Python 3.11+ compiler: Lark grammar parser -> typed AST -> BPF C emitter. Three tiers: declarative rules (Tier 1), Python-syntax functions compiling to BPF C (Tier 2), raw C escape hatch (Tier 3). Design doc: `doc/fwl.md`.
 
-### Web UI (ui/)
+### Web UI
 
-Zero-build HTMX + Tailwind CSS (standalone CLI, no npm) + Plotly.js. Crow serves static files and HTMX fragments.
+`adapters/ui/` is the firewall adapter for the sibling `einheit-ui` framework, built as `einheit-f-ui`. Templates in `adapters/ui/templates/fw/`; every page reads `fd` over the control socket.
 
 ## Key Files
 
-- `include/f/types.h` — shared BPF/userspace data structures
-- `include/f/engine.h` — core daemon interface (EngineInit, EngineRun, ApplyConfig, etc.)
-- `include/f/protocol.h` — wire protocol types and serialization
-- `bpf/fw.bpf.c` — XDP program (packet parsing, rule lookup, conntrack, counters)
-- `src/engine.cc` — main epoll loop and command dispatch
+- `include/f/types.h` — the structs the daemon reads the emitter's maps through
+- `include/f/engine.h` — core daemon interface (EngineInit, EngineRun, GetFullState)
+- `include/f/bpf_loader.h` — bundle loading, pin reconciliation, attach plan
+- `include/f/protocol.h` — control opcodes, live and retired
+- `src/engine.cc` — control loop and command dispatch
 - `doc/design.md` — full architecture documentation
 
 ## Deployment

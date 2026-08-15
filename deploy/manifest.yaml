@@ -122,21 +122,6 @@ components:
     needed_by: einheit-f-ui.service
     why: The web dashboard.
 
-  - id: f-api
-    group: binaries
-    kind: binary
-    source: f-api
-    dest: "{prefix}/bin/f-api"
-    mode: "0755"
-    requirement: optional
-    required_when: >-
-      you want the standalone REST server; einheit-f-ui serves the
-      same data and is what the shipped unit starts
-    needed_by: none
-    why: >-
-      Reads the pinned maps over HTTP without loading anything. Useful
-      for scraping, not needed for a working box.
-
   # -- The compiler ---------------------------------------------------
 
   - id: fwl
@@ -180,8 +165,8 @@ components:
     requirement: required
     needed_by: einheit-f-ui.service
     why: >-
-      The firewall adapter's own pages: dashboard, zones, NAT,
-      conntrack, counters, rules.
+      The firewall adapter's own pages: dashboard, interfaces, zones,
+      NAT and conntrack.
 
   - id: ui-assets
     group: ui
@@ -524,6 +509,32 @@ absent:
     installed_by: hand, before there was an installer
     why: >-
       Same shadow as fd.service, for DHCP and DNS.
+
+  - id: stale-f-api
+    dest: "{prefix}/bin/f-api"
+    installed_by: this manifest, before the v0.1 REST surface was cut
+    why: >-
+      The standalone REST server. It opened the pinned maps `rules_a`,
+      `rules_b`, `cidr_a`, `cidr_b`, `counters` and `config` — v0.1
+      names that no v0.4 bundle pins — so on every deployed box it
+      served `[]` for rules, one all-zero counter row and a status with
+      `rule_count: 0`, and `PUT /api/v1/rules` wrote into a datapath
+      that was not there. A left-behind copy still starts, still binds
+      its port, and still answers all of that.
+
+  - id: stale-fw-bpf-o
+    dest: /usr/lib/f/fw.bpf.o
+    installed_by: by hand, following deploy/README.md
+    why: >-
+      The v0.1 single-program XDP object, and the last entry on a
+      search list `fd` used to consult when no bundle was staged. With
+      one present, a box that lost its `current` symlink came up
+      running this instead: attached, READY, green everywhere, and
+      passing every packet, because its config map was seeded
+      `default_action = allow`. `fd` refuses to start without a bundle
+      now, so the file cannot be loaded — but it is 27 KB of XDP object
+      on the box that nothing accounts for, and the next person to find
+      it should be told what it was.
 
   - id: stale-firstboot-sh
     dest: "{prefix}/share/f/firstboot.sh"

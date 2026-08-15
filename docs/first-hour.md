@@ -190,7 +190,7 @@ zone wan  (/etc/f/rules.fw)
  1 │ allow if conntrack(pkt).state in [established, related] │ when it matches
  2 │ default drop                                            │ every packet — stops here
 
-this is the policy source on disk; `show firewall` and `show zones` report what fd
+this is the policy source on disk; `show zones` reports what fd
 has loaded and attached
 ```
 
@@ -227,7 +227,7 @@ $ einheit-f no rule wan 2
 $ einheit-f no forward wan tcp 80
 ```
 
-`show policy` reads the file. `show firewall` and `show zones` read what `fd` has actually loaded and attached — different questions, and the reason they are different commands.
+`show policy` reads the file. `show zones` reads what `fd` has actually loaded and attached — different questions, and the reason they are different commands.
 
 ## 9. Look at what is happening
 

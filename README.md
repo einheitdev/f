@@ -39,13 +39,11 @@ Rules live in BPF maps. Updates go to a standby table while the active table con
 
 ## Features
 
-- **XDP packet filtering** — exact 5-tuple and CIDR matching, connection tracking, per-source rate limiting
-- **A/B table swap** — atomic rule replacement with no packet loss
-- **Per-CPU counters** — packet and byte stats per rule, aggregated in userspace
-- **Ring buffer slow path** — kernel-to-userspace event stream for new connections, rate exceeded, unknown protocols
-- **Binary control protocol** — flat struct serialization over Unix socket, no parsing overhead
-- **REST API** — JSON and HTMX fragment endpoints for rules, counters, conntrack, interfaces
-- **Web dashboard** — HTMX + Tailwind CSS + Plotly.js, no build tooling required
+- **XDP packet filtering** — one compiled BPF program per zone, connection tracking, NAT, per-source rate limiting
+- **Zero-loss hot reload** — a new bundle replaces the running one interface by interface (`XDP_FLAGS_REPLACE`); flow-keyed state survives the policy change
+- **Refuses rather than pretends** — a bundle that attaches to no interface, and a box with no bundle staged, are both a daemon that does not start
+- **ZMQ control protocol** — `[1B Cmd][payload]`, JSON reply, at `ipc:///run/f/control.sock`
+- **Operator CLI and web dashboard** — `einheit-f` and `einheit-f-ui`, both reading the daemon
 - **FWL compiler** — small declarative language that compiles to verifier-accepted BPF C, verified construct-by-construct against three independent oracles
 
 ## Requirements
@@ -82,14 +80,14 @@ sudo ./build/fd --iface eth0
 Start the web dashboard:
 
 ```bash
-sudo ./build/f-api --port 8080
+sudo ./build/einheit-f-ui --port 8080
 ```
 
 Use the CLI to control the engine:
 
 ```bash
 ./build/fctl status
-./build/fctl counters
+./build/einheit-f show zones
 ```
 
 ## Testing
@@ -140,23 +138,11 @@ sudo .venv/bin/fwl test tests/corpus/ # add live BPF_PROG_TEST_RUN
 
 See [`fwl/README.md`](fwl/README.md) for the compiler architecture and the `.pkt` test format; the language reference is in [`docs/FWL_V01_SPEC.md`](docs/FWL_V01_SPEC.md); the methodology that gates each construct on three-oracle agreement is in [`docs/F_DEVELOPMENT_METHODOLOGY.md`](docs/F_DEVELOPMENT_METHODOLOGY.md).
 
-## REST API
+## Control surface
 
-| Method | Path | Description |
-|--------|------|-------------|
-| GET | `/api/v1/status` | Daemon state, uptime, attached interfaces |
-| GET | `/api/v1/rules` | Current rule set |
-| PUT | `/api/v1/rules` | Replace full rule set (A/B swap) |
-| POST | `/api/v1/rules` | Add single rule |
-| DELETE | `/api/v1/rules/:id` | Remove single rule |
-| GET | `/api/v1/counters` | Per-rule packet/byte counters |
-| GET | `/api/v1/conntrack` | Active connection table |
-| GET | `/api/v1/interfaces` | Attached interfaces |
-| POST | `/api/v1/interfaces/:name/attach` | Attach XDP to interface |
-| POST | `/api/v1/interfaces/:name/detach` | Detach XDP from interface |
-| GET | `/api/v1/log` | Recent log entries |
+There is no REST API. A table of `/api/v1/...` endpoints stood here, served by an `f-api` binary that read the pinned maps of the v0.1 single-program datapath — `rules_a`, `counters`, `config` — none of which a compiled bundle pins. On every deployed box it answered `[]` for rules, one all-zero counter row, and `{"rules_installed": 0}` with HTTP 200 for a `PUT` in which every map write failed `EBADF`. It was removed with that datapath.
 
-All endpoints return JSON by default. When called with `HX-Request: true`, they return HTML fragments for the HTMX dashboard.
+The daemon speaks one protocol: ZMQ REQ/REP at `ipc:///run/f/control.sock`, a request of `[1B Cmd][payload]`, a JSON reply. `include/f/protocol.h` lists the opcodes, and records which numbers are retired so they are never reused against an older client. `einheit-f`, `einheit-f-ui` and `fctl` are the three clients.
 
 ## Documentation
 

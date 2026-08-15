@@ -107,7 +107,7 @@ Note the reading again: this logs the *second and subsequent* attempts from a so
 
 ## Reading the counters back
 
-Each rate-limited rule keeps a counter of how many times the limit fired. `einheit-f show counters` prints them next to the named ones. A limit that never fires and a limit that fires constantly are both worth knowing about, and they are different from the rule's own hit count.
+Each rate-limited rule keeps a counter of how many times the limit fired, in the same `fwl_counters_<zone>` map as the named ones, and — as [5. Observability](05-observability.md) says — nothing on the box reads that map yet. `bpftool map dump pinned /sys/fs/bpf/f/fwl_counters_<zone>` is the whole story today. A limit that never fires and a limit that fires constantly are both worth knowing about, and they are different from the rule's own hit count; you cannot currently see either from the CLI.
 
 ---
 

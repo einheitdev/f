@@ -22,9 +22,7 @@ enum class ReloadError : uint8_t {
   kCompileFailed,
   /// manifest.json missing, unparseable, or violates schema.
   kManifestInvalid,
-  /// rules.json missing or unparseable.
-  kRulesInvalid,
-  /// ApplyConfig failed against the engine.
+  /// Loading or attaching the bundle failed against the engine.
   kApplyFailed,
   /// Filesystem error.
   kIoError,
@@ -33,11 +31,15 @@ enum class ReloadError : uint8_t {
 struct ReloadResult {
   /// Bundle version string from manifest (e.g. "20260414T200000Z").
   std::string version;
-  /// How many rules made it into the standby table.
-  uint32_t rules_installed = 0;
-  /// True if the BPF program was swapped (Task 4).
+  /// True once the new bundle's programs are the ones attached.
   bool program_updated = false;
 };
+
+// `rules_installed` was here, and it was always 0 on a bundle: it
+// counted rows written into the v0.1 `rules_a` map, and a bundle
+// carries its rules compiled into the BPF objects. `commit` reported
+// "0 rules installed" for every successful policy change on every box.
+// A number that cannot be anything but zero is not a measurement.
 
 /// Compile the current source into a new bundle and apply it.
 /// On any failure, no state changes are visible to the data plane.
@@ -51,9 +53,9 @@ auto RunCompiler(std::string_view fwl_path,
                  std::string_view output_dir)
     -> std::expected<std::string, Error<ReloadError>>;
 
-/// Apply an already-built bundle directory to the engine. Reads
-/// manifest.json and rules.json, translates into a ConfigMsg,
-/// calls ApplyConfig. Public for testability.
+/// Apply an already-built bundle directory to the engine: reads
+/// manifest.json, reconciles the pins, loads every zone program and
+/// swaps it onto its interfaces atomically. Public for testability.
 auto ApplyBundle(Engine& e, std::string_view bundle_dir)
     -> std::expected<ReloadResult, Error<ReloadError>>;
 

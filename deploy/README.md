@@ -8,7 +8,7 @@ How to install and run `fd` (the eBPF firewall daemon) on a Linux host. Targets 
 
 ### 1. Mount `bpffs`
 
-`fd` pins its BPF maps to `bpffs` so the userspace REST/HTMX server (`f-api`) and external tools can read them without re-loading the program. The mount point must exist before `fd` starts.
+`fd` pins the bundle's shared maps to `bpffs` so that every zone program resolves `conntrack` and `fwl_nat` to one kernel map, and so that flow state survives a restart of the daemon. The mount point must exist before `fd` starts.
 
 ```sh
 sudo mkdir -p /sys/fs/bpf
@@ -50,14 +50,16 @@ f-install verify
 
 **There is no `fd` user.** Earlier versions of this page told you to `chown fd:fd` and to `sudo -u fd`, and all three of those commands fail with "invalid user" on every box that has ever been built. `fd.service` runs as root with a capability bounding set of `CAP_BPF CAP_NET_ADMIN CAP_PERFMON CAP_SYS_RESOURCE` and the sandbox described under [Capabilities](#capabilities) below; a separate uid would not remove any of those capabilities, because loading a BPF program and attaching XDP is the whole job.
 
-The first time `fd` runs without a `current` symlink, it falls back to the built-in `fw.bpf.o` (the v0.1 search list under `fw.bpf.o`, `build/fw.bpf.o`, `../bpf/fw.bpf.o`, `/usr/lib/f/fw.bpf.o`). Compile a starter bundle with:
+**`fd` will not start without a compiled bundle at `/usr/share/f/compiled/current`.** Compile one:
 
 ```sh
 fwl compile /etc/f/rules.fw --bundle /usr/share/f/compiled/v-init
 sudo ln -sfT v-init /usr/share/f/compiled/current
 ```
 
-On a box provisioned by `firstboot.py` this has already happened: it compiles the starting policy and links `current` before it lets `fd` start, precisely so that the fallback above is never what a new box runs.
+On a box provisioned by `firstboot.py` this has already happened: it compiles the starting policy and links `current` before it lets `fd` start.
+
+This page used to describe a fallback here instead — a built-in `fw.bpf.o` that `fd` searched for under `fw.bpf.o`, `build/fw.bpf.o`, `../bpf/fw.bpf.o` and `/usr/lib/f/fw.bpf.o` when no bundle was staged, with instructions to put one at the last of those. **If you followed them, delete `/usr/lib/f/fw.bpf.o`.** It is the v0.1 single-program firewall, unrelated to anything `fwl` compiles, and its config map was seeded `default_action = allow` on load — so a box that lost its `current` symlink came up attached, READY, green in `systemctl` and in `show zones`, and passing every packet. Refusing to start is the replacement, and it is the better failure: an appliance that is down is visibly down.
 
 ### 3. Service install
 
@@ -125,13 +127,14 @@ The unit grants `fd` the smallest cap set that supports the BPF program lifecycl
 
 ## Troubleshooting cold-boot
 
-`fd` logs the BPF object path it loaded from at INFO level on every start:
+`fd` names the bundle it loaded, how many zone programs it holds, and — the number that matters — how many interfaces it actually attached to:
 
 ```
-[INFO] Loaded BPF object from /usr/share/f/compiled/current/main.bpf.o
+[INFO] Cold-boot: loading multi-zone bundle from /usr/share/f/compiled/current...
+[INFO] Multi-zone bundle loaded: 2 zone program(s), attached to 2 interface(s).
 ```
 
-If you see the fall-back path (`/usr/lib/f/fw.bpf.o` or `fw.bpf.o`), the cold-boot bundle is missing. Check:
+If instead the unit fails with `is not a compiled bundle`, the cold-boot bundle is missing. Check:
 
 ```sh
 ls -l /usr/share/f/compiled/current
@@ -141,13 +144,12 @@ ls -l /usr/share/f/compiled/current/
 # with no .bpf.o beside it is what a compile without clang produces.
 ```
 
-A broken symlink is logged at INFO ("not found, falling through to built-in") and the daemon proceeds with the built-in program. The usual cause is that nothing has compiled a bundle yet — `einheit-f reload firewall`, or `fwl compile` as above, produces one.
+A broken symlink, a directory with no `manifest.json`, and a manifest naming no `@xdp` programs are all the same answer: the unit does not start and says which directory it looked in. The usual cause is that nothing has compiled a bundle yet — `einheit-f reload firewall`, or `fwl compile` as above, produces one.
 
 ## Logs and metrics
 
 - `journalctl -u fd.service` — daemon log.
-- `sudo cat /sys/fs/bpf/f/counters` is not directly readable; use `f-api` or `bpftool map dump pinned /sys/fs/bpf/f/counters`.
-- Per-CPU rule counters: `f-api` exposes them at `GET /api/v1/counters`.
+- A policy's `count` statements write into that zone's own `fwl_counters_<zone>` map. **No command reads it.** `sudo bpftool map dump pinned /sys/fs/bpf/f/fwl_counters_<zone>` gives you slot numbers and no names, and is the whole story today; the verbs that looked like they did this (`show counters`, `show firewall rules`) read a different, v0.1 map and have been removed.
 - `__rate_limit_overflow` is a reserved counter that ticks when the per-CPU rate-limit map's bucket key space is exhausted (post-Phase-2 hardening). Watch this during soak; non-zero readings mean the operator should consider a larger `max_entries` or a different `per=` field.
 
 ## Soak procedure

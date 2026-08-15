@@ -57,15 +57,17 @@
 #include "f/sysconfig/storage.h"
 #include "f/sysconfig/validate.h"
 
+// fd's control opcodes. The gaps are the v0.1 single-program surface —
+// 1 kApplyConfig, 2 kGetCounters, 6 kGetFirewall, 7 kGetRules,
+// 8 kClearCounters — retired with the datapath they addressed. The
+// numbers do not move: fd answers a retired opcode `unknown command`,
+// which is what an older CLI against a newer box should hear. Keep in
+// step with include/f/protocol.h.
 namespace fd_cmd {
 enum : uint8_t {
-  kGetCounters = 2,
   kGetStatus = 3,
   kReloadProg = 4,
   kStop = 5,
-  kGetFirewall = 6,
-  kGetRules = 7,
-  kClearCounters = 8,
   kGetZones = 9,
   kGetNat = 10,
   kGetConntrack = 11,
@@ -561,15 +563,6 @@ class FLocalTransport final
     if (req.command == "show_interfaces") {
       return HandleShowInterfaces(req);
     }
-    if (req.command == "show_firewall") {
-      return HandleShowFirewall(req);
-    }
-    if (req.command == "show_firewall_rules") {
-      return HandleShowFirewallRules(req);
-    }
-    if (req.command == "show_counters") {
-      return HandleShowCounters(req);
-    }
     if (req.command == "show_leases") {
       return HandleShowLeases(req);
     }
@@ -593,9 +586,6 @@ class FLocalTransport final
     }
     if (req.command == "reload_firewall") {
       return HandleReloadFirewall(req);
-    }
-    if (req.command == "clear_counters") {
-      return HandleClearCounters(req);
     }
     if (req.command == "configure") {
       return HandleConfigure(req);
@@ -1072,30 +1062,9 @@ class FLocalTransport final
     return MakeOk(req.id, GatherInterfaces());
   }
 
-  auto HandleShowFirewall(const proto::Request& req)
-      -> proto::Response {
-    return FdQuery(req.id, fd_cmd::kGetFirewall);
-  }
-
-  auto HandleShowFirewallRules(
-      const proto::Request& req)
-      -> proto::Response {
-    return FdQuery(req.id, fd_cmd::kGetRules);
-  }
-
-  auto HandleShowCounters(const proto::Request& req)
-      -> proto::Response {
-    return FdQuery(req.id, fd_cmd::kGetCounters);
-  }
-
   auto HandleReloadFirewall(const proto::Request& req)
       -> proto::Response {
     return FdQuery(req.id, fd_cmd::kReloadProg);
-  }
-
-  auto HandleClearCounters(const proto::Request& req)
-      -> proto::Response {
-    return FdQuery(req.id, fd_cmd::kClearCounters);
   }
 
   auto HandleConfigure(const proto::Request& req)

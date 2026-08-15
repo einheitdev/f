@@ -87,7 +87,7 @@ def make_box(tmp_path, ports=(("enp1s0", "52:54:00:aa:bb:01", True),
     (root / path).mkdir(parents=True, exist_ok=True)
   (root / "usr/local/share/f").mkdir(parents=True, exist_ok=True)
   (root / "usr/local/share/f/fd.yaml").write_text(
-    "interfaces: []\nsocket: ipc:///run/f/control.sock\n")
+    "socket: ipc:///run/f/control.sock\n")
 
   items = [{"id": "fd", "requirement": "required", "state": "present",
             "dest": "/usr/local/bin/fd", "needed_by": "fd.service"}]
