@@ -303,6 +303,14 @@ def main(argv=None):
     print("[fc] BLOCKED: needs root (it loads BPF and writes "
           "/proc/sys/net/ipv4/ip_forward)", file=sys.stderr)
     return 2
+  # /sbin and /usr/sbin are not on a non-login root shell's PATH on
+  # Debian, and `ip` lives there. A bench that dies with "No such file
+  # or directory: 'ip'" halfway through building a topology is worse
+  # than one that never starts; see the same fix and the same reason
+  # in three_zone_gateway_netns.py.
+  os.environ["PATH"] = os.pathsep.join(
+    [os.environ.get("PATH", ""), "/usr/local/sbin", "/usr/sbin",
+     "/sbin"])
   res = Result()
   saved = forwarding()
   work = pathlib.Path(tempfile.mkdtemp(prefix="fc-work-"))

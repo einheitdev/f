@@ -347,12 +347,24 @@ def main() -> int:
   # CHECKSUM_PARTIAL end to end and every NAT'd frame is dropped by the
   # far stack — so its absence has to be a reported blocker and not a
   # traceback out of the middle of a half-built topology.
+  #
+  # `shutil.which` alone answered the wrong question and answered it
+  # confidently. `ip` and `ethtool` are in /sbin and /usr/sbin, which
+  # are not on a non-login root shell's PATH on Debian, so this bench
+  # reported `BLOCKED: not installed: ethtool` on a host where
+  # `dpkg -l ethtool` says `ii`. A blocker that names the wrong cause
+  # sends the next person to `apt-get install` something they already
+  # have.
+  sbin = ["/usr/local/sbin", "/usr/sbin", "/sbin"]
+  path = os.pathsep.join([os.environ.get("PATH", "")] + sbin)
   missing = [t for t in ("ip", "ethtool", "clang")
-             if shutil.which(t) is None]
+             if shutil.which(t, path=path) is None]
   if missing:
     print(f"[3z] BLOCKED: not installed: {', '.join(missing)}",
           file=sys.stderr)
     return 2
+  # Found them; make sure the subprocesses below can too.
+  os.environ["PATH"] = path
 
   fctl = args.fctl or str(pathlib.Path(args.fd).resolve().parent / "fctl")
   if not os.access(fctl, os.X_OK):

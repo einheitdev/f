@@ -107,8 +107,22 @@ def install_kernel(rootfs):
   the same binfmt path, the same `sudo chroot`, doing the one thing a
   rootfs needs before it can be booted at all.
   """
+  # Force IPv4, for the reason `build_image.mirror_preflight`
+  # documents at length: deb.debian.org is anycast, and on a host
+  # whose IPv6 path to the chosen POP is black-holed every fetch sits
+  # in `Connecting to ...` until its timeout. apt's timeout is 120 s
+  # per attempt rather than wget's infinity, so this does not hang
+  # forever — it merely turns a two-minute step into an hour, which is
+  # worse in one way: it looks like emulation being slow.
+  #
+  # Written unconditionally rather than probed. The build's preflight
+  # probes because it can act on the answer; here the setting costs
+  # nothing on a host where IPv6 works, and this is a throwaway rootfs
+  # for a bench.
   script = (
     "export DEBIAN_FRONTEND=noninteractive\n"
+    "echo 'Acquire::ForceIPv4 \"true\";' "
+    "> /etc/apt/apt.conf.d/99-f-bench-ipv4\n"
     "apt-get update\n"
     "apt-get install -y --no-install-recommends "
     "linux-image-arm64 initramfs-tools\n")
