@@ -147,17 +147,35 @@ def start_box(out, walk, phase):
   proc = vm.boot(out / "disk.img", out / "vmlinuz", out / "initrd.img",
                  console)
   try:
-    up = vm.wait_for_ssh(timeout=BOOT_TIMEOUT, proc=proc)
+    up = vm.wait_for_ssh(timeout=BOOT_TIMEOUT, proc=proc, key=key)
   except RuntimeError as exc:
     walk.error(phase, "boot", str(exc))
     return None, key
-  if not up:
+  if up != "ready":
     walk.error(phase, "boot",
-               f"no ssh after {BOOT_TIMEOUT}s; console at {console}")
+               f"the box never ran a command over ssh ({up}) in "
+               f"{BOOT_TIMEOUT}s; console at {console}")
     proc.kill()
     return None, key
-  walk.check(phase, "boot", True, f"ssh answered; console at {console}")
+  walk.check(phase, "boot", True,
+             f"the box ran a command over ssh; console at {console}")
   return proc, key
+def read_properties(key, unit):
+  """Read systemd properties, distinguishing "no" from "no answer".
+
+  Returns:
+    A dict, or None when the box said nothing at all. A check that
+    treats an empty answer as a value is how `fd.service is None`
+    came to be recorded as a passing refusal.
+  """
+  rc, out, _ = sh(key, f"systemctl show {unit} "
+                       f"--property=ActiveState --property=SubState "
+                       f"--property=Result --property=NRestarts")
+  if rc != 0 or not out.strip():
+    return None
+  fields = dict(line.split("=", 1) for line in out.splitlines()
+                if "=" in line)
+  return fields or None
 def wait_for_firstboot(key, walk, phase, timeout=1800):
   """Block until the provisioner has written its report.
 
@@ -591,21 +609,22 @@ def phase_corrupt(out, walk):
   walk.check("corrupt", "control-box-is-up",
              rc == 0 and running.strip() in ("running", "degraded"),
              f"systemctl is-system-running: {running.strip()}")
-  _, state, _ = sh(key, "systemctl show fd.service "
-                        "--property=ActiveState --property=Result")
-  fields = dict(line.split("=", 1) for line in state.splitlines()
-                if "=" in line)
-  walk.check("corrupt", "fd-refuses-to-start",
-             fields.get("ActiveState") != "active",
-             f"fd.service is {fields.get('ActiveState')}, "
-             f"result={fields.get('Result')}")
+  fields = read_properties(key, "fd.service")
+  if fields is None:
+    walk.error("corrupt", "fd-refuses-to-start",
+               "the box did not answer; nothing was measured")
+  else:
+    walk.check("corrupt", "fd-refuses-to-start",
+               fields.get("ActiveState") != "active",
+               f"fd.service is {fields.get('ActiveState')}, "
+               f"result={fields.get('Result')}")
   _, log, _ = sh(key, "journalctl -u fd.service --no-pager "
                       "| grep 'Init failed' | tail -1")
   walk.fact("corrupt", "fd_journal", log)
-  _, attached, _ = sh(key, "ip -d link show | grep -c 'prog/xdp' "
-                           "|| true")
+  rc, attached, _ = sh(key, "ip -d link show | grep -c 'prog/xdp' "
+                            "|| true")
   walk.check("corrupt", "whole-bundle-refused",
-             attached.strip() == "0",
+             rc == 0 and attached.strip() == "0",
              f"{attached.strip()} interface(s) carry an XDP program; "
              f"one intact object loaded would be half a firewall")
   warm_neighbours(key, walk, "corrupt")
@@ -656,31 +675,36 @@ def phase_broken(out, walk):
              f"of {vm.LAN_BOX} and {vm.WAN_BOX} the box holds: "
              f"{', '.join(held) or 'neither'}")
 
-  _, state, _ = sh(key, "systemctl show fd.service "
-                        "--property=ActiveState --property=SubState "
-                        "--property=Result --property=NRestarts")
-  fields = dict(line.split("=", 1) for line in state.splitlines()
-                if "=" in line)
+  fields = read_properties(key, "fd.service")
   walk.fact("broken", "fd_unit", fields)
-  walk.check(
-    "broken", "fd-refuses-to-start",
-    fields.get("ActiveState") != "active",
-    f"fd.service is {fields.get('ActiveState')}/"
-    f"{fields.get('SubState')}, result={fields.get('Result')}, "
-    f"{fields.get('NRestarts')} restart(s)")
+  if fields is None:
+    walk.error("broken", "fd-refuses-to-start",
+               "the box did not answer; nothing was measured")
+  else:
+    walk.check(
+      "broken", "fd-refuses-to-start",
+      fields.get("ActiveState") != "active",
+      f"fd.service is {fields.get('ActiveState')}/"
+      f"{fields.get('SubState')}, result={fields.get('Result')}, "
+      f"{fields.get('NRestarts')} restart(s)")
 
-  _, log, _ = sh(key, "journalctl -u fd.service --no-pager -n 40")
+  # The daemon's own line, not systemd's. `journalctl | tail -1` is
+  # "Failed to start fd.service", which every failure produces and
+  # which names nothing an operator can act on.
+  _, log, _ = sh(key, "journalctl -u fd.service --no-pager "
+                      "| grep 'Init failed' | tail -1")
   walk.fact("broken", "fd_journal", log)
   walk.check("broken", "fd-says-why",
-             "not a compiled bundle" in log or "bundle" in log,
-             (log.splitlines() or ["(no log)"])[-1][:160])
+             "Init failed" in log and "/usr/share/f/compiled" in log,
+             log[:200] or "(fd never said why)")
 
   # `prog/xdp`, not `xdp`: the flag word appears on the link line of
   # every interface that has ever carried a program, and counting that
   # would report a datapath on a box with none.
-  _, attached, _ = sh(key, "ip -d link show | grep -c 'prog/xdp' "
-                           "|| true")
-  walk.check("broken", "no-xdp-attached", attached.strip() == "0",
+  rc, attached, _ = sh(key, "ip -d link show | grep -c 'prog/xdp' "
+                            "|| true")
+  walk.check("broken", "no-xdp-attached",
+             rc == 0 and attached.strip() == "0",
              f"{attached.strip()} interface(s) carry an XDP program")
 
   warm_neighbours(key, walk, "broken")

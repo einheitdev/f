@@ -257,17 +257,33 @@ def boot(disk, kernel, initrd, console, **kwargs):
   print("+ " + " ".join(argv), flush=True)
   return subprocess.Popen(argv, stdout=subprocess.DEVNULL,
                           stderr=subprocess.PIPE)
-def wait_for_ssh(port=SSH_PORT, timeout=900, proc=None):
-  """Block until the box answers on the forwarded ssh port.
+def wait_for_ssh(port=SSH_PORT, timeout=900, proc=None, key=None):
+  """Block until the box RUNS A COMMAND over ssh.
+
+  Not until the port accepts. Under qemu's user-mode networking the
+  host-forwarded port is served by qemu itself, so a TCP connect to it
+  succeeds the moment the emulator is up and says nothing whatever
+  about the guest — sshd need not exist yet, or at all.
+
+  That is not a hypothetical distinction. The first full run of the
+  walk passed `boot` in every phase and then read empty output from
+  every command in the two phases that do not begin by waiting for a
+  unit: `systemctl show fd.service` returned nothing, and the check
+  reading it recorded `fd.service is None` as a PASS, because None is
+  not "active". A connect test measured qemu; this runs `true` on the
+  box.
 
   Args:
     port: Host port forwarded to the guest's 22.
     timeout: Seconds to wait.
     proc: The qemu Popen, so a dead emulator is reported as itself
       rather than as a timeout.
+    key: The private key to log in with. Without one this falls back
+      to the connect test and says so by returning "port-only".
 
   Returns:
-    True when the port answered.
+    "ready" when a command ran, "port-only" when only the port could
+    be tested, or False on timeout.
   """
   deadline = time.monotonic() + timeout
   while time.monotonic() < deadline:
@@ -278,9 +294,19 @@ def wait_for_ssh(port=SSH_PORT, timeout=900, proc=None):
       sock.settimeout(2)
       try:
         sock.connect(("127.0.0.1", port))
-        return True
       except OSError:
         time.sleep(2)
+        continue
+    if key is None:
+      return "port-only"
+    try:
+      proof = ssh(key, "echo ready", port=port, timeout=30)
+    except subprocess.TimeoutExpired:
+      time.sleep(2)
+      continue
+    if proof.returncode == 0 and "ready" in proof.stdout:
+      return "ready"
+    time.sleep(2)
   return False
 def ssh_argv(key, port=SSH_PORT):
   """The ssh prefix used for every command sent to the box."""
@@ -383,7 +409,7 @@ def main(argv=None):
   key, _ = keypair(out)
   proc = boot(out / "disk.img", out / "vmlinuz", out / "initrd.img",
               out / "console.log")
-  if not wait_for_ssh(proc=proc):
+  if not wait_for_ssh(proc=proc, key=key):
     proc.kill()
     print("vm: the box never answered on ssh", file=sys.stderr)
     return 1

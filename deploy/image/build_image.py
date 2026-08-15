@@ -65,9 +65,24 @@ import f_install  # noqa: E402
 # binary's `ldd` on the build host answers for the build host's
 # architecture, which is why `check_binaries_load` below asks the
 # rootfs itself rather than trusting this list to stay right.
+#
+# The third line is the compiler's dependencies, from Debian rather
+# than from pypi. `pip install` in the chroot used to resolve
+# lark, click and the setuptools build backend over the network, and
+# an image build that reaches the internet from inside an emulated
+# aarch64 chroot fails the way this one did: pypi.org answers with
+# AAAA records only, wget's problem one layer up, and pip sat in
+# `Installing build dependencies: started` for twenty minutes. The
+# compiler is installed `--no-build-isolation --no-deps` now, so the
+# only thing the chroot needs is the archive it was bootstrapped
+# from. lark 1.2.2 >= 1.1 and click 8.1.8 >= 8.0 satisfy
+# fwl/pyproject.toml; a version skew there is a build failure, which
+# is the right place for it.
 PACKAGES = [
   "systemd", "systemd-resolved", "dbus", "openssh-server",
   "python3", "python3-pip", "python3-yaml",
+  "python3-lark", "python3-click",
+  "python3-setuptools", "python3-setuptools-scm", "python3-wheel",
   "clang", "llvm", "libbpf1", "libbpf-dev", "libzmq5", "libyaml-cpp0.8",
   "bpftool",
   "dnsmasq", "chrony",
@@ -222,7 +237,8 @@ def build(build_dir, out_dir, suite, arch, skip_bootstrap=False,
   run(["sudo", "cp", "-r", REPO / "fwl/fwl", fwl_src])
   run(["sudo", "cp", REPO / "fwl/pyproject.toml", fwl_src])
   run(["sudo", "chroot", rootfs, "pip3", "install",
-       "--break-system-packages", "/usr/local/lib/fwl/"])
+       "--break-system-packages", "--no-build-isolation", "--no-deps",
+       "/usr/local/lib/fwl/"])
 
   enable_units(rootfs, ["systemd-networkd", "f-firstboot", "ssh"])
   mask_units(rootfs, SUPERSEDED_UNITS)

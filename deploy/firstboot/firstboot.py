@@ -786,6 +786,16 @@ def render_policy(model, uplink_zone=None,
   port, which is a narrow hole with a name — and it closes the day the
   egress hook lands and host-originated flows get tracked.
 
+  KNOWN LIMIT, measured and not fixed: with `uplink_zone` named and
+  more than one other zone, every one of them gets `redirect to
+  <uplink>` and so declares `fwl_devmap_<uplink>`, and no such bundle
+  loads. The kernel forces BPF_F_RDONLY_PROG onto every devmap in
+  `dev_map_alloc` and rejects it at creation, so libbpf's pin-reuse
+  check compares the declared 0 against the pinned 128 and refuses
+  with "parameter mismatch". A box provisioned that way comes up with
+  `fd` in auto-restart. Two zones are fine; three are not. See
+  context/image-boot-2026-08-15.md in the f-rig workspace.
+
   Args:
     model: The parsed system.yaml.
     uplink_zone: The zone facing the world. When named, every other
