@@ -98,6 +98,8 @@ Both far hosts are on `enp1s0f0` because it is the only trunk port: a macvlan ca
 
 These scenarios need `net.ipv4.ip_forward=1` and set it themselves, restoring the previous value on exit. They also put transient addresses on the two data ports and remove them on exit.
 
+**`fd` also writes that knob now, and the two do not fight.** Since the fail-closed change the daemon owns `net.ipv4.ip_forward`: it lowers it on the way in and raises it once a bundle is attached to at least one interface. A scenario that sets it to 1 is therefore agreeing with a running `fd` rather than overriding it — and, more to the point, a scenario that sets it to **0 as a control** still works, because the periodic re-check is asymmetric on purpose. `fd` puts the knob back only when it finds it OPEN on a box whose datapath is not armed; a knob it finds CLOSED on an armed box is reported once in the journal and left exactly where the scenario put it. Several of these controls prove "these frames were on the wire and no socket took one" precisely by holding forwarding down under a running `fd`, and making that impossible would have cost them their meaning. See `include/f/route_mgr.h`.
+
 Test frames use inert addresses (10.99.0.0/16, locally-administered MACs 02:00:00:00:00:01/02). The receive port runs promiscuous — the i350 MAC filter would otherwise drop builder-MAC unicast before XDP. The switch FDB is taught both MACs before each run so frames unicast port-to-port; nothing is broadcast (household-LAN rule).
 
 ## Running
