@@ -19,6 +19,7 @@
 
 #include "f/bpf_loader.h"
 #include "f/conntrack_mgr.h"
+#include "f/egress_mgr.h"
 #include "f/error.h"
 #include "f/iface_mgr.h"
 #include "f/nat_mgr.h"
@@ -75,6 +76,7 @@ struct Engine {
   ConntrackMgr conntrack;
   NatMgr nat;
   RouteMgr route;
+  EgressMgr egress;
 
   // Current firewall config.
   FwConfig current_config{};
@@ -118,6 +120,30 @@ auto EngineInit(Engine& e,
 auto EngineRun(Engine& e, std::stop_token stop)
     -> std::expected<void, Error<EngineError>>;
 
+/// Answer one control-socket request: `req` is the raw frame the
+/// client sent (`[1B Cmd][payload]`), the result is the JSON body to
+/// send back.
+///
+/// Exposed rather than kept private to the control loop because the
+/// dispatch table is where several of this project's silent defects
+/// have lived — a handler reading a file descriptor its own daemon
+/// never opened and reporting the empty result as an answer. A test
+/// cannot see that through a socket it has to stand a daemon up for,
+/// so the loop calls this and so do the tests.
+auto HandleControlRequest(Engine& e, const std::string& req)
+    -> std::string;
+
+/// How many slots the per-CPU `counters` array actually has, read
+/// from the map itself; 0 when there is no map or it cannot be
+/// interrogated.
+///
+/// The bound belongs to the map, not to the reader. `src/engine.cc`
+/// carried a literal 256 while `bpf/fw.bpf.c` declared
+/// `max_entries = 10000`, two numbers in two files with nothing tying
+/// them together, and every slot from 256 up accrued packets that no
+/// counters request could show and no clear could zero.
+auto CountersMapSlots(int counters_fd) -> uint32_t;
+
 /// Stop the engine: detach XDP, cleanup ZMQ.
 auto EngineStop(Engine& e) -> void;
 
@@ -126,10 +152,13 @@ auto ApplyConfig(Engine& e, const ConfigMsg& msg,
                  std::span<const std::byte> rule_data)
     -> std::expected<uint32_t, Error<EngineError>>;
 
-/// Read aggregated per-rule counters.
-auto GetCounters(const Engine& e, uint32_t rule_count)
-    -> std::expected<std::vector<RuleCounter>,
-                     Error<EngineError>>;
+// GetCounters(e, rule_count) was here: it read `counters[0 ..
+// rule_count)` and called the result "aggregated per-rule counters".
+// bpf/fw.bpf.c keys that map by MATCH TIER, so those were never
+// per-rule numbers and the signature said they were. It had no
+// callers anywhere in the tree; it is removed rather than left as a
+// correctly-named-looking trap for the next reader. `kGetCounters`
+// reports the same slots under their own ids, which is what they are.
 
 /// Read current rule set from active table.
 auto GetRules(const Engine& e)
@@ -155,6 +184,13 @@ auto AttachNatMgr(Engine& e) -> void;
 
 /// Point RouteMgr at the loaded bundle's routing tally.
 auto AttachRouteMgr(Engine& e) -> void;
+
+/// Point EgressMgr at the loaded bundle's egress tracker.
+///
+/// Called from the same two places for the same reason: a manager left
+/// holding the previous bundle's `fwl_egress_stats` fd reports numbers
+/// that look right about a hook that is no longer there.
+auto AttachEgressMgr(Engine& e, std::string_view bundle_dir) -> void;
 
 /// Open pinned BPF maps (for f-api read access).
 auto OpenPinnedMaps(std::string_view pin_path)

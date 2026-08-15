@@ -487,6 +487,25 @@ except Exception:
 "
 }
 
+# hw::egress <field> — one field of `fctl status`'s "egress" section
+# (the TC clsact tracker for flows the box itself originates), or -1
+# when the section or the field is absent.
+#
+# Read through the CLI rather than bpftool, for the same reason hw::nat
+# is: half of the A4 finding was that an operator had no way to see the
+# state at all. A test that reached around fctl to the pinned map would
+# pass over exactly that half.
+hw::egress() {
+  fctl status 2>/dev/null | $PY -c "
+import json, sys
+try:
+  v = json.load(sys.stdin)['egress']['$1']
+  print(int(v) if isinstance(v, bool) else v)
+except Exception:
+  print(-1)
+"
+}
+
 # hw::ct <field> — the same, for the "conntrack" section.
 hw::ct() {
   fctl status 2>/dev/null | $PY -c "
@@ -495,6 +514,34 @@ try:
   print(json.load(sys.stdin)['conntrack']['$1'])
 except Exception:
   print(-1)
+"
+}
+
+# hw::ct_flush — delete every entry from the pinned conntrack table.
+#
+# For a CONTROL, not for cleanup: a scenario that wants to show a reply
+# is admitted BY a conntrack entry has to be able to take the entry
+# away while the reply is in flight. Prints how many it deleted, so
+# "the control changed nothing" is distinguishable from "the control
+# worked".
+hw::ct_flush() {
+  local pin="$PIN/conntrack"
+  if [ ! -e "$pin" ]; then
+    echo -1
+    return
+  fi
+  bpftool -j map dump pinned "$pin" 2>/dev/null | $PY -c "
+import json, subprocess, sys
+entries = json.load(sys.stdin)
+n = 0
+for e in entries:
+  key = e.get('key')
+  if not key:
+    continue
+  cmd = ['bpftool', 'map', 'delete', 'pinned', '$pin', 'key'] + list(key)
+  if subprocess.run(cmd, capture_output=True).returncode == 0:
+    n += 1
+print(n)
 "
 }
 

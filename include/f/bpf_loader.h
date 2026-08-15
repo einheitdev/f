@@ -11,24 +11,14 @@
 #include <string_view>
 #include <vector>
 
+#include "f/bpf_error.h"
 #include "f/error.h"
+#include "f/tc_egress.h"
 
 // libbpf handle; opaque here so the header stays libbpf-free.
 struct bpf_object;
 
 namespace f {
-
-enum class BpfError : uint8_t {
-  kLoadFailed,
-  kAttachFailed,
-  kDetachFailed,
-  kPinFailed,
-  kUnpinFailed,
-  kMapUpdateFailed,
-  kMapLookupFailed,
-  kMapDeleteFailed,
-  kMapIterFailed,
-};
 
 /// File descriptors for all BPF maps and the program.
 struct BpfHandles {
@@ -141,6 +131,12 @@ struct ZoneBundleHandles {
   /// The loaded bpf_object per zone; owned by this bundle and closed
   /// by CloseZoneBundle once the bundle is replaced or shut down.
   std::vector<::bpf_object*> objs;
+  /// The bundle's TC clsact egress conntrack tracker, attached to every
+  /// interface above. Empty (`Attached()` false) for a bundle whose
+  /// policy never reads conntrack, and for one compiled before the
+  /// tracker existed. See f/tc_egress.h for why the second attach point
+  /// exists and why it is at the qdisc layer.
+  EgressTracker egress;
 };
 
 /// Load every zone program in a `fwl compile --bundle` directory.

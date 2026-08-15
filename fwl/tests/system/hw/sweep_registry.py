@@ -39,6 +39,7 @@ from sweep_lib import UnitDropIn
 
 PIN = '/sys/fs/bpf/f'
 RECV_IF = os.environ.get('RECV_IF', 'enp1s0f1')
+WAN_IF = os.environ.get('WAN_IF', 'enp1s0f2')
 
 # A stand-in compiler for the l3_06 plant. fd's watcher runs whatever
 # `watch.fwl` names, so pointing it here makes every commit — including
@@ -897,14 +898,116 @@ SCENARIOS = {s.name: s for s in [
 
     # ---------------- Layer 12: the box\'s own traffic --------------
     _s('l12_01_box_originated_flows',
-       'finding A4 reproduces: a flow the box itself originates gets no '
-       'conntrack entry, so `default drop` eats its replies — and a TC '
-       'egress hook sees exactly the gap and not the forwarded traffic',
-       [_p('wan-zone-admits-everything',
-           'the wan zone defaults to allow, so the replies survive and '
-           'the finding stops reproducing — the shape this scenario '
-           'would take if the gap were closed by accident',
+       'a flow the BOX ITSELF originates is tracked at the egress hook, '
+       'so its reply survives `default drop` — while a flow the box '
+       'merely FORWARDS is not tracked, and the port stays shut to '
+       'everyone the box did not ask',
+       [_p('egress-hook-removed',
+           'the tracker is taken off the wan port after the attach, '
+           'which is finding A4 exactly as it was measured: the query '
+           'goes out, the reply arrives at the port, and `default drop` '
+           'eats it with every counter still climbing',
+           [DeployCmd(tag='l12-01', phase='post',
+                      cmd='tc filter del dev %s egress 2>/dev/null '
+                          '|| true' % WAN_IF)],
+           residual='removes the filter directly rather than making a '
+                    'LOAD fail to attach it. The refusal path (a '
+                    'declared tracker with no compiled object, an '
+                    'attach that fails on one of several ports) is '
+                    'reachable only from a mutated bundle or a mutated '
+                    'fd, and is covered by tests/test_tc_egress.cc',
+           verify='! tc filter show dev %s egress | grep -q fwl_egress'
+                  % WAN_IF),
+        _p('wan-zone-admits-everything',
+           'the wan zone defaults to allow, so the replies survive '
+           'whether or not anything tracked them — and the unsolicited '
+           'traffic the tracker must NOT admit gets in too',
            [PolicySub(tag='l12-01', find='default drop',
-                      repl='default allow')])],
-       timeout_s=600),
+                      repl='default allow')]),
+        _p('tracker-ignores-the-socket-gate',
+           'the `skb->sk` test is compiled out, so the hook tracks '
+           'every packet leaving the box including the ones it merely '
+           'forwarded — a component whose job is to observe silently '
+           'admitting the replies of flows the policy never allowed',
+           [FileSub(path='/opt/fwl/fwl/emitter.py',
+                    find='if (skb->sk == NULL) {',
+                    repl='if (0) {')],
+           verify='grep -q "if (0) {" /opt/fwl/fwl/emitter.py')],
+       witness_note='the box\'s own sockets are the witness for the '
+                    'delivering half (a real recvfrom, not a capture), '
+                    'and the datapath counter is the vacuity guard for '
+                    'the refusing half — a drop has no positive '
+                    'witness anywhere, so "the frames arrived" is what '
+                    'separates a policy drop from an empty wire',
+       timeout_s=900),
+
+    _s('l12_02_dns_forwarding',
+       'the appliance forwards DNS end to end: a client on the test LAN '
+       'resolves a name through the box\'s own dnsmasq, whose upstream '
+       'query and reply both cross the firewall',
+       [_p('egress-hook-removed',
+           'the tracker is taken off the wan port, so dnsmasq\'s '
+           'upstream query creates no state and the answer is dropped '
+           'on the way back — the appliance cannot resolve a name, '
+           'which is the user-visible form of finding A4',
+           [DeployCmd(tag='l12-02', phase='post',
+                      cmd='tc filter del dev %s egress 2>/dev/null '
+                          '|| true' % WAN_IF)],
+           verify='! tc filter show dev %s egress | grep -q fwl_egress'
+                  % WAN_IF),
+        _p('wan-admits-only-tcp',
+           'the wan zone still reads conntrack, and still tracks, but '
+           'its stateful allow is narrowed to tcp — so the UDP answer '
+           'is dropped by a policy that looks stateful. One variable '
+           'from the passing run, and it is the variable that decides '
+           'whether the answer is admitted',
+           [PolicySub(tag='l12-02',
+                      find='count wan_dns_r if pkt.proto == udp and '
+                           'pkt.src_port == 53\nallow if '
+                           'conntrack(pkt).state in [established, '
+                           'related]',
+                      repl='count wan_dns_r if pkt.proto == udp and '
+                           'pkt.src_port == 53\nallow if '
+                           'conntrack(pkt).state in [established, '
+                           'related] and pkt.proto == tcp')]),
+        _p('upstream-answers-a-different-address',
+           'the far-side responder answers with an address of its own '
+           'choosing rather than the one the scenario expects, so a '
+           'check written on "did the query return" instead of on the '
+           'ANSWER would stay green',
+           [FileSub(path='/opt/fwl/tests/system/hw/l12_02_dns_forwarding.sh',
+                    find='ANSWER=203.0.113.77',
+                    repl='ANSWER=203.0.113.78')],
+           residual='this plants into the scenario rather than the '
+                    'product: it asks whether the assertion is on the '
+                    'answer, which is the property that made a log '
+                    'line insufficient here in the first place',
+           verify='grep -q "ANSWER=203.0.113.78" '
+                  '/opt/fwl/tests/system/hw/l12_02_dns_forwarding.sh')],
+       witness_note='a real DNS client with a real socket resolving a '
+                    'name minted this run: rank 1 (real_socket), and '
+                    'the strongest witness in the suite — the answer '
+                    'is an address nothing on the box can synthesise',
+       timeout_s=900),
+
+    _s('l12_03_egress_cold_boot',
+       'the egress tracker comes up with the datapath after a REAL '
+       'reboot, on every interface the datapath is on, and tracks the '
+       'first flow the box originates in that boot',
+       declared='the same reason l3_03_cold_boot is declared: this '
+                'scenario reboots the rig and the sweep runs ON the '
+                'rig, so the sweep cannot be the thing that plants a '
+                'defect into a run that will outlive its own process. '
+                'It is also driven from ksys rather than through '
+                'hw.sh, which is where the plant machinery lives.',
+       witness_note='fd\'s own status object plus its journal, which '
+                    'is rank 2 (daemon_selfreport) and is WEAK — the '
+                    'same weakness l3_03 carries and for the same '
+                    'reason. The tracking claim is stronger than the '
+                    'attach claim: it fires a real flow from the box '
+                    'and requires the counter to move, so a hook that '
+                    'came up attached and broken is caught. A wire '
+                    'probe from ksys after the box returns would make '
+                    'the whole thing a real measurement.',
+       timeout_s=900),
 ]}

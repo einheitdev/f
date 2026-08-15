@@ -153,6 +153,11 @@ class TestOmission:
         )
         + "default allow\n"
       ), split=True),
+      # The egress tracker is a bundle object rather than a zone one,
+      # so single-object emission never reaches its maps. Left out, the
+      # `fwl_egress_stats` row would read as dead — and a rule that
+      # cries wolf about a live row is one somebody switches off.
+      emitter.emit_egress_tracker(),
     ]
     matched: set[str] = set()
     for src in sources:

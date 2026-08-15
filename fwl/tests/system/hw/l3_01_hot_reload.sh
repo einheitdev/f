@@ -37,8 +37,17 @@ EOF
 hw::deploy l3-01 "$FW"
 cp "$FW" /etc/f/rules.fw
 
-# Watcher-produced bundles are timestamp-named (no v- prefix).
-BUNDLES_BEFORE=$(ls -d "$BUNDLE_ROOT"/*/ | wc -l)
+# Which bundle is ACTIVE, not how many exist.
+#
+# This used to count directories under the bundle root and require the
+# count to grow. It is not evidence: the same reload that produces a
+# bundle also PRUNES old ones ("pruned 40 old bundle(s), keeping 10"),
+# so on a rig where watcher bundles had accumulated the count went DOWN
+# across a reload that had worked perfectly, and the scenario reported
+# "watcher did not fire" with the atomic swap in its own journal.
+# Caught on 2026-08-15. The symlink is the claim itself — a new bundle
+# was produced AND adopted — and nothing else moves it.
+BUNDLE_BEFORE=$(readlink -f "$BUNDLE_ROOT/current")
 # Scope the reload evidence to THIS run: every scenario on this rig logs
 # "atomic swap", so a 60 s window reads other people's reloads too.
 hw::journal_mark
@@ -60,12 +69,13 @@ RECEIVED=$(hw::sniff_get udp:10.99.50.5:5050)
 
 # The reload really happened (new bundle dir + atomic-swap journal
 # line) while the stream was running.
-BUNDLES_AFTER=$(ls -d "$BUNDLE_ROOT"/*/ | wc -l)
-if [ "$BUNDLES_AFTER" -gt "$BUNDLES_BEFORE" ] \
+BUNDLE_AFTER=$(readlink -f "$BUNDLE_ROOT/current")
+if [ "$BUNDLE_AFTER" != "$BUNDLE_BEFORE" ] \
    && hw::journal_since | grep -q "atomic swap"; then
   pass "watcher reloaded mid-stream (atomic swap applied)"
 else
-  fail "no reload observed — watcher did not fire"
+  fail "no reload observed — watcher did not fire (current \
+$BUNDLE_BEFORE -> $BUNDLE_AFTER)"
 fi
 
 assert_eq "frames handed to the NIC" "$SENT" 2000

@@ -177,8 +177,12 @@ def test_shared_pinned_maps_is_read_off_the_bundle(tmp_path):
   bundle = tmp_path / "bundle"
   cli._emit_bundle_dir(program, bundle)
   manifest = json.loads((bundle / "manifest.json").read_text())
+  # `fwl_egress_stats` is here because both zones read conntrack, so
+  # this bundle carries an egress tracker (v0.4 § 6.9) and the tracker
+  # pins its own tally bundle-wide. A bundle whose policy asks no
+  # conntrack question carries neither — asserted separately.
   assert manifest["shared_pinned_maps"] == [
-    "conntrack", "fwl_devmap_b", "fwl_route_stats"
+    "conntrack", "fwl_devmap_b", "fwl_egress_stats", "fwl_route_stats"
   ]
 
 
