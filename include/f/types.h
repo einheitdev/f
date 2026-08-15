@@ -180,8 +180,11 @@ enum FwlEgressStat : uint32_t {
   kFwlEgressStatSlots = 6,
 };
 
-// Per-zone masquerade config (`fwl_nat_cfg`, slot 0). `masq_addr` is the
-// network-byte-order source the XDP masquerade action rewrites to.
+// One zone's masquerade config (`fwl_nat_cfg_<zone>`, slot 0).
+// `masq_addr` is the network-byte-order source the XDP masquerade
+// action rewrites to: the address of the zone this one redirects to.
+// One map per zone object, because two masquerading zones need not
+// redirect to the same uplink.
 struct FwlNatCfg {
   uint32_t masq_addr;
 };

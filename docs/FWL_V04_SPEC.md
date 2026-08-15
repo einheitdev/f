@@ -1363,12 +1363,7 @@ outside that range is a compile error.
 
 ### Semantics
 
-- **Source NAT (`snat`/`masquerade`).** When the action fires, the
-  emitter rewrites the source address (to the literal, or — for
-  `masquerade` — to the address the daemon wrote into the per-zone
-  `fwl_nat_cfg` map), fixes the IPv4 header checksum and the TCP/UDP
-  checksum, and installs a **reply mapping** in the shared `fwl_nat`
-  map so the return packet is de-NAT'd.
+- **Source NAT (`snat`/`masquerade`).** When the action fires, the emitter rewrites the source address (to the literal, or — for `masquerade` — to the address the daemon wrote into this zone's own `fwl_nat_cfg_<zone>` map: the first IPv4 address on the zone THIS zone redirects to, resolved per masquerading zone because two masquerading zones need not name the same uplink), fixes the IPv4 header checksum and the TCP/UDP checksum, and installs a **reply mapping** in the shared `fwl_nat` map so the return packet is de-NAT'd.
 - **Port allocation.** Source NAT **prefers to preserve** the source
   port: when the mapping key that port names is free, the translated
   port equals the original. When a **different flow already holds that

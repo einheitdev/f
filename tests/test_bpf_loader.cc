@@ -256,7 +256,7 @@ TEST(DecidePinFateTest, PolicyScopedPinsAlwaysGo) {
     for (const char* name : {"fwl_counters_a", "fwl_log_sample_a",
                              "fwl_rl_a_0", "fwl_rl_g0", "fwl_geoip_a_0",
                              "fwl_devmap_wan", "fwl_log_events",
-                             "fwl_nat_cfg"}) {
+                             "fwl_nat_cfg_a"}) {
       EXPECT_EQ(DecidePinFate(name, kPersistent, &shape, shape, policy),
                 PinVerdict::kDiscard)
           << name;
@@ -357,6 +357,60 @@ TEST(DecidePinFateTest, ADevmapPinLeftByAnOlderBundleIsSweptAway) {
                             have, policy),
               PinVerdict::kDiscard);
   }
+}
+
+TEST(DecidePinFateTest, ALegacyNatCfgPinIsSweptAway) {
+  // The upgrade path for the masquerade-source split.
+  //
+  // Until it, every zone object pinned one bundle-global `fwl_nat_cfg`,
+  // so a box that ran any masquerading policy has one in bpffs. Bundles
+  // compiled since pin `fwl_nat_cfg_<zone>` instead and declare that
+  // name not at all, so `declared` is null here and the pin has to GO:
+  // it holds the masquerade address of a policy that is no longer
+  // running, and nothing will ever overwrite it.
+  //
+  // It costs nothing to discard, which is the whole reason the split is
+  // safe. `fd` derives every slot from THIS bundle's redirect topology
+  // and the live interface addresses at every load, so the value is
+  // rewritten before the first packet either way.
+  auto have = SomeShape();
+  for (auto policy : {PinPolicy::kColdBoot, PinPolicy::kReload}) {
+    EXPECT_EQ(DecidePinFate("fwl_nat_cfg", kPersistent, nullptr,
+                            have, policy),
+              PinVerdict::kDiscard);
+    // And the new name is policy-scoped too: slot 0 is derived at load
+    // time, so a matching declaration must not rescue it either.
+    EXPECT_EQ(DecidePinFate("fwl_nat_cfg_lan", kPersistent, &have,
+                            have, policy),
+              PinVerdict::kDiscard);
+  }
+}
+
+TEST(NatCfgMapNamesTest, ThePerZoneNameIsPreferredAndTheOldOneRemains) {
+  // The masquerade source is `fwl_nat_cfg_<zone>` because the address
+  // is a per-zone fact: it is the address of the zone THIS one
+  // redirects to, and two masquerading zones need not name the same
+  // uplink. Under the old bundle-global name it was one kernel map
+  // with one slot 0, written once per masquerading zone, so the last
+  // zone loaded decided what every masquerading program translated to.
+  //
+  // The old name stays in the list, second, and dropping it would be
+  // the failure `ManifestStatesMasquerade` documents one field over: a
+  // bundle staged by an older `fwl` has only the bundle-global map, and
+  // an `fd` that could not find it would turn every masquerade in that
+  // bundle into a silent no-op across an upgrade the operator did not
+  // ask for.
+  auto names = NatCfgMapNames("ina");
+  ASSERT_EQ(names.size(), 2u);
+  EXPECT_EQ(names[0], "fwl_nat_cfg_ina");
+  EXPECT_EQ(names[1], "fwl_nat_cfg");
+}
+
+TEST(NatCfgMapNamesTest, TwoZonesAskForTwoDifferentMaps) {
+  // The property the whole change rests on, stated where a rename
+  // cannot quietly undo it.
+  EXPECT_NE(NatCfgMapNames("ina")[0], NatCfgMapNames("inb")[0]);
+  EXPECT_EQ(NatCfgMapNames("ina")[1], NatCfgMapNames("inb")[1]);
 }
 
 TEST(DecidePinFateTest, AnUnknownNameIsDiscarded) {

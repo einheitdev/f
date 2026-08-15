@@ -73,6 +73,30 @@ sys.exit(0 if any(
 PYEOF
 '''
 
+# The l2_09 plant's verification, and it asks the same question the
+# devmap one does: not "was the file edited" but "does the compiler now
+# produce the defect". A two-uplink bundle must come out with both
+# inside objects declaring the map under the ONE bundle-global name,
+# which is what makes them one kernel map and one slot 0. Grepping
+# emitter.py for `MapScope.SHARED` would pass unplanted — six rows are
+# legitimately SHARED.
+NAT_CFG_SHARED_VERIFY = r'''python3 - <<'PYEOF'
+import re, sys
+sys.path[:0] = ['/opt/fwl', '/opt/fwl-deps']
+from fwl import analyzer, emitter, parser
+src = ("zone a = [e0]\nzone b = [e1]\nzone w = [e2]\nzone x = [e3]\n"
+       "@xdp(a)\nmasquerade\nredirect to w\n"
+       "@xdp(b)\nmasquerade\nredirect to x\n"
+       "@xdp(w)\nredirect to a\n@xdp(x)\nredirect to b\n")
+files = emitter.emit_bundle(analyzer.analyze(parser.parse(src)))
+rx = re.compile(r'struct\s*\{[^{}]*\}\s*(\w+)\s*SEC\("\.maps"\);')
+shared = sum(
+    1 for name in ('a.bpf.c', 'b.bpf.c')
+    if 'fwl_nat_cfg' in rx.findall(files[name]))
+sys.exit(0 if shared == 2 else 1)
+PYEOF
+'''
+
 # A stand-in compiler for the l3_06 plant. fd's watcher runs whatever
 # `watch.fwl` names, so pointing it here makes every commit — including
 # a syntactically broken one — produce a valid, permissive bundle. That
@@ -429,6 +453,67 @@ SCENARIOS = {s.name: s for s in [
                     '"map_flags 0 vs 128" in the journal). It kills '
                     'the LOAD, so it never reaches the forwarding '
                     'assertions; the first plant does the opposite')],
+       timeout_s=600),
+
+    _s('l2_09_two_uplinks',
+       'two masquerading zones leaving through DIFFERENT uplinks each '
+       'translate to their OWN uplink address, proven by each far '
+       "side's own kernel reporting the peer it saw",
+       # Same rule as l2_08: `sweep_scenario` runs plants[0] and no
+       # other, so the FIRST plant is the one that leaves the bundle
+       # loading and attaching and breaks only what reaches the far
+       # side. It is also the original defect, restored in the one
+       # place it lived.
+       [_p('nat-cfg-shared-again',
+           'the masquerade source goes back to ONE bundle-wide slot. '
+           'Every object then declares `fwl_nat_cfg` under the '
+           'bundle-global name, libbpf resolves all of them to one '
+           'kernel map, and `LoadZoneBundle` writes slot 0 once per '
+           'masquerading zone — so the LAST zone loaded decides what '
+           'every masquerading program translates to. The bundle '
+           'loads, both objects attach, every counter climbs, and the '
+           "far side on the other uplink's segment sees a source "
+           'address it has no route back to. One line in the '
+           'registry, because that is where the decision lives',
+           [FileSub(path=EMITTER_PY,
+                    find='    r"fwl_nat_cfg", MapScope.PRIVATE,',
+                    repl='    r"fwl_nat_cfg", MapScope.SHARED,')],
+           # "The edit was made" and "the defect is present" are
+           # different claims. This asks the COMPILER for a two-uplink
+           # bundle and requires both inside objects to declare the
+           # bundle-global name — which is what makes them one kernel
+           # map. Grepping emitter.py for `MapScope.SHARED` would pass
+           # unplanted; it is the correct answer for six other rows.
+           verify=NAT_CFG_SHARED_VERIFY,
+           residual='an `fd` that read the RIGHT map and wrote the '
+                    "wrong zone's address cannot be planted from the "
+                    'bench: the daemon derives each address from that '
+                    "zone's own redirects_to in the manifest, so "
+                    'reaching it needs a mutated fd'),
+        _p('nat-cfg-name-hardcoded',
+           'the half-fix: the declaration template names `fwl_nat_cfg` '
+           'again while the registry still says PRIVATE. This is the '
+           'change that would silently undo the fix if nothing '
+           'objected — the shape is identical in every zone, so '
+           '`_check_bundle_pinned_maps` sees nothing wrong — and '
+           '`_check_map_scopes` rule (2) fails the COMPILE instead, '
+           'naming the map and the zone',
+           # The value line comes with it: `}} {name} SEC(".maps");` on
+           # its own appears in six templates, and a plant that edits
+           # five other maps is not this defect.
+           [FileSub(path=EMITTER_PY,
+                    find='  __type(value, struct fwl_nat_cfg);\n'
+                         '}} {name} SEC(".maps");',
+                    repl='  __type(value, struct fwl_nat_cfg);\n'
+                         '}} fwl_nat_cfg SEC(".maps");')],
+           residual='NOT RUN BY THE SWEEP — only plants[0] is, and '
+                    'this one is the guard rather than the defect: it '
+                    'makes every bundle compile fail, so the scenario '
+                    'dies in hw::deploy and none of its wire '
+                    'assertions is reached. Held as a unit test '
+                    'instead (test_map_scope.py::'
+                    'test_the_masquerade_source_under_a_global_name_'
+                    'fails), which is deterministic and needs no rig')],
        timeout_s=600),
 
     # ---------------- Layer 3: the daemon lifecycle ----------------

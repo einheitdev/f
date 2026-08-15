@@ -4,6 +4,7 @@
 #ifndef INCLUDE_F_BPF_LOADER_H_
 #define INCLUDE_F_BPF_LOADER_H_
 
+#include <array>
 #include <cstdint>
 #include <expected>
 #include <map>
@@ -67,6 +68,28 @@ struct ZoneProgramHandle {
   /// when the policy declares no `count` statement (the emitter then
   /// declares no map at all).
   int counters_fd = -1;
+  /// This zone's masquerade source slot (`fwl_nat_cfg_<zone>`), or -1
+  /// when the object carries no NAT machinery at all.
+  ///
+  /// PER ZONE, because the address it holds is: `masquerade` means
+  /// "translate to the address of the zone this one redirects to", and
+  /// nothing makes two masquerading zones redirect to the same place —
+  /// `deploy/firstboot` writes `masquerade` + `redirect to <uplink>`
+  /// for every non-uplink zone, and a box with two uplinks names two.
+  /// While the map was pinned under the bundle-global name
+  /// `fwl_nat_cfg` it was ONE kernel map with one slot 0 and this loop
+  /// wrote it once per masquerading zone, so the last zone loaded
+  /// decided what every masquerading program in the bundle translated
+  /// to.
+  ///
+  /// On a bundle compiled before the split this points at that one
+  /// shared map, for every zone, and `ZoneBundleHandles::legacy_nat_cfg`
+  /// says so — see the comment on that field.
+  int nat_cfg_fd = -1;
+  /// The masquerade source address this loader wrote into that slot,
+  /// or 0 when it wrote none (this zone does not masquerade, or no
+  /// redirect-destination interface carried an IPv4 address).
+  uint32_t masq_addr = 0;
   /// The name->slot table for that map, read from the same bundle
   /// directory, in the same call, as the object it describes.
   ///
@@ -103,11 +126,20 @@ struct ZoneBundleHandles {
   /// it arrived with). A masquerading gateway whose forwards are all
   /// bridged is a black hole, and nothing on the wire says so.
   int route_stats_fd = -1;
-  /// The shared masquerade config map fd (`fwl_nat_cfg`), or -1 when no
-  /// zone program masquerades. The loader seeds slot 0 with the
-  /// masquerade source address so the XDP `masquerade` action rewrites
-  /// to a real WAN address instead of no-opping.
-  int nat_cfg_fd = -1;
+  /// True when this bundle was compiled before the masquerade source
+  /// became per zone, so every object resolves ONE bundle-global
+  /// `fwl_nat_cfg` and every `ZoneProgramHandle::nat_cfg_fd` names the
+  /// same kernel map.
+  ///
+  /// The loader still seeds it — an `fd` upgrade must not turn
+  /// masquerade into a silent no-op on a bundle staged by an older
+  /// `fwl`, which is the same rule `ManifestStatesMasquerade` follows
+  /// — but on such a bundle two masquerading zones with different
+  /// redirect destinations cannot both be right, so the loader says
+  /// which one it overwrote instead of leaving that to be discovered
+  /// on the wire. Recompiling the policy is the fix; nothing here can
+  /// be.
+  bool legacy_nat_cfg = false;
   /// The loaded bpf_object per zone; owned by this bundle and closed
   /// by CloseZoneBundle once the bundle is replaced or shut down.
   std::vector<::bpf_object*> objs;
@@ -296,15 +328,48 @@ auto PlanBundleAttach(std::string_view bundle_dir) -> BundleAttachPlan;
 /// True when the bundle's manifest states, per program, which zones
 /// masquerade (the `masquerades` flag).
 ///
-/// The flag is what decides whose address is written into the shared
-/// `fwl_nat_cfg`, because the map's presence decides nothing: every
-/// object in a NAT bundle carries it for the return path's de-NAT
-/// pass. A bundle compiled before the flag existed answers the
+/// The flag is what decides whose address is written into a zone's
+/// `fwl_nat_cfg_<zone>`, because the map's presence decides nothing:
+/// every object in a NAT bundle carries one, since the NAT helper
+/// block is emitted whole into any object that carries NAT at all. A
+/// bundle compiled before the flag existed answers the
 /// question not at all, and there the loader falls back to the old
 /// presence rule rather than seeding nothing — an `fd` upgrade must
 /// not silently turn every masquerade in an already-deployed bundle
 /// into a no-op. Exposed so that fallback is testable without bpffs.
+///
+/// The two fallbacks compose, and it is worth stating how. A bundle
+/// that predates the flag also predates the per-zone map, so its
+/// fallback seeding writes every masquerading zone's address into the
+/// one shared slot — the old behaviour exactly, which is the point.
+/// A bundle that has the flag but not the per-zone map (compiled in
+/// between) is gated correctly and still shares the slot; the loader
+/// logs an error naming both zones when the second write changes the
+/// value, because nothing in a one-slot map can be right for two
+/// uplinks. On a current bundle the fallback seeding, if it ever fired
+/// again, would write into each zone's OWN map and could no longer
+/// take another zone down with it.
 auto ManifestStatesMasquerade(std::string_view bundle_dir) -> bool;
+
+/// The names a zone object's masquerade source map may go by, in the
+/// order the loader tries them.
+///
+/// [0] is `fwl_nat_cfg_<zone>`, which is what `fwl` emits: the address
+/// is a per-zone fact — "translate to the address of the zone THIS one
+/// redirects to" — and two masquerading zones need not name the same
+/// uplink. [1] is the historical bundle-global `fwl_nat_cfg`, one
+/// kernel map with one slot 0 shared by every object, where the last
+/// zone loaded decided what all of them translated to.
+///
+/// The second name is not dead code and must not be removed: a bundle
+/// staged by an older `fwl` carries only that map, and an `fd` upgrade
+/// that could not find it would turn every masquerade in an
+/// already-deployed bundle into a silent no-op — the same rule, and
+/// the same reason, as `ManifestStatesMasquerade`'s fallback.
+///
+/// Exposed so the preference order is testable without an object.
+auto NatCfgMapNames(std::string_view zone)
+    -> std::array<std::string, 2>;
 
 /// What to do with one pin found under the root, given what the bundle
 /// about to load declares.
@@ -385,8 +450,11 @@ using GeoipTries =
 
 /// First IPv4 address (network byte order) configured on any of the
 /// named interfaces, or 0 when none carries one. The masquerade
-/// source: the daemon writes this into the bundle's `fwl_nat_cfg`
-/// map so `masquerade` rules translate to the egress zone's address.
+/// source: the daemon writes this into the masquerading zone's OWN
+/// `fwl_nat_cfg_<zone>` map so its `masquerade` rules translate to the
+/// address of the zone it redirects to. Resolved per masquerading
+/// zone, from that zone's own `redirects_to`, because two of them need
+/// not name the same uplink.
 auto FirstZoneIpv4(const std::vector<std::string>& ifaces) -> uint32_t;
 
 /// Parse `<bundle_dir>/geoip.json` (written by `fwl compile --bundle

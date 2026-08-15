@@ -13,6 +13,7 @@
 
 #include <unistd.h>
 
+#include <array>
 #include <cerrno>
 #include <chrono>
 #include <cstring>
@@ -528,6 +529,12 @@ auto PlanBundleAttach(std::string_view bundle_dir) -> BundleAttachPlan {
   }
 }
 
+auto NatCfgMapNames(std::string_view zone)
+    -> std::array<std::string, 2> {
+  return {std::string("fwl_nat_cfg_") + std::string(zone),
+          std::string("fwl_nat_cfg")};
+}
+
 auto ManifestStatesMasquerade(std::string_view bundle_dir) -> bool {
   using nlohmann::json;
   std::ifstream mf(std::filesystem::path(bundle_dir) / "manifest.json");
@@ -819,7 +826,7 @@ auto CloseZoneBundle(ZoneBundleHandles& handles) -> void {
   handles.nat_fd = -1;
   handles.nat_stats_fd = -1;
   handles.route_stats_fd = -1;
-  handles.nat_cfg_fd = -1;
+  handles.legacy_nat_cfg = false;
 }
 
 auto LoadZoneBundle(std::string_view bundle_dir,
@@ -1101,24 +1108,48 @@ auto LoadZoneBundle(std::string_view bundle_dir,
 
     // masquerade (v0.4 § NAT): the program translates sources to "the
     // WAN interface address" — the first IPv4 on the redirect
-    // destination zone. fwl_nat_cfg is pinned by name, so one write
-    // configures every zone program.
+    // destination zone. THIS zone's redirect destination, into THIS
+    // zone's own map.
     //
-    // The map's PRESENCE is not the signal. Every object in a NAT
-    // bundle embeds fwl_nat_cfg, because the de-NAT pass on the return
-    // path needs it, so seeding from presence alone also seeded from
-    // the WAN program — whose redirect destination is the LAN — and
-    // the last object read won. Outbound packets were then rewritten
-    // to a source address no upstream router routes back. The
-    // manifest's per-program `masquerades` flag is the compiler's
-    // answer to "which zone is a masquerade source", and it is the
-    // only thing consulted here — unless the bundle predates the flag,
-    // in which case it answers nothing and the old presence rule is
-    // the lesser wrong (see ManifestStatesMasquerade).
-    int nat_cfg_fd = FindMap(obj, "fwl_nat_cfg");
-    if (nat_cfg_fd >= 0 && handles.nat_cfg_fd < 0) {
-      handles.nat_cfg_fd = nat_cfg_fd;
+    // The map is per zone because the address is. `masquerade` means
+    // "translate to the address of the zone this one redirects to",
+    // and nothing makes two masquerading zones redirect to the same
+    // place: `deploy/firstboot` writes `masquerade` + `redirect to
+    // <uplink>` for every non-uplink zone, and a box with two uplinks
+    // names two. While the map was pinned under the bundle-global name
+    // `fwl_nat_cfg` this loop wrote one kernel slot once per
+    // masquerading zone, so the last zone loaded decided what every
+    // masquerading program in the bundle translated to — measured on
+    // the rig as `zone 'ina' masquerade address 10.99.210.2` followed
+    // by `zone 'inb' masquerade address 10.99.31.1`, after which
+    // neither zone forwarded.
+    //
+    // The map's PRESENCE is still not the signal. Every object in a
+    // NAT bundle embeds one, because the NAT helper block is emitted
+    // whole into any object that carries NAT at all, so seeding from
+    // presence alone also seeded from the WAN program — whose redirect
+    // destination is the LAN. The manifest's per-program `masquerades`
+    // flag is the compiler's answer to "which zone is a masquerade
+    // source", and it is the only thing consulted here — unless the
+    // bundle predates the flag, in which case it answers nothing and
+    // the old presence rule is the lesser wrong (see
+    // ManifestStatesMasquerade).
+    //
+    // The name is looked up per zone FIRST and falls back to the old
+    // bundle-global one, for the same reason and with the same rule: a
+    // bundle staged by an older `fwl` still has to masquerade after an
+    // `fd` upgrade. On such a bundle every zone resolves one map, so
+    // the overwrite is still there — and is named below rather than
+    // left to be found on the wire.
+    const auto nat_cfg_names = NatCfgMapNames(zone);
+    int nat_cfg_fd = FindMap(obj, nat_cfg_names[0].c_str());
+    if (nat_cfg_fd < 0) {
+      nat_cfg_fd = FindMap(obj, nat_cfg_names[1].c_str());
+      if (nat_cfg_fd >= 0) {
+        handles.legacy_nat_cfg = true;
+      }
     }
+    zh.nat_cfg_fd = nat_cfg_fd;
     if (nat_cfg_fd >= 0 && (zh.masquerades || !manifest_states_masq)) {
       uint32_t masq_addr = 0;
       std::string masq_zone;
@@ -1137,10 +1168,32 @@ auto LoadZoneBundle(std::string_view bundle_dir,
         uint32_t key = 0;
         FwlNatCfg cfg{masq_addr};
         bpf_map_update_elem(nat_cfg_fd, &key, &cfg, BPF_ANY);
+        zh.masq_addr = masq_addr;
         char buf[INET_ADDRSTRLEN] = {};
         inet_ntop(AF_INET, &masq_addr, buf, sizeof(buf));
         spdlog::info("zone '{}' masquerade address {} (zone '{}')",
                      zone, buf, masq_zone);
+        // On a pre-split bundle every zone's write lands on the same
+        // slot, so a second masquerading zone that resolves a
+        // DIFFERENT address has just silently taken the first one's
+        // traffic with it. Nothing here can fix that — the map has one
+        // slot — so say it, name both zones, and say what does.
+        if (handles.legacy_nat_cfg) {
+          for (const auto& prev : handles.programs) {
+            if (prev.masq_addr != 0 && prev.masq_addr != masq_addr) {
+              char pbuf[INET_ADDRSTRLEN] = {};
+              inet_ntop(AF_INET, &prev.masq_addr, pbuf, sizeof(pbuf));
+              spdlog::error(
+                  "bundle {} predates the per-zone masquerade address "
+                  "and carries one bundle-wide slot: zone '{}' just "
+                  "overwrote zone '{}'s address {} with {}, so BOTH "
+                  "zones now translate to {}. Recompile the policy "
+                  "with this version of fwl",
+                  bundle_dir, zone, prev.zone, pbuf, buf, buf);
+              break;
+            }
+          }
+        }
       } else {
         spdlog::warn(
             "zone '{}' uses masquerade but no redirect-destination "

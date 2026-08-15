@@ -272,6 +272,25 @@ auto RenderShowStatus(const Response& resp,
     if (realloc > 0) {
       row("nat_port_moved", std::to_string(realloc), Semantic::Info);
     }
+    // What each masquerading zone translates to, named by zone.
+    //
+    // One line per zone even when there is one zone, because the shape
+    // is the point: two inside zones leaving through DIFFERENT uplinks
+    // have two masquerade addresses, and until this map became per
+    // zone they silently shared one — the last zone loaded decided for
+    // all of them, and nothing on this screen could have said so.
+    auto sources = n.value("masq_sources", json::array());
+    for (const auto& s : sources) {
+      row(std::format("nat_masquerade[{}]",
+                      s.value("zone", std::string{})),
+          s.value("address", std::string{}), Semantic::Info);
+    }
+    if (n.value("masq_source_is_bundle_wide", false)) {
+      row("nat_masquerade",
+          "ONE address for the whole bundle (compiled by an older "
+          "fwl) — recompile if zones use different uplinks",
+          Semantic::Warn);
+    }
     // Shown whenever anything has been de-NAT'd at all, INCLUDING at
     // zero. Every other row here is hidden when idle because idle is
     // the good state; this one is the opposite. A masquerading box
@@ -501,10 +520,28 @@ auto RenderShowNat(const Response& resp,
                    Renderer& renderer) -> void {
   auto j = ParseData(resp);
   auto translations = j.value("translations", json::array());
-  if (j.contains("masq_source")) {
-    auto& out = renderer.Out();
+  // One line per masquerading zone. A box whose inside zones leave
+  // through different uplinks has more than one masquerade source, and
+  // a single line could only ever name one of them — which is the
+  // failure this map was split to remove, so the report must not
+  // reintroduce it. `masq_source` remains for the one-uplink case and
+  // is what the older single line said.
+  auto& out = renderer.Out();
+  auto sources = j.value("masq_sources", json::array());
+  if (sources.size() > 1) {
+    for (const auto& s : sources) {
+      out << "masquerade source: "
+          << s.value("address", std::string{}) << " (zone "
+          << s.value("zone", std::string{}) << ")\n";
+    }
+  } else if (j.contains("masq_source")) {
     out << "masquerade source: "
         << j["masq_source"].get<std::string>() << "\n";
+  }
+  if (j.value("masq_source_is_bundle_wide", false)) {
+    out << "  note: this bundle predates the per-zone masquerade "
+           "address and holds ONE for the whole bundle; recompile the "
+           "policy if its zones leave through different uplinks\n";
   }
   if (translations.empty()) {
     Table t;

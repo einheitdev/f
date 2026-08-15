@@ -244,6 +244,37 @@ class TestScopeIsHonoured:
     assert "fwl_counters" in message
     assert "PRIVATE" in message
 
+  def test_the_masquerade_source_under_a_global_name_fails(
+      self, monkeypatch):
+    """The half-fix, and it must not compile.
+
+    The registry says `fwl_nat_cfg` is PRIVATE; the declaration takes
+    its name from `MapNames` so the registry decides it. Hardcoding the
+    bundle-global name back into the template — the change that would
+    silently undo all of this, since the SHAPE is identical in every
+    zone and `_check_bundle_pinned_maps` therefore sees nothing wrong —
+    fails the compile instead, naming the map and the zone.
+
+    This is the same guard `_check_map_scopes` rule (2) has always had
+    for the counters; what is new is that a map can need it on grounds
+    of its CONTENTS rather than its shape.
+    """
+    monkeypatch.setattr(
+      emitter, "_NAT_CFG_DECL_TEMPLATE",
+      emitter._NAT_CFG_DECL_TEMPLATE.replace("{name}", "fwl_nat_cfg"),
+    )
+    source = (
+      "zone ina = [e0]\n"
+      "zone wan = [e1]\n"
+      "@xdp(ina)\nmasquerade\nredirect to wan\n"
+      "@xdp(wan)\nredirect to ina\n"
+    )
+    with pytest.raises(FwlException) as excinfo:
+      emitter.emit_bundle(_analyze(source))
+    message = str(excinfo.value)
+    assert "fwl_nat_cfg" in message
+    assert "PRIVATE" in message
+
   def test_object_private_map_may_not_be_pinned(self, monkeypatch):
     # fwl_scratch and fwl_stages are this object's own transients.
     # Pinning them by name would cross-wire two split zones' pipelines
@@ -319,11 +350,65 @@ class TestDeclaredScopes:
       assert kind.private_name is not None
 
   def test_cross_zone_state_is_shared(self):
-    for base in ("conntrack", "fwl_nat", "fwl_nat_cfg",
-                 "fwl_log_events"):
+    for base in ("conntrack", "fwl_nat", "fwl_log_events"):
       kind = emitter._map_kind(base)
       assert kind is not None
       assert kind.scope is emitter.MapScope.SHARED
+
+  def test_the_masquerade_source_is_private_though_its_shape_is_not(self):
+    """The third ground for PRIVATE, and the one no check could see.
+
+    `fwl_nat_cfg` holds "the masquerade source address" — the address
+    of the zone THIS zone redirects to. Nothing makes two masquerading
+    zones redirect to the same place: `deploy/firstboot` gives every
+    non-uplink zone its own `masquerade` + `redirect to <uplink>`, and
+    a box with two uplinks names two. Under the bundle-global name it
+    was one kernel map with one slot 0, written once per masquerading
+    zone by `fd`, so the LAST zone loaded decided what every
+    masquerading program in the bundle translated to.
+
+    What makes this row different from the devmap's is that its SHAPE
+    is genuinely bundle-wide — one slot, one __u32, sized from a
+    constant — so `_check_bundle_pinned_maps` sees every zone declaring
+    it identically and has nothing to object to. The declarations agree
+    perfectly and the map is still wrong; only the scope decision can
+    say so.
+    """
+    kind = emitter._map_kind("fwl_nat_cfg")
+    assert kind is not None
+    assert kind.scope is emitter.MapScope.PRIVATE
+    assert kind.private_name == "fwl_nat_cfg_{zone}"
+    assert emitter.MapNames("ina").nat_cfg() == "fwl_nat_cfg_ina"
+    assert emitter.MapNames("inb").nat_cfg() == "fwl_nat_cfg_inb"
+
+  def test_two_masquerading_zones_get_two_kernel_maps(self):
+    """The defect, put to the compiler rather than to a docstring.
+
+    Two inside zones, two DIFFERENT uplinks. Each object must declare a
+    map of its own and read that one — a bundle in which both name
+    `fwl_nat_cfg` is the bug: it loads, attaches, and translates both
+    zones to whichever address `fd` wrote last.
+    """
+    source = (
+      "zone ina = [e0]\n"
+      "zone inb = [e1]\n"
+      "zone wan1 = [e2]\n"
+      "zone wan2 = [e3]\n"
+      "@xdp(ina)\nmasquerade\nredirect to wan1\n"
+      "@xdp(inb)\nmasquerade\nredirect to wan2\n"
+      "@xdp(wan1)\nredirect to ina\n"
+      "@xdp(wan2)\nredirect to inb\n"
+    )
+    files = emitter.emit_bundle(_analyze(source))
+    for zone in ("ina", "inb", "wan1", "wan2"):
+      src = files[f"{zone}.bpf.c"]
+      assert f'}} fwl_nat_cfg_{zone} SEC(".maps");' in src
+      assert '} fwl_nat_cfg SEC(".maps");' not in src
+      # And the program reads the one it declared. A rename that left
+      # the helper reading a neighbour's map would not compile, but it
+      # would also not be caught by anything that only greps the
+      # declarations.
+      assert f"bpf_map_lookup_elem(&fwl_nat_cfg_{zone}, &k)" in src
 
   def test_a_devmap_is_private_because_it_cannot_be_shared(self):
     """The one row where the two questions come apart.

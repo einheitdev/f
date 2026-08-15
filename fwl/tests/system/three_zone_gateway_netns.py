@@ -341,6 +341,18 @@ def main() -> int:
     return 2
   if not os.path.ismount("/sys/fs/bpf"):
     run(["mount", "-t", "bpf", "bpf", "/sys/fs/bpf"], check=True)
+  # Every external tool this bench needs, named before anything is
+  # built. `ethtool` in particular is load-bearing rather than
+  # cosmetic — see build_topology: without it a veth pair keeps
+  # CHECKSUM_PARTIAL end to end and every NAT'd frame is dropped by the
+  # far stack — so its absence has to be a reported blocker and not a
+  # traceback out of the middle of a half-built topology.
+  missing = [t for t in ("ip", "ethtool", "clang")
+             if shutil.which(t) is None]
+  if missing:
+    print(f"[3z] BLOCKED: not installed: {', '.join(missing)}",
+          file=sys.stderr)
+    return 2
 
   fctl = args.fctl or str(pathlib.Path(args.fd).resolve().parent / "fctl")
   if not os.access(fctl, os.X_OK):
@@ -389,6 +401,24 @@ def main() -> int:
     res.check(not any(n.startswith("fwl_devmap_")
                       for n in manifest["shared_pinned_maps"]),
               "the manifest claims no devmap as a bundle-global pin")
+    # The masquerade source is per zone, and this bench is where that
+    # can be asserted without four ports. `masquerade` translates to
+    # the address of the zone THIS one redirects to; under the
+    # bundle-global name `fwl_nat_cfg` every object resolved one kernel
+    # map with one slot 0, written once per masquerading zone, so the
+    # last zone loaded decided what every masquerading program
+    # translated to. Here both inside zones DO redirect to the same
+    # uplink — so this bench cannot see the consequence on the wire
+    # (l2_09_two_uplinks does, on the rig) — but it can see the shape,
+    # and the shape is what the consequence follows from.
+    res.check(all(f'}} fwl_nat_cfg_{z} SEC(".maps");' in src[z]
+                  for z in ("lan", "dmz", "wan")),
+              "each zone declares its OWN masquerade source map")
+    res.check(not any('} fwl_nat_cfg SEC(".maps");' in src[z]
+                      for z in ("lan", "dmz", "wan")),
+              "no object declares a bundle-global fwl_nat_cfg")
+    res.check("fwl_nat_cfg" not in manifest["shared_pinned_maps"],
+              "the manifest claims no bundle-global masquerade source")
 
     if not build_topology(work, res):
       return 1

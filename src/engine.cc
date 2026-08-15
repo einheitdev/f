@@ -18,6 +18,8 @@
 #include <filesystem>
 #include <format>
 #include <fstream>
+#include <set>
+#include <string>
 
 #include <bpf/bpf.h>
 #include <bpf/libbpf.h>
@@ -84,6 +86,60 @@ auto Ipv4Str(uint32_t netorder) -> std::string {
   char buf[INET_ADDRSTRLEN] = {};
   inet_ntop(AF_INET, &netorder, buf, sizeof(buf));
   return buf;
+}
+
+// Report the masquerade source address of every masquerading zone into
+// `out`, read back off the very maps the XDP programs read.
+//
+// PER ZONE, because there is one per zone: `masquerade` translates to
+// the address of the zone THIS one redirects to, and two masquerading
+// zones need not name the same uplink — `deploy/firstboot` gives every
+// non-uplink zone its own `masquerade` + `redirect to <uplink>`. A
+// single `masq_source` cannot express a box with two uplinks, and a
+// report that cannot state the truth is part of how the one-slot
+// version of this map stayed invisible: everything said healthy while
+// half the traffic was translated to the other zone's address.
+//
+// `masq_source` is kept when every masquerading zone resolved the SAME
+// address — the ordinary one-uplink gateway, and what the field always
+// meant. A box with two uplinks has no single answer and gets none;
+// `masq_sources` is where it is.
+auto AddMasqSources(const ZoneBundleHandles& bundle,
+                    nlohmann::json* out) -> void {
+  json sources = json::array();
+  std::set<std::string> distinct;
+  for (const auto& zp : bundle.programs) {
+    // Zones this loader actually seeded — a zone that does not
+    // masquerade has nothing to report. Asked of the MAP instead, a
+    // pre-split bundle would list every zone in it, because they all
+    // resolve one slot; the whole point of the row is which zone
+    // translates to what.
+    if (zp.nat_cfg_fd < 0 || zp.masq_addr == 0) continue;
+    // The value comes off the map the program reads, not off what the
+    // loader remembers writing. On a pre-split bundle those two differ
+    // for every zone but the last, and that difference IS the defect —
+    // so the report shows what the datapath holds.
+    uint32_t k = 0, masq = 0;
+    if (bpf_map_lookup_elem(zp.nat_cfg_fd, &k, &masq) != 0 || masq == 0) {
+      continue;
+    }
+    std::string addr = Ipv4Str(masq);
+    sources.push_back({{"zone", zp.zone}, {"address", addr}});
+    distinct.insert(addr);
+  }
+  if (!sources.empty()) {
+    (*out)["masq_sources"] = sources;
+  }
+  if (distinct.size() == 1) {
+    (*out)["masq_source"] = *distinct.begin();
+  }
+  // And whether those addresses can be trusted to be per zone at all:
+  // on a bundle compiled before the split they are ONE slot read
+  // several times, so two zones reading differently is not possible
+  // however the policy is written. Recompiling is the fix.
+  if (bundle.legacy_nat_cfg) {
+    (*out)["masq_source_is_bundle_wide"] = true;
+  }
 }
 
 // Cap on entries serialized per map dump — an unbounded map (up to 64k
@@ -229,15 +285,9 @@ auto HandleRequest(Engine& e, const std::string& req_str)
         }
       }
       j["translations"] = arr;
-      // Report the masquerade source address the daemon programmed.
-      if (e.zone_bundle.nat_cfg_fd >= 0) {
-        uint32_t k = 0, masq = 0;
-        if (bpf_map_lookup_elem(
-                e.zone_bundle.nat_cfg_fd, &k, &masq) == 0 &&
-            masq != 0) {
-          j["masq_source"] = Ipv4Str(masq);
-        }
-      }
+      // The masquerade source addresses the datapath is actually
+      // holding, read back per zone off the maps the programs read.
+      AddMasqSources(e.zone_bundle, &j);
       return j.dump();
     }
     case Cmd::kGetConntrack: {
@@ -770,6 +820,12 @@ auto GetFullState(const Engine& e) -> nlohmann::json {
   // connections hang, old ones are fine", and nothing in the CLI to
   // see it in.
   j["nat"] = e.nat.GetState();
+  // ...plus what each masquerading zone actually translates to. It
+  // belongs here and not only in `show nat` because this is the live
+  // view an operator watches, and because the one thing a two-uplink
+  // box could not do until the map became per zone was tell you that
+  // its two inside zones had ended up on one address.
+  AddMasqSources(e.zone_bundle, &j["nat"]);
   // Whether a redirect re-addressed the frame to a next hop or handed
   // it on with the MAC it arrived carrying. Not visible in any capture
   // — a frame addressed to the wrong MAC is still on the cable — so

@@ -56,8 +56,14 @@ cleanup(){
   # makes a devmap pin unreusable, so the second zone object of a
   # bundle could not load); a run from before that change may still
   # have left one at the bpffs root.
+  # `fwl_nat_cfg` is the same shape of leftover: the masquerade source
+  # is per zone now (`fwl_nat_cfg_<zone>`), because two masquerading
+  # zones need not redirect to the same uplink and one slot could hold
+  # only one of their addresses.
   rm -f /sys/fs/bpf/fwl_devmap_wan /sys/fs/bpf/fwl_devmap_lan \
-        /sys/fs/bpf/fwl_nat /sys/fs/bpf/fwl_nat_cfg /sys/fs/bpf/conntrack \
+        /sys/fs/bpf/fwl_nat /sys/fs/bpf/fwl_nat_cfg \
+        /sys/fs/bpf/fwl_nat_cfg_lan /sys/fs/bpf/fwl_nat_cfg_wan \
+        /sys/fs/bpf/conntrack \
         2>/dev/null
 }
 trap cleanup EXIT

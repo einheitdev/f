@@ -33,8 +33,8 @@ class MapScope(enum.Enum):
 
   PRIVATE — two zones must never land on one kernel map, so the name
     carries the zone (or the map is never pinned at all and the object
-    boundary isolates it). There are two grounds for that, and only the
-    first was known when this enum was written:
+    boundary isolates it). There are three grounds for that, and only
+    the first was known when this enum was written:
 
       * the map's size, or the meaning of its indices, comes from ONE
         zone's analysis, so sharing it would make two zones report each
@@ -45,18 +45,30 @@ class MapScope(enum.Enum):
         BPF_F_RDONLY_PROG inside `dev_map_alloc` and libbpf's pin-reuse
         check compares an object's declared `map_flags` (0) against the
         pinned map's reported flags (128), which can never agree — so
-        the SECOND object to declare a pinned devmap fails to load.
+        the SECOND object to declare a pinned devmap fails to load;
+      * the CONTENTS are a per-zone fact under a bundle-wide name.
+        `fwl_nat_cfg` is the case: one slot holding "the masquerade
+        source address", which is the address of the zone THIS zone
+        redirects to. Nothing makes two masquerading zones redirect to
+        the same place, and while the map was shared the last zone
+        loaded decided what every masquerading program translated to.
+        Unlike the first ground the SHAPE is bundle-wide (one slot, one
+        __u32, sized from a constant), so `_check_bundle_pinned_maps`
+        cannot see it: the declarations agree perfectly and the map is
+        still wrong.
 
-    The question the enum answers is the same in both cases — may two
-    zone objects of one bundle land on one kernel map? — so the second
-    ground did not need a third value. It needed the answer to stop
-    being derived from "are the contents bundle-wide", which is a
-    different question and is what put the devmap in SHARED.
+    The question the enum answers is the same in all three cases — may
+    two zone objects of one bundle land on one kernel map? — so neither
+    later ground needed a third value. What each needed was for the
+    answer to stop being derived from a different question: "are the
+    contents bundle-wide" (which put the devmap in SHARED), or "do the
+    declarations agree" (which kept fwl_nat_cfg there).
 
-  There is no third value and no default. A map that reaches the
-  generated source without a scope is a hard compile error, because
-  the failure mode of forgetting is silent: two zones' objects load
-  cleanly, share one kernel map, and report each other's numbers.
+  There are two VALUES and no default — three grounds, two answers. A
+  map that reaches the generated source without a scope is a hard
+  compile error, because the failure mode of forgetting is silent: two
+  zones' objects load cleanly, share one kernel map, and report each
+  other's numbers.
   """
   SHARED = "shared"
   PRIVATE = "private"
@@ -207,15 +219,25 @@ _MAP_KINDS: tuple[_MapKind, ...] = (
     ),
   ),
   _MapKind(
-    r"fwl_nat_cfg", MapScope.SHARED,
-    "one unit-wide masquerade address, written once by the daemon",
+    r"fwl_nat_cfg", MapScope.PRIVATE,
+    "slot 0 is THIS zone's masquerade source — the address of the "
+    "zone it redirects to — and nothing makes two masquerading zones "
+    "redirect to the same place. Under the bundle-global name it was "
+    "one kernel map with one slot 0, written once per masquerading "
+    "zone by `fd`, so the LAST zone loaded decided what every "
+    "masquerading program in the bundle translated to. That is a "
+    "third ground for PRIVATE and it is the one this row got wrong: "
+    "the contents are a per-zone FACT wearing a bundle-wide name "
+    "(\"one unit-wide masquerade address\", which is only true of a "
+    "box with one uplink)",
     lifetime=MapLifetime.POLICY,
     lifetime_why=(
-      "derived by the daemon at every load from THIS bundle's "
-      "redirect topology and the live interface addresses, so nothing "
-      "is lost by dropping it — while a stale value would translate "
-      "to an address the new policy never named"
+      "derived by the daemon at every load from THIS zone's redirect "
+      "topology and the live interface addresses, so nothing is lost "
+      "by dropping it — while a stale value would translate to an "
+      "address the new policy never named"
     ),
+    private_name=r"fwl_nat_cfg_{zone}",
   ),
   _MapKind(
     r"fwl_log_events", MapScope.SHARED,
@@ -501,6 +523,10 @@ class MapNames:
   def log_sample(self) -> str:
     """The per-zone log-sampling accumulator."""
     return self.qualified("fwl_log_sample")
+
+  def nat_cfg(self) -> str:
+    """This zone's masquerade source address slot."""
+    return self.qualified("fwl_nat_cfg")
 
   def geoip(self, call_index: int) -> str:
     """The LPM trie backing geoip call site `call_index`."""
@@ -810,13 +836,35 @@ struct {
 struct fwl_nat_cfg {
   __u32 masq_addr;
 };
+"""
 
-struct {
+
+# The masquerade source address slot, ONE PER ZONE OBJECT.
+#
+# `masquerade` means "translate to the address of the zone this one
+# redirects to", and that destination is a property of the zone, not of
+# the bundle: `deploy/firstboot` gives every non-uplink zone its own
+# `masquerade` + `redirect to <uplink>`, and nothing says the uplink has
+# to be the same one. While this map kept the bundle-global name
+# `fwl_nat_cfg` it was ONE kernel map with one slot 0, written once per
+# masquerading zone by `LoadZoneBundle`, so the last zone loaded decided
+# what every masquerading program in the bundle translated to — measured
+# on the rig as `zone 'ina' masquerade address 10.99.210.2` followed by
+# `zone 'inb' masquerade address 10.99.31.1`, after which neither zone
+# forwarded.
+#
+# The name carries the zone for that reason (`_MAP_KINDS`), and the
+# declaration takes it from `MapNames` so the registry decides it rather
+# than this string. `{name}` is what makes a half-fix impossible: a
+# hardcoded `fwl_nat_cfg` here fails `_check_map_scopes` rule (2) on
+# every bundle compile.
+_NAT_CFG_DECL_TEMPLATE = """\
+struct {{
   __uint(type, BPF_MAP_TYPE_ARRAY);
   __uint(max_entries, 1);
   __type(key, __u32);
   __type(value, struct fwl_nat_cfg);
-} fwl_nat_cfg SEC(".maps");
+}} {name} SEC(".maps");
 """
 
 
@@ -1118,9 +1166,12 @@ static __always_inline int fwl_snat_egress(
   return 0;
 }
 
+// The masquerade source is named for THIS zone: its slot 0 holds the
+// address of the zone this one redirects to, and two masquerading
+// zones need not redirect to the same place.
 static __always_inline int fwl_masquerade(struct xdp_md *ctx) {
   __u32 k = 0;
-  struct fwl_nat_cfg *cfg = bpf_map_lookup_elem(&fwl_nat_cfg, &k);
+  struct fwl_nat_cfg *cfg = bpf_map_lookup_elem(&FWL_NAT_CFG_MAP, &k);
   if (cfg && cfg->masq_addr) return fwl_snat_egress(ctx, cfg->masq_addr);
   return 0;
 }
@@ -3217,13 +3268,37 @@ def _collect_redirect_zones_stmts(stmts, add) -> None:
         _collect_redirect_zones_stmts(s.else_body, add)
 
 
-def _program_uses_nat(zp: ast.ZoneProgram) -> bool:
-  """True iff `zp` contains any NAT rewrite action (Phase 5)."""
-  for rule in zp.rules:
-    if rule.action in ast.NAT_ACTIONS:
+def _program_uses_nat(
+  zp: ast.ZoneProgram,
+  helpers: list[ast.FunctionDef] | None = None,
+) -> bool:
+  """True iff `zp` contains any NAT rewrite action (Phase 5).
+
+  `helpers` are the unit's top-level defs (v0.4 § 6.5), and they are
+  not optional in a bundle: `emit_bundle` uses this to decide whether
+  EVERY zone object carries the NAT machinery, because the reply to a
+  translated flow arrives on a different zone from the one that
+  translated it and de-NATs there. Asked without the helpers, a policy
+  whose only `masquerade` lives in a `def` answered "no NAT in this
+  bundle", the other zones' objects got no de-NAT pass, and the gateway
+  was one-way — the failure `tests/system/return_path_probe.sh` exists
+  for, reached the quiet way.
+
+  Same shape as `_program_masquerades` and `bundle_needs_egress_tracker`
+  above, and the third time this project has found one question asked
+  two ways in two places. `_emit_zone_source` decides `nat_active` over
+  the zone PLUS its reachable helpers; this must be asked the same way
+  or the two disagree.
+  """
+  units = [zp] + [
+    _synth_unit(zp, h) for h in _reachable_helpers(zp, helpers or [])
+  ]
+  for u in units:
+    for rule in u.rules:
+      if rule.action in ast.NAT_ACTIONS:
+        return True
+    if u.function is not None and _stmts_use_nat(u.function.body):
       return True
-  if zp.function is not None:
-    return _stmts_use_nat(zp.function.body)
   return False
 
 
@@ -3577,8 +3652,21 @@ def _emit_zone_source(
     conntrack_decl += _CONNTRACK_HELPERS
   ct_create = _emit_ct_create() if uses_ct else ""
 
-  nat_decl = _maybe_pin(_NAT_DECL, pinned_shared) if nat_active else ""
-  nat_helpers = _NAT_HELPERS if nat_active else ""
+  # The bundle-wide half (fwl_nat, fwl_nat_stats) and this zone's own
+  # masquerade source, which is a per-zone fact and takes its name from
+  # the registry through MapNames — see _NAT_CFG_DECL_TEMPLATE.
+  nat_decl = ""
+  nat_helpers = ""
+  if nat_active:
+    nat_cfg_name = names.nat_cfg()
+    nat_decl = (
+      _maybe_pin(_NAT_DECL, pinned_shared)
+      + "\n"
+      + _maybe_pin(
+        _NAT_CFG_DECL_TEMPLATE.format(name=nat_cfg_name), pinned_shared
+      )
+    )
+    nat_helpers = _NAT_HELPERS.replace("FWL_NAT_CFG_MAP", nat_cfg_name)
   nat_denat = "  fwl_nat_denat(ctx);\n" if nat_active else ""
 
   counter_slots = _allocate_counter_slots_units(units)
@@ -3928,12 +4016,12 @@ def emit_bundle(program: ast.Program) -> dict[str, str]:
   Returns a mapping of filename -> C source:
     - `<zone>.bpf.c` per zone program — its prelude, rules/function,
       redirect devmaps, the cross-zone shared maps it uses (conntrack,
-      fwl_nat, fwl_nat_cfg, fwl_log_events, a scope=global rate-limit
-      bucket) under their bundle-global names, and its zone-private
-      maps (counters, zone-scoped rate limits, geoip, log-sample)
-      under per-zone names. Both kinds may carry LIBBPF_PIN_BY_NAME;
-      the NAME is what decides sharing, and `_MAP_KINDS` is what
-      decides the name.
+      fwl_nat, fwl_log_events, a scope=global rate-limit bucket) under
+      their bundle-global names, and its zone-private maps (counters,
+      zone-scoped rate limits, geoip, log-sample, the masquerade source
+      address) under per-zone names. Both kinds may carry
+      LIBBPF_PIN_BY_NAME; the NAME is what decides sharing, and
+      `_MAP_KINDS` is what decides the name.
 
     - `fwl_shared.h` — a manifest header documenting the pinned maps
       every zone program shares via bpffs (the cross-zone state).
@@ -3961,8 +4049,12 @@ def emit_bundle(program: ast.Program) -> dict[str, str]:
   # When any zone uses NAT, every zone program emits the shared NAT map
   # + de-NAT pass so return traffic is un-translated on whichever zone
   # it lands (the egress zone installs the reply mapping; the ingress
-  # zone consumes it).
-  bundle_nat = any(_program_uses_nat(zp) for zp in program.programs)
+  # zone consumes it). Helpers included, or a policy whose only
+  # `masquerade` lives in a `def` gets the machinery in the zone that
+  # translates and in no other, and the gateway is one-way.
+  bundle_nat = any(
+    _program_uses_nat(zp, program.helpers) for zp in program.programs
+  )
   files: dict[str, str] = {}
   for zp in program.programs:
     files[f"{zp.zone_name}.bpf.c"] = _emit_zone_source(
