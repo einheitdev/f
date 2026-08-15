@@ -1210,11 +1210,16 @@ auto RenderReservation(const Response& resp, Renderer& renderer)
                            : Semantic::Warn}});
   RenderFormatted(t, renderer);
   if (applied && !live) {
+    // The generated config now *is* rewritten on this path — that
+    // was the half `set reservation` used to leave out entirely. What
+    // is still missing without f-confd is the restart that makes
+    // dnsmasq read it, and that is what the sentence has to say.
     for (const auto& l : Wrap(
-             "f-confd is not running, so nothing regenerated "
-             "dnsmasq's config: the reservation is recorded but the "
-             "server does not know about it yet. Run `apply system` "
-             "to make it live.",
+             "f-confd is not running: the reservation is in the "
+             "model and in dnsmasq's generated config, but nothing "
+             "restarted dnsmasq, so the running server has not read "
+             "it. `systemctl restart f-dnsmasq`, or start f-confd "
+             "and run `apply system`.",
              renderer.Caps().width)) {
       Prose(renderer) << l << "\n";
     }
@@ -1321,6 +1326,16 @@ auto RenderEdit(const Response& resp,
 auto RenderIfaceConfig(const Response& resp,
                        Renderer& renderer) -> void {
   auto j = ParseData(resp);
+  // A refused edit comes back Ok with `applied: false` and the
+  // validation findings beside it. Rendering only the table turned a
+  // named diagnostic — `SC031: zone 'dmz' asks for `ra` and no
+  // interface in it carries a v6 prefix` — into a row reading
+  // `applied: no`, which is the outcome without the reason.
+  if (!j.value("applied", true) &&
+      RenderDiagnostics(j, renderer)) {
+    renderer.Out() << "nothing was changed\n";
+    return;
+  }
   Table t;
   AddColumn(t, "FIELD", Align::Left, Priority::High);
   AddColumn(t, "VALUE", Align::Left, Priority::High);
@@ -1331,6 +1346,9 @@ auto RenderIfaceConfig(const Response& resp,
   if (j.contains("interface")) {
     row("interface", j["interface"].get<std::string>(),
         Semantic::Emphasis);
+  }
+  if (j.contains("zone")) {
+    row("zone", j["zone"].get<std::string>(), Semantic::Emphasis);
   }
   if (j.contains("action")) {
     row("action", j["action"].get<std::string>());
@@ -1347,6 +1365,11 @@ auto RenderIfaceConfig(const Response& resp,
       persisted ? Semantic::Good : Semantic::Dim);
   // "in the configuration" and "on the wire" are different claims, so
   // they get different rows.
+  if (j.contains("activated")) {
+    bool live = j["activated"].get<bool>();
+    row("reloaded", live ? "yes" : "no",
+        live ? Semantic::Good : Semantic::Warn);
+  }
   if (j.contains("via")) {
     row("applied via", j["via"].get<std::string>(),
         j["via"] == "f-confd" ? Semantic::Good : Semantic::Warn);
@@ -1358,6 +1381,13 @@ auto RenderIfaceConfig(const Response& resp,
   if (j.contains("warning")) {
     row("warning", j["warning"].get<std::string>(),
         Semantic::Warn);
+  }
+  if (j.contains("activation_note")) {
+    row("note", j["activation_note"].get<std::string>(),
+        Semantic::Warn);
+  }
+  if (j.contains("note")) {
+    row("note", j["note"].get<std::string>(), Semantic::Info);
   }
   RenderFormatted(t, renderer);
 }
@@ -1829,6 +1859,77 @@ auto RenderShowStorage(const Response& resp, Renderer& renderer)
   }
 }
 
+/// What this box has of the deployable set.
+///
+/// Rows for the items that are not fine, and nothing for the ones
+/// that are — an operator running this wants the gap, not an
+/// inventory. The verdict is printed as a word rather than inferred
+/// from an empty table, because "everything is present" and "the
+/// verifier could not look" produce the same empty table and mean
+/// opposite things.
+auto RenderShowInstall(const Response& resp, Renderer& renderer)
+    -> void {
+  auto j = ParseData(resp);
+  auto& out = renderer.Out();
+  auto verdict = j.value("verdict", "");
+  auto items = j.value("items", json::array());
+
+  Table t;
+  AddColumn(t, "STATE", Align::Left, Priority::High);
+  AddColumn(t, "ITEM", Align::Left, Priority::High);
+  AddColumn(t, "WHERE", Align::Left, Priority::Medium);
+  AddColumn(t, "NEEDED BY", Align::Left, Priority::Medium);
+  int listed = 0;
+  for (const auto& item : items) {
+    auto state = item.value("state", "");
+    if (state == "present") continue;
+    ++listed;
+    Semantic sem = Semantic::Warn;
+    if (state == "missing" || state == "wrong-kind" ||
+        state == "empty" || state == "conflict" ||
+        state == "unusable") {
+      sem = item.value("requirement", "") == "required"
+                ? Semantic::Bad
+                : Semantic::Warn;
+    } else if (state == "not-checked") {
+      sem = Semantic::Dim;
+    }
+    auto needed = item.value("needed_by", "");
+    AddRow(t, {Cell{state, sem},
+               Cell{item.value("id", ""), Semantic::Emphasis},
+               Cell{item.value("dest", "")},
+               Cell{needed.empty() ? "-" : needed, Semantic::Dim}});
+  }
+  if (listed > 0) RenderFormatted(t, renderer);
+
+  // The sentence from the manifest, for the ones that actually stop
+  // something working. An id and a path do not tell an operator what
+  // it costs, and looking it up is a step nobody takes at 2 a.m.
+  for (const auto& item : items) {
+    auto state = item.value("state", "");
+    if (state != "missing" && state != "wrong-kind" &&
+        state != "empty" && state != "conflict" &&
+        state != "unusable") {
+      continue;
+    }
+    out << "\n" << item.value("id", "") << ": "
+        << item.value("why", "") << "\n";
+    auto detail = item.value("detail", "");
+    if (!detail.empty()) out << "  " << detail << "\n";
+    auto provided = item.value("provided_by", "");
+    if (!provided.empty()) out << "  install: " << provided << "\n";
+    auto when = item.value("required_when", "");
+    if (!when.empty()) out << "  required when: " << when << "\n";
+  }
+
+  if (listed == 0) {
+    out << "every item in the deployable set is present.\n";
+  }
+  out << "\nverdict: " << verdict << " (checked "
+      << j.value("root", "/") << ", scope "
+      << j.value("scope", "") << ")\n";
+}
+
 auto RenderCheckSystem(const Response& resp, Renderer& renderer)
     -> void {
   auto j = ParseData(resp);
@@ -1906,6 +2007,204 @@ auto RenderConfirmSystem(const Response& resp, Renderer& renderer)
                  << j.value("detail", "") << ")\n";
 }
 
+/// The system-configuration revisions f-confd has recorded.
+auto RenderShowCommits(const Response& resp, Renderer& renderer)
+    -> void {
+  auto j = ParseData(resp);
+  auto commits = j.value("commits", json::array());
+  if (commits.empty()) {
+    renderer.Out() << "f-confd has recorded no revisions — nothing "
+                      "has been applied through it on this box\n";
+    return;
+  }
+  Table t;
+  AddColumn(t, "ID", Align::Right, Priority::High);
+  AddColumn(t, "BY", Align::Left, Priority::High);
+  AddColumn(t, "AT", Align::Left, Priority::Medium);
+  for (const auto& c : commits) {
+    AddRow(t, {
+        Cell{c.value("id", "")},
+        Cell{c.value("by", "")},
+        Cell{c.value("at", ""), Semantic::Dim},
+    });
+  }
+  RenderFormatted(t, renderer);
+  renderer.Out() << "these are " << j.value("scope", "revisions")
+                 << " revisions; the policy has no revision history "
+                    "— `configure` snapshots it and `rollback` puts "
+                    "it back\n";
+}
+
+/// The policy source, block by block, numbered as `no rule` names it.
+///
+/// A table per zone for a person, because the numbering restarts per
+/// block and one running sequence of row numbers beside restarting
+/// indices is how `no rule lan 4` deletes the wrong statement.
+///
+/// One table with a ZONE column for a machine, because two JSON
+/// arrays printed one after another are not a document, and the
+/// position a row carries means nothing without the zone it counts
+/// within.
+auto RenderShowPolicy(const Response& resp, Renderer& renderer)
+    -> void {
+  auto j = ParseData(resp);
+  auto blocks = j.value("blocks", json::array());
+  // Machine-readable output owns stdout: under a machine format the
+  // headings and the caveat go to stderr, so `| jq` gets a document
+  // and the operator still gets told.
+  auto& out = Prose(renderer);
+  if (blocks.empty()) {
+    out << std::format(
+        "no @xdp block in the policy at {}\n",
+        j.value("source", "?"));
+    return;
+  }
+  const bool machine =
+      renderer.Format() != cli::render::OutputFormat::Table;
+
+  /// An unguarded `allow` / `drop` / `masquerade` / `redirect` acts
+  /// on everything that reaches it, so nothing below it can match.
+  /// That is the single most expensive thing to misread in a policy,
+  /// and it is what the MATCHES column is for.
+  auto matches_of = [](const json& s) -> const char* {
+    const bool guarded = s.value("guarded", false);
+    const auto verb = s.value("verb", "other");
+    const bool terminal =
+        !guarded && (verb == "filter" || verb == "translate" ||
+                     verb == "redirect" || verb == "default");
+    // Three states, not two. A `count` with no guard also runs on
+    // every packet, but it falls through — calling that the same
+    // thing as an unguarded `drop` would put a warning beside the one
+    // statement in the block that is harmless.
+    if (terminal) return "every packet — stops here";
+    return guarded ? "when it matches" : "every packet, falls through";
+  };
+  auto is_terminal = [](const json& s) {
+    const auto verb = s.value("verb", "other");
+    return !s.value("guarded", false) &&
+           (verb == "filter" || verb == "translate" ||
+            verb == "redirect" || verb == "default");
+  };
+
+  if (machine) {
+    Table t;
+    AddColumn(t, "ZONE", Align::Left, Priority::High);
+    AddColumn(t, "#", Align::Right, Priority::High);
+    AddColumn(t, "STATEMENT", Align::Left, Priority::High);
+    AddColumn(t, "MATCHES", Align::Left, Priority::High);
+    AddColumn(t, "FILE", Align::Left, Priority::Low);
+    for (const auto& b : blocks) {
+      for (const auto& s : b.value("statements", json::array())) {
+        AddRow(t, {
+            Cell{b.value("zone", "")},
+            Cell{std::to_string(s.value("index", 0))},
+            Cell{s.value("text", "")},
+            Cell{matches_of(s)},
+            Cell{b.value("file", "")},
+        });
+      }
+    }
+    RenderFormatted(t, renderer);
+  } else {
+    for (const auto& b : blocks) {
+      out << std::format("zone {}  ({})\n",
+                         b.value("zone", "?"), b.value("file", "?"));
+      Table t;
+      AddColumn(t, "#", Align::Right, Priority::High);
+      AddColumn(t, "STATEMENT", Align::Left, Priority::High);
+      // Medium: on a console too narrow for both, the statement text
+      // wins. The warning this column carries is not lost with it —
+      // an unconditional statement is rendered `Warn`, which the
+      // plain-text renderer marks inline — and a rule the operator
+      // cannot read is worse than one they cannot see annotated.
+      AddColumn(t, "MATCHES", Align::Left, Priority::Medium);
+      for (const auto& s : b.value("statements", json::array())) {
+        const bool terminal = is_terminal(s);
+        AddRow(t, {
+            Cell{std::to_string(s.value("index", 0))},
+            Cell{s.value("text", ""),
+                 terminal ? Semantic::Warn : Semantic::Default},
+            Cell{matches_of(s),
+                 terminal ? Semantic::Warn : Semantic::Dim},
+        });
+      }
+      RenderFormatted(t, renderer);
+      out << "\n";
+    }
+  }
+  if (j.contains("caveat")) {
+    for (const auto& l :
+         Wrap(j["caveat"].get<std::string>(),
+              renderer.Caps().width)) {
+      out << l << "\n";
+    }
+  }
+}
+
+/// The result of a policy edit: what was written, where, and whether
+/// the running policy carries it.
+auto RenderPolicyEdit(const Response& resp, Renderer& renderer)
+    -> void {
+  auto j = ParseData(resp);
+  Table t;
+  AddColumn(t, "FIELD", Align::Left, Priority::High);
+  AddColumn(t, "VALUE", Align::Left, Priority::High);
+  auto row = [&](const std::string& f, const std::string& v,
+                 Semantic sem = Semantic::Default) {
+    AddRow(t, {Cell{f, Semantic::Info}, Cell{v, sem}});
+  };
+  if (j.contains("zone")) {
+    row("zone", j["zone"].get<std::string>(), Semantic::Emphasis);
+  }
+  if (j.contains("action")) row("action", j["action"]);
+  if (j.contains("statement") &&
+      !j["statement"].get<std::string>().empty()) {
+    row("statement", j["statement"].get<std::string>(),
+        Semantic::Emphasis);
+  }
+  for (const auto& r : j.value("removed", json::array())) {
+    row("removed", r.get<std::string>(), Semantic::Warn);
+  }
+  if (j.value("position", 0) != 0) {
+    row("position", std::format("{} in the block, line {}",
+                                j.value("position", 0),
+                                j.value("line", 0)));
+  }
+  // Order is the policy, so where it went is not a detail.
+  if (j.contains("before")) {
+    row("before", j["before"].get<std::string>(),
+        j.value("before_is_unconditional", false) ? Semantic::Warn
+                                                  : Semantic::Dim);
+    if (j.value("before_is_unconditional", false)) {
+      row("why there",
+          "that statement is unconditional — anything after it can "
+          "never match",
+          Semantic::Dim);
+    }
+  }
+  const bool saved = j.value("saved", false);
+  row("saved to", saved ? j.value("file", "?") : "no",
+      saved ? Semantic::Good : Semantic::Bad);
+  const bool live = j.value("activated", false);
+  row("running", live ? "yes — fd reloaded" : "no",
+      live ? Semantic::Good : Semantic::Warn);
+  if (j.contains("version") && !j["version"].is_null()) {
+    // fd has answered with this field as both a number and a string
+    // over the years, and a renderer that assumes one of them throws
+    // where it should be printing.
+    row("version", j["version"].is_string()
+                       ? j["version"].get<std::string>()
+                       : j["version"].dump());
+  }
+  for (const auto& w : j.value("warnings", json::array())) {
+    row("warning", w.get<std::string>(), Semantic::Warn);
+  }
+  if (j.contains("note")) {
+    row("note", j["note"].get<std::string>(), Semantic::Info);
+  }
+  RenderFormatted(t, renderer);
+}
+
 // -- Adapter class ---------------------------------------------------
 
 class FwAdapter final : public cli::ProductAdapter {
@@ -1964,6 +2263,9 @@ class FwAdapter final : public cli::ProductAdapter {
         Show("storage", "show_storage",
              "Disk, compiled bundles, and whether log events are "
              "being dropped"),
+        Show("install", "show_install",
+             "What this box has of the deployable set, and what it "
+             "is missing"),
         Show("time", "show_time",
              "The clock, whether it is synchronised, and whether "
              "this board can keep time across a power cut"),
@@ -1974,14 +2276,34 @@ class FwAdapter final : public cli::ProductAdapter {
         MakeApplySystem(),
         MakeApplySystemConfirmed(),
         MakeConfirmSystem(),
+        MakeRollbackSystem(),
         MakeShowLog(),
+        MakeConfigure(),
+        MakeCommit(),
+        MakeRollbackCandidate(),
+        MakeShowDiff(),
+        MakeShowPolicySource(),
+        MakeShowCommits(),
         MakeShowFiles(),
+        MakeShowPolicy(),
+        MakeSetRule(),
+        MakeNoRule(),
+        MakeSetForward(),
+        MakeNoForward(),
         MakeEdit(),
         MakeNewFile(),
         MakeRenameFile(),
         MakeDeleteFile(),
         MakeSetEditor(),
         MakeSetAddress(),
+        MakeSetZone(),
+        MakeNoZone(),
+        MakeSetInterfaceZone(),
+        MakeNoInterfaceZone(),
+        MakeSetDhcp(),
+        MakeNoDhcp(),
+        MakeSetDns(),
+        MakeNoDns(),
         MakeSetMtu(),
         MakeSetLink(),
         MakeNoAddress(),
@@ -2035,6 +2357,8 @@ class FwAdapter final : public cli::ProductAdapter {
       RenderShowTime(response, renderer);
     } else if (wc == "show_storage") {
       RenderShowStorage(response, renderer);
+    } else if (wc == "show_install") {
+      RenderShowInstall(response, renderer);
     } else if (wc == "check_system") {
       RenderCheckSystem(response, renderer);
     } else if (wc == "apply_system" ||
@@ -2044,6 +2368,11 @@ class FwAdapter final : public cli::ProductAdapter {
       RenderConfirmSystem(response, renderer);
     } else if (wc == "show_files") {
       RenderShowFiles(response, renderer);
+    } else if (wc == "show_policy") {
+      RenderShowPolicy(response, renderer);
+    } else if (wc == "set_rule" || wc == "no_rule" ||
+               wc == "set_forward" || wc == "no_forward") {
+      RenderPolicyEdit(response, renderer);
     } else if (wc == "edit" || wc == "new_file" ||
                wc == "rename_file" || wc == "delete_file") {
       RenderEdit(response, renderer);
@@ -2052,12 +2381,19 @@ class FwAdapter final : public cli::ProductAdapter {
     } else if (wc == "iface_set_address" ||
                wc == "iface_set_mtu" ||
                wc == "iface_set_state" ||
-               wc == "iface_del_address") {
+               wc == "iface_del_address" ||
+               wc == "zone_set" || wc == "zone_delete" ||
+               wc == "iface_set_zone" ||
+               wc == "iface_del_zone" ||
+               wc == "dhcp_set" || wc == "dhcp_delete" ||
+               wc == "dns_set" || wc == "dns_delete" ||
+               wc == "rollback_system") {
       RenderIfaceConfig(response, renderer);
+    } else if (wc == "show_commits") {
+      RenderShowCommits(response, renderer);
     } else if (wc == "configure" || wc == "commit" ||
-               wc == "rollback" || wc == "set" ||
-               wc == "delete" || wc == "show_config" ||
-               wc == "show_diff" || wc == "show_commits" ||
+               wc == "rollback" || wc == "show_config" ||
+               wc == "show_diff" ||
                wc == "reload_firewall" ||
                wc == "clear_counters") {
       RenderSimpleOk(response, renderer);
@@ -2273,6 +2609,25 @@ class FwAdapter final : public cli::ProductAdapter {
     return c;
   }
 
+  static auto MakeRollbackSystem() -> CommandSpec {
+    CommandSpec c;
+    c.path = "rollback system";
+    c.wire_command = "rollback_system";
+    c.help = "Restore a system-configuration revision f-confd "
+             "recorded — the previous one, or the id from `show "
+             "commits`. This is the way back from a `set` verb, "
+             "which applies on the spot. It does not touch the "
+             "policy.";
+    c.role = RoleGate::AdminOnly;
+    c.args = {{
+        .name = "revision",
+        .help = "Revision id from `show commits`; omit for the "
+                "previous one",
+        .required = false,
+    }};
+    return c;
+  }
+
   static auto MakeConfirmSystem() -> CommandSpec {
     CommandSpec c;
     c.path = "confirm system";
@@ -2288,6 +2643,185 @@ class FwAdapter final : public cli::ProductAdapter {
     c.path = "show files";
     c.wire_command = "show_files";
     c.help = "List firewall rule files";
+    return c;
+  }
+
+  // -- the policy candidate ------------------------------------------
+  //
+  // There are two lifecycles on this box because there are two
+  // documents, and the names now say which is which. These five verbs
+  // govern `/etc/f/*.fw` — the firewall policy. The **system**
+  // configuration (`/etc/f/system.yaml`: ports, zones, addresses,
+  // DHCP, DNS) is `apply system` / `apply system confirmed` /
+  // `confirm system`, and nothing here touches it.
+  //
+  // The framework registers sixteen more candidate verbs by default
+  // (`set`, `delete`, `save`, `load …`, `rollback previous|rescue|to`,
+  // `commit confirmed`, `confirm`, `show configs`, `show commit`).
+  // This product implements none of them, so it no longer advertises
+  // them — see `BuildTree` in cmd/einheit_f.cc.
+
+  static auto MakeConfigure() -> CommandSpec {
+    CommandSpec c;
+    c.path = "configure";
+    c.wire_command = "configure";
+    c.help = "Open a policy candidate: snapshot the .fw files so "
+             "`rollback` can put them back, and hold the edits until "
+             "`commit`. This is the firewall policy — the system "
+             "configuration is `apply system`.";
+    c.role = RoleGate::AdminOnly;
+    return c;
+  }
+
+  static auto MakeCommit() -> CommandSpec {
+    CommandSpec c;
+    c.path = "commit";
+    c.wire_command = "commit";
+    c.help = "Compile every .fw file and, if they all pass, make "
+             "them live. A policy that does not compile is never "
+             "loaded, and a commit fd did not apply says so rather "
+             "than closing the session.";
+    c.role = RoleGate::AdminOnly;
+    c.requires_session = true;
+    return c;
+  }
+
+  static auto MakeRollbackCandidate() -> CommandSpec {
+    CommandSpec c;
+    c.path = "rollback candidate";
+    c.wire_command = "rollback";
+    c.help = "Restore the .fw files to what they were when "
+             "`configure` opened, and discard the session";
+    c.role = RoleGate::AdminOnly;
+    c.requires_session = true;
+    return c;
+  }
+
+  static auto MakeShowDiff() -> CommandSpec {
+    CommandSpec c;
+    c.path = "show diff";
+    c.wire_command = "show_diff";
+    c.help = "What the open candidate changed in the policy files, "
+             "against the snapshot `configure` took";
+    return c;
+  }
+
+  static auto MakeShowPolicySource() -> CommandSpec {
+    CommandSpec c;
+    c.path = "show config";
+    c.wire_command = "show_config";
+    c.help = "The policy files as text. `show policy` is the same "
+             "content numbered by statement, which is what `no rule` "
+             "takes.";
+    return c;
+  }
+
+  static auto MakeShowCommits() -> CommandSpec {
+    CommandSpec c;
+    c.path = "show commits";
+    c.wire_command = "show_commits";
+    c.help = "System-configuration revisions f-confd has recorded — "
+             "who applied what, and when. Says so when f-confd is "
+             "not running, rather than printing an empty history.";
+    return c;
+  }
+
+  static auto MakeShowPolicy() -> CommandSpec {
+    CommandSpec c;
+    c.path = "show policy";
+    c.wire_command = "show_policy";
+    c.help = "The policy source, block by block, numbered — the "
+             "numbers `no rule` takes. Marks the statements that act "
+             "on every packet, because nothing below one can match.";
+    c.args = {{
+        .name = "zone",
+        .help = "Show one zone's block only",
+        .required = false,
+    }};
+    return c;
+  }
+
+  static auto MakeSetRule() -> CommandSpec {
+    CommandSpec c;
+    c.path = "set rule";
+    c.wire_command = "set_rule";
+    c.help = "Add an allow or drop rule to a zone's block. Placed at "
+             "the end of the guarded rules, never after an "
+             "unconditional statement where it could not match. The "
+             "policy is compiled before it is written.";
+    c.role = RoleGate::AdminOnly;
+    c.args = {
+        {.name = "zone", .help = "Zone whose block to edit",
+         .required = true},
+        {.name = "action", .help = "allow or drop",
+         .required = true},
+        {.name = "match",
+         .help = "tcp|udp|icmp, a port number, `from <cidr>`, "
+                 "`to <cidr>` — a port needs a protocol with it",
+         .required = false},
+    };
+    // Match terms are variadic; the framework refuses surplus tokens
+    // for a wire command that declares its arity, and this one does
+    // not have a fixed one.
+    c.variadic = true;
+    return c;
+  }
+
+  static auto MakeNoRule() -> CommandSpec {
+    CommandSpec c;
+    c.path = "no rule";
+    c.wire_command = "no_rule";
+    c.help = "Remove a statement from a zone's block by the position "
+             "`show policy` gives it";
+    c.role = RoleGate::AdminOnly;
+    c.args = {
+        {.name = "zone", .help = "Zone whose block to edit",
+         .required = true},
+        {.name = "position", .help = "Position from `show policy`",
+         .required = true},
+    };
+    return c;
+  }
+
+  static auto MakeSetForward() -> CommandSpec {
+    CommandSpec c;
+    c.path = "set forward";
+    c.wire_command = "set_forward";
+    c.help = "Forward a port to a machine inside. Writes the `dnat` "
+             "and the `redirect` as one pair with one guard — a "
+             "redirect wider than its dnat sends untranslated frames "
+             "into the inside zone. The inside zone is derived from "
+             "the system configuration, not asked for.";
+    c.role = RoleGate::AdminOnly;
+    c.args = {
+        {.name = "zone", .help = "Zone the traffic arrives on",
+         .required = true},
+        {.name = "proto", .help = "tcp or udp", .required = true},
+        {.name = "port", .help = "Port as it arrives",
+         .required = true},
+        {.name = "target", .help = "<ip>:<port> inside",
+         .required = true},
+        {.name = "from",
+         .help = "`from <cidr>` to restrict the source",
+         .required = false},
+    };
+    c.variadic = true;
+    return c;
+  }
+
+  static auto MakeNoForward() -> CommandSpec {
+    CommandSpec c;
+    c.path = "no forward";
+    c.wire_command = "no_forward";
+    c.help = "Remove both halves of a port forward";
+    c.role = RoleGate::AdminOnly;
+    c.args = {
+        {.name = "zone", .help = "Zone the traffic arrives on",
+         .required = true},
+        {.name = "proto", .help = "tcp or udp", .required = true},
+        {.name = "port", .help = "Port as it arrives",
+         .required = true},
+    };
     return c;
   }
 
@@ -2385,6 +2919,134 @@ class FwAdapter final : public cli::ProductAdapter {
          .help = "Address with prefix (e.g. 10.0.0.1/24)",
          .required = true},
     };
+    return c;
+  }
+
+  static auto MakeSetZone() -> CommandSpec {
+    CommandSpec c;
+    c.path = "set zone";
+    c.wire_command = "zone_set";
+    c.help = "Declare a zone in the system configuration, or change "
+             "its IPv6 stance. A zone is a name that interfaces join "
+             "and services bind to; it may start out empty.";
+    c.role = RoleGate::OperatorOrAdmin;
+    c.args = {
+        {.name = "name",
+         .help = "Zone name (e.g. dmz)",
+         .required = true},
+        {.name = "ipv6",
+         .help = "IPv6 stance: off or ra. Omit to leave it alone "
+                 "(a new zone with no stance is off)",
+         .required = false},
+    };
+    return c;
+  }
+
+  static auto MakeNoZone() -> CommandSpec {
+    CommandSpec c;
+    c.path = "no zone";
+    c.wire_command = "zone_delete";
+    c.help = "Remove a zone. Refused while an interface is still in "
+             "it or a service is still bound to it.";
+    c.role = RoleGate::OperatorOrAdmin;
+    c.args = {{
+        .name = "name",
+        .help = "Zone name",
+        .required = true,
+    }};
+    return c;
+  }
+
+  static auto MakeSetInterfaceZone() -> CommandSpec {
+    CommandSpec c;
+    c.path = "set interface zone";
+    c.wire_command = "iface_set_zone";
+    c.help = "Put an interface in a zone, declaring the interface "
+             "(pinned to its MAC) if the configuration does not "
+             "mention it yet. An interface is in exactly one zone.";
+    c.role = RoleGate::OperatorOrAdmin;
+    c.args = {
+        {.name = "interface",
+         .help = "Interface name (e.g. lan0)",
+         .required = true},
+        {.name = "zone",
+         .help = "Zone name — must already be declared",
+         .required = true},
+    };
+    return c;
+  }
+
+  static auto MakeNoInterfaceZone() -> CommandSpec {
+    CommandSpec c;
+    c.path = "no interface zone";
+    c.wire_command = "iface_del_zone";
+    c.help = "Take an interface out of its zone, leaving it declared "
+             "and in no zone";
+    c.role = RoleGate::OperatorOrAdmin;
+    c.args = {{
+        .name = "interface",
+        .help = "Interface name",
+        .required = true,
+    }};
+    return c;
+  }
+
+  static auto MakeSetDhcp() -> CommandSpec {
+    CommandSpec c;
+    c.path = "set dhcp";
+    c.wire_command = "dhcp_set";
+    c.help = "Serve DHCP on a zone. There is no interface argument "
+             "and there cannot be one: the ports the server answers "
+             "on are derived from zone membership every time the "
+             "config is generated.";
+    c.role = RoleGate::OperatorOrAdmin;
+    c.args = {
+        {.name = "zone", .help = "Zone to serve", .required = true},
+        {.name = "range",
+         .help = "<first>-<last>, e.g. 10.10.0.100-10.10.0.200",
+         .required = true},
+        {.name = "lease", .help = "Lease duration, e.g. 12h",
+         .required = false},
+    };
+    return c;
+  }
+
+  static auto MakeNoDhcp() -> CommandSpec {
+    CommandSpec c;
+    c.path = "no dhcp";
+    c.wire_command = "dhcp_delete";
+    c.help = "Stop serving DHCP on a zone. Reservations on that zone "
+             "go with it.";
+    c.role = RoleGate::OperatorOrAdmin;
+    c.args = {{.name = "zone", .help = "Zone", .required = true}};
+    return c;
+  }
+
+  static auto MakeSetDns() -> CommandSpec {
+    CommandSpec c;
+    c.path = "set dns";
+    c.wire_command = "dns_set";
+    c.help = "Forward DNS for a zone. With no upstream named it "
+             "inherits the system resolver, which on a DHCP uplink "
+             "is whatever the upstream handed us.";
+    c.role = RoleGate::OperatorOrAdmin;
+    c.args = {
+        {.name = "zone", .help = "Zone to serve", .required = true},
+        {.name = "upstream",
+         .help = "Resolvers to forward to, e.g. 9.9.9.9 1.1.1.1",
+         .required = false},
+    };
+    c.variadic = true;
+    return c;
+  }
+
+  static auto MakeNoDns() -> CommandSpec {
+    CommandSpec c;
+    c.path = "no dns";
+    c.wire_command = "dns_delete";
+    c.help = "Stop forwarding DNS for a zone";
+    c.role = RoleGate::OperatorOrAdmin;
+    c.args = {{.name = "zone", .help = "Zone", .required = true}};
     return c;
   }
 

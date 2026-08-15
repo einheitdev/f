@@ -151,6 +151,22 @@ target_link_libraries(libf-sysconfig PUBLIC
 )
 
 # ============================================================================
+# Policy source editing
+#
+# The shape of a `.fw` document — zone blocks and the statements in
+# them — and nothing about what a rule means. The compiler stays the
+# authority; this is what lets the CLI number a rule, remove one, and
+# put a new one where it can still match.
+# ============================================================================
+add_library(libf-policy STATIC
+  src/policy/edit.cc
+)
+
+target_include_directories(libf-policy PUBLIC
+  ${PROJECT_SOURCE_DIR}/include
+)
+
+# ============================================================================
 # Lease / device visibility
 #
 # Observed state, not configuration: what dnsmasq handed out, when each
@@ -340,6 +356,15 @@ target_compile_definitions(einheit-f-ui PRIVATE
 
 # ============================================================================
 # Install rules
+#
+# `deploy/manifest.yaml` is the authority on what a box needs; these
+# rules are the convenience path for a native build on a development
+# machine, and `deploy/tests/test_manifest_covers_build.py` fails if the
+# two ever disagree about which binaries ship. For a cross build or a
+# real appliance, use the manifest:
+#
+#   deploy/f_install.py stage --build-dir build-aarch64 --root <rootfs>
+#   deploy/f_install.py verify
 # ============================================================================
 install(TARGETS fd fctl f-sysconf f-confd einheit-f einheit-f-ui f-api
   RUNTIME DESTINATION bin
@@ -359,12 +384,26 @@ install(FILES
 install(FILES deploy/system.yaml.example
   DESTINATION share/f
 )
+install(FILES deploy/firstboot/f-provision.yaml.example
+  DESTINATION share/f
+)
+# Reference only. Deliberately NOT installed into /etc/systemd/network:
+# `10-eth0.network` sorts before the model's own `10-f-eth0.network` and
+# would silently win, configuring the uplink from a v0.1 example instead
+# of from /etc/f/system.yaml.
 install(FILES
   deploy/networkd/10-eth0.network
   deploy/networkd/20-lan.network
   DESTINATION share/f/networkd
 )
-install(PROGRAMS deploy/firstboot/firstboot.sh
+install(FILES deploy/manifest.yaml
+  DESTINATION share/f
+)
+install(PROGRAMS deploy/f_install.py
+  DESTINATION bin
+  RENAME f-install
+)
+install(PROGRAMS deploy/firstboot/firstboot.py
   DESTINATION share/f
 )
 

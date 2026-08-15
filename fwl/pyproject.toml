@@ -32,3 +32,13 @@ testpaths = ["tests"]
 
 [tool.setuptools.packages.find]
 include = ["fwl*"]
+
+# The grammar is read at import time with importlib.resources, so a
+# wheel without it produces an `fwl` that raises FileNotFoundError on
+# `import fwl.cli` — before it can print a usage message, and for every
+# subcommand. Nobody hit it on a development machine because
+# `pip install -e` leaves the source tree in place; the first box it
+# reached was an appliance, where it means the datapath is running the
+# policy it booted with and can never be given another.
+[tool.setuptools.package-data]
+fwl = ["*.lark"]

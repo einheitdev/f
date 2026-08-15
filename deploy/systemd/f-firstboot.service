@@ -1,13 +1,32 @@
 [Unit]
 Description=f appliance first-boot provisioning
+Documentation=file:///usr/share/f/f-provision.yaml.example
+
+# The marker is written by the provisioner and only after a run that
+# finished. A run that stopped at a failure leaves it absent, so the
+# next boot tries again rather than skipping past a box that was never
+# provisioned.
 ConditionPathExists=!/etc/f/.provisioned
+
 After=local-fs.target systemd-networkd.service
-Before=fd.service einheit-f-ui.service
+
+# Before everything it configures. fd is the one that matters: it
+# cold-boots into whatever `current` points at, so it must not start
+# until a bundle has been compiled and linked. f-confd and f-dnsmasq
+# read files this script writes.
+Before=fd.service f-confd.service einheit-f-ui.service
+Before=f-dnsmasq.service f-chrony.service
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/share/f/firstboot.sh
+ExecStart=/usr/local/share/f/firstboot.py
 RemainAfterExit=yes
+
+# A failed provisioning run is a box that is reachable and not
+# filtering, and it says so on the console. It must not be retried in
+# a loop: the operator has to see the message and act on it.
+Restart=no
+
 StandardOutput=journal+console
 StandardError=journal+console
 

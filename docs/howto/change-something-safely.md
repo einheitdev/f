@@ -2,6 +2,31 @@
 
 You are on SSH, about to change an address, a zone, or an interface's pinning. If you get it wrong you lose the session and the box.
 
+## First: which document are you about to change?
+
+There are two, and only one of them has a timer.
+
+| Changing | Verbs | The way back |
+|---|---|---|
+| `/etc/f/system.yaml` — addresses, zones, ports, DHCP, DNS | `set address`, `set zone`, `set interface zone`, `set dhcp`, `set dns`, `set reservation` | `apply system confirmed <minutes>` — this page |
+| `/etc/f/*.fw` — the firewall policy | `set rule`, `set forward`, `edit` | `configure` … `rollback candidate`, and [recovery.md](../recovery.md) |
+
+**The `set …` verbs apply immediately.** There is no window on them, so for a change that could sever your session, do not use one — edit `/etc/f/system.yaml` and then `apply system confirmed`, which is what the rest of this page is about.
+
+What the verbs give you instead is a *recorded revision* each, which is the way back after the fact rather than before it:
+
+```
+$ einheit-f show commits
+ ID │ BY   │ AT
+  1 │ root │ 2026-08-15T08:48:35Z
+  2 │ root │ 2026-08-15T08:48:35Z
+
+$ einheit-f rollback system        # back to the previous revision
+$ einheit-f rollback system 1      # back to a named one
+```
+
+That works when you can still reach the box. It is not a substitute for the timer, which is what covers the case where you cannot.
+
 ## Do this
 
 ```

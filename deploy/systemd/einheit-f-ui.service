@@ -18,7 +18,19 @@ RestartSec=3s
 
 User=www-data
 Group=www-data
-SupplementaryGroups=f
+
+# There is deliberately no `SupplementaryGroups=f`. There was, and
+# nothing on any box has ever created a group called `f`, so systemd
+# failed at step GROUP with status 216 before exec — on every start,
+# forever, at RestartSec=3s. `systemctl is-active` says "activating"
+# rather than "failed" while a unit is in auto-restart, which is how a
+# dashboard that had never once served a page read as coming up.
+#
+# It would also have granted nothing. The data this process shows
+# arrives over /run/f/control.sock, and fd's pins under /sys/fs/bpf/f
+# are 0700 root with no group ownership for anything to inherit. If
+# the pins are ever given a group, the group and this line get added
+# in the same change.
 
 # Hardening.
 ProtectSystem=strict

@@ -2,7 +2,27 @@
 
 Something on the office side needs to reach a service on a bench machine — a web UI on a test rig, a build agent, an instrument's control port.
 
-## The policy
+## The command
+
+```
+$ einheit-f set forward wan tcp 80 10.10.0.20:8080
+```
+
+You did not name the inside zone. `10.10.0.20` is in a subnet the system configuration already describes, so the model answers that question and a `redirect` pointing at the wrong zone is not a mistake this command can make. If the address is in no zone, or in two, it refuses and says which.
+
+To restrict who may use it, add a source:
+
+```
+$ einheit-f set forward wan tcp 80 10.10.0.20:8080 from 10.1.0.0/16
+```
+
+To take it away — both halves, together:
+
+```
+$ einheit-f no forward wan tcp 80
+```
+
+## What it writes, and why it is two rules
 
 Two rules, not one. `dnat` rewrites the destination and **falls through**; `redirect` is what actually emits the frame into the other zone.
 
@@ -55,4 +75,4 @@ redirect to lan if pkt.proto == tcp and pkt.dst_port == 80
        and pkt.src_ip in 10.1.0.0/16
 ```
 
-Both rules need the same guard. A `dnat` whose guard is narrower than its `redirect` sends untranslated frames into the bench zone.
+Both rules need the same guard. A `dnat` whose guard is narrower than its `redirect` sends untranslated frames into the bench zone. That is the reason `set forward` writes the pair as one edit and copies the guard character for character between them — and the reason `no rule` on one half of a pair warns you that the other is still there rather than reporting a clean removal.

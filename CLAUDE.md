@@ -80,3 +80,29 @@ Zero-build HTMX + Tailwind CSS (standalone CLI, no npm) + Plotly.js. Crow serves
 - `bpf/fw.bpf.c` — XDP program (packet parsing, rule lookup, conntrack, counters)
 - `src/engine.cc` — main epoll loop and command dispatch
 - `doc/design.md` — full architecture documentation
+
+## Deployment
+
+`deploy/manifest.yaml` is the single enumeration of what an appliance
+needs — every file, where it goes, and one sentence on what breaks
+without it. Add a binary to `CMakeLists.txt:351` and
+`deploy/tests/test_manifest_covers_build.py:40` fails until it is in the
+manifest or in `not_deployed`.
+
+- `deploy/f_install.py` — the manifest's only consumer:
+  `list` / `stage` / `install` / `verify`. Exit code is the verdict
+  (`deploy/f_install.py:20`).
+- `deploy/firstboot/firstboot.py` — runs once per device and decides
+  what a new box is. Zones, MAC-pinned interface names, a `default drop`
+  starting policy, a compiled bundle, and the units the model implies.
+- `deploy/image/build_image.py` — debootstrap plus the manifest.
+  Unwalked; no aarch64 board on the bench.
+- `docs/install.md` — the operator path, walked on a real target.
+- `einheit-f show install` runs `f-install verify` rather than keeping a
+  second list (`adapters/cli/src/transport.cc` `HandleShowInstall`).
+
+```bash
+deploy/f_install.py verify          # what this box has of the set
+sudo deploy/f_install.py install --build-dir build
+pytest -q deploy/tests              # 72 tests, no build needed
+```
