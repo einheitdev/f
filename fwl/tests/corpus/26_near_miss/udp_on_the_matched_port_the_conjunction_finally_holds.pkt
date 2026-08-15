@@ -1,0 +1,11 @@
+name: "udp on the matched port: the conjunction finally holds"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.proto == udp and pkt.dst_port == 53
+  default allow
+# The whole condition true. Operand coverage proved every conjunct of this shape already decided both ways in the 14 programs that contain it, so the never-taken TRUE arm was a missing CASE and not a missing capability — this is it.
+test_packet:
+  builder: udp(dst_port=53, src_port=51000)
+expected:
+  compiles: true
+  bpf_action: drop

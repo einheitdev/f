@@ -1,0 +1,15 @@
+name: "syn without ack: control, !(tcp_ack) decides true"
+source_fw: |
+  @xdp(eth0)
+  def filter(pkt):
+    if pkt.proto == tcp:
+      if pkt.tcp.syn and not pkt.tcp.ack:
+        drop
+    allow
+# The control for the case above. Same policy, and the only difference is the field `!(tcp_ack)` reads — so it must produce the OPPOSITE action.
+# Without this a program that matched nothing at all would satisfy the near-miss and the pair would be untestable.
+test_packet:
+  builder: tcp(syn=true, dst_port=80)
+expected:
+  compiles: true
+  bpf_action: drop

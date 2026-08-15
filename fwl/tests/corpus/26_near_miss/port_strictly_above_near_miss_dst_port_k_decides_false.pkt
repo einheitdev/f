@@ -1,0 +1,12 @@
+name: "port strictly above: near miss, dst_port > K decides false"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.proto == tcp and pkt.dst_port > 49152
+  default allow
+# Reaches the rule and fails ONLY on `dst_port > K`. Exactly the bound. `>` is strict, so this is the one port that distinguishes `>` from `>=` — and no case had ever sent it.
+# That arm had never been taken by any corpus case: the corpus sends packets that match this rule, and packets that fail at the first conjunct and never evaluate this one.
+test_packet:
+  builder: tcp(dst_port=49152, syn=true)
+expected:
+  compiles: true
+  bpf_action: allow

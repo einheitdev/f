@@ -1,0 +1,12 @@
+name: "vlan priority threshold: near miss, vlan_priority >= K decides false"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.vlan_priority >= 5
+  default allow
+# Reaches the rule and fails ONLY on `vlan_priority >= K`. One below the threshold: the boundary that separates `>= 5` from `> 4` read off a three-bit field.
+# That arm had never been taken by any corpus case: the corpus sends packets that match this rule, and packets that fail at the first conjunct and never evaluate this one.
+test_packet:
+  builder: tcp(vlan_id=10, vlan_priority=4, dst_port=80)
+expected:
+  compiles: true
+  bpf_action: allow

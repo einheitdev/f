@@ -1,0 +1,12 @@
+name: "not tcp syn: near miss, !((l4_ok && tcp_syn)) decides false"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.proto == tcp and not pkt.tcp.syn
+  default allow
+# Reaches the rule and fails ONLY on `!((l4_ok && tcp_syn))`. A SYN segment. The negation decides false for the first time in 100 programs that contain it — every one written as `established traffic only`, where a SYN is the packet the rule is about.
+# That arm had never been taken by any corpus case: the corpus sends packets that match this rule, and packets that fail at the first conjunct and never evaluate this one.
+test_packet:
+  builder: tcp(syn=true, dst_port=80)
+expected:
+  compiles: true
+  bpf_action: allow

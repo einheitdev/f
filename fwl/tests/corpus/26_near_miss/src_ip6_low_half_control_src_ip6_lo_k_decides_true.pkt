@@ -1,0 +1,12 @@
+name: "src ip6 low half: control, src_ip6_lo == K decides true"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.src_ip6 == ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff
+  default allow
+# The control for the case above. Same policy, and the only difference is the field `src_ip6_lo == K` reads — so it must produce the OPPOSITE action.
+# Without this a program that matched nothing at all would satisfy the near-miss and the pair would be untestable.
+test_packet:
+  builder: tcp6(src_ip="ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff", dst_port=80)
+expected:
+  compiles: true
+  bpf_action: drop

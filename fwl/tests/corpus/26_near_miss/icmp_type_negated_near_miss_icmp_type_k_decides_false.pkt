@@ -1,0 +1,12 @@
+name: "icmp type negated: near miss, icmp_type != K decides false"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.proto == icmp and pkt.icmp.type != 8
+  default allow
+# Reaches the rule and fails ONLY on `icmp_type != K`. An echo request against `type != 8`. The inequality decides false for the first time — every case so far sent a type that made it true.
+# That arm had never been taken by any corpus case: the corpus sends packets that match this rule, and packets that fail at the first conjunct and never evaluate this one.
+test_packet:
+  builder: icmp(type=8, code=0)
+expected:
+  compiles: true
+  bpf_action: allow

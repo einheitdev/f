@@ -1,0 +1,12 @@
+name: "vlan priority equality: near miss, vlan_priority == K decides false"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.vlan_priority == 3
+  default allow
+# Reaches the rule and fails ONLY on `vlan_priority == K`. A tagged frame whose PCP is one above the named value. The priority field is three bits at the top of the TCI and a shift off by one reads a different one — which is `vlan_priority_off_by_one_shift` in the mutation catalogue.
+# That arm had never been taken by any corpus case: the corpus sends packets that match this rule, and packets that fail at the first conjunct and never evaluate this one.
+test_packet:
+  builder: tcp(vlan_id=10, vlan_priority=4, dst_port=80)
+expected:
+  compiles: true
+  bpf_action: allow

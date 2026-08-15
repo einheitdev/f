@@ -1,0 +1,16 @@
+name: "tier2 local ip6 low half: control, fwl_local_addr_lo == K decides true"
+source_fw: |
+  @xdp(eth0)
+  def firewall(pkt):
+    if pkt.src_ip6 in ::/0:
+      addr = pkt.src_ip6
+      if addr == 2001:db8::1:
+        drop
+    allow
+# The control for the case above. Same policy, and the only difference is the field `fwl_local_addr_lo == K` reads — so it must produce the OPPOSITE action.
+# Without this a program that matched nothing at all would satisfy the near-miss and the pair would be untestable.
+test_packet:
+  builder: tcp6(src_ip="2001:db8::1", dst_port=80)
+expected:
+  compiles: true
+  bpf_action: drop

@@ -1,0 +1,12 @@
+name: "icmp code: near miss, icmp_code == K decides false"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.proto == icmp and pkt.icmp.code == 0
+  default allow
+# Reaches the rule and fails ONLY on `icmp_code == K`. Fragmentation-needed: type 3 code 4, the packet path-MTU discovery runs on. The rule names code 0, so the code comparison is reached and decides false.
+# That arm had never been taken by any corpus case: the corpus sends packets that match this rule, and packets that fail at the first conjunct and never evaluate this one.
+test_packet:
+  builder: icmp(type=3, code=4)
+expected:
+  compiles: true
+  bpf_action: allow

@@ -1,0 +1,16 @@
+name: "tier2 local ip6 low half: near miss, fwl_local_addr_lo == K decides false"
+source_fw: |
+  @xdp(eth0)
+  def firewall(pkt):
+    if pkt.src_ip6 in ::/0:
+      addr = pkt.src_ip6
+      if addr == 2001:db8::1:
+        drop
+    allow
+# Reaches the rule and fails ONLY on `fwl_local_addr_lo == K`. The high half matches and the low half is one greater, which is the only packet that makes the SECOND comparison decide anything.
+# That arm had never been taken by any corpus case: the corpus sends packets that match this rule, and packets that fail at the first conjunct and never evaluate this one.
+test_packet:
+  builder: tcp6(src_ip="2001:db8::2", dst_port=80)
+expected:
+  compiles: true
+  bpf_action: allow

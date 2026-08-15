@@ -1,0 +1,12 @@
+name: "tcp rst: near miss, tcp_rst decides false"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.proto == tcp and pkt.tcp.rst
+  default allow
+# Reaches the rule and fails ONLY on `tcp_rst`. A TCP segment with RST clear (and ACK set, so it is a segment a wire actually carries). v4_ok, proto and l4_ok all decide true and the rule falls to `rst`.
+# That arm had never been taken by any corpus case: the corpus sends packets that match this rule, and packets that fail at the first conjunct and never evaluate this one.
+test_packet:
+  builder: tcp(ack=true, dst_port=80)
+expected:
+  compiles: true
+  bpf_action: allow

@@ -1,0 +1,12 @@
+name: "vlan id range above: near miss, vlan_id <= K decides false"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.vlan_id in 100..199
+  default allow
+# Reaches the rule and fails ONLY on `vlan_id <= K`. One VLAN above the range. The upper bound decides false for the first time; deleting it from the emitted condition would drop every VLAN from 100 upward and no corpus case would notice.
+# That arm had never been taken by any corpus case: the corpus sends packets that match this rule, and packets that fail at the first conjunct and never evaluate this one.
+test_packet:
+  builder: tcp(vlan_id=200, dst_port=80)
+expected:
+  compiles: true
+  bpf_action: allow

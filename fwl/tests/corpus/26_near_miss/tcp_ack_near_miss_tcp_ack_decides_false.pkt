@@ -1,0 +1,12 @@
+name: "tcp ack: near miss, tcp_ack decides false"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.proto == tcp and pkt.tcp.ack
+  default allow
+# Reaches the rule and fails ONLY on `tcp_ack`. A TCP segment with ACK clear (and SYN set, so it is a segment a wire actually carries). v4_ok, proto and l4_ok all decide true and the rule falls to `ack`.
+# That arm had never been taken by any corpus case: the corpus sends packets that match this rule, and packets that fail at the first conjunct and never evaluate this one.
+test_packet:
+  builder: tcp(syn=true, dst_port=80)
+expected:
+  compiles: true
+  bpf_action: allow
