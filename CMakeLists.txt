@@ -191,6 +191,28 @@ target_link_libraries(libf-lease PUBLIC
 )
 
 # ============================================================================
+# Named counters
+#
+# The name->slot table the compiler wrote, the join against the map,
+# and the wire shape both ends of that answer use. No libbpf: the CLI
+# links this to READ the daemon's answer with the same vocabulary the
+# daemon produced it with, and a CLI that could open a BPF map in
+# process is how the removed UI counter page came to read the wrong
+# maps on every box ever deployed.
+# ============================================================================
+add_library(libf-counters STATIC
+  src/counters.cc
+)
+
+target_include_directories(libf-counters PUBLIC
+  ${PROJECT_SOURCE_DIR}/include
+)
+
+target_link_libraries(libf-counters PUBLIC
+  nlohmann_json::nlohmann_json
+)
+
+# ============================================================================
 # Engine library (BPF + ZMQ, no HTTP)
 # ============================================================================
 add_library(libf-engine STATIC
@@ -212,6 +234,7 @@ target_include_directories(libf-engine PUBLIC
 )
 
 target_link_libraries(libf-engine PUBLIC
+  libf-counters
   libf-sysconfig
   ${BPF_LIB}
   nlohmann_json::nlohmann_json

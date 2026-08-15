@@ -276,6 +276,23 @@ auto HandleRequest(Engine& e, const std::string& req_str)
       }
       return arr.dump();
     }
+    case Cmd::kGetFwlCounters: {
+      // The policy's own `count <name>` statements, per zone. Both
+      // halves of each answer were captured by the load that put the
+      // program in the packet path: the map descriptor from the
+      // object, the name->slot table from the generated C beside it.
+      // Nothing here re-derives the pairing, and nothing here numbers
+      // anything — the name the operator wrote travels with the value.
+      std::vector<ZoneCounters> zones;
+      zones.reserve(e.zone_bundle.programs.size());
+      for (const auto& p : e.zone_bundle.programs) {
+        BpfCounterMap map(p.counters_fd);
+        zones.push_back(ReadZoneCounters(
+            p.zone, p.counters,
+            p.counters_fd >= 0 ? &map : nullptr));
+      }
+      return ZoneCountersToJson(zones).dump();
+    }
     default:
       return R"({"error":"unknown command"})";
   }

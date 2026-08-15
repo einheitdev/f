@@ -148,7 +148,7 @@ TEST(RetiredOpcodes, TheLiveOnesStillAnswer) {
   // serves everything that was not part of the v0.1 surface.
   Engine e;
   for (auto live : {Cmd::kGetStatus, Cmd::kGetZones, Cmd::kGetNat,
-                    Cmd::kGetConntrack}) {
+                    Cmd::kGetConntrack, Cmd::kGetFwlCounters}) {
     std::string req(1, static_cast<char>(live));
     auto reply = HandleControlRequest(e, req);
     auto j = json::parse(reply);
@@ -158,6 +158,22 @@ TEST(RetiredOpcodes, TheLiveOnesStillAnswer) {
           << "opcode " << static_cast<int>(live) << " went missing";
     }
   }
+}
+
+TEST(NamedCounters, AnswerTheAgreedShapeWithNoBundleLoaded) {
+  // The gap the v0.1 removal left stated: `count` wrote into
+  // fwl_counters_<zone> and nothing read it. Opcode 12 does — and on a
+  // daemon holding no bundle it answers the agreed shape with no
+  // zones, rather than an error the CLI would render as "fd is
+  // broken" or a bare array the CLI cannot tell from a failure.
+  Engine e;
+  std::string req(1, static_cast<char>(Cmd::kGetFwlCounters));
+  auto j = json::parse(HandleControlRequest(e, req));
+  ASSERT_TRUE(j.is_object()) << j.dump();
+  ASSERT_TRUE(j.contains("zones")) << j.dump();
+  EXPECT_TRUE(j["zones"].is_array());
+  EXPECT_TRUE(j["zones"].empty());
+  EXPECT_FALSE(j.contains("error"));
 }
 
 TEST(FullState, CarriesNoRulesOrSlowPathSection) {

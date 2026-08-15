@@ -576,6 +576,145 @@ auto RenderShowConntrack(const Response& resp,
   RenderFormatted(t, renderer);
 }
 
+/// Where prose goes: the terminal in table mode, stderr otherwise, so
+/// a pipe stays parseable and the operator is still told. Defined
+/// below, beside the renderers that established the rule.
+auto Prose(Renderer& renderer) -> std::ostream&;
+
+/// One sentence for a zone whose counters are not simply readable.
+///
+/// The vocabulary is fd's, mapped here rather than passed through, so
+/// a token this build has no sentence for reads as an unknown state
+/// instead of being printed raw at the operator.
+auto CounterStateWord(const std::string& availability) -> std::string {
+  if (availability == "none_declared") return "no count statements";
+  if (availability == "table_unreadable") return "names unknown";
+  if (availability == "map_missing") return "no counter map";
+  if (availability == "bound_unreadable") return "size unknown";
+  if (availability == "table_map_mismatch") return "stale table";
+  return "unknown state";
+}
+
+/// `show counters` — the loaded policy's named `count` statements.
+///
+/// The rule this renderer exists to keep is the one the removed v0.1
+/// counter page broke: every empty answer says WHICH kind of empty it
+/// is. A counter that read zero and a counter whose map could not be
+/// read look nothing alike here, and a zone that could not be read at
+/// all still occupies a row — vanishing from the table is how a
+/// firewall with unreadable counters comes to look like a firewall
+/// with none.
+auto RenderShowCounters(const Response& resp,
+                        Renderer& renderer) -> void {
+  auto j = ParseData(resp);
+  auto zones = j.value("zones", json::array());
+  auto query = j.value("query", std::string{});
+
+  if (!query.empty()) {
+    auto verdict = j.value("verdict", std::string{});
+    // The two negative verdicts still render a table, so `--format
+    // json` carries the answer rather than an empty stream — and the
+    // two answers are different rows, not one blank.
+    if (verdict == "no_such_name" || verdict == "cannot_tell") {
+      auto blind = JoinStrings(
+          j.value("unsearchable_zones", json::array()));
+      Table t;
+      AddColumn(t, "COUNTER", Align::Left, Priority::High);
+      AddColumn(t, "RESULT", Align::Left, Priority::High);
+      AddRow(t, {
+          Cell{query, Semantic::Emphasis},
+          Cell{verdict == "no_such_name" ? "no such counter"
+                                         : "cannot tell",
+               Semantic::Bad},
+      });
+      RenderFormatted(t, renderer);
+      auto& out = Prose(renderer);
+      if (verdict == "no_such_name") {
+        out << "no counter named '" << query
+            << "' — the loaded policy declares none by that name\n"
+            << "hint: `show counters` lists every counter it "
+               "declares\n";
+      } else {
+        out << "cannot say whether a counter named '" << query
+            << "' exists\n";
+        out << "  '" << query << "' was not found in what could be "
+            << "read, and the counter names of "
+            << (blind.empty() ? std::string("some zones") : blind)
+            << " could not be read at all — so this is not the same "
+               "as 'there is no such counter'\n";
+      }
+      return;
+    }
+  }
+
+  if (!zones.is_array() || zones.empty()) {
+    Table t;
+    AddColumn(t, "COUNTERS");
+    AddRow(t, {Cell{"fd reports no zone programs loaded",
+                    Semantic::Warn}});
+    RenderFormatted(t, renderer);
+    return;
+  }
+
+  Table t;
+  AddColumn(t, "ZONE", Align::Left, Priority::High);
+  AddColumn(t, "COUNTER", Align::Left, Priority::High);
+  AddColumn(t, "PACKETS", Align::Right, Priority::High);
+  std::vector<std::string> notes;
+  for (const auto& z : zones) {
+    auto zone = z.value("zone", "");
+    auto availability = z.value("availability", "");
+    auto detail = z.value("detail", "");
+    auto rows = z.value("counters", json::array());
+    if (availability != "read") {
+      AddRow(t, {
+          Cell{zone, Semantic::Emphasis},
+          Cell{"(" + CounterStateWord(availability) + ")",
+               availability == "none_declared" ? Semantic::Dim
+                                               : Semantic::Bad},
+          Cell{"-", Semantic::Dim},
+      });
+      if (!detail.empty()) {
+        notes.push_back(std::format("{}: {}", zone, detail));
+      }
+      continue;
+    }
+    if (rows.empty()) {
+      // kRead with nothing in it should not happen — a zone with no
+      // counters is `none_declared` — so say that rather than draw a
+      // blank.
+      AddRow(t, {
+          Cell{zone, Semantic::Emphasis},
+          Cell{"(read, but no counters returned)", Semantic::Bad},
+          Cell{"-", Semantic::Dim},
+      });
+      continue;
+    }
+    for (const auto& c : rows) {
+      bool read = c.value("read", false);
+      auto packets = c.value("packets", std::uint64_t{0});
+      AddRow(t, {
+          Cell{zone, Semantic::Emphasis},
+          Cell{c.value("name", ""), Semantic::Info},
+          // A slot that could not be read renders as a word, never as
+          // a zero. "Nothing hit this rule" and "nobody could ask" are
+          // the two answers an operator must never see spelled the
+          // same way.
+          read ? Cell{std::to_string(packets),
+                      packets > 0 ? Semantic::Good : Semantic::Dim}
+               : Cell{"unreadable", Semantic::Bad},
+      });
+    }
+    if (!detail.empty()) {
+      notes.push_back(std::format("{}: {}", zone, detail));
+    }
+  }
+  RenderFormatted(t, renderer);
+  for (const auto& n : notes) {
+    Prose(renderer) << n << "\n";
+  }
+}
+
 /// Render a `diagnostics` array if the reply carries one, and say
 /// whether it did. Defined below; used by the device renderers here.
 auto RenderDiagnostics(const json& j, Renderer& renderer) -> bool;
@@ -2122,6 +2261,7 @@ class FwAdapter final : public cli::ProductAdapter {
              "Active NAT translations and masquerade source"),
         Show("conntrack", "show_conntrack",
              "Connection-tracking table entries"),
+        MakeShowCounters(),
         MakeShowLeases(),
         MakeShowDevice(),
         MakeSetReservation(),
@@ -2201,6 +2341,8 @@ class FwAdapter final : public cli::ProductAdapter {
       RenderShowNat(response, renderer);
     } else if (wc == "show_conntrack") {
       RenderShowConntrack(response, renderer);
+    } else if (wc == "show_counters") {
+      RenderShowCounters(response, renderer);
     } else if (wc == "show_leases") {
       RenderShowLeases(response, renderer);
     } else if (wc == "show_device") {
@@ -2332,6 +2474,22 @@ class FwAdapter final : public cli::ProductAdapter {
   std::shared_ptr<Schema> schema_;
   /// Active-device count, one sample per watch event.
   mutable std::vector<double> active_series_;
+
+  static auto MakeShowCounters() -> CommandSpec {
+    CommandSpec c;
+    c.path = "show counters";
+    c.wire_command = "show_counters";
+    c.help = "What the policy's own `count <name>` statements have "
+             "counted, per zone — the map the datapath writes, read "
+             "back under the names the policy gave the counters";
+    c.args = {{
+        .name = "counter",
+        .help = "One counter's name; omit to list every counter the "
+                "loaded policy declares",
+        .required = false,
+    }};
+    return c;
+  }
 
   static auto MakeShowLeases() -> CommandSpec {
     CommandSpec c;

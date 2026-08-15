@@ -107,7 +107,9 @@ Note the reading again: this logs the *second and subsequent* attempts from a so
 
 ## Reading the counters back
 
-Each rate-limited rule keeps a counter of how many times the limit fired, in the same `fwl_counters_<zone>` map as the named ones, and — as [5. Observability](05-observability.md) says — nothing on the box reads that map yet. `bpftool map dump pinned /sys/fs/bpf/f/fwl_counters_<zone>` is the whole story today. A limit that never fires and a limit that fires constantly are both worth knowing about, and they are different from the rule's own hit count; you cannot currently see either from the CLI.
+`einheit-f show counters` prints every counter in the loaded policy under the name that declared it — see [5. Observability](05-observability.md) for the verb and the four states it keeps apart. A limit that never fires and a limit that fires constantly are both worth knowing about, and they are different from the rule's own hit count.
+
+One counter in that list is not one you wrote: `__rate_limit_overflow`. It ticks when the per-CPU rate-limit map's bucket key space is exhausted, and a non-zero reading means some sources are sharing a bucket with others — the limit is still being applied, but not per the `per=` field you asked for. The double underscore marks it as reserved; it is listed rather than hidden, because a limit that has quietly stopped discriminating is exactly the thing a counter view exists to show.
 
 ---
 

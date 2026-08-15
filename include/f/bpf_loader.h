@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "f/bpf_error.h"
+#include "f/counters.h"
 #include "f/error.h"
 #include "f/tc_egress.h"
 
@@ -62,6 +63,21 @@ struct ZoneProgramHandle {
   std::vector<std::string> interfaces;  ///< zone interface names
   std::vector<std::string> redirects_to;  ///< redirect destinations
   bool masquerades = false;    ///< true if this zone masquerades
+  /// This zone's private `fwl_counters_<zone>` per-CPU array, or -1
+  /// when the policy declares no `count` statement (the emitter then
+  /// declares no map at all).
+  int counters_fd = -1;
+  /// The name->slot table for that map, read from the same bundle
+  /// directory, in the same call, as the object it describes.
+  ///
+  /// Captured at LOAD time on purpose. Re-reading the bundle directory
+  /// later to name the slots of a map loaded earlier is a second
+  /// derivation of one pairing, and a reload between the two answers
+  /// it differently — the counter names would then belong to a policy
+  /// that is no longer in the packet path while the values belong to
+  /// one that is. The table and the descriptor come from one load or
+  /// neither does.
+  CounterTable counters;
 };
 
 /// Result of loading a multi-zone bundle: one entry per @xdp block.
@@ -207,6 +223,28 @@ struct PinReconcileReport {
   /// Entries dropped from an adopted conntrack map because the
   /// daemon's own GC rule had already condemned them (kColdBoot only).
   uint32_t conntrack_swept = 0;
+};
+
+/// A live `fwl_counters_<zone>` per-CPU array, seen as the counter
+/// join needs to see it.
+///
+/// The bound is taken from the map at construction (`bpf_map_get_info`)
+/// and is 0 when the kernel could not be asked — never a default and
+/// never a literal. A literal 256 here against a map declared with
+/// 10000 slots is a defect this project has already shipped once: it
+/// hid every counter from 256 up, accruing packets that no view could
+/// surface.
+class BpfCounterMap final : public CounterMap {
+ public:
+  /// `fd` may be negative; `Slots()` is then 0 and every read fails.
+  explicit BpfCounterMap(int fd);
+  auto Slots() const -> uint32_t override { return slots_; }
+  auto Read(uint32_t slot) const -> std::optional<uint64_t> override;
+
+ private:
+  int fd_ = -1;
+  uint32_t slots_ = 0;
+  int ncpus_ = 1;
 };
 
 /// The persistent map names assumed for a bundle whose manifest predates

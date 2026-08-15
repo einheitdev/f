@@ -104,14 +104,33 @@ TEST_F(FwAdapterTest, TheV01VerbsAreGoneRatherThanEmpty) {
   // `FwConfig` only the removed ApplyConfig ever wrote) and the other
   // three were refused by fd. A verb that cannot answer is worse than
   // no verb: the operator reaches for it first and is told something.
+  //
+  // `show counters` is off this list now — see below. The other three
+  // still have no datapath to ask.
   auto cmds = adapter_->Commands();
   for (const auto& gone : {"show firewall", "show firewall rules",
-                           "show counters", "clear counters"}) {
+                           "clear counters"}) {
     for (const auto& c : cmds) {
       EXPECT_NE(c.path, gone)
           << gone << " is registered again; it has no datapath to ask";
     }
   }
+}
+
+TEST_F(FwAdapterTest, ShowCountersIsBackAgainstTheOtherMap) {
+  // The verb returned because the map it reads changed, not because
+  // the old one was forgiven. The v0.1 version asked opcode 2 for a
+  // `counters` map keyed by match tier, which no v0.4 bundle pins;
+  // this one asks opcode 12 for each zone's own `fwl_counters_<zone>`
+  // — the map a policy's `count <name>` statements actually write —
+  // and presents the values under the names the policy gave them.
+  const cli::CommandSpec* spec = nullptr;
+  for (const auto& c : adapter_->Commands()) {
+    if (c.path == "show counters") spec = &c;
+  }
+  ASSERT_NE(spec, nullptr)
+      << "`count` is a language feature; something must read it back";
+  EXPECT_EQ(spec->wire_command, "show_counters");
 }
 
 TEST_F(FwAdapterTest, CommandTreeIntegration) {

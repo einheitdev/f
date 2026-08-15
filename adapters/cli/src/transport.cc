@@ -38,6 +38,7 @@
 
 #include "einheit/cli/transport/zmq_local.h"
 #include "f/confd/system_backend.h"
+#include "f/counters.h"
 #include "f/lease/journal.h"
 #include "f/lease/lease.h"
 #include "f/lease/view.h"
@@ -71,6 +72,12 @@ enum : uint8_t {
   kGetZones = 9,
   kGetNat = 10,
   kGetConntrack = 11,
+  // The loaded policy's own `count <name>` statements. 12, not 2:
+  // opcode 2 asked the removed v0.1 datapath about a different map
+  // keyed a different way, and an old daemon must answer this
+  // `unknown command` rather than hand back numbers keyed by match
+  // tier that would render under FWL counter names.
+  kGetFwlCounters = 12,
 };
 }  // namespace fd_cmd
 
@@ -584,6 +591,9 @@ class FLocalTransport final
     if (req.command == "show_conntrack") {
       return FdQuery(req.id, fd_cmd::kGetConntrack);
     }
+    if (req.command == "show_counters") {
+      return HandleShowCounters(req);
+    }
     if (req.command == "reload_firewall") {
       return HandleReloadFirewall(req);
     }
@@ -1065,6 +1075,61 @@ class FLocalTransport final
   auto HandleReloadFirewall(const proto::Request& req)
       -> proto::Response {
     return FdQuery(req.id, fd_cmd::kReloadProg);
+  }
+
+  /// `show counters [<name>]` — the policy's named `count` statements,
+  /// read out of the map the datapath actually writes.
+  ///
+  /// The CLI does not open a BPF map. fd holds the loaded objects and
+  /// the tables that name their slots, and it is the process that put
+  /// them there; a second reader guessing at pin paths is precisely
+  /// what the removed UI counter page did, on names no v0.4 bundle
+  /// pins, on every box ever deployed.
+  auto HandleShowCounters(const proto::Request& req)
+      -> proto::Response {
+    if (auto err = RequireFd(req.id)) return *err;
+    auto reply = AskFd(fd_cmd::kGetFwlCounters);
+    if (!reply.ok) {
+      return MakeErr(req.id, "fd_error", reply.error);
+    }
+    if (!reply.body.is_object() || !reply.body.contains("zones") ||
+        !reply.body["zones"].is_array()) {
+      // An answer arriving is not an answer. An `fd` too old to know
+      // opcode 12 replies `unknown command`, which AskFd already
+      // turns into an error; anything else that is not the shape
+      // agreed here is reported rather than rendered as no counters.
+      return MakeErr(req.id, "fd_error",
+          "fd answered the counter query with a payload carrying no "
+          "zones — this box's fd is not the one this CLI expects",
+          "Check that fd and einheit-f are from the same build: "
+          "einheit-f show install");
+    }
+    auto zones = ::f::ZoneCountersFromJson(reply.body);
+    if (req.args.empty()) {
+      auto out = ::f::ZoneCountersToJson(zones);
+      out["query"] = "";
+      return MakeOk(req.id, out);
+    }
+    // Asked for one name. The verdict is three-valued because the
+    // three answers are different findings: it exists and here it is,
+    // no policy on this box declares it, and it was not found in what
+    // could be read — which is not the same as not being there.
+    auto q = ::f::FindCounter(zones, req.args[0]);
+    auto out = ::f::ZoneCountersToJson(q.zones);
+    out["query"] = req.args[0];
+    out["verdict"] = std::string(::f::CounterLookupName(q.verdict));
+    // The zones that could not be named, so the renderer can say
+    // which ones the search was blind to rather than just that it was.
+    json blind = json::array();
+    for (const auto& z : zones) {
+      if (z.availability ==
+              ::f::CounterAvailability::kTableUnreadable ||
+          z.availability == ::f::CounterAvailability::kUnknown) {
+        blind.push_back(z.zone);
+      }
+    }
+    out["unsearchable_zones"] = blind;
+    return MakeOk(req.id, out);
   }
 
   auto HandleConfigure(const proto::Request& req)
