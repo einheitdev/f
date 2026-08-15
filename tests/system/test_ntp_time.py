@@ -40,8 +40,6 @@ Run on the target, as root:
 """
 import argparse
 import os
-import socket
-import struct
 import subprocess
 import sys
 import tempfile

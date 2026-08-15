@@ -1,3 +1,6 @@
 [flake8]
 indent-size = 2
 max-line-length = 80
+# House style is ONE blank line between top-level definitions,
+# not PEP 8's two. E302/E305 enforce the opposite.
+extend-ignore = E302,E305
