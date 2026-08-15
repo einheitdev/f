@@ -1,0 +1,10 @@
+name: "tagged wake on lan vlan 1 into a default drop policy"
+source_fw: |
+  @xdp(eth0)
+  default drop
+# 802.1Q tag 1, then EtherType 0x0842. The prelude reads the tag and re-reads fwl_l3p from vh->inner_proto, so the non-IP test runs against the REAL type and not against 0x8100.
+test_packet:
+  builder: eth(ethertype=0x0842, vlan_id=1)
+expected:
+  compiles: true
+  bpf_action: allow

@@ -1,0 +1,10 @@
+name: "tagged lldp vlan 4094 into a unconditional drop policy"
+source_fw: |
+  @xdp(eth0)
+  drop
+# 802.1Q tag 4094, then EtherType 0x88cc. The prelude reads the tag and re-reads fwl_l3p from vh->inner_proto, so the non-IP test runs against the REAL type and not against 0x8100.
+test_packet:
+  builder: eth(ethertype=0x88cc, payload_hex="0207040200000000010403053031060200780000", vlan_id=4094)
+expected:
+  compiles: true
+  bpf_action: allow

@@ -1,0 +1,12 @@
+name: "icmp6 type: near miss, icmp6_type == K decides false"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.proto == icmp6 and pkt.icmp6.type == 128
+  default allow
+# Reaches the rule and fails ONLY on `icmp6_type == K`. An echo REPLY where the rule names the echo request. proto and icmp6_ok both decide true and the type comparison is reached.
+# That arm had never been taken by any corpus case: the corpus sends packets that match this rule, and packets that fail at the first conjunct and never evaluate this one.
+test_packet:
+  builder: icmp6(type=129, code=0)
+expected:
+  compiles: true
+  bpf_action: allow

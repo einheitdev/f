@@ -1,0 +1,12 @@
+name: "icmp6 code: near miss, icmp6_code == K decides false"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.proto == icmp6 and pkt.icmp6.code == 0
+  default allow
+# Reaches the rule and fails ONLY on `icmp6_code == K`. Destination unreachable, code 4 (port unreachable) against a rule naming code 0. The code field is read second and had never decided false.
+# That arm had never been taken by any corpus case: the corpus sends packets that match this rule, and packets that fail at the first conjunct and never evaluate this one.
+test_packet:
+  builder: icmp6(type=1, code=4)
+expected:
+  compiles: true
+  bpf_action: allow

@@ -1,0 +1,15 @@
+name: "bare nat arp request into the ipv4 helper"
+source_fw: |
+  @xdp(wan)
+  masquerade
+  allow
+state:
+  nat:
+    masq_ip: "198.51.100.9"
+# EtherType 0x0806 reaches `h_proto != bpf_htons(ETH_P_IP)` inside fwl_find_ipv4.
+# NAT is IPv4-only by design; the frame is forwarded untranslated rather than mangled.
+test_packet:
+  builder: eth(ethertype=0x0806, payload_hex="00010800060400010200000000010a0000010000000000000a000002")
+expected:
+  compiles: true
+  bpf_action: allow

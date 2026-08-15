@@ -1,0 +1,11 @@
+name: "tcp on the matched port fails only the proto conjunct"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.proto == udp and pkt.dst_port == 53
+  default allow
+# Right family, right port, wrong proto: the rule short-circuits at `proto` and never reads dst_port.
+test_packet:
+  builder: tcp(dst_port=53, syn=true)
+expected:
+  compiles: true
+  bpf_action: allow

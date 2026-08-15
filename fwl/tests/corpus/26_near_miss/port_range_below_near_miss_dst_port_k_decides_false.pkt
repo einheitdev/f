@@ -1,0 +1,12 @@
+name: "port range below: near miss, dst_port >= K decides false"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.proto == tcp and pkt.dst_port in 5000..6000
+  default allow
+# Reaches the rule and fails ONLY on `dst_port >= K`. One port below the range, which short-circuits before the upper comparison is evaluated at all.
+# That arm had never been taken by any corpus case: the corpus sends packets that match this rule, and packets that fail at the first conjunct and never evaluate this one.
+test_packet:
+  builder: tcp(dst_port=4999, syn=true)
+expected:
+  compiles: true
+  bpf_action: allow

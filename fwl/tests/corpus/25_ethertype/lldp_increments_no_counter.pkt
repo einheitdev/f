@@ -1,0 +1,13 @@
+name: "lldp increments no counter"
+source_fw: |
+  @xdp(eth0)
+  count l2_noise
+  default drop
+# `count` is emitted after the prelude, so a frame that early-outs never reaches it. Asserting the counter — not just the action — is what distinguishes 'the early-out fired' from 'the policy happened to pass it'.
+test_packet:
+  builder: eth(ethertype=0x88cc, payload_hex="0207040200000000010403053031060200780000")
+expected:
+  compiles: true
+  bpf_action: allow
+  counter_changes:
+    l2_noise: 0

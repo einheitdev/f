@@ -144,7 +144,20 @@ class TestNonIpEarlyOut:
     )
     assert result.action is interpreter.XdpAction.PASS
 
-  def test_truncated_ipv6_frame_passes_a_drop_default(self):
+  def test_truncated_ipv6_frame_reaches_a_drop_default(self):
+    """A v6 frame is IP even when its header did not fit.
+
+    This test used to assert PASS, and it was encoding the defect
+    rather than the behaviour: the emitted gate is `!v4_ok && !v6_ok
+    && !is_v6_frame`, and `is_v6_frame` is set from the EtherType
+    BEFORE the 40-byte bounds check. So the compiled program falls
+    through to the default here. Measured as root on deb-02:
+    interpreter PASS, bpf DROP.
+
+    Found by a hunt reading `_non_ip_early_out` on 2026-08-14 — the
+    day the `eth()` builder made the other route to it (an
+    `eth(ethertype=0x86dd)` frame with no payload) buildable at all.
+    """
     src = "2001:db8::1"
     source = (
       f"@xdp(eth0)\nallow if pkt.src_ip6 in {src}/128\ndefault drop\n"
@@ -153,6 +166,32 @@ class TestNonIpEarlyOut:
       source, _build(f'tcp6(src_ip="{src}", dst_port=80)',
                      truncate_to=40)
     )
+    assert result.action is interpreter.XdpAction.DROP
+
+  def test_a_bare_v6_ethertype_frame_reaches_a_drop_default(self):
+    """The same gate, reached without truncation at all.
+
+    `eth(ethertype=0x86dd)` carries no L3 keys either, so it isolates
+    `is_v6_frame` from `_strip_truncated_fields`. Two independent
+    routes to one guard: if a future change fixes only one of them,
+    the other still fails.
+    """
+    src = "2001:db8::1"
+    source = (
+      f"@xdp(eth0)\nallow if pkt.src_ip6 in {src}/128\ndefault drop\n"
+    )
+    result = _evaluate(source, _build("eth(ethertype=0x86dd)"))
+    assert result.action is interpreter.XdpAction.DROP
+
+  def test_a_non_ip_ethertype_still_takes_the_early_out(self):
+    """The control. Without it the guard above could be `return
+    False` unconditionally and every assertion here would still
+    pass — ARP would then be dropped by a `default drop`, which is
+    the incident the early-out exists to prevent."""
+    source = (
+      "@xdp(eth0)\nallow if pkt.proto == tcp\ndefault drop\n"
+    )
+    result = _evaluate(source, _build("eth(ethertype=0x0806)"))
     assert result.action is interpreter.XdpAction.PASS
 
   def test_whole_frame_still_reaches_the_default(self):
@@ -162,13 +201,34 @@ class TestNonIpEarlyOut:
     )
     assert result.action is interpreter.XdpAction.DROP
 
-  def test_a_program_reading_no_field_has_no_early_out(self):
-    """No prelude is emitted at all, so the default really applies."""
+  def test_a_program_reading_no_field_still_reaches_the_default(self):
+    """A no-fields program gets a SHORTER prelude, not none.
+
+    This used to be titled "has no early-out", which was wrong: the
+    emitter's no-referenced-fields branch emits an EtherType test and
+    nothing else. A truncated IPv4 frame still resolves to 0x0800, so
+    it does NOT early out — the short prelude does not bounds-check
+    L3 — and the default applies. Same verdict as before, different
+    reason, and the reason is what a non-IP frame turns on.
+    """
     result = _evaluate(
       "@xdp(eth0)\ndefault drop\n",
       _build('tcp(dst_port=80)', truncate_to=20),
     )
     assert result.action is interpreter.XdpAction.DROP
+
+  def test_a_no_field_program_does_early_out_on_a_non_ip_frame(self):
+    """The other half, and the one that had never been testable.
+
+    `@xdp(eth0) / default drop` against ARP gave interpreter DROP and
+    BPF PASS across 1434 corpus cases, because no builder could make
+    the frame. This is the gate that keeps an unconditional
+    `redirect` from re-emitting the upstream switch's own BPDUs.
+    """
+    result = _evaluate(
+      "@xdp(eth0)\ndefault drop\n", _build("eth(ethertype=0x0806)")
+    )
+    assert result.action is interpreter.XdpAction.PASS
 
   def test_a_vlan_rule_still_sees_a_tagged_non_ip_frame(self):
     """`vlan_ok` joins the gate when the program reads vlan fields."""

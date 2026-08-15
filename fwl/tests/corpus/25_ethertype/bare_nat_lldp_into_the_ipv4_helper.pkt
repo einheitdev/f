@@ -1,0 +1,15 @@
+name: "bare nat lldp into the ipv4 helper"
+source_fw: |
+  @xdp(wan)
+  masquerade
+  allow
+state:
+  nat:
+    masq_ip: "198.51.100.9"
+# EtherType 0x88cc reaches `h_proto != bpf_htons(ETH_P_IP)` inside fwl_find_ipv4.
+# NAT is IPv4-only by design; the frame is forwarded untranslated rather than mangled.
+test_packet:
+  builder: eth(ethertype=0x88cc, payload_hex="0207040200000000010403053031060200780000")
+expected:
+  compiles: true
+  bpf_action: allow

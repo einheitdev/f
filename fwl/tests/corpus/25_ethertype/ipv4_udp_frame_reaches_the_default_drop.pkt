@@ -1,0 +1,10 @@
+name: "ipv4 udp frame reaches the default drop"
+source_fw: |
+  @xdp(eth0)
+  default drop
+# The negative arm of the EtherType sweep. This frame IS one of the two families, so the prelude does not early out and the policy's `default drop` applies. Every non-IP case in this strategy asserts allow against this same policy; without this case a program that passed everything would satisfy all of them.
+test_packet:
+  builder: udp(src_ip="10.0.0.3", dst_ip="10.0.0.4", dst_port=53)
+expected:
+  compiles: true
+  bpf_action: drop

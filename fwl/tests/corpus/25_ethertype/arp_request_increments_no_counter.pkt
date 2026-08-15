@@ -1,0 +1,13 @@
+name: "arp request increments no counter"
+source_fw: |
+  @xdp(eth0)
+  count l2_noise
+  default drop
+# `count` is emitted after the prelude, so a frame that early-outs never reaches it. Asserting the counter — not just the action — is what distinguishes 'the early-out fired' from 'the policy happened to pass it'.
+test_packet:
+  builder: eth(ethertype=0x0806, payload_hex="00010800060400010200000000010a0000010000000000000a000002")
+expected:
+  compiles: true
+  bpf_action: allow
+  counter_changes:
+    l2_noise: 0

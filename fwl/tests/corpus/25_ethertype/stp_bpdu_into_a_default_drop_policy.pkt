@@ -1,0 +1,11 @@
+name: "stp bpdu into a default drop policy"
+source_fw: |
+  @xdp(eth0)
+  default drop
+# EtherType 0x0026 is neither ETH_P_IP nor ETH_P_IPV6, so the no-fields prelude returns XDP_PASS BEFORE the policy's action runs — which is why even the `default drop` shape expects allow.
+# This is the arm 1434 corpus cases never took, and stray non-IP frames are the normal traffic on the network this box is going into.
+test_packet:
+  builder: eth(ethertype=0x0026, payload_hex="4242030000000000800002000000000100000000800002000000000180010000140002000f00")
+expected:
+  compiles: true
+  bpf_action: allow

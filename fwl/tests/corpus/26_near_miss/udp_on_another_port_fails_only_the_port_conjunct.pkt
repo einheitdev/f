@@ -1,0 +1,11 @@
+name: "udp on another port fails only the port conjunct"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.proto == udp and pkt.dst_port == 53
+  default allow
+# Right family, right proto, wrong port: the last conjunct decides false and nothing before it does.
+test_packet:
+  builder: udp(dst_port=54, src_port=51000)
+expected:
+  compiles: true
+  bpf_action: allow

@@ -1,0 +1,12 @@
+name: "proto negated: near miss, proto != IPPROTO_TCP decides false"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.proto != tcp
+  default allow
+# Reaches the rule and fails ONLY on `proto != IPPROTO_TCP`. A TCP segment against `proto != tcp`. The family conjunct decides true and the inequality decides false — which is the only packet that tells `!=` from a constant.
+# That arm had never been taken by any corpus case: the corpus sends packets that match this rule, and packets that fail at the first conjunct and never evaluate this one.
+test_packet:
+  builder: tcp(dst_port=80, syn=true)
+expected:
+  compiles: true
+  bpf_action: allow

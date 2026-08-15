@@ -1,0 +1,17 @@
+name: "arp request is not redirected out of the lan zone"
+source_fw: |
+  zone wan = [wan0]
+  zone lan = [lan0]
+  @xdp(lan)
+  count lan_out
+  masquerade
+  redirect to wan
+ingress_zone: lan
+# storm_shield.fw's lan block. The early-out must fire before `redirect to wan`, or the firewall re-emits L2 control traffic — including the upstream switch's own BPDUs — out a port in a different broadcast domain. XDP_PASS here, XDP_REDIRECT is the defect.
+test_packet:
+  builder: eth(ethertype=0x0806, payload_hex="00010800060400010200000000010a0000010000000000000a000002")
+expected:
+  compiles: true
+  bpf_action: allow
+  counter_changes:
+    lan_out: 0

@@ -1,0 +1,15 @@
+name: "icmp6 type range above: control, icmp6_type <= K decides true"
+source_fw: |
+  @xdp(eth0)
+  def filter(pkt):
+    if pkt.proto == icmp6:
+      if pkt.icmp6.type in 133..137:
+        drop
+    allow
+# The control for the case above. Same policy, and the only difference is the field `icmp6_type <= K` reads — so it must produce the OPPOSITE action.
+# Without this a program that matched nothing at all would satisfy the near-miss and the pair would be untestable.
+test_packet:
+  builder: icmp6(type=137, code=0)
+expected:
+  compiles: true
+  bpf_action: drop

@@ -1,0 +1,12 @@
+name: "port range above: control, dst_port <= K decides true"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.proto == tcp and pkt.dst_port in 5000..6000
+  default allow
+# The control for the case above. Same policy, and the only difference is the field `dst_port <= K` reads — so it must produce the OPPOSITE action.
+# Without this a program that matched nothing at all would satisfy the near-miss and the pair would be untestable.
+test_packet:
+  builder: tcp(dst_port=6000, syn=true)
+expected:
+  compiles: true
+  bpf_action: drop

@@ -1,0 +1,12 @@
+name: "vlan priority threshold: control, vlan_priority >= K decides true"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.vlan_priority >= 5
+  default allow
+# The control for the case above. Same policy, and the only difference is the field `vlan_priority >= K` reads — so it must produce the OPPOSITE action.
+# Without this a program that matched nothing at all would satisfy the near-miss and the pair would be untestable.
+test_packet:
+  builder: tcp(vlan_id=10, vlan_priority=5, dst_port=80)
+expected:
+  compiles: true
+  bpf_action: drop

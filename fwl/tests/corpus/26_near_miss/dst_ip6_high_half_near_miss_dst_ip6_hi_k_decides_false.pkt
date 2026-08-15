@@ -1,0 +1,12 @@
+name: "dst ip6 high half: near miss, dst_ip6_hi == K decides false"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.dst_ip6 == ::1
+  default allow
+# Reaches the rule and fails ONLY on `dst_ip6_hi == K`. The loopback address is all-zero in its high half and 1 in its low half, so an address whose low half is also 1 reaches the high comparison and fails there.
+# That arm had never been taken by any corpus case: the corpus sends packets that match this rule, and packets that fail at the first conjunct and never evaluate this one.
+test_packet:
+  builder: tcp6(dst_ip="2001:db8::1", dst_port=80)
+expected:
+  compiles: true
+  bpf_action: allow

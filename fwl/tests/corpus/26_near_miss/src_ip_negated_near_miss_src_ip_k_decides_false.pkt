@@ -1,0 +1,12 @@
+name: "src ip negated: near miss, src_ip != K decides false"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.src_ip != 8.8.8.8
+  default allow
+# Reaches the rule and fails ONLY on `src_ip != K`. The one address that makes the inequality false. Both arms of this operand were never taken, which means no case reached the rule at all.
+# That arm had never been taken by any corpus case: the corpus sends packets that match this rule, and packets that fail at the first conjunct and never evaluate this one.
+test_packet:
+  builder: tcp(src_ip="8.8.8.8", dst_port=80)
+expected:
+  compiles: true
+  bpf_action: allow

@@ -1,0 +1,15 @@
+name: "syn without ack: near miss, !(tcp_ack) decides false"
+source_fw: |
+  @xdp(eth0)
+  def filter(pkt):
+    if pkt.proto == tcp:
+      if pkt.tcp.syn and not pkt.tcp.ack:
+        drop
+    allow
+# Reaches the rule and fails ONLY on `!(tcp_ack)`. A SYN-ACK: the flag pair that separates a connection ATTEMPT from the reply to one. Treating it as an attempt makes every established conversation look new, which is the defect the `and not` in that rule exists to prevent.
+# That arm had never been taken by any corpus case: the corpus sends packets that match this rule, and packets that fail at the first conjunct and never evaluate this one.
+test_packet:
+  builder: tcp(syn=true, ack=true, dst_port=80)
+expected:
+  compiles: true
+  bpf_action: allow

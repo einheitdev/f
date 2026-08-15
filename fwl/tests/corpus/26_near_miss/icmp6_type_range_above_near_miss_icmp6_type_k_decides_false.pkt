@@ -1,0 +1,15 @@
+name: "icmp6 type range above: near miss, icmp6_type <= K decides false"
+source_fw: |
+  @xdp(eth0)
+  def filter(pkt):
+    if pkt.proto == icmp6:
+      if pkt.icmp6.type in 133..137:
+        drop
+    allow
+# Reaches the rule and fails ONLY on `icmp6_type <= K`. One above the neighbour-discovery range: the only packet that makes the UPPER bound decide anything. Deleting `<= 137` from the emitted condition passes every other ICMPv6 case in the corpus.
+# That arm had never been taken by any corpus case: the corpus sends packets that match this rule, and packets that fail at the first conjunct and never evaluate this one.
+test_packet:
+  builder: icmp6(type=138, code=0)
+expected:
+  compiles: true
+  bpf_action: allow

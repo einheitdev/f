@@ -1,0 +1,12 @@
+name: "not tcp syn: control, !((l4_ok && tcp_syn)) decides true"
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.proto == tcp and not pkt.tcp.syn
+  default allow
+# The control for the case above. Same policy, and the only difference is the field `!((l4_ok && tcp_syn))` reads — so it must produce the OPPOSITE action.
+# Without this a program that matched nothing at all would satisfy the near-miss and the pair would be untestable.
+test_packet:
+  builder: tcp(ack=true, dst_port=80)
+expected:
+  compiles: true
+  bpf_action: drop
