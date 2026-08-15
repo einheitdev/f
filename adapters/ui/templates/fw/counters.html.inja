@@ -1,0 +1,9 @@
+<section class="card">
+  <h2 class="card-title">counters</h2>
+  <div class="card-body">
+    <p class="cell-dim">Every <span class="mono">count &lt;name&gt;</span> statement in the loaded policy, read out of that zone's <span class="mono">fwl_counters_&lt;zone&gt;</span> map by the daemon that loaded it. A rule with no <span class="mono">count</span> on it does not appear here — there is no per-rule hit count.</p>
+    <div id="counters-table">
+      {% include "fw/counters_table" %}
+    </div>
+  </div>
+</section>

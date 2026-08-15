@@ -33,6 +33,7 @@ TEST(ProtocolTest, SurvivingOpcodesKeepTheirNumbers) {
   EXPECT_EQ(static_cast<uint8_t>(Cmd::kGetZones), 9);
   EXPECT_EQ(static_cast<uint8_t>(Cmd::kGetNat), 10);
   EXPECT_EQ(static_cast<uint8_t>(Cmd::kGetConntrack), 11);
+  EXPECT_EQ(static_cast<uint8_t>(Cmd::kGetFwlCounters), 12);
 }
 
 TEST(ProtocolTest, RetiredOpcodesAreNotReused) {
@@ -45,7 +46,7 @@ TEST(ProtocolTest, RetiredOpcodesAreNotReused) {
   for (uint8_t retired : {1, 2, 6, 7, 8}) {
     for (auto live : {Cmd::kGetStatus, Cmd::kReloadProg, Cmd::kStop,
                       Cmd::kGetZones, Cmd::kGetNat,
-                      Cmd::kGetConntrack}) {
+                      Cmd::kGetConntrack, Cmd::kGetFwlCounters}) {
       EXPECT_NE(static_cast<uint8_t>(live), retired)
           << "opcode " << static_cast<int>(retired)
           << " belonged to the v0.1 single-program surface";

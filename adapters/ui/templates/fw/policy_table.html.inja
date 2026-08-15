@@ -1,0 +1,32 @@
+{% if not answered %}
+<div class="empty cell-bad">{{ unavailable }}</div>
+{% else if length(zones) == 0 %}
+<div class="empty cell-bad">{{ empty_text }}</div>
+{% else %}
+<table class="data-table">
+  <thead>
+    <tr>
+      <th>zone</th>
+      <th>interfaces</th>
+      <th>attached</th>
+      <th>mode</th>
+      <th>redirects to</th>
+      <th>masquerades</th>
+      <th>counts</th>
+    </tr>
+  </thead>
+  <tbody>
+{% for z in zones %}
+    <tr>
+      <td class="mono">{{ z.zone }}</td>
+      <td>{{ z.ifaces_str }}</td>
+      <td><span class="badge badge-{{ z.attach_semantic }}">{{ z.attached_str }}</span></td>
+      <td><span class="badge badge-{{ z.mode_semantic }}">{{ z.xdp_mode }}</span></td>
+      <td>{{ z.redirects_str }}</td>
+      <td><span class="badge badge-{{ z.masq_semantic }}">{{ z.masq_str }}</span></td>
+      <td class="mono cell-{{ z.counts_semantic }}">{{ z.counts_str }}</td>
+    </tr>
+{% endfor %}
+  </tbody>
+</table>
+{% endif %}

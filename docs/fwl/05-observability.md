@@ -27,7 +27,22 @@ default allow
 
 Both of those are useful; the mistake is writing the second and reading it as the first. Put the total at the top of the block.
 
-**Nothing on the box reads these back yet, and that is a real gap rather than a phrasing.** `count` compiles to a slot in the zone's own `fwl_counters_<zone>` map, and the only thing that can print one today is `sudo bpftool map dump pinned /sys/fs/bpf/f/fwl_counters_<zone>`, which gives you slot numbers and no names. There were two verbs here — `show counters` and `show firewall rules` — and both addressed a different datapath: the v0.1 single-program firewall, whose `counters` map is not the one your policy writes to. On a v0.4 box they printed "no counters active" and "no rules loaded" beside counters that were moving. They are gone rather than left saying that. A verb that reads `fwl_counters_<zone>` and resolves the slot numbers against the bundle's manifest is the thing that has to be built.
+**Reading them back: `einheit-f show counters`.** `count` compiles to a slot in the zone's own `fwl_counters_<zone>` map, and the verb reads that map and prints each slot under the name your policy gave it:
+
+```
+ ZONE  │ COUNTER                    │ PACKETS
+ edge  │ edge_probe                 │       7
+ edge  │ edge_never                 │       0
+ quiet │ (no count statements)      │       -
+```
+
+`show counters <name>` answers for one counter. The names come from the bundle's own generated C — the compiler writes a `// fwl_counter_table:` block into each `<zone>.bpf.c`, and `fd` reads it in the same load that opens the map, so a name and a value always come from the same policy.
+
+Four states are kept apart on purpose, because three of them used to render as the same blank screen. A counter that reads `0` was read and nothing hit it. A zone shown as `(no count statements)` declares none. A zone shown as `(names unknown)` has a map whose slots nobody can name — its generated C is missing — and its counters are deliberately **not** shown as zeros. A zone shown as `(stale table)` has generated C that is not the source of the object that is loaded, so every name it offers would be attached to the wrong slot; none is offered. `show counters <name>` distinguishes them too: a name no policy declares is refused, while a name that was not found in a zone whose table could not be read answers "cannot say whether it exists", which is a different thing.
+
+This verb is not the one that used to be here. The v0.1 `show counters` and `show firewall rules` addressed the single-program firewall, whose `counters` map is not the one your policy writes to; on a v0.4 box they printed "no counters active" and "no rules loaded" beside counters that were moving. `show firewall rules` is still gone — the bundle carries no per-zone rule metadata — and `clear counters` with it.
+
+**The same answer on the web UI.** `http://<box>:7542/counters` renders the same table, in the same words, from the same daemon command — a second consumer of one answer, not a second reader of the map. The four states above are four visibly different pages there too; that is asserted rather than assumed (`tests/system/test_ui_counters.py` compares them). The `/policy` page beside it reports what `fd` has **loaded**: each zone's interfaces, the XDP mode measured on them, its redirect and masquerade behaviour, and the counters that zone's loaded policy declares. It does not list rules, and it says so on the page — the daemon holds compiled objects, and there is nothing in the bundle it could be asked for a rule with.
 
 ## Counters as evidence
 

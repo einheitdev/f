@@ -165,8 +165,8 @@ components:
     requirement: required
     needed_by: einheit-f-ui.service
     why: >-
-      The firewall adapter's own pages: dashboard, interfaces, zones,
-      NAT and conntrack.
+      The firewall adapter's own pages: dashboard, interfaces, policy,
+      counters, zones, NAT and conntrack.
 
   - id: ui-assets
     group: ui

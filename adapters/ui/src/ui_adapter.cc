@@ -1,6 +1,7 @@
 /// @file ui_adapter.cc
 /// @brief f firewall UI adapter. Serves dashboard, interfaces, zones,
-/// NAT and conntrack via HTMX and pushes live updates over WebSocket.
+/// policy, counters, NAT and conntrack via HTMX and pushes live
+/// updates over WebSocket.
 ///
 /// Everything on these pages comes from the daemon over the control
 /// socket. It used to open the pinned BPF maps in-process as well, and
@@ -15,6 +16,14 @@
 /// `fwl_counters_testnet` was counting every frame on the wire. Those
 /// pages are gone rather than fixed: there was nothing behind them to
 /// fix, and an empty table is a claim.
+///
+/// `/counters` is back, and the difference is where its numbers come
+/// from. fd holds the loaded objects AND the name->slot tables read in
+/// the same call that opened the maps, and answers both halves over
+/// opcode 12; this page is a second consumer of the answer
+/// `einheit-f show counters` already reads. It opens nothing itself.
+/// `/policy` is the same rule applied to the policy: it reports what
+/// fd has LOADED, and states in place the one thing fd cannot answer.
 
 #include "adapters/fw/ui_adapter.h"
 
@@ -42,6 +51,7 @@
 #include "einheit/ui/route.h"
 #include "einheit/ui/stream.h"
 
+#include "adapters/fw/views.h"
 #include "f/protocol.h"
 #include "f/types.h"
 
@@ -128,17 +138,14 @@ auto StateSemantic(const std::string& s) -> std::string {
   return "info";
 }
 
-// What fd said, and whether it is an answer at all. A reply arriving
-// is not the same thing as fd having the data: every command can come
+// What fd said, and whether it is an answer at all, plus every
+// decision made about it, live in views.{h,cc} — reachable from a unit
+// test, which the inside of a Crow handler is not. A reply arriving is
+// not the same thing as fd having the data: every command can come
 // back with an `error` payload, and rendering that as an empty table
-// tells the operator there are no zones / no NAT when the truth is
-// that nobody could ask.
-struct DaemonReply {
-  bool ok = false;
-  /// fd's own words for why not, or why we could not reach it.
-  std::string error;
-  json body;
-};
+// tells the operator there are no zones / no counters when the truth
+// is that nobody could ask.
+using DaemonReply = FdAnswer;
 
 // Send a single-byte control command to fd and classify the answer.
 // The v0.4 zone/NAT/conntrack views read their data from the daemon's
@@ -197,63 +204,6 @@ auto QueryDaemon(const std::string& fd_socket, f::Cmd cmd) -> json {
   return reply.ok ? reply.body : json();
 }
 
-// The message a view shows instead of a table: never a claim that the
-// thing is empty when the truth is that we could not read it.
-auto UnavailableText(const DaemonReply& reply,
-                     const std::string& empty_text) -> std::string {
-  if (reply.ok) return empty_text;
-  return "cannot read this from fd: " + reply.error;
-}
-
-auto JoinArr(const json& arr) -> std::string {
-  std::string out;
-  if (!arr.is_array()) return out;
-  for (const auto& s : arr) {
-    if (!out.empty()) out += ", ";
-    out += s.get<std::string>();
-  }
-  return out;
-}
-
-// Add the display fields the zones_table template renders (joined
-// interface/redirect lists, yes/no + semantic badges).
-auto DecorateZones(json zones) -> json {
-  if (!zones.is_array()) return json::array();
-  for (auto& z : zones) {
-    z["ifaces_str"] = JoinArr(z.value("interfaces", json::array()));
-    z["attached_str"] = JoinArr(z.value("attached", json::array()));
-    if (z["attached_str"].get<std::string>().empty()) {
-      z["attached_str"] = "(none)";
-    }
-    auto redir = JoinArr(z.value("redirects_to", json::array()));
-    z["redirects_str"] = redir.empty() ? "-" : redir;
-    bool masq = z.value("masquerades", false);
-    z["masq_str"] = masq ? "yes" : "no";
-    z["masq_semantic"] = masq ? "good" : "dim";
-    z["attach_semantic"] =
-        z.value("attached_count", 0) > 0 ? "good" : "warn";
-    auto mode = z.value("xdp_mode", std::string("-"));
-    if (mode.empty()) mode = "-";
-    z["xdp_mode"] = mode;
-    z["mode_semantic"] = mode == "native"    ? "good"
-                         : mode == "generic" ? "warn"
-                                             : "dim";
-  }
-  return zones;
-}
-
-// Tag each conntrack entry with a badge semantic for its state.
-auto DecorateConntrack(json entries) -> json {
-  if (!entries.is_array()) return json::array();
-  for (auto& c : entries) {
-    auto st = c.value("state", "");
-    c["state_semantic"] = st == "established" ? "good"
-                          : st == "invalid"   ? "bad"
-                                              : "warn";
-  }
-  return entries;
-}
-
 class FwUiAdapter final : public ui::ProductUiAdapter {
  public:
   explicit FwUiAdapter(FwUiConfig cfg)
@@ -278,6 +228,8 @@ class FwUiAdapter final : public ui::ProductUiAdapter {
         {"/", "Dashboard", "dashboard", "monitor"},
         {"/interfaces", "Interfaces", "interfaces",
          "network"},
+        {"/policy", "Policy", "policy", "shield"},
+        {"/counters", "Counters", "counters", "list"},
         {"/zones", "Zones", "zones", "layers"},
         {"/nat", "NAT", "nat", "shuffle"},
         {"/conntrack", "Conntrack", "conntrack", "activity"},
@@ -311,6 +263,22 @@ class FwUiAdapter final : public ui::ProductUiAdapter {
         .swap_target = "zones-table",
         .swap_strategy = "outerHTML",
     });
+    // Counters move while the operator watches, and a policy changes
+    // under him on a reload. Both fragments are republished from the
+    // same sampler tick that feeds the rest, so a page left open shows
+    // the box as it is now rather than as it was when it loaded.
+    events->Bind(ui::TopicBinding{
+        .topic = "fw.counters",
+        .fragment = "fw/counters_table",
+        .swap_target = "counters-table",
+        .swap_strategy = "outerHTML",
+    });
+    events->Bind(ui::TopicBinding{
+        .topic = "fw.policy",
+        .fragment = "fw/policy_table",
+        .swap_target = "policy-table",
+        .swap_strategy = "outerHTML",
+    });
 
     // -- Dashboard --
     CROW_ROUTE(app, "/")
@@ -321,6 +289,14 @@ class FwUiAdapter final : public ui::ProductUiAdapter {
       auto zones = QueryDaemon(cfg_.fd_socket, f::Cmd::kGetZones);
       auto nat = QueryDaemon(cfg_.fd_socket, f::Cmd::kGetNat);
       auto ct = QueryDaemon(cfg_.fd_socket, f::Cmd::kGetConntrack);
+      // A measurement, in the row where an unconditional red badge
+      // used to sit. `maps [FAIL] unavailable` was painted by a field
+      // nothing in this adapter ever set, on a box whose counters were
+      // moving — a status indicator that has never once been a status.
+      // This one either counts what the loaded policy declares or says
+      // which zones it could not read and why.
+      auto counters =
+          AskDaemon(cfg_.fd_socket, f::Cmd::kGetFwlCounters);
       // How many interfaces are actually being filtered, summed from
       // the per-zone `attached_count` the daemon derives from the
       // kernel — NOT from how many NICs the box has, and not from how
@@ -346,6 +322,7 @@ class FwUiAdapter final : public ui::ProductUiAdapter {
           {"nat_count", 0},
           {"has_masq", false},
           {"masq_source", ""},
+          {"counters", CountersSummary(counters)},
       };
       if (nat.is_object()) {
         auto tr = nat.value("translations", json::array());
@@ -399,6 +376,62 @@ class FwUiAdapter final : public ui::ProductUiAdapter {
           {"title", "Interfaces"},
           {"brand", "f firewall"},
           {"active", "interfaces"},
+          {"nav", ui::NavToJson(nav)},
+      };
+      auto r = ui::Render(*eng, req, args);
+      if (!r) {
+        return ui::RenderError(
+            *eng, req, 500, "render", r.error().message);
+      }
+      return std::move(*r);
+    });
+
+    // -- Policy: what fd has loaded, per zone --
+    //
+    // Not the source on disk. `einheit-f show policy` reads the `.fw`
+    // files and says in its own output that a file edited and never
+    // reloaded reads exactly like one that is live; this page makes
+    // the opposite claim — that what it shows is in the packet path —
+    // so it is built only from what fd itself attached and loaded.
+    CROW_ROUTE(app, "/policy")
+    ([eng, nav, this](const crow::request& req) {
+      auto zones = AskDaemon(cfg_.fd_socket, f::Cmd::kGetZones);
+      auto counters =
+          AskDaemon(cfg_.fd_socket, f::Cmd::kGetFwlCounters);
+      auto status = AskDaemon(cfg_.fd_socket, f::Cmd::kGetStatus);
+      json data = PolicyView(zones, counters);
+      data["features"] = PolicyFeatures(status);
+      ui::RenderArgs args;
+      args.fragment = "fw/policy";
+      args.layout = "layout";
+      args.data = data;
+      args.meta = {
+          {"title", "Policy"},
+          {"brand", "f firewall"},
+          {"active", "policy"},
+          {"nav", ui::NavToJson(nav)},
+      };
+      auto r = ui::Render(*eng, req, args);
+      if (!r) {
+        return ui::RenderError(
+            *eng, req, 500, "render", r.error().message);
+      }
+      return std::move(*r);
+    });
+
+    // -- Counters: the policy's own `count` statements (opcode 12) --
+    CROW_ROUTE(app, "/counters")
+    ([eng, nav, this](const crow::request& req) {
+      auto counters =
+          AskDaemon(cfg_.fd_socket, f::Cmd::kGetFwlCounters);
+      ui::RenderArgs args;
+      args.fragment = "fw/counters";
+      args.layout = "layout";
+      args.data = CountersView(counters);
+      args.meta = {
+          {"title", "Counters"},
+          {"brand", "f firewall"},
+          {"active", "counters"},
           {"nav", ui::NavToJson(nav)},
       };
       auto r = ui::Render(*eng, req, args);
@@ -497,13 +530,28 @@ class FwUiAdapter final : public ui::ProductUiAdapter {
       }
       return std::move(*r);
     });
-
   }
 
  private:
   FwUiConfig cfg_;
   std::atomic<bool> sampler_stop_{false};
   std::jthread sampler_;
+
+  /// Publish one live fragment, and say so when it does not go out.
+  ///
+  /// `Publish` fails on an unbound topic and on a fragment that will
+  /// not render, and every call site here used to discard that. A live
+  /// view whose updates stop arriving looks exactly like a box where
+  /// nothing is changing — the page keeps showing the numbers it was
+  /// loaded with, and nothing anywhere says they are old.
+  static void Push(ui::EventStream* events, const char* topic,
+                   const json& ctx) {
+    auto r = events->Publish(topic, ctx);
+    if (!r) {
+      spdlog::warn("live update '{}' not sent: {}", topic,
+                   r.error().message);
+    }
+  }
 
   void StartSampler(ui::EventStream* events) {
     sampler_ = std::jthread(
@@ -519,27 +567,33 @@ class FwUiAdapter final : public ui::ProductUiAdapter {
         // view that silently keeps showing the last good table is
         // showing something that is no longer true.
         auto zones = AskDaemon(cfg_.fd_socket, f::Cmd::kGetZones);
-        events->Publish(
-            "fw.zones",
-            {{"zones", DecorateZones(zones.body)},
-             {"zones_empty",
-              UnavailableText(zones,
-                              "no zones (single-program mode)")}});
+        Push(events, "fw.zones",
+             {{"zones", DecorateZones(zones.body)},
+              {"zones_empty",
+               UnavailableText(zones,
+                               "no zones (single-program mode)")}});
         auto nat = AskDaemon(cfg_.fd_socket, f::Cmd::kGetNat);
-        events->Publish(
-            "fw.nat",
-            {{"translations",
-              nat.body.is_object()
-                  ? nat.body.value("translations", json::array())
-                  : json::array()},
-             {"translations_empty",
-              UnavailableText(nat, "no active translations")}});
+        Push(events, "fw.nat",
+             {{"translations",
+               nat.body.is_object()
+                   ? nat.body.value("translations", json::array())
+                   : json::array()},
+              {"translations_empty",
+               UnavailableText(nat, "no active translations")}});
         auto ct = AskDaemon(cfg_.fd_socket, f::Cmd::kGetConntrack);
-        events->Publish(
-            "fw.conntrack",
-            {{"conntrack", DecorateConntrack(ct.body)},
-             {"conntrack_empty",
-              UnavailableText(ct, "no tracked connections")}});
+        Push(events, "fw.conntrack",
+             {{"conntrack", DecorateConntrack(ct.body)},
+              {"conntrack_empty",
+               UnavailableText(ct, "no tracked connections")}});
+        // Counters and the loaded policy, from the same tick. Both
+        // fragments are published whatever fd answered — a live table
+        // that stops updating when the daemon goes away keeps showing
+        // numbers that were true a minute ago, which is the one thing
+        // a live view must never do.
+        auto counters =
+            AskDaemon(cfg_.fd_socket, f::Cmd::kGetFwlCounters);
+        Push(events, "fw.counters", CountersView(counters));
+        Push(events, "fw.policy", PolicyView(zones, counters));
       }
     });
   }

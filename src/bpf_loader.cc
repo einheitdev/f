@@ -384,6 +384,34 @@ auto ExplainPinConflict(
 
 }  // namespace
 
+BpfCounterMap::BpfCounterMap(int fd) : fd_(fd) {
+  if (fd_ < 0) return;
+  struct bpf_map_info info = {};
+  uint32_t len = sizeof(info);
+  if (bpf_obj_get_info_by_fd(fd_, &info, &len) != 0) {
+    // A descriptor we hold and cannot describe. Leaving the bound at
+    // zero is what makes the caller say so; returning a guess is how
+    // counters above the guess stopped being reported at all.
+    slots_ = 0;
+    return;
+  }
+  slots_ = info.max_entries;
+  ncpus_ = libbpf_num_possible_cpus();
+  if (ncpus_ < 1) ncpus_ = 1;
+}
+
+auto BpfCounterMap::Read(uint32_t slot) const
+    -> std::optional<uint64_t> {
+  if (fd_ < 0 || slot >= slots_) return std::nullopt;
+  std::vector<uint64_t> per_cpu(static_cast<size_t>(ncpus_), 0);
+  if (bpf_map_lookup_elem(fd_, &slot, per_cpu.data()) != 0) {
+    return std::nullopt;
+  }
+  uint64_t total = 0;
+  for (uint64_t v : per_cpu) total += v;
+  return total;
+}
+
 auto DefaultPersistentMapNames() -> std::vector<std::string> {
   // Mirrors emitter.persistent_map_names() for bundles compiled before
   // manifests carried `persistent_maps`. Keep in step with the
@@ -1010,6 +1038,22 @@ auto LoadZoneBundle(std::string_view bundle_dir,
     // disagree — the simple `@xdp(eth0)` form used to render an empty
     // interface list here for the same reason it attached to nothing.
     zh.interfaces = zone_ifnames[zone];
+
+    // The zone's own named counters. Both halves are taken here, in
+    // one place, from one bundle: the descriptor out of the object
+    // that was just loaded, and the name->slot table out of the
+    // generated C that object was compiled from. A consumer that
+    // re-derived either half later would be pairing a name from one
+    // policy with a value from another — which is the failure that
+    // made the whole v0.1 counter surface print plausible numbers
+    // against the wrong rules.
+    //
+    // A policy with no `count` statement declares no map and emits no
+    // table: -1 and an empty (but READ) table, which the reader
+    // reports as "declares no counters" rather than as a failure.
+    zh.counters_fd = FindMap(obj, ("fwl_counters_" + zone).c_str());
+    zh.counters = ReadCounterTable(
+        dir / p.value("source", zone + ".bpf.c"));
 
     // Capture the shared conntrack fd from whichever zone defines it.
     if (handles.conntrack_fd < 0) {

@@ -30,6 +30,16 @@ enum class Cmd : uint8_t {
   kGetZones = 9,
   kGetNat = 10,
   kGetConntrack = 11,
+  /// The loaded policy's own named counters: every `count <name>` in
+  /// every zone, read out of that zone's `fwl_counters_<zone>` map and
+  /// presented under the name the policy gave it.
+  ///
+  /// A NEW number rather than a reuse of 2 (`kGetCounters`), which
+  /// asked the v0.1 datapath about a different map with a different
+  /// key. An old `einheit-f` sending 2 to this daemon must hear
+  /// `unknown command` and not be answered with counters keyed a way
+  /// it does not expect.
+  kGetFwlCounters = 12,
 };
 
 }  // namespace f

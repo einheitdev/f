@@ -48,6 +48,14 @@
             <td>NOT armed — no interface has an XDP program attached; traffic is not being inspected</td>
           </tr>
 {% endif %}
+          {# A measurement, in the row an unconditional red `maps
+             unavailable` badge used to occupy. It counts what the
+             loaded policy declares, or names the zones whose counters
+             could not be read. #}
+          <tr>
+            <td>counters</td>
+            <td><span class="badge badge-{{ counters.semantic }}">{{ counters.text }}</span></td>
+          </tr>
         </tbody>
       </table>
     </div>

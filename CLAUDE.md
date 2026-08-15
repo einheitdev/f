@@ -66,7 +66,9 @@ Python 3.11+ compiler: Lark grammar parser -> typed AST -> BPF C emitter. Three 
 
 ### Web UI
 
-`adapters/ui/` is the firewall adapter for the sibling `einheit-ui` framework, built as `einheit-f-ui`. Templates in `adapters/ui/templates/fw/`; every page reads `fd` over the control socket.
+`adapters/ui/` is the firewall adapter for the sibling `einheit-ui` framework, built as `einheit-f-ui`. Templates in `adapters/ui/templates/fw/`; every page reads `fd` over the control socket and **the UI opens no BPF map** — the pages that did opened v0.1 names no bundle pins and were blank on every box ever deployed. Seven pages: dashboard, interfaces, policy, counters, zones, NAT, conntrack.
+
+The judgement each page makes about fd's answer lives in `adapters/ui/src/views.cc` (`CountersView`, `PolicyView`, `PolicyFeatures`, `CountersSummary`), not inside the Crow handlers, because a decision inside a handler is not reachable from a test — `tests/test_ui_views.cc` covers the view models and `tests/test_ui_pages.cc` renders the real templates, since a view model that keeps the four counter-availability states apart and a template that draws all four as one blank row is still a blank screen.
 
 ## Key Files
 

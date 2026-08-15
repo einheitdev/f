@@ -6,6 +6,8 @@ formatting changes shouldn't fail the suite. The corpus + clang
 compile already verifies the C is well-formed; these tests pin
 specific emission decisions.
 """
+import re
+
 import pytest
 
 from fwl import analyzer, emitter, parser
@@ -223,6 +225,32 @@ class TestLogAndCount:
     assert "fwl_counter_table:" in src
     assert "0\ta" in src
     assert "1\tb" in src
+
+  def test_counter_table_rows_match_the_readers_format(self):
+    """The table is a wire format, not a comment.
+
+    Two readers parse it: `hw::counter` in the hardware harness and
+    `f::ParseCounterTable` in the daemon, which is what makes
+    `show counters` able to say `lan_total` instead of `slot 0`. Both
+    require the marker on its own line and each row as `//`, spaces,
+    the slot, a TAB, the name. A stylistic tidy-up here — spaces for
+    the tab, a colon, an aligned column — silently costs every counter
+    on the box its name, and the box still comes up.
+    """
+    src = emit(
+      "@xdp(eth0)\n"
+      "count a if pkt.proto == tcp\n"
+      "count b if pkt.proto == udp\n"
+    )
+    lines = src.splitlines()
+    marker = lines.index("// fwl_counter_table:")
+    rows = []
+    for line in lines[marker + 1:]:
+      m = re.fullmatch(r"//\s+(\d+)\t(\S+)", line)
+      if m is None:
+        break
+      rows.append((int(m.group(1)), m.group(2)))
+    assert rows == [(0, "a"), (1, "b")]
 
   def test_counter_slots_stable(self):
     src = emit(

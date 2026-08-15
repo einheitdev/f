@@ -1,0 +1,50 @@
+{# The four kinds of empty, kept apart on the page.
+
+   A zone whose counters could not be read still occupies a row, and
+   the row says which kind of empty it is — vanishing from the table is
+   how a firewall with unreadable counters comes to look like a
+   firewall with none. A slot that could not be read prints the word
+   `unreadable`, never `0`: "nothing hit this rule" and "nobody could
+   ask" are the two answers an operator must never see spelled the
+   same way. #}
+{% if not answered %}
+<div class="empty cell-bad">{{ unavailable }}</div>
+{% else if length(zones) == 0 %}
+<div class="empty">{{ empty_text }}</div>
+{% else %}
+<table class="data-table">
+  <thead>
+    <tr>
+      <th>zone</th>
+      <th>counter</th>
+      <th class="right">packets</th>
+    </tr>
+  </thead>
+  <tbody>
+{% for z in zones %}
+{% if z.has_rows %}
+{% for r in z.rows %}
+    <tr>
+      <td class="mono">{{ z.zone }}</td>
+      <td class="mono cell-info">{{ r.name }}</td>
+      <td class="right cell-{{ r.value_semantic }}">{{ r.value }}</td>
+    </tr>
+{% endfor %}
+{% else %}
+    <tr>
+      <td class="mono">{{ z.zone }}</td>
+      <td><span class="badge badge-{{ z.state_semantic }}">{{ z.state_word }}</span></td>
+      <td class="right cell-dim">-</td>
+    </tr>
+{% endif %}
+{% endfor %}
+  </tbody>
+</table>
+{% if length(notes) > 0 %}
+<ul class="card-notes">
+{% for n in notes %}
+  <li class="cell-warn">{{ n }}</li>
+{% endfor %}
+</ul>
+{% endif %}
+{% endif %}

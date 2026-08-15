@@ -1,0 +1,33 @@
+<section class="card">
+  <h2 class="card-title">loaded policy</h2>
+  <div class="card-body">
+    <p class="cell-dim">What the daemon has loaded and attached, zone by zone — not the policy source on disk. A <span class="mono">.fw</span> file that was edited and never reloaded reads exactly like one that is live, so nothing on this page comes from a file.</p>
+    <div id="policy-table">
+      {% include "fw/policy_table" %}
+    </div>
+  </div>
+</section>
+
+<section class="card">
+  <h2 class="card-title">policy-wide</h2>
+  <div class="card-body">
+    <table class="data-table">
+      <tbody>
+{% for f in features %}
+        <tr>
+          <td>{{ f.label }}</td>
+          <td class="cell-{{ f.semantic }}">{{ f.value }}</td>
+        </tr>
+{% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section class="card card-warn">
+  <h2 class="card-title">the rules are not here, and this is why</h2>
+  <div class="card-body">
+    <p><strong>This page does not list the rules of the loaded policy, because the daemon cannot be asked for them.</strong> <span class="mono">fd</span> holds compiled BPF objects; the bundle manifest carries per-zone topology and no rule metadata, and the daemon has never seen the policy text. Anything a rule table here could show would have been re-derived from the files in the bundle directory — which is a claim about the disk, on a page whose whole claim is about the packet path.</p>
+    <p>The rules as WRITTEN are <span class="mono">einheit-f show policy [&lt;zone&gt;]</span>, which reads the source and says so in its own output. Closing the gap needs both halves: per-zone rule metadata emitted into <span class="mono">manifest.json</span> by the compiler and captured at load, and a control opcode to serve it.</p>
+  </div>
+</section>
