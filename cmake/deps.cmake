@@ -1,8 +1,20 @@
 include(FetchContent)
 
-# ----- spdlog (shared) -------------------------------------------------------
-set(SPDLOG_BUILD_SHARED ON CACHE BOOL "" FORCE)
-set(SPDLOG_BUILD_STATIC OFF CACHE BOOL "" FORCE)
+# ----- spdlog (static, deliberately) -----------------------------------------
+#
+# It was shared, and the shared object lived in the build tree. Nothing
+# installed it, because it is not a file anybody wrote — so `fd` on a
+# real box died with
+#
+#   error while loading shared libraries: libspdlog.so.1.16
+#
+# at exec, before a single line of its own logging. A FetchContent
+# dependency has no packaged home on the target: either it is linked
+# in, or the deployable set has to carry a versioned .so and keep it
+# in step with the binaries. Linking it in is the answer that cannot
+# drift.
+set(SPDLOG_BUILD_SHARED OFF CACHE BOOL "" FORCE)
+set(SPDLOG_BUILD_STATIC ON CACHE BOOL "" FORCE)
 set(SPDLOG_NO_EXCEPTIONS OFF CACHE BOOL "" FORCE)
 
 FetchContent_Declare(spdlog

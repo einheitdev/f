@@ -62,6 +62,11 @@ struct FLocalConfig {
   /// that plugging a board in and seeing it appear feels immediate,
   /// long enough not to spin on a file.
   std::chrono::milliseconds lease_poll{2000};
+  /// The installer, which owns the deployable set. `show install`
+  /// runs it rather than keeping a second list of what a box needs:
+  /// two enumerations that can disagree is the failure this command
+  /// exists to report.
+  std::string install_tool = "/usr/local/bin/f-install";
   /// f-confd's control socket. f-confd owns the commit-confirmed
   /// revert timer, which has to outlive the session that armed it —
   /// so applying the system configuration goes through it whenever it

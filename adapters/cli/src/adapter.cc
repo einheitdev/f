@@ -1756,6 +1756,77 @@ auto RenderShowStorage(const Response& resp, Renderer& renderer)
   }
 }
 
+/// What this box has of the deployable set.
+///
+/// Rows for the items that are not fine, and nothing for the ones
+/// that are — an operator running this wants the gap, not an
+/// inventory. The verdict is printed as a word rather than inferred
+/// from an empty table, because "everything is present" and "the
+/// verifier could not look" produce the same empty table and mean
+/// opposite things.
+auto RenderShowInstall(const Response& resp, Renderer& renderer)
+    -> void {
+  auto j = ParseData(resp);
+  auto& out = renderer.Out();
+  auto verdict = j.value("verdict", "");
+  auto items = j.value("items", json::array());
+
+  Table t;
+  AddColumn(t, "STATE", Align::Left, Priority::High);
+  AddColumn(t, "ITEM", Align::Left, Priority::High);
+  AddColumn(t, "WHERE", Align::Left, Priority::Medium);
+  AddColumn(t, "NEEDED BY", Align::Left, Priority::Medium);
+  int listed = 0;
+  for (const auto& item : items) {
+    auto state = item.value("state", "");
+    if (state == "present") continue;
+    ++listed;
+    Semantic sem = Semantic::Warn;
+    if (state == "missing" || state == "wrong-kind" ||
+        state == "empty" || state == "conflict" ||
+        state == "unusable") {
+      sem = item.value("requirement", "") == "required"
+                ? Semantic::Bad
+                : Semantic::Warn;
+    } else if (state == "not-checked") {
+      sem = Semantic::Dim;
+    }
+    auto needed = item.value("needed_by", "");
+    AddRow(t, {Cell{state, sem},
+               Cell{item.value("id", ""), Semantic::Emphasis},
+               Cell{item.value("dest", "")},
+               Cell{needed.empty() ? "-" : needed, Semantic::Dim}});
+  }
+  if (listed > 0) RenderFormatted(t, renderer);
+
+  // The sentence from the manifest, for the ones that actually stop
+  // something working. An id and a path do not tell an operator what
+  // it costs, and looking it up is a step nobody takes at 2 a.m.
+  for (const auto& item : items) {
+    auto state = item.value("state", "");
+    if (state != "missing" && state != "wrong-kind" &&
+        state != "empty" && state != "conflict" &&
+        state != "unusable") {
+      continue;
+    }
+    out << "\n" << item.value("id", "") << ": "
+        << item.value("why", "") << "\n";
+    auto detail = item.value("detail", "");
+    if (!detail.empty()) out << "  " << detail << "\n";
+    auto provided = item.value("provided_by", "");
+    if (!provided.empty()) out << "  install: " << provided << "\n";
+    auto when = item.value("required_when", "");
+    if (!when.empty()) out << "  required when: " << when << "\n";
+  }
+
+  if (listed == 0) {
+    out << "every item in the deployable set is present.\n";
+  }
+  out << "\nverdict: " << verdict << " (checked "
+      << j.value("root", "/") << ", scope "
+      << j.value("scope", "") << ")\n";
+}
+
 auto RenderCheckSystem(const Response& resp, Renderer& renderer)
     -> void {
   auto j = ParseData(resp);
@@ -1891,6 +1962,9 @@ class FwAdapter final : public cli::ProductAdapter {
         Show("storage", "show_storage",
              "Disk, compiled bundles, and whether log events are "
              "being dropped"),
+        Show("install", "show_install",
+             "What this box has of the deployable set, and what it "
+             "is missing"),
         Show("time", "show_time",
              "The clock, whether it is synchronised, and whether "
              "this board can keep time across a power cut"),
@@ -1962,6 +2036,8 @@ class FwAdapter final : public cli::ProductAdapter {
       RenderShowTime(response, renderer);
     } else if (wc == "show_storage") {
       RenderShowStorage(response, renderer);
+    } else if (wc == "show_install") {
+      RenderShowInstall(response, renderer);
     } else if (wc == "check_system") {
       RenderCheckSystem(response, renderer);
     } else if (wc == "apply_system" ||

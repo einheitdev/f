@@ -1,0 +1,541 @@
+# The deployable set.
+#
+# Every file that has to be on an f appliance for it to work, why it
+# has to be there, and what breaks when it is not. This file is the
+# authority: `f-install stage` puts these things on a box, and
+# `f-install verify` asks a box whether it has them. Nothing else
+# keeps a second list.
+#
+# It exists because there was no list. `build-aarch64/staging/` was a
+# directory somebody maintained by hand; it held `fd`, `fctl` and
+# `einheit-f-ui`, and it had never heard of `einheit-f`, `f-confd` or
+# `f-sysconf`. A box built from it started, logged nothing unusual,
+# and had no anti-lockout timer and no way to generate a networkd
+# unit. That is the failure this file is shaped against: the missing
+# piece must be named at install time, not discovered a week later as
+# a service that will not start.
+#
+#   f-install list              what the set is
+#   f-install verify            what this box has of it
+#   f-install stage --root DIR  put it somewhere
+#
+# Fields:
+#   id           stable name, used in reports and by firstboot
+#   group        for grouping output only
+#   kind         binary | file | tree | python-package | dir |
+#                external | mount | absent
+#   source       where it comes from (build dir for `binary`,
+#                repo root for everything else)
+#   dest         where it goes, absolute, {prefix} substituted
+#   mode         octal, for things we create
+#   requirement  required | optional
+#   required_when  what makes an optional item required
+#   needed_by    the unit or command that stops working without it
+#   why          one sentence an operator can act on
+
+version: 1
+
+# Everything under {prefix} moves together. The systemd unit files
+# name /usr/local/bin explicitly, so changing this means changing
+# them.
+prefix: /usr/local
+
+components:
+
+  # -- Binaries -------------------------------------------------------
+  # Sources are relative to the CMake build directory. Every target in
+  # CMakeLists.txt's `install(TARGETS ...)` line appears here or in
+  # `not_deployed` below; `deploy/tests/test_manifest_covers_build.py`
+  # fails the build if a new binary appears in neither.
+
+  - id: fd
+    group: binaries
+    kind: binary
+    source: fd
+    dest: "{prefix}/bin/fd"
+    mode: "0755"
+    requirement: required
+    needed_by: fd.service
+    why: >-
+      The datapath. Without it nothing is filtered and nothing is
+      forwarded between zones.
+
+  - id: fctl
+    group: binaries
+    kind: binary
+    source: fctl
+    dest: "{prefix}/bin/fctl"
+    mode: "0755"
+    requirement: required
+    needed_by: recovery
+    why: >-
+      Speaks to fd over the control socket without the CLI's session
+      layer, which is what you have left when einheit-f is the thing
+      that is broken. docs/recovery.md is written around it.
+
+  - id: f-sysconf
+    group: binaries
+    kind: binary
+    source: f-sysconf
+    dest: "{prefix}/bin/f-sysconf"
+    mode: "0755"
+    requirement: required
+    needed_by: apply system
+    why: >-
+      Turns /etc/f/system.yaml into networkd units, the dnsmasq and
+      chrony configs, the forwarding sysctl and the IPv6 stance. A box
+      without it has no way to make a configuration take effect.
+
+  - id: f-confd
+    group: binaries
+    kind: binary
+    source: f-confd
+    dest: "{prefix}/bin/f-confd"
+    mode: "0755"
+    requirement: required
+    needed_by: f-confd.service
+    why: >-
+      Owns the commit-confirmed revert timer, which is the only thing
+      standing between a wrong address and a box you cannot reach.
+      Without it `apply system confirmed` is refused outright.
+
+  - id: einheit-f
+    group: binaries
+    kind: binary
+    source: einheit-f
+    dest: "{prefix}/bin/einheit-f"
+    mode: "0755"
+    requirement: required
+    needed_by: operator login shell
+    why: >-
+      The operator's CLI, and the login shell of the `operator`
+      account on an image-built box. Missing, the account logs in to
+      nothing.
+
+  - id: einheit-f-ui
+    group: binaries
+    kind: binary
+    source: einheit-f-ui
+    dest: "{prefix}/bin/einheit-f-ui"
+    mode: "0755"
+    requirement: required
+    needed_by: einheit-f-ui.service
+    why: The web dashboard.
+
+  - id: f-api
+    group: binaries
+    kind: binary
+    source: f-api
+    dest: "{prefix}/bin/f-api"
+    mode: "0755"
+    requirement: optional
+    required_when: >-
+      you want the standalone REST server; einheit-f-ui serves the
+      same data and is what the shipped unit starts
+    needed_by: none
+    why: >-
+      Reads the pinned maps over HTTP without loading anything. Useful
+      for scraping, not needed for a working box.
+
+  # -- The compiler ---------------------------------------------------
+
+  - id: fwl
+    group: compiler
+    kind: python-package
+    source: fwl
+    dest: "{prefix}/bin/fwl"
+    requirement: required
+    needed_by: fd.service, commit
+    # `fwl version`, not `python3 -c "import fwl"`. Importing the
+    # package succeeds on a wheel that is missing grammar.lark;
+    # running the console script is what loads the grammar, which is
+    # the failure this check exists to catch.
+    verify_command: ["fwl", "version"]
+    why: >-
+      Every policy change goes through it. fd spawns it by the path in
+      /etc/f/fd.yaml (`watch.fwl`) to compile a bundle, and the CLI
+      runs `fwl check` before it will commit. A box without it can
+      run the policy it booted with and can never change it.
+
+  # -- The web UI's own files -----------------------------------------
+
+  - id: ui-templates
+    group: ui
+    kind: tree
+    source: ../ui/templates
+    dest: /usr/share/einheit-ui/templates
+    requirement: required
+    needed_by: einheit-f-ui.service
+    why: >-
+      The framework's layout and widgets. einheit-f-ui is built with
+      the build host's source directory baked in as a fallback search
+      path, so a box missing these renders empty pages rather than
+      failing to start — install them and the fallback never matters.
+
+  - id: ui-fw-templates
+    group: ui
+    kind: tree
+    source: adapters/ui/templates/fw
+    dest: /usr/share/einheit-ui/templates/fw
+    requirement: required
+    needed_by: einheit-f-ui.service
+    why: >-
+      The firewall adapter's own pages: dashboard, zones, NAT,
+      conntrack, counters, rules.
+
+  - id: ui-assets
+    group: ui
+    kind: tree
+    source: ../ui/assets
+    dest: /usr/share/einheit-ui/assets
+    requirement: required
+    needed_by: einheit-f-ui.service
+    why: CSS, htmx, icons and fonts the pages reference.
+
+  # -- systemd units --------------------------------------------------
+
+  - id: unit-fd
+    group: units
+    kind: file
+    source: deploy/systemd/fd.service
+    dest: /lib/systemd/system/fd.service
+    mode: "0644"
+    requirement: required
+    needed_by: fd.service
+    why: Starts the datapath and holds network.target until XDP is on.
+
+  - id: unit-f-confd
+    group: units
+    kind: file
+    source: deploy/systemd/f-confd.service
+    dest: /lib/systemd/system/f-confd.service
+    mode: "0644"
+    requirement: required
+    needed_by: f-confd.service
+    why: Starts the configuration daemon that owns the revert timer.
+
+  - id: unit-einheit-f-ui
+    group: units
+    kind: file
+    source: deploy/systemd/einheit-f-ui.service
+    dest: /lib/systemd/system/einheit-f-ui.service
+    mode: "0644"
+    requirement: required
+    needed_by: einheit-f-ui.service
+    why: Starts the dashboard on 443.
+
+  - id: unit-f-firstboot
+    group: units
+    kind: file
+    source: deploy/systemd/f-firstboot.service
+    dest: /lib/systemd/system/f-firstboot.service
+    mode: "0644"
+    requirement: required
+    needed_by: first boot
+    why: >-
+      Runs the provisioner once, before fd and the UI. It is what
+      turns a rootfs into a box.
+
+  - id: unit-f-dnsmasq
+    group: units
+    kind: file
+    source: deploy/systemd/f-dnsmasq.service
+    dest: /lib/systemd/system/f-dnsmasq.service
+    mode: "0644"
+    requirement: required
+    needed_by: f-dnsmasq.service
+    why: >-
+      DHCP and DNS for zones that ask for them. The unit asserts its
+      generated config exists, so it is safe to install unconditionally
+      and enable only when the model binds a service.
+
+  - id: unit-f-chrony
+    group: units
+    kind: file
+    source: deploy/systemd/f-chrony.service
+    dest: /lib/systemd/system/f-chrony.service
+    mode: "0644"
+    requirement: required
+    needed_by: f-chrony.service
+    why: >-
+      Time, on the same terms as f-dnsmasq: installed always, enabled
+      only when a zone binds ntp.
+
+  # -- Data and tooling that ships with them --------------------------
+
+  - id: manifest
+    group: data
+    kind: file
+    source: deploy/manifest.yaml
+    dest: "{prefix}/share/f/manifest.yaml"
+    mode: "0644"
+    requirement: required
+    needed_by: f-install
+    why: >-
+      This file. A box that cannot say what it should have cannot say
+      what it is missing.
+
+  - id: f-install
+    group: data
+    kind: file
+    source: deploy/f_install.py
+    dest: "{prefix}/bin/f-install"
+    mode: "0755"
+    requirement: required
+    needed_by: first boot, show install
+    why: >-
+      Reads the manifest and answers `verify`. firstboot runs it before
+      it provisions anything, and `einheit-f show install` runs it for
+      the operator.
+
+  - id: firstboot
+    group: data
+    kind: file
+    source: deploy/firstboot/firstboot.py
+    dest: "{prefix}/share/f/firstboot.py"
+    mode: "0755"
+    requirement: required
+    needed_by: f-firstboot.service
+    why: >-
+      Runs once per device and decides what a new box is: its zones,
+      its durable interface names, its services and its starting
+      policy.
+
+  - id: fd-yaml-default
+    group: data
+    kind: file
+    source: deploy/fd.yaml
+    dest: "{prefix}/share/f/fd.yaml"
+    mode: "0644"
+    requirement: required
+    needed_by: first boot
+    why: >-
+      The template firstboot copies to /etc/f/fd.yaml. Names the
+      control socket, the pin path and the fwl binary fd compiles with.
+
+  - id: system-yaml-example
+    group: data
+    kind: file
+    source: deploy/system.yaml.example
+    dest: "{prefix}/share/f/system.yaml.example"
+    mode: "0644"
+    requirement: required
+    needed_by: the operator
+    why: >-
+      The commented reference for /etc/f/system.yaml. The only place
+      the zone/interface/service shape is spelled out on the box.
+
+  - id: provision-example
+    group: data
+    kind: file
+    source: deploy/firstboot/f-provision.yaml.example
+    dest: "{prefix}/share/f/f-provision.yaml.example"
+    mode: "0644"
+    requirement: required
+    needed_by: the operator
+    why: >-
+      What to put on /boot/f-provision.yaml to have firstboot build
+      the box you wanted rather than the safe default one.
+
+  - id: networkd-examples
+    group: data
+    kind: tree
+    source: deploy/networkd
+    dest: "{prefix}/share/f/networkd"
+    requirement: optional
+    required_when: never
+    needed_by: none
+    why: >-
+      Reference only, and deliberately NOT installed into
+      /etc/systemd/network — see the `absent` entries below for what
+      happens when they are.
+
+  # -- Directories ----------------------------------------------------
+
+  - id: dir-etc-f
+    group: dirs
+    kind: dir
+    dest: /etc/f
+    mode: "0755"
+    requirement: required
+    needed_by: everything
+    why: system.yaml, fd.yaml and the policy sources live here.
+
+  - id: dir-etc-f-generated
+    group: dirs
+    kind: dir
+    dest: /etc/f/generated
+    mode: "0755"
+    requirement: required
+    needed_by: f-dnsmasq.service
+    why: >-
+      Where f-sysconf writes the derived service configs. The dnsmasq
+      unit asserts its config here and refuses to start without it.
+
+  - id: dir-compiled
+    group: dirs
+    kind: dir
+    dest: /usr/share/f/compiled
+    mode: "0755"
+    requirement: required
+    needed_by: fd.service
+    why: >-
+      Compiled bundles and the `current` symlink fd cold-boots from.
+
+  - id: dir-var-lib-f
+    group: dirs
+    kind: dir
+    dest: /var/lib/f
+    mode: "0755"
+    requirement: required
+    needed_by: f-confd.service, f-dnsmasq.service
+    why: >-
+      Configuration revisions, the confirm deadline that has to survive
+      a restart, the device journal and the DHCP leases.
+
+  - id: dir-var-log-f
+    group: dirs
+    kind: dir
+    dest: /var/log/f
+    mode: "0755"
+    requirement: required
+    needed_by: fd.service
+    why: fd's ReadWritePaths names it; it must exist before fd starts.
+
+  # -- Things we do not ship and cannot work without ------------------
+
+  - id: ext-python3
+    group: external
+    kind: external
+    dest: /usr/bin/python3
+    requirement: required
+    needed_by: fwl, firstboot
+    provided_by: python3 (>= 3.11)
+    why: The compiler and the provisioner are both Python.
+
+  - id: ext-clang
+    group: external
+    kind: external
+    dest: /usr/bin/clang
+    requirement: required
+    needed_by: fwl compile
+    provided_by: clang
+    why: >-
+      fwl emits BPF C and needs clang to turn it into the .bpf.o fd
+      loads. Without it a compile still "succeeds" and writes a bundle
+      with no objects in it.
+
+  - id: ext-networkctl
+    group: external
+    kind: external
+    dest: /usr/bin/networkctl
+    requirement: required
+    needed_by: apply system
+    provided_by: systemd (systemd-networkd)
+    why: >-
+      The generated .network and .link units are systemd-networkd's;
+      nothing else reads them.
+
+  - id: ext-dnsmasq
+    group: external
+    kind: external
+    dest: /usr/sbin/dnsmasq
+    requirement: optional
+    required_when: a dhcp or dns service is bound to a zone
+    needed_by: f-dnsmasq.service
+    provided_by: dnsmasq
+    why: >-
+      f generates its config and supervises it; it does not contain a
+      DHCP server.
+
+  - id: ext-chronyd
+    group: external
+    kind: external
+    dest: /usr/sbin/chronyd
+    requirement: optional
+    required_when: an ntp service is bound to a zone
+    needed_by: f-chrony.service
+    provided_by: chrony
+    why: >-
+      Same shape as dnsmasq. A board with no battery-backed RTC boots
+      at the epoch and stamps every log line 1970 until this runs.
+
+  - id: ext-bpftool
+    group: external
+    kind: external
+    dest: /usr/sbin/bpftool
+    requirement: optional
+    required_when: you want to read the pinned maps by hand
+    needed_by: none
+    provided_by: bpftool
+    why: Diagnostics only. Nothing on the box calls it.
+
+  - id: mount-bpffs
+    group: external
+    kind: mount
+    dest: /sys/fs/bpf
+    requirement: required
+    needed_by: fd.service
+    why: >-
+      fd pins its maps here and its unit has
+      ConditionPathIsMountPoint=/sys/fs/bpf, so a missing mount is a
+      unit that is skipped rather than one that fails — which reads as
+      "inactive" in systemctl and as nothing at all in the journal.
+
+# Things that must NOT be on the box. Each one was, or would be,
+# installed by an earlier version of the deployment and each one
+# produces a box that looks configured and is not.
+absent:
+
+  - id: stale-networkd-eth0
+    dest: /etc/systemd/network/10-eth0.network
+    installed_by: deploy/image/build-image.sh before this change
+    why: >-
+      systemd-networkd applies the first matching unit in lexical
+      order. `10-eth0.network` sorts before `10-f-eth0.network`, so
+      this file silently wins and the uplink is configured by a v0.1
+      example instead of by /etc/f/system.yaml. Nothing reports a
+      conflict; the address is simply not the one the model says.
+
+  - id: stale-networkd-lan
+    dest: /etc/systemd/network/20-lan.network
+    installed_by: deploy/image/build-image.sh before this change
+    why: >-
+      Matches `lan*`, so it claims every lan port at once. Same
+      failure as 10-eth0.network, multiplied by the number of ports.
+
+  - id: shadowed-unit-fd
+    dest: /etc/systemd/system/fd.service
+    installed_by: hand, before there was an installer
+    why: >-
+      A copy of our own unit in /etc/systemd/system outranks the one
+      in /lib/systemd/system for the rest of the box's life. An
+      upgrade that changes fd.service then changes nothing, and
+      `systemctl cat fd` is the only place the box says so.
+
+  - id: shadowed-unit-ui
+    dest: /etc/systemd/system/einheit-f-ui.service
+    installed_by: hand, before there was an installer
+    why: >-
+      Same shadow as fd.service, for the dashboard.
+
+  - id: shadowed-unit-dnsmasq
+    dest: /etc/systemd/system/f-dnsmasq.service
+    installed_by: hand, before there was an installer
+    why: >-
+      Same shadow as fd.service, for DHCP and DNS.
+
+  - id: stale-firstboot-sh
+    dest: "{prefix}/share/f/firstboot.sh"
+    installed_by: deploy/image/build-image.sh before this change
+    why: >-
+      The v0.1 provisioner. It writes `default allow` as the starting
+      policy, creates no zones and no system.yaml, never starts
+      f-confd or f-dnsmasq, and tells the operator to run
+      `einheit-f configure firewall`, which is not a command. Replaced
+      by firstboot.py.
+
+# Built by CMake and deliberately not part of the deployable set.
+# Listed so that the coverage test can tell "decided against" from
+# "forgotten".
+not_deployed: []

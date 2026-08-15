@@ -6,6 +6,7 @@ Two audiences, and they want opposite things. Somebody commissioning a box wants
 
 | If you are… | Read |
 |---|---|
+| putting the software on a board | [install.md](install.md) — image or bare Debian, to a box passing traffic |
 | putting a box on a bench for the first time | [first-hour.md](first-hour.md) — one path, box to a testnet that browses |
 | wondering *why* it is shaped like this | [concepts.md](concepts.md) — ports, interfaces, zones, services, and what the datapath does |
 | learning to write policy | [fwl/](fwl/README.md) — a progression from `allow`/`drop` to NAT and helpers |
@@ -33,17 +34,15 @@ The specifications are the reference, and stay the authority on meaning: [FWL_V0
 
 So a page is filled in when the thing it describes works, and not before. Two consequences you will notice:
 
-- There is no `install.md`. Installing this on a fresh board is not yet a thing you can do by following instructions — see [the gaps](#known-gaps) below — and writing the page before the install exists would be writing fiction.
+- [install.md](install.md) was deliberately unwritten until there was an install. Writing it found five more defects, each named on the page where it still shapes a step — a compiler that could not parse after being installed, a daemon that died at exec on a library from somebody's build tree, a dashboard that flapped sixty-seven times while reporting `activating`, an upgrade that stopped in the middle on `ETXTBSY`, and a provisioning run that severed the SSH session making it. Its one remaining unwalked section says so in place.
 - Where a how-to says "there is no command for this yet", that is not an omission. It is the finding.
 
 ## Known gaps
 
 Recorded here so they are not rediscovered. None of these is a documentation problem; each is a thing that has to be built before its page can honestly exist.
 
-- **No install or package step.** Nothing enumerates the deployable set. `build-aarch64/staging/` is hand-maintained and contains `fd`, `fctl` and `einheit-f-ui` — it is missing `einheit-f`, `f-confd` and `f-sysconf` entirely.
-- **`deploy/README.md` tells you to `chown fd:fd`.** There is no `fd` user and the unit runs as root, so those commands fail.
-- **`deploy/firstboot/firstboot.sh` is v0.1-era.** No zones, no `system.yaml`, no `f-confd`, no `f-dnsmasq`; it writes `default allow` as the starting policy and calls `einheit-f configure firewall`, which does not exist. This is the least-tested code that matters most: it runs once per device and defines what a new box is.
+- **The image build is unwalked.** `deploy/image/build_image.py` reads the same manifest as everything else and pre-flights and verifies around the debootstrap, but there is no aarch64 board on this bench, so its chroot steps have never been run. [install.md](install.md#building-an-image) says so in place.
 - **`einheit-f --help` lists no commands** — only global options. The command list exists only inside the interactive shell (`help`). See [reference/cli.md](reference/cli.md#gaps-in-the-command-surface).
-- **No verb creates a zone, moves an interface into one, or edits a policy file's contents.** `system.yaml` and `.fw` files are edited with an editor. `edit` opens one; nothing composes one.
+- **No verb creates a zone, moves an interface into one, or edits a policy file's contents.** `system.yaml` and `.fw` files are edited with an editor. `edit` opens one; nothing composes one. This is what makes firstboot load-bearing rather than convenient: it is the only thing on the box that *writes* a zone or a policy, and everything the operator does afterwards is editing what it produced.
 - **`log` has no sampling and no message.** `log` writes a fixed record to a ring buffer. `log(msg, sampled=N)` is named in the v0.1 spec as deferred and is still deferred.
 - **The FWL v0.4 spec has no §6.5/§6.6.** Multi-def helpers and the pipeline splitter are implemented and tested (`fwl/tests/unit/test_multidef.py`, `test_pipeline.py`) but the spec sections they are numbered after do not exist in this branch.

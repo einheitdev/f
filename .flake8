@@ -2,3 +2,7 @@
 indent-size = 2
 max-line-length = 80
 exclude = build,build-debug,build-aarch64,.git,fwl
+# The house Python style is one blank line between top-level
+# definitions, not PEP 8's two. Files written to the older convention
+# still pass — this only stops flake8 objecting to the newer one.
+extend-ignore = E301,E302,E305

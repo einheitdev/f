@@ -338,6 +338,15 @@ target_compile_definitions(einheit-f-ui PRIVATE
 
 # ============================================================================
 # Install rules
+#
+# `deploy/manifest.yaml` is the authority on what a box needs; these
+# rules are the convenience path for a native build on a development
+# machine, and `deploy/tests/test_manifest_covers_build.py` fails if the
+# two ever disagree about which binaries ship. For a cross build or a
+# real appliance, use the manifest:
+#
+#   deploy/f_install.py stage --build-dir build-aarch64 --root <rootfs>
+#   deploy/f_install.py verify
 # ============================================================================
 install(TARGETS fd fctl f-sysconf f-confd einheit-f einheit-f-ui f-api
   RUNTIME DESTINATION bin
@@ -357,12 +366,26 @@ install(FILES
 install(FILES deploy/system.yaml.example
   DESTINATION share/f
 )
+install(FILES deploy/firstboot/f-provision.yaml.example
+  DESTINATION share/f
+)
+# Reference only. Deliberately NOT installed into /etc/systemd/network:
+# `10-eth0.network` sorts before the model's own `10-f-eth0.network` and
+# would silently win, configuring the uplink from a v0.1 example instead
+# of from /etc/f/system.yaml.
 install(FILES
   deploy/networkd/10-eth0.network
   deploy/networkd/20-lan.network
   DESTINATION share/f/networkd
 )
-install(PROGRAMS deploy/firstboot/firstboot.sh
+install(FILES deploy/manifest.yaml
+  DESTINATION share/f
+)
+install(PROGRAMS deploy/f_install.py
+  DESTINATION bin
+  RENAME f-install
+)
+install(PROGRAMS deploy/firstboot/firstboot.py
   DESTINATION share/f
 )
 

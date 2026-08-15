@@ -2,7 +2,7 @@
 
 One path from a box on a bench to a testnet that gets addresses and reaches the internet. No alternatives and no options: if you need this page you cannot yet make those choices, and the point is to reach something working that you can then take apart.
 
-This assumes the software is already on the box. Getting it there is not yet a documented path — see [the known gaps](README.md#known-gaps).
+This assumes the software is already on the box and provisioned. Getting it there is [install.md](install.md); if firstboot ran with a provisioning file, most of what follows has already happened and this page is how to check it and take it apart.
 
 Two ports, and this page calls them what they are for the rest of their lives:
 

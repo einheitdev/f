@@ -596,6 +596,9 @@ class FLocalTransport final
     if (req.command == "show_storage") {
       return HandleShowStorage(req);
     }
+    if (req.command == "show_install") {
+      return HandleShowInstall(req);
+    }
     if (req.command == "show_services") {
       return HandleShowServices(req);
     }
@@ -1932,6 +1935,48 @@ class FLocalTransport final
         {"detail", r.detail},
         {"banner", sc::StorageWarningBanner(r)},
     });
+  }
+
+  /// What this box has of the deployable set.
+  ///
+  /// The answer comes from `f-install verify`, not from a list kept
+  /// here. A second enumeration of what an appliance needs would be a
+  /// second thing to forget `f-confd` in, which is how the deployable
+  /// set came to be missing three binaries in the first place.
+  ///
+  /// A verifier that is not installed is itself a finding, and it is
+  /// reported as one rather than as an empty, healthy-looking table.
+  auto HandleShowInstall(const proto::Request& req)
+      -> proto::Response {
+    if (!std::filesystem::exists(cfg_.install_tool)) {
+      return MakeErr(
+          req.id, "no_installer",
+          std::format(
+              "{} is not installed, so this box cannot say what else "
+              "it is missing", cfg_.install_tool),
+          "it is part of the deployable set itself; reinstall from "
+          "the build with `f-install install --build-dir <dir>`");
+    }
+    auto [rc, out] = RunSubprocess(
+        {cfg_.install_tool, "verify", "--format", "json"});
+    if (rc < 0) {
+      return MakeErr(req.id, "installer_failed",
+                     std::format("could not run {}: {}",
+                                 cfg_.install_tool, out));
+    }
+    json parsed;
+    try {
+      parsed = json::parse(out);
+    } catch (const std::exception&) {
+      return MakeErr(
+          req.id, "installer_failed",
+          std::format("{} produced no report (exit {}): {}",
+                      cfg_.install_tool, rc, out));
+    }
+    // The exit code is the machine-readable verdict; carry it so the
+    // renderer never has to re-derive one from the rows.
+    parsed["exit_code"] = rc;
+    return MakeOk(req.id, parsed);
   }
 
   auto HandleShowServices(const proto::Request& req)
