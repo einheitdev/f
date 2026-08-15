@@ -1579,12 +1579,22 @@ static __always_inline int fwl_route_l2(struct xdp_md *ctx,
       return XDP_DROP;
     }
     // The route is known and the next hop's MAC is not. XDP cannot
-    // resolve it; the stack can, so hand the frame over and let it send
-    // the ARP. Counted because for a SOURCE-TRANSLATED frame the stack
-    // will discard it (its source is one of our own addresses, which
-    // fib_validate_source rejects as martian) — the resolution happens,
-    // this packet does not survive it, and the counter is the only
-    // trace.
+    // resolve it, so the frame goes to the stack, which is the only
+    // thing here that can — and on a SOURCE-TRANSLATED frame it does
+    // not: the source is one of our own addresses, fib_validate_source
+    // throws it out as a martian BEFORE anything asks for a neighbour,
+    // and no ARP is sent. So this is a DROP that nothing retries into
+    // a success. Every frame after it meets the same empty table, and
+    // the counter is the only trace.
+    //
+    // Measured under qemu on 2026-08-15, twice, on a box that had just
+    // rebooted: 7 forwarded frames spanning a TCP client's entire retry
+    // window all counted here, `routed` stayed 0, nothing reached the
+    // far side's wire, and afterwards the box's neighbour table STILL
+    // held no entry of any state for that next hop. One ping from the
+    // box's own stack and the identical flow crossed. A box in this
+    // state reads healthy everywhere else, which is why fd escalates
+    // the report when routed is 0 (src/route_mgr.cc, adapter.cc).
     if (rc == BPF_FIB_LKUP_RET_NO_NEIGH) {
       fwl_route_stat(FWL_ROUTE_STAT_NO_NEIGH);
       return XDP_PASS;

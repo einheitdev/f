@@ -382,9 +382,28 @@ auto RenderShowStatus(const Response& resp,
     }
     auto no_neigh = rt.value("no_neigh", uint64_t{0});
     if (no_neigh > 0) {
+      // A warning while traffic is crossing, and the DIAGNOSIS when
+      // none is. A reboot empties the neighbour table, and a
+      // masquerading box cannot refill it from forwarded traffic: the
+      // frame it hands to the stack carries one of our own addresses
+      // as its source, which is rejected as a martian before anything
+      // would ask for a neighbour. So nothing crosses until this
+      // box's own stack talks to the next hop — while `forwarding`
+      // says on, both zones are attached, and the `forwards` row
+      // above is hidden exactly BECAUSE routed and bridged are still
+      // 0. Measured under qemu on 2026-08-15: no_neigh 0 -> 7,
+      // routed 0, nothing on the far wire, and the same flow crossed
+      // immediately after a ping from the box. If the cure is not on
+      // this screen it is on no screen.
       row("route_no_neighbour",
-          std::format("{} (next hop not in the ARP table)", no_neigh),
-          Semantic::Warn);
+          routed == 0
+              ? std::format("{} DROPPED — this box has not resolved "
+                            "its next hop and nothing is crossing. "
+                            "Ping the next hop FROM this box.",
+                            no_neigh)
+              : std::format("{} lost (next hop not in the ARP table)",
+                            no_neigh),
+          routed == 0 ? Semantic::Bad : Semantic::Warn);
     }
     auto off_zone = rt.value("off_zone", uint64_t{0});
     if (off_zone > 0) {

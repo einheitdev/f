@@ -254,10 +254,20 @@ def wait_for_attach(timeout_s: float = 20.0) -> list[str]:
 def warm_neighbours(res: Result) -> None:
   """Resolve each host's MAC from the firewall's own stack.
 
-  XDP cannot ARP; the stack can, and on a live box it already has (the
-  router talks to its own gateway for DNS and NTP). Doing it here keeps
-  the measurement about forwarding rather than about ARP timing — the
-  cold-ARP gap is a separate, recorded finding.
+  XDP cannot ARP, and on a masquerading box neither can the traffic it
+  forwards: the frame handed to the stack carries one of the box's own
+  addresses as its source, so the kernel discards it as a martian
+  before it would ask for a neighbour, and no ARP is sent. Nothing
+  self-heals — a box whose neighbour table is empty forwards NOTHING
+  until its own stack talks to the next hop, which on a live box its
+  DNS and NTP traffic does within a minute or two of boot.
+
+  This does it deliberately, so that what follows measures forwarding
+  rather than whether that has happened yet. It is a warm-up and not a
+  workaround: `phase_reboot` in `deploy/image/operator_walk.py` probes
+  the COLD case on purpose and reads the tally either side of it,
+  because the gap itself is worth a measurement (2026-08-15: no_neigh
+  0 -> 7, routed 0, nothing on the far wire).
   """
   for dev, _, _, _, host_addr in LEGS:
     run(["ping", "-c1", "-W2", "-I", dev, host_addr])
