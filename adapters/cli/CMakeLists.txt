@@ -11,6 +11,7 @@ target_link_libraries(einheit_adapter_fw PUBLIC
   einheit_cli
   libf-sysconfig
   libf-lease
+  libf-policy
   # The candidate-key contract shared with f-confd: the CLI names the
   # revision, the daemon applies it.
   libf-confd

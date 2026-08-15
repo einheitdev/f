@@ -22,9 +22,24 @@ $ ip -o link
 
 Write down the two MAC addresses and which physical socket each one is. Label the case now; you will not remember in a month, and the label and the config are supposed to be the same string.
 
-## 2. Write the configuration
+## 2. Say what the box is
 
-Everything is one file, `/etc/f/system.yaml`. Start from `deploy/system.yaml.example`, which is the same shape with every option commented.
+Everything the box is lives in one file, `/etc/f/system.yaml`, and you can write the whole of it from the CLI. Each command edits that file in place and applies it; nothing is written anywhere else.
+
+```
+$ einheit-f set zone wan
+$ einheit-f set zone testnet
+$ einheit-f set interface zone enp1s0f0 wan
+$ einheit-f set interface zone enp1s0f1 testnet
+$ einheit-f set address enp1s0f0 dhcp
+$ einheit-f set address enp1s0f1 10.10.0.1/24
+$ einheit-f set dhcp testnet 10.10.0.100-10.10.0.200 12h
+$ einheit-f set dns testnet 9.9.9.9 1.1.1.1
+```
+
+`set interface zone` on a port the configuration has not seen before declares it *and pins it to the MAC the kernel reports for it*, which is why you wrote those down in step 1. The names above are the ones the ports have now; giving them the durable names this page uses — `wan0`, `lan0` — means editing the `interfaces:` keys, which is a rename and is covered in [reference/system-yaml.md](reference/system-yaml.md).
+
+What the commands wrote:
 
 ```yaml
 zones:
@@ -51,7 +66,11 @@ services:
       upstream: [9.9.9.9, 1.1.1.1]
 ```
 
-Read the `services` block again and notice what is not in it: no interface name, anywhere. Services bind to a zone, so "DHCP answers on the uplink" is not a configuration mistake you can make. See [concepts.md](concepts.md#zone-to-service-why-the-rogue-dhcp-leak-is-inexpressible).
+You can also write that file by hand — start from `deploy/system.yaml.example`, which is the same shape with every option commented — and the CLI will keep your comments and your ordering when it next edits it. The two are the same document, not two ways of configuring the box.
+
+Read the `services` block again and notice what is not in it: no interface name, anywhere. `set dhcp` takes a zone and has no argument for a port either. Services bind to a zone, so "DHCP answers on the uplink" is not a configuration mistake you can make — at the prompt or in the file. See [concepts.md](concepts.md#zone-to-service-why-the-rogue-dhcp-leak-is-inexpressible).
+
+**Two keys still need the editor**: `gateway:` on a static interface, and `address6:` on a zone that advertises IPv6. There is no verb for either yet, and [reference/cli.md](reference/cli.md#gaps-in-the-command-surface) says so.
 
 ## 3. Check it before you apply it
 
@@ -126,7 +145,7 @@ At this point the bench has addresses and can resolve names. It cannot yet reach
 
 ## 7. Give the bench a way out
 
-Write `/etc/f/testnet.fw`:
+The policy is a second document, `/etc/f/rules.fw`. Its shape — which zone gets which block, and in what order the statements go — is the thing worth understanding, so write it once:
 
 ```
 zone wan = [wan0]
@@ -160,7 +179,57 @@ The bench can now reach the internet, hidden behind the uplink address, and noth
 
 If you want to understand what you just pasted rather than only run it, that policy is the destination of [the FWL guide](fwl/README.md), and its steps build up to exactly this shape.
 
-## 8. Look at what is happening
+## 8. Change it without opening it again
+
+From here the policy is *evolved*, and the everyday changes have verbs. Look at it first — the numbers are what the removal verb takes, and they restart in each block:
+
+```
+$ einheit-f show policy wan
+zone wan  (/etc/f/rules.fw)
+ # │ STATEMENT                                               │ MATCHES
+ 1 │ allow if conntrack(pkt).state in [established, related] │ when it matches
+ 2 │ default drop                                            │ every packet — stops here
+
+this is the policy source on disk; `show firewall` and `show zones` report what fd
+has loaded and attached
+```
+
+Read the `MATCHES` column. `default drop` acts on every packet that reaches it and stops there, so nothing written below it can ever match — which is why you do not choose where a new rule goes:
+
+```
+$ einheit-f set rule wan allow tcp 22
+ zone      │ wan
+ action    │ add rule
+ statement │ allow if pkt.proto == tcp and pkt.dst_port == 22
+ position  │ 2 in the block, line 12
+ before    │ default drop
+ why there │ that statement is unconditional — anything after it can never match
+ saved to  │ /etc/f/rules.fw
+ running   │ yes — fd reloaded
+```
+
+(On a console narrower than about a hundred columns the `MATCHES` column is dropped and the statement text kept. The warning is still there: an unconditional statement is highlighted in the `STATEMENT` column itself.)
+
+The policy was compiled before it was written and reloaded after: one that does not compile never replaces one that does, and if `fd` refuses the reload you are told the file changed and the running policy did not.
+
+Opening a port inwards is a pair of statements, and it is one command because getting them out of step is the classic way to leak untranslated frames into the bench:
+
+```
+$ einheit-f set forward wan tcp 80 10.10.0.20:8080
+```
+
+You did not name the inside zone. The model already knows which segment `10.10.0.20` is on.
+
+To take something back out, name the position:
+
+```
+$ einheit-f no rule wan 2
+$ einheit-f no forward wan tcp 80
+```
+
+`show policy` reads the file. `show firewall` and `show zones` read what `fd` has actually loaded and attached — different questions, and the reason they are different commands.
+
+## 9. Look at what is happening
 
 ```
 $ einheit-f show zones          # which ports are attached, and in what XDP mode

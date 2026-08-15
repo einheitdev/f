@@ -4,8 +4,19 @@ You have a bench segment with private addresses and an office uplink, and you wa
 
 ## What you need first
 
-- Both ports in `system.yaml`, in zones, applied, and `show system` reporting `PRESENT: yes` for both.
-- The bench interface with a static address; the uplink usually on DHCP.
+Both ports in zones, addressed, applied, and `show system` reporting `PRESENT: yes` for both. From nothing, that is:
+
+```
+$ einheit-f set zone wan
+$ einheit-f set zone lan
+$ einheit-f set interface zone wan0 wan
+$ einheit-f set interface zone lan0 lan
+$ einheit-f set address wan0 dhcp
+$ einheit-f set address lan0 10.10.0.1/24
+$ einheit-f show system
+```
+
+Each of those edits `/etc/f/system.yaml` and applies it. `set interface zone` on a port that is not declared yet declares it and pins it to the MAC the kernel reports, so the name survives a reboot that renumbers the bus.
 
 ## The policy
 
@@ -44,6 +55,8 @@ Load it:
 ```
 $ einheit-f reload firewall
 ```
+
+After that, the everyday changes have verbs — `einheit-f show policy lan` numbers the statements, `set rule` adds one where it can still match, `no rule` takes one out. See [reference/cli.md](../reference/cli.md#the-policy). The whole-file version above is what you write once, because the *ordering* below is the part that has to be deliberate.
 
 ## Check it worked
 

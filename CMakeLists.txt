@@ -151,6 +151,22 @@ target_link_libraries(libf-sysconfig PUBLIC
 )
 
 # ============================================================================
+# Policy source editing
+#
+# The shape of a `.fw` document — zone blocks and the statements in
+# them — and nothing about what a rule means. The compiler stays the
+# authority; this is what lets the CLI number a rule, remove one, and
+# put a new one where it can still match.
+# ============================================================================
+add_library(libf-policy STATIC
+  src/policy/edit.cc
+)
+
+target_include_directories(libf-policy PUBLIC
+  ${PROJECT_SOURCE_DIR}/include
+)
+
+# ============================================================================
 # Lease / device visibility
 #
 # Observed state, not configuration: what dnsmasq handed out, when each

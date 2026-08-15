@@ -17,6 +17,11 @@ foreach(test_source ${test_sources})
       libf-sysconfig
       GTest::gtest_main
     )
+  elseif(test_name MATCHES "^test_policy")
+    target_link_libraries(${test_name} PRIVATE
+      libf-policy
+      GTest::gtest_main
+    )
   elseif(test_name MATCHES "^test_lease")
     target_link_libraries(${test_name} PRIVATE
       libf-lease
