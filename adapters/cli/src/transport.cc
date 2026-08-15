@@ -43,6 +43,8 @@
 #include "f/lease/lease.h"
 #include "f/lease/view.h"
 #include "f/policy/edit.h"
+#include "f/rules.h"
+#include "f/sha256.h"
 #include "f/sysconfig/artifact.h"
 #include "f/sysconfig/chrony.h"
 #include "f/sysconfig/dnsmasq.h"
@@ -78,6 +80,12 @@ enum : uint8_t {
   // `unknown command` rather than hand back numbers keyed by match
   // tier that would render under FWL counter names.
   kGetFwlCounters = 12,
+  // The loaded policy's rules. 13, not 7: opcode 7 was `kGetRules`,
+  // and it paired counters with rules by iteration order while the
+  // datapath keyed them by match tier, so every number it showed was
+  // wrong and next to the wrong rule. An old daemon must answer this
+  // `unknown command` rather than a reply this CLI would misread.
+  kGetFwlRules = 13,
 };
 }  // namespace fd_cmd
 
@@ -1955,10 +1963,105 @@ class FLocalTransport final
     return j;
   }
 
+  /// What fd has LOADED, and whether the source on disk still is it.
+  ///
+  /// Two separate claims, kept separate. `loaded` is the packet path:
+  /// fd's rules were captured by the load that attached the programs,
+  /// from the manifest that named the objects, and nothing here reads
+  /// a bundle directory. `drift` is a claim about the DISK, made by
+  /// digesting the `.fw` files this CLI can see and weighing them
+  /// against the digest the loaded bundle carries.
+  ///
+  /// The drift answer is three-valued. "It matches", "it has been
+  /// edited", and "this box cannot tell" are different findings, and
+  /// a box that reported the third as the first would be reassuring
+  /// an operator about a comparison it never made.
+  auto LoadedPolicy(const std::vector<std::string>& sources) -> json {
+    json out;
+    auto reply = AskFd(fd_cmd::kGetFwlRules);
+    out["answered"] = reply.ok;
+    out["error"] = reply.ok ? "" : reply.error;
+    out["zones"] = json::array();
+    if (reply.ok) {
+      if (!reply.body.is_object() || !reply.body.contains("zones") ||
+          !reply.body["zones"].is_array()) {
+        out["answered"] = false;
+        out["error"] =
+            "fd answered the rule query with a payload carrying no "
+            "zones — this box's fd is not the one this CLI expects";
+      } else {
+        out["zones"] = reply.body["zones"];
+      }
+    }
+    auto loaded_src = out["answered"].get<bool>()
+                          ? ::f::PolicySourceFromJson(reply.body)
+                          : ::f::PolicySource{};
+    out["source_known"] = loaded_src.known;
+    out["source_name"] = loaded_src.name;
+    out["source_path"] = loaded_src.path;
+    out["source_sha256"] = loaded_src.sha256;
+
+    // Which file on disk to weigh against. The bundle records the
+    // path it was compiled from; when that is gone, the file of the
+    // same name among the sources this CLI is configured with. A
+    // comparison against some OTHER `.fw` in the directory would be a
+    // verdict about a file nobody asked about.
+    std::string disk_path;
+    if (loaded_src.known) {
+      if (!loaded_src.path.empty() &&
+          std::filesystem::is_regular_file(loaded_src.path)) {
+        disk_path = loaded_src.path;
+      } else {
+        for (const auto& s : sources) {
+          if (std::filesystem::path(s).filename().string() ==
+              loaded_src.name) {
+            disk_path = s;
+            break;
+          }
+        }
+      }
+    }
+    std::optional<std::string> disk_sha;
+    if (!disk_path.empty()) disk_sha = ::f::Sha256File(disk_path);
+    auto cmp = ::f::CompareSource(
+        loaded_src, disk_sha,
+        disk_path.empty() ? loaded_src.path : disk_path);
+    if (!out["answered"].get<bool>()) {
+      // fd could not be asked at all, so there is nothing to compare
+      // the file against. Saying "cannot tell" for fd's own reason is
+      // the honest verdict; saying "matches" would be worse than
+      // saying nothing.
+      cmp.verdict = ::f::SourceDrift::kCannotTell;
+      cmp.text = "cannot read the loaded policy from fd: " +
+                 out["error"].get<std::string>();
+    }
+    out["drift"] = std::string(::f::SourceDriftName(cmp.verdict));
+    out["drift_text"] = cmp.text;
+    out["compared_file"] = disk_path;
+    return out;
+  }
+
   auto HandleShowPolicy(const proto::Request& req)
       -> proto::Response {
     auto sources = ListFwFiles(cfg_.fw_source);
+    auto loaded = LoadedPolicy(sources);
     if (sources.empty()) {
+      // No source on disk is not the same as no policy. A box whose
+      // `.fw` was deleted goes on enforcing the bundle it loaded, and
+      // an error here would hide the rules it is running behind a
+      // complaint about a missing file.
+      if (loaded["answered"].get<bool>()) {
+        json j = {
+            {"blocks", json::array()},
+            {"source", cfg_.fw_source},
+            {"loaded", loaded},
+        };
+        j["caveat"] = std::format(
+            "no .fw source found at {} — the rules above are what fd "
+            "has LOADED; there is no file here to compare them with",
+            cfg_.fw_source);
+        return MakeOk(req.id, j);
+      }
       return MakeErr(req.id, "no_sources",
           std::format("no .fw source found at {}", cfg_.fw_source));
     }
@@ -1996,15 +2099,25 @@ class FLocalTransport final
     json j = {
         {"blocks", blocks},
         {"source", cfg_.fw_source},
+        // What is in the packet path, beside what is in the file. The
+        // caveat this used to carry — "the source is not necessarily
+        // the running policy, go and look somewhere else" — was the
+        // best answer available while the bundle carried no rule
+        // metadata. The comparison is now made rather than deferred.
+        {"loaded", loaded},
     };
-    // The source is not the running policy. `fd` loads a compiled
-    // bundle, and a cold start loads the last one compiled — so a
-    // file edited by hand and never reloaded reads exactly like one
-    // that is live. Naming the other command is cheaper than a
-    // comparison this side cannot make honestly.
-    j["caveat"] =
-        "this is the policy source on disk; `show firewall` and "
-        "`show zones` report what fd has loaded and attached";
+    if (!want.empty()) {
+      // A zone filter applies to both halves or the two tables are
+      // about different things.
+      json filtered = json::array();
+      for (const auto& z : loaded["zones"]) {
+        if (z.is_object() && z.value("zone", std::string{}) == want) {
+          filtered.push_back(z);
+        }
+      }
+      j["loaded"]["zones"] = filtered;
+      j["loaded"]["filtered_to"] = want;
+    }
     return MakeOk(req.id, j);
   }
 

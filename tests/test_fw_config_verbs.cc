@@ -347,8 +347,17 @@ TEST_F(ConfigVerbs, ShowPolicyNumbersTheStatements) {
   EXPECT_EQ(stmts[0].value("index", 0), 1);
   EXPECT_EQ(stmts[3].value("text", ""), "default drop");
   EXPECT_FALSE(stmts[3].value("guarded", true));
-  // The source is not the running policy, and the reply says so.
-  EXPECT_FALSE(j.value("caveat", "").empty());
+  // The reply used to carry a caveat saying the source is not
+  // necessarily the running policy and to go and look elsewhere. It
+  // makes the comparison now instead: fd's own answer, and a verdict
+  // on whether the file on disk is still the policy in the packet
+  // path. fd is not running in this fixture, so the verdict is
+  // `cannot_tell` — never `match`, which is the answer that would
+  // reassure an operator about a comparison nobody made.
+  ASSERT_TRUE(j.contains("loaded"));
+  EXPECT_FALSE(j["loaded"].value("answered", true));
+  EXPECT_EQ(j["loaded"].value("drift", ""), "cannot_tell");
+  EXPECT_FALSE(j["loaded"].value("drift_text", "").empty());
 }
 
 TEST_F(ConfigVerbs, SetRuleWritesThePolicyFile) {

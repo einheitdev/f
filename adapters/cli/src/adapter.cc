@@ -24,6 +24,7 @@
 #include "einheit/cli/schema.h"
 
 #include "f/counters.h"
+#include "f/rules.h"
 
 namespace einheit::adapters::fw {
 
@@ -2060,6 +2061,95 @@ auto RenderShowCommits(const Response& resp, Renderer& renderer)
 /// arrays printed one after another are not a document, and the
 /// position a row carries means nothing without the zone it counts
 /// within.
+/// What fd has LOADED, zone by zone, in policy order.
+///
+/// This table is the answer to "what is this box enforcing right now",
+/// and every row in it came off the box: the compiler wrote each rule
+/// into the bundle manifest, and the load that put the programs in the
+/// packet path captured them beside the objects. Nothing here reads a
+/// bundle directory.
+///
+/// There is no position column, deliberately. `no rule` numbers the
+/// SOURCE statements, which include the `count` and `log` lines the
+/// compiler folds away, so the two numberings are not the same — and a
+/// second column of positions beside the first is how somebody deletes
+/// a rule they were not looking at. Order is the meaning here; the
+/// numbers live in the source table below.
+auto RenderLoadedPolicy(const json& loaded, Renderer& renderer)
+    -> void {
+  auto& out = Prose(renderer);
+  out << "LOADED — what fd has in the packet path\n";
+  if (!loaded.value("answered", false)) {
+    out << std::format(
+        "  cannot read the loaded policy from fd: {}\n",
+        loaded.value("error", "?"));
+    return;
+  }
+  auto zones = loaded.value("zones", json::array());
+  if (zones.empty()) {
+    out << "  fd has no zone programs loaded — nothing of the policy "
+           "is in the packet path\n";
+    return;
+  }
+  for (const auto& z : zones) {
+    const auto avail = ::f::RuleAvailabilityFromName(
+        z.value("availability", std::string{}));
+    out << std::format("zone {}\n", z.value("zone", "?"));
+    auto rules = z.value("rules", json::array());
+    if (avail != ::f::RuleAvailability::kListed || rules.empty()) {
+      // A zone whose rules cannot be given still occupies its place,
+      // with its own word for why. A zone that vanished here would be
+      // how a box that cannot describe its policy comes to look like
+      // a box with no policy.
+      out << std::format("  ({})\n",
+                         ::f::RuleStateWord(avail));
+      auto detail = z.value("detail", std::string{});
+      if (!detail.empty()) out << std::format("  {}\n", detail);
+    } else {
+      Table t;
+      AddColumn(t, "ACTION", Align::Left, Priority::High);
+      AddColumn(t, "MATCH", Align::Left, Priority::High);
+      AddColumn(t, "LIMIT", Align::Left, Priority::Low);
+      for (const auto& r : rules) {
+        const bool terminal = r.value("terminal", false);
+        const bool guarded = r.value("guarded", false);
+        std::string match;
+        if (!guarded) {
+          match = ::f::UnguardedMatchWord(terminal);
+        } else if (!r.value("renderable", true)) {
+          // Never a blank, and never the empty string an unguarded
+          // rule shows: "this rule matches everything" and "this
+          // build cannot write down what this rule matches" are
+          // opposite claims about a firewall.
+          match = "(a guard this build cannot render)";
+        } else {
+          match = r.value("match", "");
+        }
+        AddRow(t, {
+            Cell{r.value("action", ""),
+                 terminal && !guarded ? Semantic::Warn
+                                      : Semantic::Default},
+            Cell{match, (!guarded && terminal) ? Semantic::Warn
+                        : guarded              ? Semantic::Default
+                                               : Semantic::Dim},
+            Cell{r.value("rate_limit", ""), Semantic::Dim},
+        });
+      }
+      RenderFormatted(t, renderer);
+    }
+    if (z.contains("default") && z["default"].is_object()) {
+      const auto& d = z["default"];
+      out << std::format(
+          "  default {}{}\n", d.value("action", "?"),
+          d.value("stated", false)
+              ? ""
+              : "  (no `default` line — the block falls through to "
+                "ALLOW)");
+    }
+    out << "\n";
+  }
+}
+
 auto RenderShowPolicy(const Response& resp, Renderer& renderer)
     -> void {
   auto j = ParseData(resp);
@@ -2068,14 +2158,33 @@ auto RenderShowPolicy(const Response& resp, Renderer& renderer)
   // headings and the caveat go to stderr, so `| jq` gets a document
   // and the operator still gets told.
   auto& out = Prose(renderer);
-  if (blocks.empty()) {
-    out << std::format(
-        "no @xdp block in the policy at {}\n",
-        j.value("source", "?"));
+  const bool machine_fmt =
+      renderer.Format() != cli::render::OutputFormat::Table;
+  if (!machine_fmt && j.contains("loaded")) {
+    RenderLoadedPolicy(j["loaded"], renderer);
+  }
+  // No source on disk is not no policy: the machine document still
+  // carries the loaded rows, and the reader still gets told the file
+  // is missing. Only the human view can stop here.
+  if (blocks.empty() && !machine_fmt) {
+    if (j.contains("caveat")) {
+      for (const auto& l :
+           Wrap(j["caveat"].get<std::string>(),
+                renderer.Caps().width)) {
+        out << l << "\n";
+      }
+    } else {
+      out << std::format(
+          "no @xdp block in the policy at {}\n",
+          j.value("source", "?"));
+    }
     return;
   }
-  const bool machine =
-      renderer.Format() != cli::render::OutputFormat::Table;
+  if (!machine_fmt) {
+    out << "SOURCE — the `.fw` files on disk; these are the positions "
+           "`no rule` takes\n";
+  }
+  const bool machine = machine_fmt;
 
   /// An unguarded `allow` / `drop` / `masquerade` / `redirect` acts
   /// on everything that reaches it, so nothing below it can match.
@@ -2102,21 +2211,77 @@ auto RenderShowPolicy(const Response& resp, Renderer& renderer)
   };
 
   if (machine) {
+    // ONE document, not two arrays printed one after another. Every
+    // row says which of the two claims it belongs to: `loaded` is the
+    // packet path as fd reports it, `source` is a statement in a file.
+    //
+    // A loaded row carries no POSITION, and that is the point. `no
+    // rule` numbers the SOURCE statements — the compiler folds some of
+    // them away and the default is not among them at all — so a
+    // position taken from a loaded row would delete a statement
+    // nobody was looking at. A blank cell is the only honest value.
     Table t;
+    AddColumn(t, "KIND", Align::Left, Priority::High);
     AddColumn(t, "ZONE", Align::Left, Priority::High);
     AddColumn(t, "#", Align::Right, Priority::High);
     AddColumn(t, "STATEMENT", Align::Left, Priority::High);
     AddColumn(t, "MATCHES", Align::Left, Priority::High);
     AddColumn(t, "FILE", Align::Left, Priority::Low);
+    auto row = [&](const std::string& kind, const std::string& zone,
+                   const std::string& pos, const std::string& stmt,
+                   const std::string& matches,
+                   const std::string& file) {
+      AddRow(t, {Cell{kind}, Cell{zone}, Cell{pos}, Cell{stmt},
+                 Cell{matches}, Cell{file}});
+    };
+    if (j.contains("loaded")) {
+      const auto& l = j["loaded"];
+      if (!l.value("answered", false)) {
+        row("loaded", "", "", "",
+            "cannot read the loaded policy from fd: " +
+                l.value("error", std::string("?")),
+            "");
+      }
+      for (const auto& z : l.value("zones", json::array())) {
+        const auto zone = z.value("zone", std::string{});
+        const auto avail = ::f::RuleAvailabilityFromName(
+            z.value("availability", std::string{}));
+        auto rules = z.value("rules", json::array());
+        if (avail != ::f::RuleAvailability::kListed || rules.empty()) {
+          row("loaded", zone, "",
+              std::format("({})", ::f::RuleStateWord(avail)),
+              z.value("detail", std::string{}), "");
+        }
+        for (const auto& r : rules) {
+          const bool guarded = r.value("guarded", false);
+          row("loaded", zone, "", r.value("text", ""),
+              guarded ? std::string("when it matches")
+                      : std::string(::f::UnguardedMatchWord(
+                            r.value("terminal", false))),
+              "");
+        }
+        if (z.contains("default") && z["default"].is_object()) {
+          const auto& d = z["default"];
+          row("loaded", zone, "",
+              std::format("default {}", d.value("action", "?")),
+              d.value("stated", false)
+                  ? "everything that reaches the end"
+                  : "everything that reaches the end (no `default` "
+                    "line — the block falls through)",
+              "");
+        }
+      }
+      // The verdict as a row, so a fleet check can read it without
+      // parsing prose. A drift nobody can grep for is a drift nobody
+      // finds.
+      row("drift", "", "", l.value("drift", "cannot_tell"),
+          l.value("drift_text", ""), l.value("compared_file", ""));
+    }
     for (const auto& b : blocks) {
       for (const auto& s : b.value("statements", json::array())) {
-        AddRow(t, {
-            Cell{b.value("zone", "")},
-            Cell{std::to_string(s.value("index", 0))},
-            Cell{s.value("text", "")},
-            Cell{matches_of(s)},
-            Cell{b.value("file", "")},
-        });
+        row("source", b.value("zone", ""),
+            std::to_string(s.value("index", 0)), s.value("text", ""),
+            matches_of(s), b.value("file", ""));
       }
     }
     RenderFormatted(t, renderer);
@@ -2152,6 +2317,19 @@ auto RenderShowPolicy(const Response& resp, Renderer& renderer)
          Wrap(j["caveat"].get<std::string>(),
               renderer.Caps().width)) {
       out << l << "\n";
+    }
+  }
+  // The verdict that joins the two tables. A box whose source and
+  // loaded policy have parted company is a box someone edited and
+  // never applied, and until this line existed nothing anywhere said
+  // so — the operator was told to compare two screens by eye.
+  if (j.contains("loaded")) {
+    const auto text = j["loaded"].value("drift_text", "");
+    if (!text.empty()) {
+      out << "\n";
+      for (const auto& l : Wrap(text, renderer.Caps().width)) {
+        out << l << "\n";
+      }
     }
   }
 }
@@ -2750,9 +2928,11 @@ class FwAdapter final : public cli::ProductAdapter {
     CommandSpec c;
     c.path = "show policy";
     c.wire_command = "show_policy";
-    c.help = "The policy source, block by block, numbered — the "
-             "numbers `no rule` takes. Marks the statements that act "
-             "on every packet, because nothing below one can match.";
+    c.help = "What fd has LOADED, zone by zone in policy order, and "
+             "the source on disk beside it — with a verdict on "
+             "whether the file is still the policy in the packet "
+             "path. The source positions are the numbers `no rule` "
+             "takes.";
     c.args = {{
         .name = "zone",
         .help = "Show one zone's block only",

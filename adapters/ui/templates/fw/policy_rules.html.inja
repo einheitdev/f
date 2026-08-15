@@ -1,0 +1,42 @@
+<div id="policy-rules">
+{% if not rules.answered %}
+<div class="empty cell-bad">{{ rules.unavailable }}</div>
+{% else if length(rules.zones) == 0 %}
+<div class="empty cell-bad">{{ rules.empty_text }}</div>
+{% else %}
+{% for z in rules.zones %}
+<div class="zone-rules">
+  <h3 class="mono">{{ z.zone }} <span class="badge badge-{{ z.state_semantic }}">{{ z.state_word }}</span></h3>
+{% if z.detail %}
+  <p class="cell-dim">{{ z.detail }}</p>
+{% endif %}
+{% if z.has_rows %}
+  <table class="data-table">
+    <thead>
+      <tr>
+        <th>action</th>
+        <th>match</th>
+        <th>limit</th>
+        <th>line</th>
+      </tr>
+    </thead>
+    <tbody>
+{% for r in z.rows %}
+      <tr>
+        <td class="mono">{{ r.action }}</td>
+        <td class="mono cell-{{ r.match_semantic }}">{{ r.match }}</td>
+        <td class="mono cell-dim">{{ r.rate_limit }}</td>
+        <td class="cell-dim">{{ r.line }}</td>
+      </tr>
+{% endfor %}
+    </tbody>
+  </table>
+{% endif %}
+{% if existsIn(z, "default") and z.default %}
+  <p class="cell-{{ z.default.semantic }}"><span class="mono">{{ z.default.text }}</span></p>
+{% endif %}
+</div>
+{% endfor %}
+<p class="cell-dim">{{ rules.source.text }}</p>
+{% endif %}
+</div>

@@ -148,7 +148,8 @@ TEST(RetiredOpcodes, TheLiveOnesStillAnswer) {
   // serves everything that was not part of the v0.1 surface.
   Engine e;
   for (auto live : {Cmd::kGetStatus, Cmd::kGetZones, Cmd::kGetNat,
-                    Cmd::kGetConntrack, Cmd::kGetFwlCounters}) {
+                    Cmd::kGetConntrack, Cmd::kGetFwlCounters,
+                    Cmd::kGetFwlRules}) {
     std::string req(1, static_cast<char>(live));
     auto reply = HandleControlRequest(e, req);
     auto j = json::parse(reply);
@@ -174,6 +175,55 @@ TEST(NamedCounters, AnswerTheAgreedShapeWithNoBundleLoaded) {
   EXPECT_TRUE(j["zones"].is_array());
   EXPECT_TRUE(j["zones"].empty());
   EXPECT_FALSE(j.contains("error"));
+}
+
+TEST(LoadedRules, AnswerTheAgreedShapeWithNoBundleLoaded) {
+  // Opcode 13 on a daemon holding no bundle: the agreed shape with no
+  // zones and a source that says it is unknown. Not an error the CLI
+  // would render as "fd is broken", and not a bare array it could not
+  // tell from a failure.
+  Engine e;
+  std::string req(1, static_cast<char>(Cmd::kGetFwlRules));
+  auto j = json::parse(HandleControlRequest(e, req));
+  ASSERT_TRUE(j.is_object()) << j.dump();
+  ASSERT_TRUE(j.contains("zones")) << j.dump();
+  EXPECT_TRUE(j["zones"].is_array());
+  EXPECT_TRUE(j["zones"].empty());
+  ASSERT_TRUE(j.contains("source")) << j.dump();
+  EXPECT_FALSE(j["source"].value("known", true));
+  EXPECT_FALSE(j.contains("error"));
+}
+
+TEST(LoadedRules, ComeFromTheHandlesRatherThanTheBundleDirectory) {
+  // The whole discipline in one assertion. The rules the daemon serves
+  // are the ones captured on the ZoneProgramHandle at load; no path is
+  // consulted here, so a bundle directory recompiled behind the
+  // daemon's back cannot change this answer.
+  Engine e;
+  ZoneProgramHandle zh;
+  zh.zone = "edge";
+  zh.rules.zone = "edge";
+  zh.rules.availability = RuleAvailability::kListed;
+  LoadedRule r;
+  r.action = "drop";
+  r.match = "pkt.dst_port == 22";
+  r.guarded = true;
+  r.terminal = true;
+  zh.rules.rules.push_back(r);
+  e.zone_bundle.programs.push_back(zh);
+  e.zone_bundle.policy_source.known = true;
+  e.zone_bundle.policy_source.name = "office.fw";
+  e.zone_bundle.policy_source.sha256 = std::string(64, 'a');
+
+  std::string req(1, static_cast<char>(Cmd::kGetFwlRules));
+  auto j = json::parse(HandleControlRequest(e, req));
+  ASSERT_EQ(j["zones"].size(), 1u) << j.dump();
+  EXPECT_EQ(j["zones"][0]["zone"], "edge");
+  EXPECT_EQ(j["zones"][0]["availability"], "listed");
+  ASSERT_EQ(j["zones"][0]["rules"].size(), 1u);
+  EXPECT_EQ(j["zones"][0]["rules"][0]["match"], "pkt.dst_port == 22");
+  EXPECT_TRUE(j["source"]["known"].get<bool>());
+  EXPECT_EQ(j["source"]["name"], "office.fw");
 }
 
 TEST(FullState, CarriesNoRulesOrSlowPathSection) {

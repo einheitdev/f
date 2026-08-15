@@ -24,10 +24,11 @@
   </div>
 </section>
 
-<section class="card card-warn">
-  <h2 class="card-title">the rules are not here, and this is why</h2>
+<section class="card">
+  <h2 class="card-title">rules — in policy order, per zone</h2>
   <div class="card-body">
-    <p><strong>This page does not list the rules of the loaded policy, because the daemon cannot be asked for them.</strong> <span class="mono">fd</span> holds compiled BPF objects; the bundle manifest carries per-zone topology and no rule metadata, and the daemon has never seen the policy text. Anything a rule table here could show would have been re-derived from the files in the bundle directory — which is a claim about the disk, on a page whose whole claim is about the packet path.</p>
-    <p>The rules as WRITTEN are <span class="mono">einheit-f show policy [&lt;zone&gt;]</span>, which reads the source and says so in its own output. Closing the gap needs both halves: per-zone rule metadata emitted into <span class="mono">manifest.json</span> by the compiler and captured at load, and a control opcode to serve it.</p>
+    <p class="cell-dim">The rules of the policy that is LOADED. The compiler wrote them into the bundle manifest and the load that put these programs in the packet path captured them beside the objects — so they belong to the policy that is running, not to whatever is in the bundle directory now. Nothing on this page reads a file.</p>
+    <p class="cell-dim">There is no position column and no hit count: the numbers <span class="mono">no rule</span> takes belong to the source statements, which are numbered differently, and pairing a rule with a counter by position is how the removed rule surface put every number beside the wrong rule. The counters a policy declares are on <a href="/counters">/counters</a>, under their own names.</p>
+    {% include "fw/policy_rules" %}
   </div>
 </section>

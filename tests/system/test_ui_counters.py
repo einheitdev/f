@@ -21,8 +21,8 @@ the pages are compared with each other rather than merely inspected:
      plausible on its own.
   3. with fd stopped, the page says so — it does not draw an empty
      table, and it does not say the policy declares no counters.
-  4. `/policy` reports what fd has LOADED, and says on the page itself
-     that the rules are not among what the daemon can be asked for.
+  4. `/policy` reports what fd has LOADED, rules included — the same
+     answer `einheit-f show policy` renders, over the same opcode.
   5. the dashboard's counters row is a measurement. The badge it
      replaced was an unconditional red `unavailable` that nothing on
      the box ever set.
@@ -463,7 +463,10 @@ def scenario_counts_on_the_page(fd_bin, ui_bin, fwl_root, work):
     uilog = open(ui.log, encoding="utf-8", errors="replace").read()
     check("every live fragment rendered and was sent",
           "live update" not in uilog,
-          [ln for ln in uilog.splitlines() if "live update" in ln])
+          # A list here crashed the reporter on the one path that
+          # matters — the failing one — so the detail is text.
+          "; ".join(ln for ln in uilog.splitlines()
+                    if "live update" in ln))
 
     dash = ui.get("/")
     check("the dashboard counters row is a measurement, not a badge",
@@ -636,12 +639,15 @@ def scenario_policy_page(fd_bin, ui_bin, fwl_root, work):
     check("a zone declaring no counters says so on the policy page",
           "no count statements" in zones.get("quiet", [""] * 7)[6],
           json.dumps(zones.get("quiet")))
-    check("the page states that it does not list rules",
-          "does not list the rules" in page)
-    check("...and names the verb that shows the source instead",
-          "show policy" in page)
-    check("the page does not claim to show rules",
-          "<th>rule" not in page.lower())
+    # The page used to state that fd could not be asked for the
+    # rules, which was true while the bundle carried none. It carries
+    # them now, so the sentence is gone and the rules are here — and
+    # the assertion moved with it, because a page still explaining a
+    # closed gap is a page describing a different box.
+    check("the gap sentence is gone now that the rules are served",
+          "does not list the rules" not in page)
+    check("the rules of the loaded policy are on the page",
+          "pkt.dst_port" in page, page[-800:])
     rows = {r[0]: r[1] for r in table_rows(page) if len(r) == 2}
     check("connection tracking is reported for this policy",
           "connection tracking" in rows, json.dumps(rows))

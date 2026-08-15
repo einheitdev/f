@@ -17,7 +17,7 @@ import click
 
 from . import (
   __version__, analyzer, ast, emitter, interpreter, log_abi, parser,
-  pkt, runner
+  pkt, rulemeta, runner
 )
 from .errors import FwlException
 
@@ -179,7 +179,8 @@ def compile(source: Path, output: Path | None, bundle_dir: Path | None,
     geoip_data = json.loads(geoip_file.read_text(encoding="utf-8"))
 
   if bundle_dir is not None:
-    _emit_bundle_dir(program, bundle_dir, geoip_data)
+    _emit_bundle_dir(program, bundle_dir, geoip_data,
+                     source=source, source_text=text)
     return
 
   # A multi-zone unit has more than one program; a single C file cannot
@@ -304,15 +305,22 @@ def _manifest_zones(program: ast.Program) -> list[dict]:
 
 
 def _emit_bundle_dir(program: ast.Program, bundle_dir: Path,
-                     geoip_data: dict | None = None) -> None:
+                     geoip_data: dict | None = None,
+                     source: Path | None = None,
+                     source_text: str | None = None) -> None:
   """Write a multi-zone bundle to `bundle_dir`.
 
   Emits each zone's `<zone>.bpf.c` and the shared header, compiles each
   C file to `<zone>.bpf.o` when clang is available, and writes a
   `manifest.json` describing the zones, per-zone objects, redirect
-  topology, and the bpffs-pinned shared maps the daemon must wire up.
-  With geoip() in the program, also writes `geoip.json` (resolved
-  prefix lists per trie) for the daemon to load.
+  topology, the per-zone RULES, and the bpffs-pinned shared maps the
+  daemon must wire up. With geoip() in the program, also writes
+  `geoip.json` (resolved prefix lists per trie) for the daemon to load.
+
+  `source`/`source_text` are the policy file this program was compiled
+  from. They are optional because tests and other callers build a
+  bundle straight from an AST; when they are absent the manifest says
+  the source is unknown rather than naming a file it did not read.
   """
   import json
   import subprocess
@@ -352,6 +360,12 @@ def _emit_bundle_dir(program: ast.Program, bundle_dir: Path,
       # only for zones that actually masquerade; a zone that merely
       # carries the shared de-NAT pass must not be treated as one.
       "masquerades": emitter._program_masquerades(zp, program.helpers),
+      # This zone's policy as an operator reads it: the rules in
+      # policy order, each with its action and its match. The loader
+      # captures it in the same call that opens the object, so a
+      # consumer never re-derives it from the bundle directory — the
+      # same rule the counter table follows, for the same reason.
+      "rules": rulemeta.zone_rules(zp),
     })
 
   # The TC clsact egress conntrack tracker (v0.4 § 6.9). One object for
@@ -402,6 +416,14 @@ def _emit_bundle_dir(program: ast.Program, bundle_dir: Path,
     # see LoadZoneBundle. A bundle compiled before this field existed
     # has no tracker, and fd says so rather than assuming one.
     "egress_tracker": egress_meta,
+    # The identity of the policy TEXT this bundle was compiled from,
+    # so a box can be asked whether the `.fw` on disk is still the one
+    # in the packet path. `null` when the caller built the bundle from
+    # an AST and there is no file to name — an unknown source is a
+    # state, not a reason to invent a digest.
+    "policy_source": (
+      rulemeta.source_identity(str(source), source_text)
+      if source is not None and source_text is not None else None),
   }
   (bundle_dir / "manifest.json").write_text(
     json.dumps(manifest, indent=2), encoding="utf-8"

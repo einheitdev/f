@@ -959,6 +959,12 @@ auto LoadZoneBundle(std::string_view bundle_dir,
   const bool manifest_states_masq = ManifestStatesMasquerade(bundle_dir);
 
   ZoneBundleHandles handles;
+  // The policy text this bundle was compiled from, taken from the
+  // manifest already parsed above rather than looked up later. It is
+  // the other half of the drift answer: the digest of what was
+  // compiled, against which a consumer weighs the digest of what is on
+  // disk now.
+  handles.policy_source = ParsePolicySource(manifest);
   auto bail = [&](BpfError code, std::string message)
       -> std::unexpected<Error<BpfError>> {
     for (const auto& [idx, old_fd] : flipped) {
@@ -1059,6 +1065,16 @@ auto LoadZoneBundle(std::string_view bundle_dir,
     zh.counters_fd = FindMap(obj, ("fwl_counters_" + zone).c_str());
     zh.counters = ReadCounterTable(
         dir / p.value("source", zone + ".bpf.c"));
+
+    // This zone's rules, from the manifest entry `p` that named the
+    // object two statements up — the same parse, the same call, the
+    // same bundle. Nothing reads the bundle directory again to answer
+    // "what rules is this box running": a reload between the load and
+    // the answer would otherwise hand an operator one policy's rules
+    // beside another policy's program, and the two are indistinguish-
+    // able on the screen. A bundle compiled before this metadata
+    // existed yields kNotEmitted — "cannot say", never "no rules".
+    zh.rules = ParseRuleTable(p, zone);
 
     // Capture the shared conntrack fd from whichever zone defines it.
     if (handles.conntrack_fd < 0) {

@@ -457,6 +457,176 @@ TEST(PolicyFeatures, ConntrackReportsWhatTheDaemonMeasured) {
             std::string::npos);
 }
 
+// -- the loaded policy's rules (opcode 13) ---------------------------
+
+/// fd's opcode-13 reply for one zone.
+auto RulesBody(const std::string& zone, const std::string& avail,
+               json rules, json def = nullptr,
+               const std::string& detail = "",
+               bool source_known = true) -> json {
+  json src = {{"known", source_known}};
+  if (source_known) {
+    src["name"] = "office.fw";
+    src["path"] = "/etc/f/office.fw";
+    src["sha256"] = std::string(64, 'a');
+    src["bytes"] = 42;
+  }
+  return {{"zones", json::array({json{
+               {"zone", zone},
+               {"availability", avail},
+               {"detail", detail},
+               {"rules", std::move(rules)},
+               {"default", std::move(def)},
+               {"stage_boundaries", json::array()}}})},
+          {"source", std::move(src)}};
+}
+
+auto RuleJson(const std::string& action, const std::string& match,
+              bool guarded, bool renderable = true) -> json {
+  return {{"log_rule_index", 0},   {"line", 5},
+          {"action", action},      {"match", match},
+          {"text", ""},            {"rate_limit", ""},
+          {"guarded", guarded},    {"terminal", true},
+          {"renderable", renderable}};
+}
+
+TEST(PolicyRulesViewTest, ADeadDaemonIsNotAPolicyWithNoRules) {
+  auto v = PolicyRulesView(Failed("fd is not running"));
+  EXPECT_FALSE(v["answered"].get<bool>());
+  EXPECT_NE(v["unavailable"].get<std::string>().find(
+                "fd is not running"),
+            std::string::npos);
+  EXPECT_TRUE(v["zones"].empty());
+}
+
+TEST(PolicyRulesViewTest, AnOldDaemonsUnknownCommandIsAVersionSkew) {
+  // fd predating opcode 13 answers `unknown command`, which AskDaemon
+  // turns into an error. A page must say so rather than draw a
+  // firewall with no rules in it.
+  auto v = PolicyRulesView(Failed("unknown command"));
+  EXPECT_FALSE(v["answered"].get<bool>());
+  EXPECT_NE(v["unavailable"].get<std::string>().find(
+                "unknown command"),
+            std::string::npos);
+}
+
+TEST(PolicyRulesViewTest, AWrongShapedReplyIsReportedNotRendered) {
+  auto v = PolicyRulesView(Ok(json::array()));
+  EXPECT_FALSE(v["answered"].get<bool>());
+  EXPECT_NE(v["unavailable"].get<std::string>().find("same build"),
+            std::string::npos);
+}
+
+TEST(PolicyRulesViewTest, RulesArriveInOrderWithTheirMatches) {
+  auto v = PolicyRulesView(Ok(RulesBody(
+      "edge", "listed",
+      json::array({RuleJson("drop", "pkt.dst_port == 22", true),
+                   RuleJson("allow", "", false)}))));
+  ASSERT_TRUE(v["answered"].get<bool>());
+  ASSERT_EQ(v["zones"].size(), 1u);
+  const auto& rows = v["zones"][0]["rows"];
+  ASSERT_EQ(rows.size(), 2u);
+  EXPECT_EQ(rows[0]["action"], "drop");
+  EXPECT_EQ(rows[0]["match"], "pkt.dst_port == 22");
+  // An unguarded action runs on every packet that reaches it. That is
+  // a word, not a blank cell.
+  EXPECT_EQ(rows[1]["match"], "every packet — stops here");
+  EXPECT_EQ(v["rule_count"], 2u);
+}
+
+TEST(PolicyRulesViewTest, AnUnguardedCountIsNotWarnedLikeAnUnguardedDrop) {
+  // A `count` with no guard runs on every packet and FALLS THROUGH.
+  // Marking it the way an unguarded `drop` is marked would put a red
+  // flag beside the one statement in the block that is harmless, and
+  // an operator who learns to ignore that column loses the flag that
+  // matters.
+  auto rule = RuleJson("count edge_seen", "", false);
+  rule["terminal"] = false;
+  auto v = PolicyRulesView(Ok(RulesBody(
+      "edge", "listed", json::array({rule}))));
+  const auto& row = v["zones"][0]["rows"][0];
+  EXPECT_EQ(row["match"], "every packet, falls through");
+  EXPECT_NE(row["match_semantic"], "warn");
+}
+
+TEST(PolicyRulesViewTest, AnUnrenderableGuardIsNotAnUnguardedRule) {
+  auto v = PolicyRulesView(Ok(RulesBody(
+      "edge", "listed",
+      json::array({RuleJson("drop", "", true, false)}))));
+  const auto& row = v["zones"][0]["rows"][0];
+  EXPECT_NE(row["match"], "every packet");
+  EXPECT_NE(row["match"].get<std::string>().find("cannot render"),
+            std::string::npos);
+}
+
+TEST(PolicyRulesViewTest, EveryZoneKeepsItsPlaceWhateverItsState) {
+  for (const auto* avail : {"listed", "none_declared",
+                            "function_form", "not_emitted",
+                            "something_new"}) {
+    auto v = PolicyRulesView(
+        Ok(RulesBody("edge", avail, json::array())));
+    ASSERT_EQ(v["zones"].size(), 1u) << avail;
+    EXPECT_EQ(v["zones"][0]["zone"], "edge") << avail;
+  }
+}
+
+TEST(PolicyRulesViewTest, TheFiveStatesGetFiveDifferentWords) {
+  std::vector<std::string> words;
+  for (const auto* avail : {"listed", "none_declared",
+                            "function_form", "not_emitted",
+                            "something_new"}) {
+    auto v = PolicyRulesView(
+        Ok(RulesBody("edge", avail, json::array())));
+    words.push_back(v["zones"][0]["state_word"].get<std::string>());
+  }
+  for (size_t i = 0; i < words.size(); ++i) {
+    for (size_t j = i + 1; j < words.size(); ++j) {
+      EXPECT_NE(words[i], words[j])
+          << "two rule states spell the same on the page";
+    }
+  }
+}
+
+TEST(PolicyRulesViewTest, ABundleWithNoRuleMetadataIsNotAnEmptyOne) {
+  auto old = PolicyRulesView(
+      Ok(RulesBody("edge", "not_emitted", json::array())));
+  auto empty = PolicyRulesView(
+      Ok(RulesBody("edge", "none_declared", json::array())));
+  EXPECT_NE(old["zones"][0]["state_word"],
+            empty["zones"][0]["state_word"]);
+  // And they are not both benign: a bundle nobody can read the rules
+  // of is a finding; a policy that is only a default action is not.
+  EXPECT_NE(old["zones"][0]["state_semantic"],
+            empty["zones"][0]["state_semantic"]);
+}
+
+TEST(PolicyRulesViewTest, AnUnstatedDefaultIsMarkedAsAFallThrough) {
+  auto v = PolicyRulesView(Ok(RulesBody(
+      "edge", "listed", json::array({RuleJson("drop", "x", true)}),
+      json{{"action", "allow"}, {"line", 0}, {"stated", false}})));
+  const auto& d = v["zones"][0]["default"];
+  ASSERT_FALSE(d.is_null());
+  EXPECT_NE(d["text"].get<std::string>().find("falls through"),
+            std::string::npos);
+  EXPECT_EQ(d["semantic"], "warn");
+}
+
+TEST(PolicyRulesViewTest, TheSourceIdentityIsCarriedOrSaidToBeAbsent) {
+  auto known = PolicyRulesView(
+      Ok(RulesBody("edge", "listed", json::array())));
+  EXPECT_TRUE(known["source"]["known"].get<bool>());
+  EXPECT_NE(known["source"]["text"].get<std::string>().find(
+                "office.fw"),
+            std::string::npos);
+
+  auto unknown = PolicyRulesView(Ok(RulesBody(
+      "edge", "listed", json::array(), nullptr, "", false)));
+  EXPECT_FALSE(unknown["source"]["known"].get<bool>());
+  EXPECT_NE(unknown["source"]["text"].get<std::string>().find(
+                "records no policy source"),
+            std::string::npos);
+}
+
 // -- the shared helpers the pages lean on ----------------------------
 
 TEST(UnavailableTextTest, AnErrorNeverReadsAsAnEmptyTable) {

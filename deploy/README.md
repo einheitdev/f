@@ -149,7 +149,7 @@ A broken symlink, a directory with no `manifest.json`, and a manifest naming no 
 ## Logs and metrics
 
 - `journalctl -u fd.service` — daemon log.
-- `einheit-f show counters` — a policy's `count` statements write into that zone's own `fwl_counters_<zone>` map, and this reads it, resolving each slot to the name the policy gave it from the `// fwl_counter_table:` block the compiler wrote into the zone's generated C. `sudo bpftool map dump pinned /sys/fs/bpf/f/fwl_counters_<zone>` is still the raw view; it gives slot numbers and no names. `show firewall rules` remains removed — it read a different, v0.1 map, and the bundle carries no per-zone rule metadata to replace it with.
+- `einheit-f show counters` — a policy's `count` statements write into that zone's own `fwl_counters_<zone>` map, and this reads it, resolving each slot to the name the policy gave it from the `// fwl_counter_table:` block the compiler wrote into the zone's generated C. `sudo bpftool map dump pinned /sys/fs/bpf/f/fwl_counters_<zone>` is still the raw view; it gives slot numbers and no names. `show firewall rules` remains removed — it read a different, v0.1 map. What replaced the question it was asked for is `einheit-f show policy`, which reports the rules `fd` has LOADED (opcode 13, captured at load beside the objects) beside the `.fw` on disk, and says whether the two still agree.
 - `__rate_limit_overflow` is a reserved counter that ticks when the per-CPU rate-limit map's bucket key space is exhausted (post-Phase-2 hardening). It is listed by `show counters` like any other. Watch this during soak; non-zero readings mean the operator should consider a larger `max_entries` or a different `per=` field.
 
 ## Soak procedure

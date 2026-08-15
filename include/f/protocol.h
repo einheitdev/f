@@ -40,6 +40,19 @@ enum class Cmd : uint8_t {
   /// `unknown command` and not be answered with counters keyed a way
   /// it does not expect.
   kGetFwlCounters = 12,
+  /// The loaded policy's RULES: every zone's rules in policy order,
+  /// with the action and the match the compiler wrote into the bundle
+  /// manifest, captured at load beside the object they were compiled
+  /// into — plus the identity of the policy text the bundle came from,
+  /// so a consumer can tell a live policy from an edited file.
+  ///
+  /// A NEW number again, for the reason 12 was: 7 was `kGetRules`, and
+  /// it paired counters with rules by iteration order while the
+  /// datapath keyed them by match tier, so every number it showed was
+  /// wrong and next to the wrong rule. An old `einheit-f` sending 7
+  /// must hear `unknown command`, not a reply in a shape it will
+  /// misread.
+  kGetFwlRules = 13,
 };
 
 }  // namespace f

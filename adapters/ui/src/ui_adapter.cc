@@ -23,7 +23,10 @@
 /// opcode 12; this page is a second consumer of the answer
 /// `einheit-f show counters` already reads. It opens nothing itself.
 /// `/policy` is the same rule applied to the policy: it reports what
-/// fd has LOADED, and states in place the one thing fd cannot answer.
+/// fd has LOADED — topology over opcode 9, declared counters over 12,
+/// and now the RULES over opcode 13, every one of them captured by the
+/// load that put the programs in the packet path. It still opens no
+/// file and no map.
 
 #include "adapters/fw/ui_adapter.h"
 
@@ -279,6 +282,16 @@ class FwUiAdapter final : public ui::ProductUiAdapter {
         .swap_target = "policy-table",
         .swap_strategy = "outerHTML",
     });
+    // The rules go live with the rest of the page. A reload replaces
+    // the policy in the packet path, and a rule table left showing the
+    // previous one is the same lie as a counter table that stopped
+    // updating.
+    events->Bind(ui::TopicBinding{
+        .topic = "fw.rules",
+        .fragment = "fw/policy_rules",
+        .swap_target = "policy-rules",
+        .swap_strategy = "outerHTML",
+    });
 
     // -- Dashboard --
     CROW_ROUTE(app, "/")
@@ -399,8 +412,14 @@ class FwUiAdapter final : public ui::ProductUiAdapter {
       auto counters =
           AskDaemon(cfg_.fd_socket, f::Cmd::kGetFwlCounters);
       auto status = AskDaemon(cfg_.fd_socket, f::Cmd::kGetStatus);
+      auto rules = AskDaemon(cfg_.fd_socket, f::Cmd::kGetFwlRules);
       json data = PolicyView(zones, counters);
       data["features"] = PolicyFeatures(status);
+      // The rules of the loaded policy (opcode 13), captured at load
+      // beside the objects. This page used to state in place that fd
+      // could not be asked for them; it can now, and it is asked here
+      // rather than by reading the bundle directory.
+      data["rules"] = PolicyRulesView(rules);
       ui::RenderArgs args;
       args.fragment = "fw/policy";
       args.layout = "layout";
@@ -594,6 +613,13 @@ class FwUiAdapter final : public ui::ProductUiAdapter {
             AskDaemon(cfg_.fd_socket, f::Cmd::kGetFwlCounters);
         Push(events, "fw.counters", CountersView(counters));
         Push(events, "fw.policy", PolicyView(zones, counters));
+        auto rules = AskDaemon(cfg_.fd_socket, f::Cmd::kGetFwlRules);
+        // Wrapped under `rules`, the same shape the /policy route
+        // gives the template. Published bare it rendered nothing and
+        // every tick logged a failed live update — which is exactly
+        // what that log line exists for.
+        Push(events, "fw.rules", json{{"rules",
+                                       PolicyRulesView(rules)}});
       }
     });
   }
