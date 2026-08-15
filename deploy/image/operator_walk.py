@@ -728,6 +728,9 @@ def build_parser():
   parser.add_argument("--rootfs", help="Staged rootfs to prepare from")
   parser.add_argument("--out", required=True, help="Working directory")
   parser.add_argument("--phases", default="all")
+  parser.add_argument("--keep-net", action="store_true",
+                      help="Leave the bench fabric up on exit, to "
+                           "poke at a failure by hand")
   return parser
 
 
@@ -779,6 +782,14 @@ def main(argv=None):
     dns.terminate()
     if proc is not None:
       vm.shutdown(proc, key)
+    # Take the fabric down too, which this did not and `firstboot_walk`
+    # always has. Six `fvm-*` links and two namespaces left on the
+    # operator's workstation are harmless — the bridges carry no host
+    # address, which is the whole point of them — and they are still
+    # debris on somebody else's machine, and the next run's `net_up`
+    # would have had to step over them.
+    if not args.keep_net:
+      vm.net_down()
     counts = walk.save()
     print(f"\n=== operator walk: {counts} ===")
     for entry in walk.frictions:
