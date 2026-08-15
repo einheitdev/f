@@ -909,8 +909,32 @@ struct ServiceSequence {
   std::size_t item_indent = 4;
 };
 
+/// Whatever sits after `key:` on the same line, comment stripped.
+///
+/// Empty for a header that opens a block. `{}`/`[]` for a key written
+/// as an empty flow collection, which is the case that mattered.
+auto InlineValue(const std::string& line) -> std::string {
+  auto colon = line.find(':');
+  if (colon == std::string::npos) return {};
+  std::string rest = line.substr(colon + 1);
+  // A `#` that starts a comment is preceded by whitespace or begins
+  // the remainder; one inside a value is not. Good enough here, where
+  // the values are `{}`, `[]` or nothing.
+  for (std::size_t i = 0; i < rest.size(); ++i) {
+    if (rest[i] != '#') continue;
+    if (i == 0 || rest[i - 1] == ' ' || rest[i - 1] == '\t') {
+      rest = rest.substr(0, i);
+      break;
+    }
+  }
+  auto first = rest.find_first_not_of(" \t\r");
+  if (first == std::string::npos) return {};
+  auto last = rest.find_last_not_of(" \t\r");
+  return rest.substr(first, last - first + 1);
+}
+
 auto OpenServiceSequence(Lines* lines, const std::string& kind)
-    -> ServiceSequence {
+    -> std::expected<ServiceSequence, std::string> {
   auto services = FindTopLevelKey(*lines, "services");
   if (services == std::string::npos) {
     if (!lines->empty() && !lines->back().empty()) {
@@ -919,7 +943,36 @@ auto OpenServiceSequence(Lines* lines, const std::string& kind)
     services = lines->size();
     lines->push_back("services:");
     lines->push_back(std::format("  {}:", kind));
-    return {lines->size(), lines->size(), 4};
+    return ServiceSequence{lines->size(), lines->size(), 4};
+  }
+  // `services: {}` is what firstboot writes on every box it
+  // provisions, and it is an empty FLOW mapping rather than a header
+  // over a block. Appending `  dhcp:` under it produces a file that
+  // is not YAML, so every service verb was refused on every factory
+  // box with `the edit would not parse ... end of map not found` —
+  // the guard working, and a message naming neither the cause nor
+  // anything to do about it. An EMPTY collection says exactly what an
+  // empty block says, so the marker is replaced and the comments
+  // above it, which are the reason the file is readable, stay put.
+  //
+  // Only `{}`, and not `[]`: an empty flow SEQUENCE is a different
+  // document, one the model refuses as SC102 ("services must be a map
+  // of service kind -> list") before any edit is attempted. Handling
+  // it here would be unreachable code that reads as cover.
+  const std::string inline_value = InlineValue((*lines)[services]);
+  if (inline_value == "{}") {
+    auto colon = (*lines)[services].find(':');
+    (*lines)[services] = (*lines)[services].substr(0, colon + 1);
+  } else if (!inline_value.empty()) {
+    // A non-empty inline collection is a document this editor would
+    // have to guess at, and guessing produces the same unparseable
+    // file with a different cause. Refuse, and name the shape.
+    return std::unexpected(std::format(
+        "`services:` is written inline ({}), and these commands edit "
+        "the file a line at a time. Rewrite it with one key per line "
+        "— `services:` on its own, each service indented under it — "
+        "and run this again.",
+        inline_value));
   }
   auto [sbegin, send] = BlockRange(*lines, services);
   auto key = FindChildKey(*lines, sbegin, send, kind);
@@ -933,7 +986,7 @@ auto OpenServiceSequence(Lines* lines, const std::string& kind)
     lines->insert(lines->begin() + static_cast<long>(send),
                   std::format("{}{}:", std::string(child_indent, ' '),
                               kind));
-    return {send + 1, send + 1, child_indent + 2};
+    return ServiceSequence{send + 1, send + 1, child_indent + 2};
   }
   auto [kbegin, kend] =
       KeyBlockRange(*lines, key, Indent((*lines)[key]), send);
@@ -941,7 +994,7 @@ auto OpenServiceSequence(Lines* lines, const std::string& kind)
   std::size_t item_indent =
       items.empty() ? Indent((*lines)[key]) + 2
                     : items.front().dash_indent;
-  return {kbegin, kend, item_indent};
+  return ServiceSequence{kbegin, kend, item_indent};
 }
 
 /// The item of a `services.<kind>` sequence whose `zone:` is `zone`.
@@ -1027,7 +1080,9 @@ auto SetDhcpServer(std::string_view document, const std::string& zone,
   }
 
   auto lines = SplitLines(document);
-  auto seq = OpenServiceSequence(&lines, "dhcp");
+  auto opened = OpenServiceSequence(&lines, "dhcp");
+  if (!opened) return std::unexpected(opened.error());
+  const auto& seq = *opened;
   auto existing = FindServiceItem(lines, seq, zone);
   const std::string range =
       std::format("{}-{}", range_start, range_end);
@@ -1118,7 +1173,9 @@ auto SetDnsForwarder(std::string_view document,
   const std::string upstream_line = std::format("[{}]", list);
 
   auto lines = SplitLines(document);
-  auto seq = OpenServiceSequence(&lines, "dns");
+  auto opened = OpenServiceSequence(&lines, "dns");
+  if (!opened) return std::unexpected(opened.error());
+  const auto& seq = *opened;
   auto existing = FindServiceItem(lines, seq, zone);
   if (existing) {
     if (upstreams.empty()) {

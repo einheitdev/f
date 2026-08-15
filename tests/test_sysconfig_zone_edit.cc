@@ -303,6 +303,119 @@ TEST(SysconfigServiceEdit, OpensTheServicesSectionWhenThereIsNone) {
   EXPECT_TRUE(parsed->ZoneServesDhcp("lan"));
 }
 
+/// The shape firstboot ACTUALLY writes, and it broke every service
+/// verb on every factory box.
+///
+/// `services: {}` is an empty FLOW mapping. `OpenServiceSequence`
+/// found the top-level key, found no child under it — correctly,
+/// there is no block — and appended `  dhcp:` on the next line, which
+/// produces
+///
+///     services: {}
+///       dhcp:
+///         - zone: lan
+///
+/// and that is not YAML. The command refused with `the edit would not
+/// parse (error[SC100]: 51:3: yaml parse: end of map not found) —
+/// nothing was changed`, which is the guard working and also a
+/// message that names neither the cause nor anything the operator
+/// can do. Measured on a booted image: a box that had just
+/// provisioned itself, split into zones through `set interface zone`,
+/// could not then be given a DHCP server or a resolver through the
+/// CLI at all. `OpensTheServicesSectionWhenThereIsNone` passed
+/// throughout, because it uses a document with no `services:` line —
+/// the one shape a factory box never has.
+TEST(SysconfigServiceEdit, OpensAnEmptyFlowServicesMap) {
+  const std::string doc =
+      "zones:\n"
+      "  lan:\n"
+      "interfaces:\n"
+      "  lan0:\n"
+      "    mac: \"52:54:00:aa:bb:02\"\n"
+      "    address: 10.10.0.1/24\n"
+      "    zone: lan\n"
+      "\n"
+      "# No service is bound to any zone.\n"
+      "services: {}\n";
+  auto out =
+      SetDhcpServer(doc, "lan", "10.10.0.100", "10.10.0.200", "12h");
+  ASSERT_TRUE(out.has_value()) << out.error();
+  auto parsed = ParseSystemConfigString(*out);
+  ASSERT_TRUE(parsed.has_value());
+  EXPECT_TRUE(parsed->ZoneServesDhcp("lan"));
+  // The comment above it is why the file is readable at 18:00 with a
+  // serial console in one hand.
+  EXPECT_NE(out->find("# No service is bound to any zone."),
+            std::string::npos);
+  // ...and the flow marker is gone rather than left beside a block
+  // that now says something different.
+  EXPECT_EQ(out->find("services: {}"), std::string::npos) << *out;
+}
+
+TEST(SysconfigServiceEdit, OpensAnEmptyFlowServicesMapForDns) {
+  // The same document and the other verb, because the two reach
+  // `OpenServiceSequence` by different callers and a fix in one is
+  // not a fix in the other.
+  const std::string doc =
+      "zones:\n"
+      "  lan:\n"
+      "interfaces:\n"
+      "  lan0:\n"
+      "    mac: \"52:54:00:aa:bb:02\"\n"
+      "    address: 10.10.0.1/24\n"
+      "    zone: lan\n"
+      "services: {}\n";
+  auto out = SetDnsForwarder(doc, "lan", {"10.10.2.2"});
+  ASSERT_TRUE(out.has_value()) << out.error();
+  auto parsed = ParseSystemConfigString(*out);
+  ASSERT_TRUE(parsed.has_value());
+  EXPECT_TRUE(parsed->ZoneServesDns("lan"));
+}
+
+/// An empty flow SEQUENCE looks like the same mistake and is not one:
+/// `services` must be a MAP, so `services: []` is a document the
+/// model refuses before any edit is attempted. Pinned so that nobody
+/// "fixes" it in `OpenServiceSequence`, where the code would be
+/// unreachable and would read as cover.
+TEST(SysconfigServiceEdit, AnEmptyFlowSequenceIsRefusedByTheModel) {
+  const std::string doc =
+      "zones:\n"
+      "  lan:\n"
+      "interfaces:\n"
+      "  lan0:\n"
+      "    mac: \"52:54:00:aa:bb:02\"\n"
+      "    address: 10.10.0.1/24\n"
+      "    zone: lan\n"
+      "services: []\n";
+  auto out =
+      SetDhcpServer(doc, "lan", "10.10.0.100", "10.10.0.200", "12h");
+  ASSERT_FALSE(out.has_value());
+  EXPECT_NE(out.error().find("SC102"), std::string::npos)
+      << out.error();
+}
+
+/// A NON-empty inline value is a document this editor cannot extend
+/// without guessing, and it must say so rather than produce the same
+/// unparseable file with a different cause.
+TEST(SysconfigServiceEdit, RefusesAServicesMapWrittenInline) {
+  const std::string doc =
+      "zones:\n"
+      "  lan:\n"
+      "interfaces:\n"
+      "  lan0:\n"
+      "    mac: \"52:54:00:aa:bb:02\"\n"
+      "    address: 10.10.0.1/24\n"
+      "    zone: lan\n"
+      "services: {dns: [{zone: lan}]}\n";
+  auto out =
+      SetDhcpServer(doc, "lan", "10.10.0.100", "10.10.0.200", "12h");
+  ASSERT_FALSE(out.has_value());
+  EXPECT_NE(out.error().find("services"), std::string::npos)
+      << out.error();
+  EXPECT_NE(out.error().find("one key per line"), std::string::npos)
+      << out.error();
+}
+
 TEST(SysconfigServiceEdit, ReRangesAnExistingServer) {
   auto out = SetDhcpServer(kDoc, "lan", "10.10.0.50", "10.10.0.60");
   ASSERT_TRUE(out.has_value()) << out.error();
