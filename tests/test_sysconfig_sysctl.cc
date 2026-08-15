@@ -122,7 +122,8 @@ TEST_F(SysctlTest, TheDropInIsADerivedArtifactLikeEveryOther) {
   // box passing no traffic WILL find this file and WILL try setting
   // it to 1. It tells them where the real answer is instead.
   EXPECT_NE(unit.content.find("BOOT-TIME FLOOR"), std::string::npos);
-  EXPECT_NE(unit.content.find("fctl status"), std::string::npos);
+  EXPECT_NE(unit.content.find("einheit-f show status"),
+            std::string::npos);
   // Nothing on disk yet, so the drift kind is kAbsent — not kNone,
   // which would say "identical to the model".
   EXPECT_EQ(CheckSysctlDrift(unit), DriftKind::kAbsent);

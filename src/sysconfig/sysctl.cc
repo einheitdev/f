@@ -59,9 +59,9 @@ auto PlanSysctl(const SystemConfig& cfg, const SysctlOptions& opts)
   o << "# and when it is stopping.\n";
   o << "#\n";
   o << "# So do NOT set this to 1 to 'fix' a box that is not passing\n";
-  o << "# traffic. It will be back at 0 within seconds and the reason\n";
-  o << "# is in `fctl status` under forwarding, and in the journal:\n";
-  o << "#   journalctl -u fd | grep forwarding\n";
+  o << "# traffic. fd put it where it is, and it says why:\n";
+  o << "#   einheit-f show status      (the `forwarding` row)\n";
+  o << "#   journalctl -u fd -g forwarding\n";
   o << "\n";
   for (const auto& [k, v] : PlanSysctlValues(cfg)) {
     o << k << " = " << v << "\n";

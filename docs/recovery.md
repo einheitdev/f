@@ -412,6 +412,47 @@ An ICMP error carries no ports, so it can never be `established` — including t
 
 ---
 
+## Nothing crosses the box, and `show zones` looks fine
+
+**Symptom.** The box answers, its addresses are up, `show zones` shows every port attached, and no traffic gets from one zone to another. A ping from the inside to the box works; a ping *through* it does not.
+
+**Read `forwarding` in `show status` first.** It is there in every state, and it is the only line that distinguishes the four:
+
+```
+$ einheit-f show status | grep -i forwarding
+ forwarding   OFF — this box is not routing (cold boot: NO interface is
+              running an f program, so nothing is being filtered)
+```
+
+**This box fails closed: it routes only while it is filtering.** `fd` owns `net.ipv4.ip_forward` — it lowers it on the way in, raises it once a compiled bundle is attached to at least one interface, and lowers it again when it stops, when an attach leaves nothing in the packet path, and when it is killed. The generated `/etc/sysctl.d/10-f-forwarding.conf` sets it to `0` and is only the boot-time floor.
+
+That is a deliberate reversal of an earlier decision, and knowing why saves you the wrong fix. A box whose bundle had been removed used to refuse to start `fd` — correctly and loudly — and go on routing anyway, unfiltered and un-NATed, because the sysctl had been written once at provisioning time and reapplied every boot. An unsolicited inbound connection the healthy box refused with zero frames on the inside wire completed end to end. **A box that does not forward is a fault you can see; a box that forwards unfiltered is one you cannot.**
+
+**So do not set the sysctl by hand.** What each row means:
+
+| `forwarding` says | What is true | What to do |
+|---|---|---|
+| `on (…datapath armed on N interface(s))` | Healthy. The problem is elsewhere — check `MODE` and `ATTACHED` in `show zones`, and `route_unreachable` / `route_no_neighbour` in `show status`. | — |
+| `OFF — this box is not routing (…)` | `fd` closed it, because nothing of yours is in the packet path. | Fix what the reason names. This is the fault; forwarding is the symptom. |
+| `OFF, and fd did not do it` | The datapath IS armed and something else set the knob to 0. `fd` reports this and deliberately does not override you. | `sysctl -w net.ipv4.ip_forward=1`, then find what set it — usually another drop-in in `/etc/sysctl.d/` sorting after f's own. |
+| `ON WITHOUT A DATAPATH` | Seen only in the seconds before `fd` closes it. | Nothing. If it persists, `fd` is not running at all. |
+
+`fctl status` answers the same question in raw JSON, under `route`: `ip_forward`, `forwarding_desired`, `forwarding_reason` and `forwarding_corrections`. A non-zero `forwarding_corrections` means something else on this box writes the knob too.
+
+**The journal carries every transition**, with the reason attached, which is the fastest way to see what happened while you were not looking:
+
+```
+$ journalctl -u fd -g forwarding
+fd[412]: forwarding: net.ipv4.ip_forward 0 -> 1 (cold boot: datapath
+         armed on 2 interface(s)).
+fd[412]: forwarding: net.ipv4.ip_forward 1 -> 0 (fd is stopping: XDP is
+         being detached from every port).
+```
+
+**Why `systemctl stop fd` stops traffic and `systemctl restart fd` does not.** The lowering happens *before* the XDP detach, so there is no window in which this box is a plain unfiltered router; a restart raises it again as soon as the new bundle is attached, which under normal load is a second or two. If you need the box to keep forwarding while you work on `fd`, you do not — that is the whole point.
+
+---
+
 ## Where the state lives
 
 | Path | What it is | Who writes it |
@@ -420,6 +461,7 @@ An ICMP error carries no ports, so it can never be `established` — including t
 | `/etc/f/generated/dnsmasq.conf` | Derived artifact. Digest-stamped; edits are reported as drift. | `apply system` |
 | `/etc/chrony/f-generated.conf` | Derived artifact. **Not** under `/etc/f/` — Debian's AppArmor profile confines chronyd to `/etc/chrony/`. | `apply system` |
 | `/etc/sysctl.d/10-f-ipv6.conf` | Derived artifact: the per-zone IPv6 stance. | `apply system` |
+| `/etc/sysctl.d/10-f-forwarding.conf` | Derived artifact, and only the **boot-time floor** (`ip_forward = 0`). The running value is `fd`'s. | `apply system` writes the file; `fd` writes the kernel |
 | `/etc/systemd/journald.conf.d/10-f.conf` | Derived artifact: the journal cap and the rate limiter. | `apply system` |
 | `/etc/systemd/network/10-f-*.link` | Derived artifact: hardware identity to durable name. Removed when its interface leaves the model. | `apply system` |
 | `/etc/systemd/network/10-f-*.network` | Derived artifact: addressing. | `apply system` |

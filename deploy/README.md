@@ -109,11 +109,13 @@ This reverses an earlier decision, and the measurement that reversed it is worth
 **So do not "fix" a box that is passing no traffic by setting the sysctl.** It will be back at 0 within seconds, and the reason is written down in two places:
 
 ```sh
-fctl status | grep forwarding      # the row, and why it reads what it reads
-journalctl -u fd | grep forwarding # every raise and every lower, with its reason
+einheit-f show status              # the `forwarding` row, and its reason
+journalctl -u fd -g forwarding     # every raise and lower, with its reason
 ```
 
-The `forwarding` row is rendered on every `fctl status`, in every state, and reads one of four ways:
+(`fctl status` answers too, and answers in raw JSON — `forwarding_desired`, `forwarding_reason`, `forwarding_corrections` under `route`. The rendered row is `einheit-f show status`.)
+
+The `forwarding` row is rendered on every `einheit-f show status`, in every state, and reads one of four ways:
 
 | Row | What it means | What to do |
 |-----|---------------|------------|
@@ -130,7 +132,7 @@ f-sysconf apply             # install it; touches no running knob
 f-sysconf status            # reports the live value as `owned-by-fd`
 ```
 
-**Recovery: "it stopped forwarding, now what".** Read the `forwarding` row first. If it says `OFF — this box is not routing`, the firewall is not in the packet path and that is the fault to chase; `fctl status` above the row says how many interfaces are attached, and `journalctl -u fd` says why the load or the attach failed. Restoring forwarding by hand fixes nothing and hides the fault: an armed box is one `systemctl restart fd` away, and an unarmed one must not forward.
+**Recovery: "it stopped forwarding, now what".** Read the `forwarding` row first ([recovery.md](../docs/recovery.md#nothing-crosses-the-box-and-show-zones-looks-fine) walks all four states). If it says `OFF — this box is not routing`, the firewall is not in the packet path and that is the fault to chase; `show zones` says which ports are attached, and `journalctl -u fd` says why the load or the attach failed. Restoring forwarding by hand fixes nothing and hides the fault: an armed box is one `systemctl restart fd` away, and an unarmed one must not forward.
 
 ## Capabilities
 

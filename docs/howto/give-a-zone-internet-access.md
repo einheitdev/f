@@ -87,4 +87,6 @@ The symptom is distinctive: stopping the firewall makes DHCP work instantly.
 
 ## If nothing crosses at all
 
-Check `show zones` for the `MODE` column. `generic` means the driver would not take a native XDP program and you are on the software slow path — correct, but slow. A port showing `(none)` under `ATTACHED` is not carrying the policy at all.
+Check `show status` for the `forwarding` row before anything else. This box **fails closed** — it routes only while it is filtering — so `OFF` there means nothing of yours is in the packet path, and that is the fault to chase rather than the sysctl. The row names its own reason, and [recovery.md](../recovery.md#nothing-crosses-the-box-and-show-zones-looks-fine) reads all four of them. Setting `net.ipv4.ip_forward` by hand fixes nothing: `fd` put it where it is.
+
+If forwarding is `on`, check `show zones` for the `MODE` column. `generic` means the driver would not take a native XDP program and you are on the software slow path — correct, but slow. A port showing `(none)` under `ATTACHED` is not carrying the policy at all.
