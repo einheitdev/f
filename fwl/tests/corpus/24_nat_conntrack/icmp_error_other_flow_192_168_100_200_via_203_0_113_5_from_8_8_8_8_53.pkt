@@ -1,0 +1,23 @@
+name: "icmp error other flow 192.168.100.200 via 203.0.113.5 from 8.8.8.8 53"
+source_fw: |
+  @xdp(lan)
+  masquerade if pkt.src_ip in [192.168.0.0/16]
+  allow if pkt.proto == tcp and pkt.tcp.syn
+  allow if conntrack(pkt).state in [established, related]
+  default drop
+state:
+  nat:
+    masq_ip: "203.0.113.5"
+sequence:
+  - name: outbound SYN — one flow open, on one port
+    builder: tcp(src_ip="192.168.100.200", dst_ip="8.8.8.8", src_port=51000, dst_port=53, syn=true)
+    expected:
+      bpf_action: allow
+      output_packet:
+        src_ip: "203.0.113.5"
+        dst_ip: "8.8.8.8"
+        src_port: 51000
+  - name: an error about a DIFFERENT flow, identical in every byte an outer-header reader can see — no entry, so drop
+    builder: icmperr(src_ip="192.0.2.1", dst_ip="203.0.113.5", type=3, code=4, mtu=1400, inner_proto="tcp", inner_src_ip="203.0.113.5", inner_dst_ip="8.8.8.8", inner_src_port=51001, inner_dst_port=53)
+    expected:
+      bpf_action: drop

@@ -30,6 +30,16 @@
 /// | SC027 | bad or out-of-subnet reservation                      |
 /// | SC028 | more than one DNS forwarder bound to one zone         |
 /// | SC029 | zone asks for IPv6 RAs but nothing can send them      |
+/// | SC030 | zone asks for full IPv6, which this build refuses     |
+/// | SC031 | zone asks for IPv6 RAs but has no prefix to advertise |
+/// | SC032 | IPv6 address on a port whose zone says v6 is off      |
+/// | SC040 | malformed NTP upstream                                |
+/// | SC041 | more than one NTP server bound to one zone            |
+/// | SC042 | NTP server in a zone that also holds a DHCP client    |
+/// | SC043 | NTP zone has no statically addressed interface        |
+/// | SC044 | (warning) nothing is configured to set the clock      |
+/// | SC045 | (warning) DNS rebind protection exempts no domain     |
+/// | SC046 | (warning) `rebind_ok` listed while protection is off  |
 
 #ifndef INCLUDE_F_SYSCONFIG_VALIDATE_H_
 #define INCLUDE_F_SYSCONFIG_VALIDATE_H_

@@ -1,0 +1,24 @@
+name: "dnat established 203.0.113.250 80 to 192.168.4.20 8080 sp51000"
+source_fw: |
+  @xdp(lan)
+  dnat to 192.168.4.20:8080 if pkt.proto == tcp and pkt.dst_port == 80
+  allow if pkt.proto == tcp and pkt.tcp.syn
+  allow if conntrack(pkt).state == established
+  default drop
+sequence:
+  - name: inbound SYN — DNAT'd to the backend and tracked
+    builder: tcp(src_ip="208.67.222.222", dst_ip="203.0.113.250", src_port=51000, dst_port=80, syn=true)
+    expected:
+      bpf_action: allow
+      output_packet:
+        src_ip: "208.67.222.222"
+        dst_ip: "192.168.4.20"
+        dst_port: 8080
+  - name: backend reply — ESTABLISHED, source restored to public
+    builder: tcp(src_ip="192.168.4.20", dst_ip="208.67.222.222", src_port=8080, dst_port=51000, ack=true)
+    expected:
+      bpf_action: allow
+      output_packet:
+        src_ip: "203.0.113.250"
+        dst_ip: "208.67.222.222"
+        src_port: 80

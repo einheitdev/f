@@ -2,3 +2,8 @@
 indent-size = 2
 max-line-length = 80
 exclude = build,build-debug,build-aarch64,.git,fwl
+# House style is ONE blank line between top-level definitions, not
+# PEP 8's two. E301/E302/E305 enforce the opposite. Files written
+# to either convention pass; this only stops flake8 objecting to
+# the one we actually keep.
+extend-ignore = E301,E302,E305

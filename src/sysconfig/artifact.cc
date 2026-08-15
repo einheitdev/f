@@ -85,6 +85,18 @@ auto CheckArtifactDrift(const std::string& path,
   return DriftKind::kNone;
 }
 
+auto ArtifactIsGenerated(const std::string& path) -> bool {
+  std::error_code ec;
+  if (!std::filesystem::exists(path, ec)) return false;
+  std::ifstream in(path);
+  if (!in) return false;
+  std::ostringstream ss;
+  ss << in.rdbuf();
+  std::string declared;
+  std::string body;
+  return SplitDigest(ss.str(), &declared, &body);
+}
+
 auto InstallArtifact(const std::string& path,
                      const std::string& content)
     -> std::expected<bool, std::string> {

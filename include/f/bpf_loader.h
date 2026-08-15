@@ -11,24 +11,14 @@
 #include <string_view>
 #include <vector>
 
+#include "f/bpf_error.h"
 #include "f/error.h"
+#include "f/tc_egress.h"
 
 // libbpf handle; opaque here so the header stays libbpf-free.
 struct bpf_object;
 
 namespace f {
-
-enum class BpfError : uint8_t {
-  kLoadFailed,
-  kAttachFailed,
-  kDetachFailed,
-  kPinFailed,
-  kUnpinFailed,
-  kMapUpdateFailed,
-  kMapLookupFailed,
-  kMapDeleteFailed,
-  kMapIterFailed,
-};
 
 /// File descriptors for all BPF maps and the program.
 struct BpfHandles {
@@ -120,6 +110,19 @@ struct ZoneBundleHandles {
   /// -1 when no zone program uses NAT. Read to report active
   /// translations (`show nat`).
   int nat_fd = -1;
+  /// The shared `fwl_nat_stats` per-CPU tally fd, or -1. Counts what
+  /// the datapath did with the table: mappings claimed, source ports
+  /// reallocated around a collision, and allocations REFUSED (a
+  /// refusal means the packet was dropped). Read by NatMgr for
+  /// `fctl status` and for the log line that fires when refusals move.
+  int nat_stats_fd = -1;
+  /// The shared `fwl_route_stats` per-CPU tally fd, or -1 when no zone
+  /// program can redirect. Says whether a forwarded frame was ROUTED
+  /// (next hop resolved through the zone the policy named, MACs
+  /// rewritten, TTL decremented) or BRIDGED (forwarded with the header
+  /// it arrived with). A masquerading gateway whose forwards are all
+  /// bridged is a black hole, and nothing on the wire says so.
+  int route_stats_fd = -1;
   /// The shared masquerade config map fd (`fwl_nat_cfg`), or -1 when no
   /// zone program masquerades. The loader seeds slot 0 with the
   /// masquerade source address so the XDP `masquerade` action rewrites
@@ -128,6 +131,12 @@ struct ZoneBundleHandles {
   /// The loaded bpf_object per zone; owned by this bundle and closed
   /// by CloseZoneBundle once the bundle is replaced or shut down.
   std::vector<::bpf_object*> objs;
+  /// The bundle's TC clsact egress conntrack tracker, attached to every
+  /// interface above. Empty (`Attached()` false) for a bundle whose
+  /// policy never reads conntrack, and for one compiled before the
+  /// tracker existed. See f/tc_egress.h for why the second attach point
+  /// exists and why it is at the qdisc layer.
+  EgressTracker egress;
 };
 
 /// Load every zone program in a `fwl compile --bundle` directory.
@@ -159,6 +168,15 @@ struct ZoneBundleHandles {
 /// generic (SKB) mode; some NICs have no native XDP at all — the
 /// RTL8125 (`r8169`) rejects a native attach outright — and there the
 /// program must run generic or not run.
+///
+/// A load that ends with ZERO interfaces attached is an error, always.
+/// Loading and attaching are different jobs, and a count of the first
+/// is not evidence about the second: the failure this rule exists to
+/// close reported "1 zone program(s)" — which was true — while every
+/// packet on the box flowed unfiltered. There is no bundle for which
+/// "attached to nothing" is a correct outcome, whatever the manifest
+/// said, so the caller never has to know why the interface list came
+/// out empty to know the firewall is not up.
 auto LoadZoneBundle(std::string_view bundle_dir,
                     std::string_view pin_root,
                     const ZoneBundleHandles* replace = nullptr)
@@ -239,6 +257,39 @@ auto DefaultPersistentMapNames() -> std::vector<std::string>;
 /// DefaultPersistentMapNames() when the manifest is missing the field.
 auto ReadPersistentMapNames(std::string_view bundle_dir)
     -> std::vector<std::string>;
+
+/// What a bundle asks the loader to attach, and where.
+///
+/// The manifest's `zones` array does not answer this on its own. A
+/// unit written in the simple form — `@xdp(eth0)` with no `zone`
+/// declaration, which FWL_V04_SPEC.md § 6.2 defines as "one implicit
+/// zone whose name is the @xdp argument" — declares no zones at all,
+/// so its `zones` array is `[]` while its `programs` array names
+/// `eth0`. Reading only the array yielded an empty interface list for
+/// that program, and the loader attached it to nothing and returned
+/// success.
+struct BundleAttachPlan {
+  /// Zone name -> the interface names belonging to it. Carries every
+  /// DECLARED zone, including one with no `@xdp` block of its own (it
+  /// is still a redirect destination, and its interfaces are what
+  /// fills the destination devmap), plus one implicit entry per `@xdp`
+  /// block whose zone is not declared — the simple form, where the
+  /// zone name IS the interface name.
+  std::map<std::string, std::vector<std::string>> zone_interfaces;
+  /// Zone programs for which the manifest names no interface at all.
+  /// This is a malformed bundle — a compiler/daemon contract
+  /// disagreement — and is a different thing from a host that is
+  /// missing a NIC the manifest did name.
+  std::vector<std::string> zones_without_interfaces;
+};
+
+/// Derive the attach plan from `<bundle_dir>/manifest.json`.
+///
+/// Exposed so the whole manifest-to-interfaces derivation is testable
+/// without bpffs, root, or a compiled object. An unreadable or
+/// unparseable manifest yields an empty plan; LoadZoneBundle reports
+/// those cases itself with the parse error attached.
+auto PlanBundleAttach(std::string_view bundle_dir) -> BundleAttachPlan;
 
 /// True when the bundle's manifest states, per program, which zones
 /// masquerade (the `masquerades` flag).

@@ -1,0 +1,24 @@
+name: "dnat established 198.51.100.255 80 to 10.0.0.7 443 sp65535"
+source_fw: |
+  @xdp(lan)
+  dnat to 10.0.0.7:443 if pkt.proto == tcp and pkt.dst_port == 80
+  allow if pkt.proto == tcp and pkt.tcp.syn
+  allow if conntrack(pkt).state == established
+  default drop
+sequence:
+  - name: inbound SYN — DNAT'd to the backend and tracked
+    builder: tcp(src_ip="1.1.1.1", dst_ip="198.51.100.255", src_port=65535, dst_port=80, syn=true)
+    expected:
+      bpf_action: allow
+      output_packet:
+        src_ip: "1.1.1.1"
+        dst_ip: "10.0.0.7"
+        dst_port: 443
+  - name: backend reply — ESTABLISHED, source restored to public
+    builder: tcp(src_ip="10.0.0.7", dst_ip="1.1.1.1", src_port=443, dst_port=65535, ack=true)
+    expected:
+      bpf_action: allow
+      output_packet:
+        src_ip: "198.51.100.255"
+        dst_ip: "1.1.1.1"
+        src_port: 80

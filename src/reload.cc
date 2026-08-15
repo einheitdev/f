@@ -17,6 +17,8 @@
 #include <sstream>
 #include <vector>
 
+#include "f/sysconfig/storage.h"
+
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
 
@@ -253,6 +255,14 @@ auto ApplyBundle(Engine& e, std::string_view bundle_dir)
       for (int idx : op.ifindexes) {
         if (!covered.contains(idx)) {
           DetachXdp(idx);
+          // Both attach points come off together. The new tracker was
+          // attached to the interfaces the new bundle covers, so this
+          // one still carries the OLD bundle's filter — a tracker with
+          // no bundle behind it, writing conntrack entries that the
+          // policy which would have read them is no longer on. The
+          // qdisc goes with it when this daemon is the one that made
+          // it; the old tracker's own record is what says so.
+          RemoveEgressFrom(idx, e.zone_bundle.egress);
         }
       }
     }
@@ -264,6 +274,21 @@ auto ApplyBundle(Engine& e, std::string_view bundle_dir)
       // (see the note there — it never ran in bundle mode at all).
       e.conntrack.enabled = true;
     }
+    // Same reason, same defect class: the NAT table's fds belong to the
+    // bundle that was just swapped in. Left pointing at the old
+    // bundle's maps, the sweep would collect a table nothing is using
+    // and the status section would report it — the map is FLOW-lifetime
+    // and its pin is adopted, so the numbers would look plausible.
+    AttachNatMgr(e);
+    // Same reason, second attach point. Left out, `e.egress.stats_fd`
+    // still pointed into the object CloseZoneBundle had just closed:
+    // every egress counter in `fctl status` read 0 for the rest of the
+    // process's life and EgressMgr::Report could never fire, so the one
+    // failure this whole feature exists to surface — a refused insert
+    // because conntrack is full — was permanently silent after the
+    // first reload. The manager's own doc comment said it was called
+    // from both places; it was not.
+    AttachEgressMgr(e, dir.string());
     // Re-derive the tracked interface list from the bundle that is
     // now attached. Leaving it stale made `fctl status` describe the
     // boot-time topology forever, and gave EngineStop the wrong set
@@ -285,9 +310,12 @@ auto ApplyBundle(Engine& e, std::string_view bundle_dir)
     out.version = manifest["version"].get<std::string>();
     out.rules_installed = 0;
     out.program_updated = true;
+    // The interface count is the one that answers "is the new policy
+    // in the packet path". A program count on its own read the same
+    // whether every interface had been swapped or none had.
     spdlog::info("reload: multi-zone bundle hot-swapped, "
-                 "{} zone program(s), atomic swap",
-                 e.zone_bundle.programs.size());
+                 "{} zone program(s) on {} interface(s), atomic swap",
+                 e.zone_bundle.programs.size(), e.ifaces.count);
     return out;
   }
 
@@ -428,6 +456,32 @@ auto ReloadFromSource(Engine& e)
   }
 
   UpdateCurrentSymlink(e.watcher.compiled_dir, version);
+
+  // Bound the set here, because here is where it grows. Every reload
+  // writes a new timestamped bundle and nothing ever removed the old
+  // ones — the rig accumulated ~500. Pruning after the symlink move
+  // means the running policy is already `current` and therefore
+  // never a candidate: tidying up must not be able to cause an
+  // outage. A failure to prune is logged and not propagated, because
+  // a reload that worked did work.
+  sysconfig::RetentionPolicy retention;
+  retention.compiled_dir = e.watcher.compiled_dir;
+  auto pruned = sysconfig::PruneBundles(retention);
+  if (!pruned) {
+    spdlog::warn("reload: could not prune old bundles: {}",
+                 pruned.error());
+  } else if (!pruned->removed.empty()) {
+    spdlog::info(
+        "reload: pruned {} old bundle(s), {} KiB reclaimed "
+        "(keeping {})",
+        pruned->removed.size(), pruned->reclaimed_bytes / 1024,
+        retention.keep);
+  }
+  for (const auto& f : pruned ? pruned->failed
+                              : std::vector<std::string>{}) {
+    spdlog::warn("reload: could not remove {}", f);
+  }
+
   spdlog::info(
       "reload: ok version={} rules_installed={}",
       applied->version, applied->rules_installed);

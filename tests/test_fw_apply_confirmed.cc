@@ -98,6 +98,8 @@ class Box {
     cfg.fw_source = (root_ / "rules").string();
     cfg.fwl_path = "/bin/true";
     cfg.networkd_dir = (root_ / "network").string();
+    cfg.sysctl_dir = (root_ / "sysctl.d").string();
+    cfg.sysctl_proc_dir = (root_ / "proc-sys").string();
     return cfg;
   }
 
@@ -106,6 +108,8 @@ class Box {
     o.config_path = config().string();
     o.snapshot_dir = (root_ / "snapshots").string();
     o.networkd_dir = (root_ / "network").string();
+    o.sysctl_dir = (root_ / "sysctl.d").string();
+    o.sysctl_proc_dir = (root_ / "proc-sys").string();
     o.dnsmasq_conf = (root_ / "dnsmasq.conf").string();
     o.activate = f::confd::NullActivator();
     return o;

@@ -1,24 +1,86 @@
 # f appliance provisioning data.
-# Place this file at /boot/f-provision.yaml before first boot.
+#
+# Put this on the boot partition as /boot/f-provision.yaml before the
+# first power-up. firstboot reads it once, writes what it says into
+# /etc/f/, and never looks at it again — after that the box's own
+# /etc/f/system.yaml is the configuration.
+#
+# Everything here is optional. With no file at all the box comes up in
+# the safe default shape: every port pinned to the MAC it was found
+# on, all in one zone, each asking for a DHCP address, and a policy
+# that drops what it was not asked for. That box filters and does not
+# route, and says so in the file it generates.
+#
+# This is not the v0.1 provisioning format. The keys `management:`,
+# top-level `interfaces:` and `dns:` described a box that no longer
+# exists, and firstboot refuses a file containing them by name rather
+# than ignoring them into a box that is not the one described.
 
 hostname: fw-edge-01
 
-# Management interface (eth0) static IP.
-# Omit this section to use DHCP.
-management:
-  address: 192.168.1.1/24
-  gateway: 192.168.1.254
-  dns:
-    - 1.1.1.1
-    - 8.8.8.8
-
-# SSH authorized keys for root access.
+# Authorized keys for root. Appended, not replaced.
 ssh_keys:
   - ssh-ed25519 AAAA... operator@workstation
 
-# Interfaces to attach XDP firewall programs.
-interfaces:
-  - lan0
-  - lan1
-  - lan2
-  - lan3
+# The `system:` block is /etc/f/system.yaml, verbatim. There is no
+# second schema to keep in step, and `f-sysconf check` validates it
+# before the box is provisioned with it. See
+# /usr/local/share/f/system.yaml.example for every key it accepts and
+# the reasoning behind each one.
+#
+#     physical port  ->  interface  ->  zone  ->  services bind here
+#
+system:
+  zones:
+    # The office-facing port. Nothing is bound here, and that is the
+    # point.
+    wan:
+      ipv6: off
+    # The bench. This is where the services live.
+    testnet:
+      ipv6: off
+
+  interfaces:
+    # A name pinned to a hardware identity. Get the MACs from
+    # `ip -o link` on the board, or leave this block out and let
+    # firstboot pin the names the kernel already gave the ports —
+    # which needs no reboot, because nothing is being renamed.
+    wan0:
+      mac: "52:54:00:aa:bb:01"
+      address: dhcp
+      zone: wan
+    lan0:
+      mac: "52:54:00:aa:bb:02"
+      address: 10.10.0.1/24
+      zone: testnet
+
+  services:
+    dhcp:
+      - zone: testnet
+        range: 10.10.0.100-10.10.0.200
+        lease: 12h
+    dns:
+      - zone: testnet
+        upstream: [9.9.9.9, 1.1.1.1]
+
+# The starting firewall policy.
+policy:
+  # Naming an uplink zone is what turns a filtering box into a
+  # gateway: every other zone gets `masquerade` and `redirect to
+  # <uplink>` at the bottom of its block, and the delivery rules that
+  # have to come before them. Leave it out and the box filters each
+  # zone and forwards nothing.
+  uplink_zone: wan
+
+  # TCP ports the box itself answers on, in every zone. These are the
+  # rules that keep a `default drop` policy from being a box you have
+  # to drive to.
+  management_ports: [22, 443]
+
+  # Alternatively, bring your own policy. The path is relative to this
+  # file, so a `rules.fw` next to it on the boot partition is enough.
+  # It is checked with `fwl check` before the box is provisioned with
+  # it, and a policy that does not compile stops the first boot rather
+  # than producing a box running something else.
+  #
+  # source: rules.fw

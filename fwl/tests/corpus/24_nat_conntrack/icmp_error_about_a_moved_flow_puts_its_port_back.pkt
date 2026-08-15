@@ -1,0 +1,44 @@
+name: "an icmp error about a reallocated flow is delivered with the guest's own port"
+source_fw: |
+  @xdp(lan)
+  masquerade if pkt.src_ip in [10.0.0.0/8]
+  allow if pkt.proto == tcp and pkt.tcp.syn
+  allow if conntrack(pkt).state in [established, related]
+  default drop
+state:
+  nat:
+    masq_ip: "203.0.113.5"
+sequence:
+  - name: host A claims the shared ephemeral port
+    builder: tcp(src_ip="10.0.0.7", dst_ip="8.8.8.8", src_port=40000, dst_port=443, syn=true)
+    expected:
+      bpf_action: allow
+      output_packet:
+        src_ip: "203.0.113.5"
+        src_port: 40000
+  - name: host B collides and is moved into the NAT-owned range
+    builder: tcp(src_ip="10.0.0.8", dst_ip="8.8.8.8", src_port=40000, dst_port=443, syn=true)
+    expected:
+      bpf_action: allow
+      output_packet:
+        src_ip: "203.0.113.5"
+        src_port: 63820
+  - name: a frag-needed about B's flow, which the router saw on the MOVED port. Both the address and the port have to come back, and only the port makes the ICMP checksum move — the embedded IP header's own checksum absorbs an address change exactly, so a NAT that never updated the ICMP checksum passes every address-only case and fails this one
+    builder: icmperr(src_ip="192.0.2.1", dst_ip="203.0.113.5", type=3, code=4, mtu=1400, inner_src_ip="203.0.113.5", inner_dst_ip="8.8.8.8", inner_src_port=63820, inner_dst_port=443)
+    expected:
+      bpf_action: allow
+      output_packet:
+        src_ip: "192.0.2.1"
+        dst_ip: "10.0.0.8"
+        inner_src_ip: "10.0.0.8"
+        inner_dst_ip: "8.8.8.8"
+        inner_src_port: 40000
+        inner_dst_port: 443
+  - name: and the same error carrying A's port reaches A, not B — one mapping per flow, read one header deeper
+    builder: icmperr(src_ip="192.0.2.1", dst_ip="203.0.113.5", type=3, code=4, mtu=1400, inner_src_ip="203.0.113.5", inner_dst_ip="8.8.8.8", inner_src_port=40000, inner_dst_port=443)
+    expected:
+      bpf_action: allow
+      output_packet:
+        dst_ip: "10.0.0.7"
+        inner_src_ip: "10.0.0.7"
+        inner_src_port: 40000

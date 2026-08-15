@@ -80,7 +80,11 @@ EOF
 sleep 2
 
 SEEN=$(hw::counter seen)
-OVERFLOW=$(hw::counter __rate_limit_overflow 2>/dev/null || echo 0)
+# -1 means the running bundle declares no such counter at all,
+# which is a different answer from "it stayed at zero" and the
+# note below now says which one it got.
+OVERFLOW=$(hw::counter __rate_limit_overflow 2>/dev/null)
+OVERFLOW=${OVERFLOW:--1}
 log "distributed flood: program saw $SEEN frames, \
 __rate_limit_overflow=$OVERFLOW"
 
@@ -95,7 +99,7 @@ log "a source arriving after the bucket table filled: $LATE/200 \
 passed (limit $LIMIT)"
 
 if [ "$LATE" -gt "$((LIMIT * 3))" ]; then
-  pass "EVASION CONFIRMED and it is the documented behaviour: once \
+  record "EVASION CONFIRMED and it is the documented behaviour: once \
 the 4096-bucket table is full, a new source is treated as below \
 threshold and passes $LATE/200 despite the limit being $LIMIT. \
 rate_limit(per=src_ip) is a per-source fairness control, NOT a \
@@ -103,16 +107,17 @@ defence against a distributed flood. Operators should alarm on \
 __rate_limit_overflow (currently $OVERFLOW) rather than assume the \
 limit holds."
 else
-  pass "the limit still bit for a late source ($LATE/200) — the \
+  record "the limit still bit for a late source ($LATE/200) — the \
 bucket table had room or recycled entries"
 fi
 
 if [ "$OVERFLOW" -gt 0 ]; then
-  pass "__rate_limit_overflow reported the pressure ($OVERFLOW), so \
+  record "__rate_limit_overflow reported the pressure ($OVERFLOW), so \
 the condition is at least observable"
 else
-  log "NOTE: __rate_limit_overflow stayed at 0. Either the table \
-never overflowed, or the overflow path did not tick — if evasion \
+  log "NOTE: __rate_limit_overflow read $OVERFLOW (-1 = the bundle \
+declares no such counter; 0 = it exists and did not tick). Either the \
+table never overflowed, or the overflow path did not tick — if evasion \
 was confirmed above while this stayed 0, the condition is happening \
 silently and that is the more serious half."
 fi

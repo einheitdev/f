@@ -18,13 +18,33 @@ zones:
   # The office-facing port. Nothing is bound here, and that is the
   # point.
   wan:
+    # The uplink is where an office router advertisement arrives, so
+    # this is the one that matters most. `off` means incoming RAs are
+    # received, counted and refused — not merely that we send none.
+    ipv6: off
 
   # The test benches. This is where the services live.
   testnet:
-    # off | ra. Default off. The office is flat L2 and may have router
-    # advertisements flying around; a testnet device that
-    # autoconfigures v6 from an office RA routes around the v4 policy
-    # entirely while appearing to work perfectly.
+    # off | ra | full. Default off.
+    #
+    # off  — no v6 here in either direction. An arriving router
+    #        advertisement is counted and refused, nothing
+    #        autoconfigures, no v6 is forwarded. `show ipv6` prints
+    #        how many were refused, because a gate nobody can see
+    #        held is indistinguishable from a quiet network.
+    # ra   — we are the router on this zone: we advertise a prefix
+    #        and still accept nobody else's. Needs an `address6:` on
+    #        an interface in the zone, or it is refused (SC031) —
+    #        dnsmasq's enable-ra without a prefix sends nothing.
+    # full — refused (SC030). The datapath cannot classify an ICMPv6
+    #        error as `related`, and IPv6 routers never fragment, so
+    #        Packet Too Big cannot get through and a large transfer
+    #        hangs with nothing logged. See docs/IPV6_STANCE.md.
+    #
+    # This is the most complete bypass available on a flat office L2:
+    # a testnet device that autoconfigures v6 from an office RA routes
+    # around the v4 NAT and the whole firewall while every counter
+    # keeps climbing and everything appears to work.
     ipv6: off
 
 interfaces:
@@ -71,3 +91,35 @@ services:
   dns:
     - zone: testnet
       upstream: [9.9.9.9, 1.1.1.1]
+      # DNS rebind protection: discard any upstream answer pointing
+      # into private address space. Off by default, deliberately.
+      #
+      # This box lives inside a company, and inside a company every
+      # internal name — the file server, the git server, the printer —
+      # is private-addressed *by definition*. With this on, every one
+      # of them resolves to an empty answer with no error code; the
+      # only trace is a `possible DNS-rebind attack detected` line in
+      # the journal, which no symptom points you towards.
+      #
+      # Turn it on only for a zone that resolves nothing but public
+      # names, and name the exceptions when you do:
+      #   stop_dns_rebind: true
+      #   rebind_ok: [corp, internal.example]
+      #
+      # Setting it without `rebind_ok` is allowed and warned about
+      # (SC045). Listing `rebind_ok` without it is warned about too
+      # (SC046) — the domains would exempt nothing.
+
+  # Time. Conntrack timeouts, rate-limit windows and every log line
+  # are stated in this clock, and a board with no battery-backed RTC
+  # boots at the epoch — logs stamped 1970 are not merely untidy, they
+  # destroy the ordering any later analysis depends on.
+  #
+  # The client half has no placement: it is outbound. The `zone` binds
+  # the *server* half, and the addresses it answers on are derived
+  # from zone membership like everything else, so it cannot answer the
+  # office. Set `serve: false` for a client-only box, which closes the
+  # server port entirely rather than merely refusing queries.
+  ntp:
+    - zone: testnet
+      upstream: [pool.ntp.org]

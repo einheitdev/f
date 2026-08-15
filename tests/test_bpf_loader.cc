@@ -474,6 +474,202 @@ TEST_F(BpfLoaderResolverTest, AnAbsentManifestAnswersNothingEither) {
       ManifestStatesMasquerade((scratch_ / "absent").string()));
 }
 
+// --- What the bundle asks to be attached, and where ------------------
+//
+// The manifest's "zones" array is not the answer on its own. A unit
+// written in the simple form — `@xdp(eth0)`, no `zone` line, the form
+// the docs teach and the first one anybody writes — declares no zones,
+// so the array is `[]` while the program entry names `eth0`. Deriving
+// interfaces from the array alone gave that bundle none, and the
+// loader attached it to nothing and returned success: `fd` logged
+// "1 zone program(s)", which was true of the program list and said
+// nothing at all about attachment, while every packet on the box
+// flowed unfiltered.
+
+class BundlePlanTest : public BpfLoaderResolverTest {
+ protected:
+  auto Plan(const std::string& manifest) -> BundleAttachPlan {
+    auto bundle = scratch_ / "bundle";
+    fs::create_directories(bundle);
+    std::ofstream(bundle / "manifest.json") << manifest;
+    return PlanBundleAttach(bundle.string());
+  }
+};
+
+TEST_F(BundlePlanTest, DeclaredZonesCarryTheirInterfaces) {
+  auto plan = Plan(R"({"version":"0.4",
+    "zones":[{"name":"lan","interfaces":["lan0","lan1"]},
+             {"name":"wan","interfaces":["wan0"]}],
+    "programs":[{"zone":"lan","object":"lan.bpf.o"},
+                {"zone":"wan","object":"wan.bpf.o"}]})");
+  EXPECT_EQ(plan.zone_interfaces["lan"],
+            (std::vector<std::string>{"lan0", "lan1"}));
+  EXPECT_EQ(plan.zone_interfaces["wan"],
+            (std::vector<std::string>{"wan0"}));
+  EXPECT_TRUE(plan.zones_without_interfaces.empty());
+}
+
+TEST_F(BundlePlanTest, TheSimpleFormNamesItsInterfaceInTheProgram) {
+  // `@xdp(eth0)` with no zone declaration. FWL_V04_SPEC.md § 6.2:
+  // "one implicit zone whose name is the @xdp argument"; the v0.1
+  // spec spells the hook `@xdp(<interface>)`. So the zone name IS the
+  // interface name, and a plan that comes back empty here is a
+  // firewall that attaches to nothing.
+  auto plan = Plan(R"({"version":"0.4","zones":[],
+    "programs":[{"zone":"eth0","object":"eth0.bpf.o"}]})");
+  EXPECT_EQ(plan.zone_interfaces["eth0"],
+            (std::vector<std::string>{"eth0"}));
+  EXPECT_TRUE(plan.zones_without_interfaces.empty());
+}
+
+TEST_F(BundlePlanTest, ARedirectOnlyZoneKeepsItsInterfaces) {
+  // A declared zone with no @xdp block of its own is legal (v0.4
+  // § 6.2) and is still a redirect destination — its interfaces are
+  // what fills the destination devmap, so dropping it from the plan
+  // would make every redirect into it drop the frame.
+  auto plan = Plan(R"({"version":"0.4",
+    "zones":[{"name":"lan","interfaces":["lan0"]},
+             {"name":"dmz","interfaces":["dmz0"]}],
+    "programs":[{"zone":"lan","object":"lan.bpf.o",
+                 "redirects_to":["dmz"]}]})");
+  EXPECT_EQ(plan.zone_interfaces["dmz"],
+            (std::vector<std::string>{"dmz0"}));
+}
+
+TEST_F(BundlePlanTest, AProgramZoneWithNoInterfacesIsReported) {
+  // A declared zone the manifest gives an empty interface list. `fwl`
+  // cannot emit this (the analyzer rejects an empty zone), which is
+  // the point: it means the manifest and the compiler disagree, and
+  // the program can never be attached to anything. That is a
+  // different fact from "the NIC has not appeared yet" and must not
+  // be reported as one.
+  auto plan = Plan(R"({"version":"0.4",
+    "zones":[{"name":"lan","interfaces":[]}],
+    "programs":[{"zone":"lan","object":"lan.bpf.o"}]})");
+  EXPECT_EQ(plan.zones_without_interfaces,
+            (std::vector<std::string>{"lan"}));
+}
+
+TEST_F(BundlePlanTest, AnUnreadableManifestPlansNothing) {
+  EXPECT_TRUE(
+      PlanBundleAttach((scratch_ / "absent").string())
+          .zone_interfaces.empty());
+}
+
+// --- Refusing a load that would attach to nothing ---------------------
+
+class ZeroAttachTest : public BpfLoaderResolverTest {
+ protected:
+  // A bundle whose manifest is `manifest` and whose named objects
+  // exist as files. The objects are not valid ELF: these tests must
+  // fail BEFORE libbpf is reached, so reaching it at all is the
+  // failure they detect.
+  auto Load(const std::string& manifest,
+            const std::vector<std::string>& objects)
+      -> std::expected<ZoneBundleHandles, Error<BpfError>> {
+    auto bundle = scratch_ / "bundle";
+    fs::create_directories(bundle);
+    std::ofstream(bundle / "manifest.json") << manifest;
+    for (const auto& o : objects) {
+      Touch(bundle / o);
+    }
+    return LoadZoneBundle(bundle.string(),
+                          (scratch_ / "pins").string());
+  }
+};
+
+TEST_F(ZeroAttachTest, NoInterfaceOnThisHostIsAFailedLoad) {
+  // Every interface the bundle names is absent. Nothing can be
+  // attached, so not one packet would be inspected — and a load that
+  // returns success here hands `fd` a firewall that is not in the
+  // path while every indicator reads healthy. The rule is about the
+  // outcome, not the reason: zero interfaces attached is a failed
+  // load however it came about.
+  auto r = Load(R"({"version":"0.4",
+    "zones":[{"name":"lan","interfaces":["f-no-such-if0"]}],
+    "programs":[{"zone":"lan","object":"lan.bpf.o"}]})",
+                {"lan.bpf.o"});
+  ASSERT_FALSE(r.has_value()) << "attached to nothing and said ok";
+  EXPECT_EQ(r.error().code, BpfError::kAttachFailed);
+  // Refused for the right reason, and early: had it got as far as
+  // libbpf the message would be about opening a file that is not an
+  // object. It must name the interface it wanted, too — an operator
+  // reading this at 3am needs the typo, not a verdict.
+  EXPECT_NE(r.error().message.find("f-no-such-if0"),
+            std::string::npos)
+      << r.error().message;
+  EXPECT_NE(r.error().message.find("ZERO"), std::string::npos)
+      << r.error().message;
+}
+
+TEST_F(ZeroAttachTest, TheSimpleFormIsRefusedForItsOwnInterface) {
+  // The degenerate `@xdp(<iface>)` bundle, with an interface that
+  // does not exist. Before the loader read the program's zone name as
+  // an interface this could not even reach the refusal: the plan was
+  // empty, the attach loop ran zero times, and the load succeeded.
+  // Now it is the ordinary missing-interface case and says so.
+  auto r = Load(R"({"version":"0.4","zones":[],
+    "programs":[{"zone":"f-no-such-if1","object":"x.bpf.o"}]})",
+                {"x.bpf.o"});
+  ASSERT_FALSE(r.has_value()) << "attached to nothing and said ok";
+  EXPECT_EQ(r.error().code, BpfError::kAttachFailed);
+  EXPECT_NE(r.error().message.find("f-no-such-if1"),
+            std::string::npos)
+      << r.error().message;
+}
+
+TEST_F(ZeroAttachTest, AZoneProgramWithNoInterfaceAtAllIsRefused) {
+  // Not a missing NIC — a manifest that names no interface for a
+  // program at all. There is nothing to wait for, so it is refused
+  // before any object is opened, with a message that says which zone.
+  auto r = Load(R"({"version":"0.4",
+    "zones":[{"name":"lan","interfaces":[]}],
+    "programs":[{"zone":"lan","object":"lan.bpf.o"}]})",
+                {"lan.bpf.o"});
+  ASSERT_FALSE(r.has_value());
+  EXPECT_EQ(r.error().code, BpfError::kLoadFailed);
+  // The specific sentence, not merely "some error": the fake ELF in
+  // this bundle would fail the load anyway, and a test satisfied by
+  // that would pass without the check it exists to pin.
+  EXPECT_NE(r.error().message.find("names no interface"),
+            std::string::npos)
+      << r.error().message;
+  EXPECT_NE(r.error().message.find("lan"), std::string::npos)
+      << r.error().message;
+}
+
+TEST_F(ZeroAttachTest, AnObjectlessBundleStillReportsItsOwnFault) {
+  // The l8_01 case: no compiled object anywhere (clang unavailable at
+  // compile time). The interface pre-flight must not steal this
+  // message — nothing is attachable because nothing was compiled, and
+  // that is what the operator has to fix.
+  auto r = Load(R"({"version":"0.4",
+    "zones":[{"name":"lan","interfaces":["lo"]}],
+    "programs":[{"zone":"lan","object":null}]})",
+                {});
+  ASSERT_FALSE(r.has_value());
+  EXPECT_EQ(r.error().code, BpfError::kLoadFailed);
+  EXPECT_NE(r.error().message.find("no loadable zone programs"),
+            std::string::npos)
+      << r.error().message;
+}
+
+TEST_F(ZeroAttachTest, APresentInterfaceGetsPastThePreflight) {
+  // The control that keeps the tests above from passing for the wrong
+  // reason. `lo` exists on every host, so the pre-flight must let this
+  // through and the load must fail later, on the object — proving the
+  // refusals above are about attachment and not about the fake ELF
+  // every one of these bundles carries.
+  auto r = Load(R"({"version":"0.4",
+    "zones":[{"name":"lan","interfaces":["lo"]}],
+    "programs":[{"zone":"lan","object":"lan.bpf.o"}]})",
+                {"lan.bpf.o"});
+  ASSERT_FALSE(r.has_value());
+  EXPECT_EQ(r.error().message.find("ZERO"), std::string::npos)
+      << "pre-flight fired on a host that has `lo`: "
+      << r.error().message;
+}
+
 TEST_F(BpfLoaderResolverTest, ReconcileOnAnAbsentPinRootIsQuiet) {
   // First boot, or bpffs freshly mounted. Nothing pinned, nothing to
   // reconcile, and no error either.

@@ -270,6 +270,39 @@ def _build_geoip_bundle_file(
   return {"tries": [tries[k] for k in sorted(tries)]}
 
 
+def _manifest_zones(program: ast.Program) -> list[dict]:
+  """Every zone the daemon must attach to, with its interfaces.
+
+  The declared zones, plus one implicit zone per `@xdp` block whose
+  argument is not a declared zone. That second case is the simple form
+  the language has had since v0.1 — `@xdp(eth0)`, no `zone` line,
+  where FWL_V04_SPEC.md § 6.2 says the argument names "one implicit
+  zone whose name is the @xdp argument" and the v0.1 spec spells the
+  hook `@xdp(<interface>)`. It is the form every example teaches and
+  the first one anybody writes.
+
+  Writing it out here rather than leaving the array empty is the same
+  decision `emitter.emitting_zone_names` already made for the log ABI,
+  and for the same reason: a consumer given only `program.zones` cannot
+  resolve a unit that emits records under a name that is not in it. The
+  daemon was that consumer, and the interfaces it derived from an empty
+  array were an empty set — so it attached the program to nothing and
+  reported a successful load.
+  """
+  zones = [
+    {"name": z.name, "interfaces": list(z.interfaces)}
+    for z in program.zones
+  ]
+  declared = {z["name"] for z in zones}
+  for zp in program.programs:
+    if zp.zone_name not in declared:
+      zones.append(
+        {"name": zp.zone_name, "interfaces": [zp.zone_name]}
+      )
+      declared.add(zp.zone_name)
+  return zones
+
+
 def _emit_bundle_dir(program: ast.Program, bundle_dir: Path,
                      geoip_data: dict | None = None) -> None:
   """Write a multi-zone bundle to `bundle_dir`.
@@ -321,12 +354,34 @@ def _emit_bundle_dir(program: ast.Program, bundle_dir: Path,
       "masquerades": emitter._program_masquerades(zp, program.helpers),
     })
 
+  # The TC clsact egress conntrack tracker (v0.4 § 6.9). One object for
+  # the whole bundle — what it does is a property of the box, not of a
+  # policy — compiled and reported exactly like a zone object, because
+  # the failure it must not have is the one zone objects already had: a
+  # `null` here and a load that says "ok".
+  egress_meta = None
+  e_src = emitter.EGRESS_TRACKER_SOURCE
+  if e_src in files:
+    e_obj = e_src.replace(".bpf.c", ".bpf.o")
+    try:
+      result = bpf_runner.compile_c(files[e_src], work_dir=bundle_dir)
+      result.obj_path.replace(bundle_dir / e_obj)
+      e_compiled = True
+    except (bpf_runner.BpfUnavailable, subprocess.CalledProcessError):
+      e_compiled = False
+    egress_meta = {
+      "source": e_src,
+      "object": e_obj if e_compiled else None,
+      "program": emitter.EGRESS_TRACKER_PROG,
+    }
+
   manifest = {
     "version": "0.4",
-    "zones": [
-      {"name": z.name, "interfaces": list(z.interfaces)}
-      for z in program.zones
-    ],
+    # Declared zones AND the implicit zone of a simple `@xdp(eth0)`
+    # unit. The daemon derives every interface it attaches to from
+    # this array; a program entry naming a zone the array does not
+    # carry got no interfaces and was attached to none of them.
+    "zones": _manifest_zones(program),
     "programs": programs_meta,
     # zone name -> the id its log events carry. The lookup table for
     # `fwl_log_events`, which is one ring for the whole bundle: a
@@ -341,6 +396,12 @@ def _emit_bundle_dir(program: ast.Program, bundle_dir: Path,
     # is removed before the load. Taken from _MAP_KINDS so the decision
     # lives in one place and reaches the daemon without being restated.
     "persistent_maps": list(emitter.persistent_map_names()),
+    # Present only when this policy reads conntrack at all. `fd`
+    # attaches it to every interface the bundle attaches XDP to, and a
+    # bundle that declares one and cannot attach it is a failed load —
+    # see LoadZoneBundle. A bundle compiled before this field existed
+    # has no tracker, and fd says so rather than assuming one.
+    "egress_tracker": egress_meta,
   }
   (bundle_dir / "manifest.json").write_text(
     json.dumps(manifest, indent=2), encoding="utf-8"
@@ -353,10 +414,25 @@ def _emit_bundle_dir(program: ast.Program, bundle_dir: Path,
   stray = bundle_dir / "fwl_prog.bpf.c"
   if stray.exists():
     stray.unlink()
+  # Count what was compiled, not what was intended. When clang is
+  # unavailable every entry gets `"object": null` and the bundle
+  # cannot enforce anything, yet the sentence "wrote bundle: 2 zone
+  # program(s)" read exactly the same as a successful compile —
+  # `fd` refusing the bundle on load was the first anyone heard of it.
+  built = sum(1 for p in programs_meta if p["object"] is not None)
+  total = len(programs_meta)
   click.echo(
-    f"wrote bundle: {len(program.programs)} zone program(s) to "
+    f"wrote bundle: {built}/{total} zone program(s) compiled to "
     f"{bundle_dir}"
   )
+  if built < total:
+    missing = [p["zone"] for p in programs_meta if p["object"] is None]
+    click.echo(
+      f"warning: no compiled object for zone(s) "
+      f"{', '.join(missing)} — clang/bpftool unavailable. This "
+      f"bundle cannot be loaded; `fd` will refuse it.",
+      err=True,
+    )
 
 
 @main.command()

@@ -1,0 +1,15 @@
+name: "cold icmp error drops 10.0.0.7 via 200.100.50.25 from 151.101.0.1 443"
+source_fw: |
+  @xdp(lan)
+  masquerade if pkt.src_ip in [10.0.0.0/8]
+  allow if pkt.proto == tcp and pkt.tcp.syn
+  allow if conntrack(pkt).state in [established, related]
+  default drop
+state:
+  nat:
+    masq_ip: "200.100.50.25"
+sequence:
+  - name: an error naming a flow nothing ever opened — no entry under the embedded tuple, so RELATED cannot match either
+    builder: icmperr(src_ip="192.0.2.1", dst_ip="200.100.50.25", type=3, code=4, mtu=1400, inner_proto="tcp", inner_src_ip="200.100.50.25", inner_dst_ip="151.101.0.1", inner_src_port=33333, inner_dst_port=443)
+    expected:
+      bpf_action: drop

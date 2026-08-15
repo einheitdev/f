@@ -47,9 +47,17 @@
       <table class="data-table">
         <tbody>
           <tr>
-            <td>interfaces</td>
-            <td>{{ iface_count }}</td>
+            <td>filtering on</td>
+            <td>
+              <span class="badge badge-{{ datapath_semantic }}">{{ attached_count }} of {{ iface_count }}</span>
+            </td>
           </tr>
+{% if not datapath_armed %}
+          <tr>
+            <td>datapath</td>
+            <td>NOT armed — no interface has an XDP program attached; traffic is not being inspected</td>
+          </tr>
+{% endif %}
 {% if has_firewall %}
           <tr>
             <td>default action</td>

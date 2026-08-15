@@ -81,7 +81,16 @@ else
   fail "no conntrack state before the reload"
 fi
 
-BUNDLES_BEFORE=$(ls -d "$BUNDLE_ROOT"/*/ | wc -l)
+# Which bundle is ACTIVE, not how many exist. Counting directories is
+# not evidence of a reload: the same reload that produces a bundle also
+# PRUNES old ones ("pruned 40 old bundle(s), keeping 10"), so on a rig
+# where watcher bundles had accumulated the count went DOWN across a
+# reload that had worked — and here it also gated the wait loop, so the
+# scenario sat out its full 30 s and aborted on a reload that had
+# landed at second five. Caught on 2026-08-15; l3_01 carried the same
+# defect. The symlink is the claim, and nothing else moves it.
+BUNDLE_BEFORE=$(readlink -f "$BUNDLE_ROOT/current")
+hw::journal_mark
 
 # The reload: append an unrelated rule to the watched source. The
 # watcher recompiles and applies it in place — no restart, no detach.
@@ -92,14 +101,14 @@ sed -i "s/^default drop/drop if pkt.proto == tcp and pkt.dst_port == 12346\ndefa
   /etc/f/rules.fw
 
 for i in $(seq 1 30); do
-  if [ "$(ls -d "$BUNDLE_ROOT"/*/ | wc -l)" -gt "$BUNDLES_BEFORE" ]; then
+  if [ "$(readlink -f "$BUNDLE_ROOT/current")" != "$BUNDLE_BEFORE" ]; then
     break
   fi
   sleep 1
 done
 sleep 2
-if [ "$(ls -d "$BUNDLE_ROOT"/*/ | wc -l)" -gt "$BUNDLES_BEFORE" ] \
-   && journalctl -u fd --since "-90s" --no-pager | grep -q "atomic swap"; then
+if [ "$(readlink -f "$BUNDLE_ROOT/current")" != "$BUNDLE_BEFORE" ] \
+   && hw::journal_since | grep -q "atomic swap"; then
   pass "watcher reloaded the policy in place (atomic swap)"
 else
   journalctl -u fd -n 15 --no-pager >&2

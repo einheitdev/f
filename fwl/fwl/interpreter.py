@@ -79,12 +79,37 @@ _TERMINAL_ACTION_TO_XDP = {
 # without sharing code with the emitter. v0.4 tracks IPv4 only — the
 # daemon's `conntrack` map is keyed on 32-bit addresses — so an IPv6
 # or non-IP frame is always NEW and never creates an entry. RELATED is
-# never produced (ICMP-error tracking is deferred).
+# an ICMP error whose EMBEDDED datagram names a tracked flow — the only
+# way an error can be classified at all, because it carries no ports of
+# its own and its own 5-tuple therefore matches nothing.
 
 
 # Sentinel for "this frame is not conntracked" — an IPv6 frame (v0.4
 # conntrack is IPv4-only) or a frame with no readable IPv4 5-tuple.
 _UNTRACKED = None
+
+
+# The NAT-owned source-port range and probe budget. These MUST equal the
+# emitter's FWL_NAT_PORT_BASE / FWL_NAT_PORT_MASK / FWL_NAT_ALLOC_TRIES:
+# a reallocated port appears on the wire, and both oracles assert it.
+_NAT_PORT_BASE = 49152
+_NAT_PORT_MASK = 0x3FFF
+_NAT_ALLOC_TRIES = 8
+_U32 = 0xFFFFFFFF
+
+
+def _nat_hash(a: int, b: int, p: int, q: int) -> int:
+  """The emitter's `fwl_nat_hash`, in host-order integers.
+
+  Independent implementation of the same function rather than a shared
+  one: the oracles agree on the reallocated port only if two separately
+  written mixes produce the same sequence, which is the whole basis for
+  comparing them.
+  """
+  h = 2166136261
+  for word in (a & _U32, b & _U32, p & 0xFFFF, q & 0xFFFF):
+    h = ((h ^ word) * 16777619) & _U32
+  return h ^ (h >> 15)
 
 
 def _ct_key(packet: dict[str, Any]) -> tuple | None:
@@ -106,6 +131,40 @@ def _ct_key(packet: dict[str, Any]) -> tuple | None:
   return (proto, _ipv4_to_int(src), _ipv4_to_int(dst), sport, dport)
 
 
+# ICMPv4 types that carry the datagram that provoked them (RFC 792).
+# Mirrors the emitter's FWL_ICMP_IS_ERROR; written out separately per
+# the oracle-independence rule.
+_ICMP_ERROR_TYPES = frozenset({3, 4, 5, 11, 12})
+
+
+def _icmp_inner_key(packet: dict[str, Any]) -> tuple | None:
+  """Forward 5-tuple of the datagram embedded in an ICMP error.
+
+  None for anything that is not an ICMP error carrying a readable
+  embedded datagram — a query type, a frame the builder cut before the
+  embedded IP header + 8 transport bytes, or an outer header the parse
+  never reached. Ports are 0 when the embedded datagram is itself ICMP,
+  matching the key its own mapping was installed under.
+
+  This tuple is the error's real identity. Its OWN 5-tuple is
+  (error-sender, us, 0, 0, icmp), which belongs to no flow.
+  """
+  if packet.get("proto") != "icmp":
+    return None
+  if packet.get("icmp_type") not in _ICMP_ERROR_TYPES:
+    return None
+  proto = packet.get("_inner_proto")
+  src = packet.get("_inner_src_ip")
+  dst = packet.get("_inner_dst_ip")
+  if proto is None or src is None or dst is None:
+    return None
+  return (
+    proto, _ipv4_to_int(src), _ipv4_to_int(dst),
+    int(packet.get("_inner_src_port") or 0),
+    int(packet.get("_inner_dst_port") or 0),
+  )
+
+
 class ConntrackTable:
   """Mutable set of forward 5-tuple keys, the interpreter's CT state.
 
@@ -113,6 +172,10 @@ class ConntrackTable:
   reverse (src/dst and sport/dport swapped) is present — matching the
   BPF lookup's forward-then-reverse probe. `create` adds the forward
   key, the side effect an allowed NEW packet produces.
+
+  An ICMP error is RELATED when the datagram it CARRIES names a tracked
+  flow, forward or reverse. Nothing is created or refreshed for it: an
+  error is evidence about a flow, not traffic belonging to one.
   """
   def __init__(self, entries=None):
     self._fwd: set[tuple] = set(entries or ())
@@ -126,6 +189,12 @@ class ConntrackTable:
     rev = (proto, dst, src, dport, sport)
     if key in self._fwd or rev in self._fwd:
       return ast.CtState.ESTABLISHED
+    inner = _icmp_inner_key(packet)
+    if inner is not None:
+      i_proto, i_src, i_dst, i_sport, i_dport = inner
+      i_rev = (i_proto, i_dst, i_src, i_dport, i_sport)
+      if inner in self._fwd or i_rev in self._fwd:
+        return ast.CtState.RELATED
     # A TCP segment with no SYN for an untracked flow is a state-machine
     # violation (data/ACK/RST without a handshake we ever saw).
     if proto == "tcp" and not packet.get("syn", False):
@@ -169,9 +238,72 @@ class NatState:
       return None  # untracked frame: no reply mapping can apply
     return self._reply.get(key)
 
+  def denat_icmp_error(self, packet: dict[str, Any]) -> tuple | None:
+    """Return the rewrite for an ICMP error, off its embedded datagram.
+
+    Mirrors `fwl_nat_denat_icmp_error` (RFC 5508 § 4.2). The embedded
+    datagram is the packet this NAT already translated on its way out,
+    so reversing its tuple yields the reply mapping's own key — no new
+    state and no second table.
+
+    Tried BEFORE the ordinary lookup, because an error's own 5-tuple is
+    (error-sender, us, 0, 0, icmp), which can collide with the ports-0
+    mapping of an unrelated ICMP echo the same host sent. Which header
+    identifies the flow is not a preference: for an error it is the
+    inner one.
+    """
+    inner = _icmp_inner_key(packet)
+    if inner is None:
+      return None
+    proto, src, dst, sport, dport = inner
+    return self._reply.get((proto, dst, src, dport, sport))
+
+  def _claim(
+    self, key: tuple, value: tuple, may_realloc: bool
+  ) -> int | None:
+    """Claim `key` for `value`, or return None when refused.
+
+    Mirrors `fwl_nat_claim`: the insert is BPF_NOEXIST, so a key another
+    flow already holds is DETECTED rather than overwritten. When the
+    caller owns the port (a source NAT) a replacement is taken from the
+    NAT-owned range with the same bounded probe sequence the emitter
+    walks; when it does not (a destination NAT names its port), the only
+    answer is refusal. Returns the port actually claimed.
+
+    The probe sequence has to be the emitter's exactly, not merely
+    "some free port": both oracles assert the translated port that
+    appears on the wire, so a different-but-valid choice here would read
+    as a divergence.
+    """
+    proto, k_src, k_dst, k_sport, want = key
+    held = self._reply.get(key)
+    if held is None:
+      self._reply[key] = value
+      return want
+    if held == value:
+      return want  # the same flow, already mapped
+    if not may_realloc:
+      return None
+    h = _nat_hash(value[1], k_src, value[2] or 0, k_sport)
+    for i in range(_NAT_ALLOC_TRIES):
+      cand = _NAT_PORT_BASE + (
+        (h + i * 2654435761) % 0x100000000 & _NAT_PORT_MASK
+      )
+      cand_key = (proto, k_src, k_dst, k_sport, cand)
+      cand_held = self._reply.get(cand_key)
+      if cand_held is None:
+        self._reply[cand_key] = value
+        return cand
+      # Our own earlier reallocation: a later packet of a moved flow
+      # must land back on the port it was given, or one collision costs
+      # a port per packet and the flow dies after the probe budget.
+      if cand_held == value:
+        return cand
+    return None
+
   def install_egress_reply(
     self, packet: dict[str, Any], new_saddr: int
-  ) -> None:
+  ) -> int | None:
     """Record how to de-NAT the reply to an egress SNAT/masquerade.
 
     Mirrors `fwl_snat_egress` in the emitter, which writes the reply
@@ -183,24 +315,33 @@ class NatState:
     correct one on this oracle.
 
     Keyed the way the reply arrives: source and destination swapped,
-    with the translated address in the destination position. SNAT is
-    port-preserving, so the reply's destination port is the original
-    source port.
+    with the translated address in the destination position. The
+    translated port is the original when that key is free, and one from
+    the NAT-owned range when a different flow already holds it.
+
+    Returns the translated source port, or None when no mapping could be
+    claimed — in which case NOTHING has been installed and the caller
+    must drop the packet rather than translate it.
     """
     old_saddr = _ipv4_to_int(packet.get("src_ip"))
     daddr = _ipv4_to_int(packet.get("dst_ip"))
     proto = packet.get("proto")
     if old_saddr is None or daddr is None or proto is None:
-      return
+      return None
     sport = int(packet.get("src_port") or 0)
     dport = int(packet.get("dst_port") or 0)
-    self._reply[(proto, daddr, new_saddr, dport, sport)] = (
-      "dnat", old_saddr, sport
+    # A frame with no L4 ports has no port to move, so a collision on
+    # its ports-0 key can only be refused.
+    may_realloc = proto in ("tcp", "udp")
+    return self._claim(
+      (proto, daddr, new_saddr, dport, sport),
+      ("dnat", old_saddr, sport),
+      may_realloc,
     )
 
   def install_ingress_reply(
     self, packet: dict[str, Any], new_daddr: int, new_dport: int | None
-  ) -> None:
+  ) -> bool:
     """Record how to de-NAT the reply to an ingress DNAT.
 
     Mirrors `fwl_dnat_ingress`. The reply comes back from the internal
@@ -209,19 +350,24 @@ class NatState:
     the public address the client believes it is talking to.
 
     The emitter only rewrites TCP and UDP here (it returns early for
-    anything else), so neither does this.
+    anything else), so neither does this. Returns False when a different
+    flow holds the key: a destination NAT's port is the operator's, not
+    the NAT's, so there is nothing to reallocate.
     """
     old_daddr = _ipv4_to_int(packet.get("dst_ip"))
     saddr = _ipv4_to_int(packet.get("src_ip"))
     proto = packet.get("proto")
     if old_daddr is None or saddr is None or proto not in ("tcp", "udp"):
-      return
+      return True  # no rewrite applies; not a refusal
     sport = int(packet.get("src_port") or 0)
     old_dport = int(packet.get("dst_port") or 0)
     reply_sport = old_dport if new_dport is None else int(new_dport)
-    self._reply[(proto, new_daddr, saddr, reply_sport, sport)] = (
-      "snat", old_daddr, old_dport
+    got = self._claim(
+      (proto, new_daddr, saddr, reply_sport, sport),
+      ("snat", old_daddr, old_dport),
+      False,
     )
+    return got is not None
 
 
 def _program_uses_conntrack(program: ast.Program) -> bool:
@@ -416,10 +562,17 @@ def evaluate_full(
       )
     if rule.action in ast.NAT_ACTIONS and _nat_can_parse(packet):
       # Non-terminal rewrite: translate the working packet and fall
-      # through to the next rule (the terminal emits the rewrite).
-      _before_src = ctx.work.get("src_ip")
-      _apply_nat(rule.action, rule.nat_addr, rule.nat_port,
-                 ctx.work, ctx.nat)
+      # through to the next rule (the terminal emits the rewrite) —
+      # unless no reply mapping could be claimed, which is terminal.
+      _before_src = (ctx.work.get("src_ip"), ctx.work.get("dst_ip"))
+      if not _apply_nat(rule.action, rule.nat_addr, rule.nat_port,
+                        ctx.work, ctx.nat):
+        return EvalResult(
+          action=XdpAction.DROP,
+          counter_changes=counters,
+          log_events=log_events,
+          output_packet=None,
+        )
       ctx.nat_fired = True
       _track_source_nat(rule.action, ctx, _before_src)
     if rule.action == ast.Action.COUNT and rule.counter_name:
@@ -486,9 +639,11 @@ def _exec_stmts(
         # Non-terminal rewrite: translate and fall through. Gated on
         # the same `fwl_find_ipv4` conditions the Tier 1 path uses.
         if _nat_can_parse(packet):
-          _before_src = ctx.work.get("src_ip")
-          _apply_nat(stmt.action, stmt.nat_addr, stmt.nat_port,
-                     ctx.work, ctx.nat)
+          _before_src = (ctx.work.get("src_ip"),
+                         ctx.work.get("dst_ip"))
+          if not _apply_nat(stmt.action, stmt.nat_addr, stmt.nat_port,
+                            ctx.work, ctx.nat):
+            return XdpAction.DROP
           ctx.nat_fired = True
           _track_source_nat(stmt.action, ctx, _before_src)
         continue
@@ -1367,11 +1522,27 @@ def _nat_work_init(packet: dict[str, Any]) -> dict[str, Any]:
 
   Carries the dotted-quad src/dst IPs and src/dst ports (when present)
   so output_packet reports the post-rewrite 5-tuple regardless of which
-  fields a given action changes."""
+  fields a given action changes.
+
+  For an ICMP error the embedded datagram's tuple is carried too, under
+  the names the BPF oracle's frame decoder reports. Seeding it (rather
+  than adding it only when a rewrite touches it) is what lets a case
+  assert that the inner header was left ALONE — the failure mode where
+  the error reaches the right host still describing the wrong
+  connection.
+  """
   work: dict[str, Any] = {}
   for k in ("src_ip", "dst_ip", "src_port", "dst_port", "proto"):
     if packet.get(k) is not None:
       work[k] = packet[k]
+  for inner, out in (
+    ("_inner_src_ip", "inner_src_ip"),
+    ("_inner_dst_ip", "inner_dst_ip"),
+    ("_inner_src_port", "inner_src_port"),
+    ("_inner_dst_port", "inner_dst_port"),
+  ):
+    if packet.get(inner) is not None:
+      work[out] = packet[inner]
   return work
 
 
@@ -1402,6 +1573,8 @@ def _apply_ingress_denat(packet: dict[str, Any], ctx: "_Ctx") -> None:
     return
   if not _nat_can_parse(packet):
     return
+  if _apply_icmp_error_denat(packet, ctx):
+    return
   hit = ctx.nat.denat(packet)
   if hit is None:
     return
@@ -1415,6 +1588,44 @@ def _apply_ingress_denat(packet: dict[str, Any], ctx: "_Ctx") -> None:
     if new_port is not None:
       ctx.work["src_port"] = new_port
   ctx.nat_fired = True
+
+
+def _apply_icmp_error_denat(packet: dict[str, Any], ctx: "_Ctx") -> bool:
+  """Translate an ICMP error in both places at once (RFC 5508 § 4.2).
+
+  Returns True when the frame was translated. Mirrors
+  `fwl_nat_denat_icmp_error`: the outer header is re-addressed to the
+  host behind the NAT, and the EMBEDDED header is put back the way that
+  host sent it. Either alone is useless — an error the guest receives
+  describing a connection it never opened is discarded by its own
+  stack, which is the same black hole as never delivering it.
+
+  The embedded transport checksum is not modelled because the emitter
+  does not rewrite it: only 8 bytes of that header travel, so its
+  checksum covers a payload the error does not carry.
+  """
+  hit = ctx.nat.denat_icmp_error(packet)
+  if hit is None:
+    return False
+  kind, new_addr, new_port = hit
+  addr = _int_to_ipv4(new_addr)
+  # An embedded ICMP datagram has no ports, and its mapping is keyed on
+  # ports 0 — there is nothing to put back.
+  has_ports = packet.get("_inner_proto") in ("tcp", "udp")
+  if kind == "dnat":
+    ctx.work["dst_ip"] = addr
+    ctx.work["inner_src_ip"] = addr
+    if has_ports and new_port is not None:
+      ctx.work["inner_src_port"] = new_port
+  elif kind == "snat":
+    ctx.work["src_ip"] = addr
+    ctx.work["inner_dst_ip"] = addr
+    if has_ports and new_port is not None:
+      ctx.work["inner_dst_port"] = new_port
+  else:
+    return False
+  ctx.nat_fired = True
+  return True
 
 
 # `fwl_snat_egress` has TWO side effects on the maps, and the next two
@@ -1454,60 +1665,97 @@ def _snat_is_noop(work: dict[str, Any], new_addr: int) -> bool:
 
 def _track_source_nat(action: ast.Action, ctx: "_Ctx",
                       before_src: Any) -> None:
-  """Track a source-NAT flow in conntrack (mirrors fwl_snat_egress).
+  """Track a NAT'd flow in conntrack (mirrors the emitter's helpers).
 
-  A `masquerade`/`snat` that actually rewrote the source inserts the
-  post-NAT forward 5-tuple, so the reply (its reverse 5-tuple) reads
-  `established`. Only when the source changed — the BPF returns early
-  when old == new — and only for IPv4 (ct.create is a no-op otherwise).
+  A NAT action that actually rewrote the packet inserts the post-NAT
+  forward 5-tuple, so the reply (its reverse 5-tuple) reads
+  `established`. For `masquerade`/`snat` only when the source changed —
+  the BPF returns early when old == new — and only for IPv4 (ct.create
+  is a no-op otherwise).
 
   The tuple is taken from `ctx.work`, i.e. AFTER the rewrite, and that
-  is the whole mechanism behind masquerade composing with `allow if
-  established`: the reply arrives addressed to the translated source,
+  is the whole mechanism behind NAT composing with `allow if
+  established`: the reply arrives addressed to the translated endpoint,
   so only a post-NAT tuple makes its reverse match.
+
+  `dnat` is here for the same reason and was not: a port forward's
+  reply comes back from the internal server, whose tuple no rule ever
+  tracked, so a stateful inside zone dropped every one of them. That is
+  l11_04's defect in its destination-NAT form, and it also left half
+  the reply mappings with no conntrack entry behind them for the
+  collector to age against.
   """
-  if action not in (ast.Action.MASQUERADE, ast.Action.SNAT):
+  if action not in (ast.Action.MASQUERADE, ast.Action.SNAT,
+                    ast.Action.DNAT):
     return
-  if ctx.ct is None or ctx.work.get("src_ip") == before_src:
+  if ctx.ct is None:
+    return
+  # `before_src` is the (src_ip, dst_ip) pair from before the rewrite.
+  # Nothing rewritten means nothing translated means nothing to track:
+  # the emitter's helpers return before their conntrack insert in every
+  # such case (SNAT to self, DNAT of a frame with no L4 ports).
+  if (ctx.work.get("src_ip"), ctx.work.get("dst_ip")) == before_src:
     return
   ctx.ct.create(ctx.work)
 
 
 def _apply_nat(action: ast.Action, nat_addr: int | None,
                nat_port: int | None, work: dict[str, Any],
-               nat: "NatState | None") -> None:
+               nat: "NatState | None") -> bool:
   """Apply one NAT rewrite action to the working packet dict `work`.
 
-  Port-preserving (the translated source port equals the original) so
-  both oracles agree deterministically; only the address (and, for
-  DNAT, the destination port) changes. masquerade rewrites the source
-  to the masquerade IP (`state.nat.masq_ip`); snat to the literal
-  target; dnat rewrites the destination address and port.
+  The translated source port is the original whenever the reply mapping
+  that key names is free; when a different flow holds it, one is taken
+  from the NAT-owned range and the source port is rewritten too.
+  masquerade rewrites the source to the masquerade IP
+  (`state.nat.masq_ip`); snat to the literal target; dnat rewrites the
+  destination address and port.
 
   Each rewrite also records the reply mapping, mirroring the emitter,
   which installs it before touching the frame. The mapping is derived
   from `work` BEFORE the rewrite — the reply is keyed on where the
   packet came from, not where it was translated to.
+
+  Returns False when no mapping could be claimed. `work` is then
+  untouched and the caller must drop: a translated packet with no
+  mapping is a reply delivered to the firewall's own address or into
+  another guest's socket, and both used to happen silently.
   """
   if action == ast.Action.SNAT and nat_addr is not None:
     if _snat_is_noop(work, nat_addr):
-      return
+      return True
     if nat is not None:
-      nat.install_egress_reply(work, nat_addr)
+      got = nat.install_egress_reply(work, nat_addr)
+      if got is None:
+        return False
+      if work.get("src_port") is not None:
+        work["src_port"] = got
     work["src_ip"] = _int_to_ipv4(nat_addr)
   elif action == ast.Action.MASQUERADE:
     masq = nat.masq_ip if nat is not None else None
     if masq is not None:
       if _snat_is_noop(work, masq):
-        return
-      nat.install_egress_reply(work, masq)
+        return True
+      got = nat.install_egress_reply(work, masq)
+      if got is None:
+        return False
+      if work.get("src_port") is not None:
+        work["src_port"] = got
       work["src_ip"] = _int_to_ipv4(masq)
   elif action == ast.Action.DNAT and nat_addr is not None:
-    if nat is not None:
-      nat.install_ingress_reply(work, nat_addr, nat_port)
+    # `fwl_dnat_ingress` returns before touching the frame for anything
+    # that is not TCP or UDP — a destination NAT rewrites a port, and
+    # there is none to rewrite. The interpreter rewrote the address
+    # anyway, which no corpus case had ever put a packet through.
+    if work.get("proto") not in ("tcp", "udp"):
+      return True
+    if nat is not None and not nat.install_ingress_reply(
+        work, nat_addr, nat_port):
+      return False
     work["dst_ip"] = _int_to_ipv4(nat_addr)
     if nat_port is not None:
       work["dst_port"] = nat_port
+  return True
 
 
 def _ipv6_to_int(addr: str | int) -> int:

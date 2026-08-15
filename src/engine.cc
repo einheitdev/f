@@ -11,6 +11,7 @@
 #include <sys/un.h>
 #include <unistd.h>
 
+#include <cerrno>
 #include <cstddef>
 #include <chrono>
 #include <cstring>
@@ -124,6 +125,29 @@ auto XdpMode(int ifindex) -> std::string {
   }
 }
 
+// What the daemon says when a handler is asked about the v0.1
+// single-program datapath and that datapath is not loaded.
+//
+// `rules_a`/`rules_b`, `config` and `counters` belong to
+// bpf/fw.bpf.c. Every v0.4 deployment is a bundle: EngineInit takes
+// the multi-zone branch, never assigns `e.bpf`, and every descriptor
+// in it stays at its -1 default. The handlers below then read a
+// descriptor nothing ever opened and answered "no rules loaded",
+// "no counters active", "cleared 0" — success, on a box whose
+// `fwl_counters_<zone>` map is counting every frame on the wire.
+// An empty answer from a datapath that was never asked is the same
+// defect as a wrong number: it is confident and it is not about
+// anything.
+constexpr const char* kNoLegacyDatapath =
+    "this daemon is running a v0.4 zone bundle, which has no "
+    "single-program rule table and no `counters` map — the per-zone "
+    "counters live in fwl_counters_<zone>; read them with "
+    "`fctl status` or `f show status`";
+
+auto NoLegacyDatapath() -> std::string {
+  return json({{"error", kNoLegacyDatapath}}).dump();
+}
+
 auto HandleRequest(Engine& e, const std::string& req_str)
     -> std::string {
   if (req_str.empty()) {
@@ -144,6 +168,15 @@ auto HandleRequest(Engine& e, const std::string& req_str)
     case Cmd::kApplyConfig: {
       if (req_str.size() <= 1) {
         return R"({"error":"missing config payload"})";
+      }
+      // ApplyConfig writes into `e.bpf.rules_a_fd` / `config_fd`.
+      // With no single-program datapath those are -1, every
+      // bpf_map_update_elem fails EBADF, the loop's `continue`
+      // swallows it and the reply is `{"rules_installed":0}` with no
+      // error — a 200 from `PUT /api/v1/rules` for a write that
+      // reached nothing. Refuse instead of counting to zero.
+      if (e.bpf.rules_a_fd < 0 || e.bpf.config_fd < 0) {
+        return NoLegacyDatapath();
       }
       try {
         auto j = json::parse(
@@ -202,27 +235,37 @@ auto HandleRequest(Engine& e, const std::string& req_str)
       return j.dump();
     }
     case Cmd::kGetRules: {
+      // No single-program datapath, no single-program rule table.
+      // The old answer was `[]`, which the CLI renders as "no rules
+      // loaded" — a statement about the operator's policy, made by a
+      // handler that never looked at it.
+      if (e.bpf.rules_a_fd < 0 && e.bpf.rules_b_fd < 0) {
+        return NoLegacyDatapath();
+      }
       auto rules_res = GetRules(e);
       if (!rules_res) {
         return json({{"error",
             rules_res.error().message}}).dump();
       }
-      auto status = GetStatus(e);
-      int ncpus = libbpf_num_possible_cpus();
-      if (ncpus < 1) ncpus = 1;
       json arr = json::array();
       uint32_t idx = 0;
       for (const auto& [key, val] : *rules_res) {
-        uint64_t pkts = 0, bytes = 0;
-        std::vector<RuleCounter> per_cpu(ncpus);
-        if (bpf_map_lookup_elem(
-                e.bpf.counters_fd, &idx,
-                per_cpu.data()) == 0) {
-          for (int c = 0; c < ncpus; c++) {
-            pkts += per_cpu[c].packets;
-            bytes += per_cpu[c].bytes;
-          }
-        }
+        // No `packets`/`bytes` here, and that is the fix rather than
+        // a gap in it. This handler used to report `counters[idx]`
+        // beside the rule at iteration position `idx`, but
+        // bpf/fw.bpf.c never keys `counters` by a rule index: it
+        // increments `counters[0]` for every packet it sees and
+        // `counters[k+1]` for the MATCH TIER k (0 = full 5-tuple,
+        // 1 = wildcard source port, ...). So rule 0 carried the
+        // total-traffic count, rules 1..5 carried per-tier counts
+        // aggregated over whichever rules matched at that tier, and
+        // every rule from the sixth on read zero. Nine numbers, each
+        // beside the wrong rule, each looking authoritative.
+        //
+        // There is no per-rule count in this datapath to report, so
+        // reporting none is the honest answer; `kGetCounters` gives
+        // the tier counters under their own ids, which is what they
+        // are.
         char src[INET_ADDRSTRLEN], dst[INET_ADDRSTRLEN];
         inet_ntop(AF_INET, &key.src_addr, src,
                   sizeof(src));
@@ -251,23 +294,38 @@ auto HandleRequest(Engine& e, const std::string& req_str)
             {"proto", proto_str},
             {"action", action_str},
             {"action_semantic", action_sem},
-            {"packets", pkts},
-            {"bytes", bytes},
         });
         idx++;
       }
       return arr.dump();
     }
     case Cmd::kGetCounters: {
+      // The bound comes from the map. A literal 256 here against a
+      // map declared with 10000 slots hid every counter from 256 up:
+      // it accrued packets and bytes that no status and no counters
+      // request could surface. Deriving it is what stops the two
+      // disagreeing again — there is one number now and the kernel
+      // owns it.
+      uint32_t slots = CountersMapSlots(e.bpf.counters_fd);
+      if (slots == 0) {
+        return NoLegacyDatapath();
+      }
       int ncpus = libbpf_num_possible_cpus();
       if (ncpus < 1) ncpus = 1;
       json arr = json::array();
-      for (uint32_t i = 0; i < 256; i++) {
+      for (uint32_t i = 0; i < slots; i++) {
         std::vector<RuleCounter> per_cpu(ncpus);
         if (bpf_map_lookup_elem(
                 e.bpf.counters_fd, &i,
                 per_cpu.data()) != 0) {
-          break;
+          // Every in-range lookup on a per-CPU array succeeds, so
+          // this is an anomaly, not the end of the map. Breaking
+          // here is what truncation looks like from the inside;
+          // say so and keep reading.
+          spdlog::warn(
+              "counters: slot {} of {} could not be read: {}",
+              i, slots, std::strerror(errno));
+          continue;
         }
         uint64_t pkts = 0, bytes = 0;
         for (int c = 0; c < ncpus; c++) {
@@ -283,17 +341,32 @@ auto HandleRequest(Engine& e, const std::string& req_str)
       return arr.dump();
     }
     case Cmd::kClearCounters: {
+      uint32_t slots = CountersMapSlots(e.bpf.counters_fd);
+      if (slots == 0) {
+        return NoLegacyDatapath();
+      }
       int ncpus = libbpf_num_possible_cpus();
       if (ncpus < 1) ncpus = 1;
       std::vector<RuleCounter> zeros(ncpus);
       uint32_t cleared = 0;
-      for (uint32_t i = 0; i < 256; i++) {
+      uint32_t failed = 0;
+      for (uint32_t i = 0; i < slots; i++) {
         if (bpf_map_update_elem(
                 e.bpf.counters_fd, &i, zeros.data(),
                 BPF_ANY) != 0) {
-          break;
+          failed++;
+          continue;
         }
         cleared++;
+      }
+      // A partial clear reported as `{"cleared": N}` is an operator
+      // told the counters are zero while some of them are not. If
+      // any slot kept its value, that is the answer.
+      if (failed > 0) {
+        return json({{"error",
+            std::format("cleared {} of {} counter slots; {} could "
+                        "not be written",
+                        cleared, slots, failed)}}).dump();
       }
       return json({{"cleared", cleared}}).dump();
     }
@@ -349,6 +422,13 @@ auto HandleRequest(Engine& e, const std::string& req_str)
     case Cmd::kGetNat: {
       json j;
       json arr = json::array();
+      // The same clock the datapath stamps with (bpf_ktime_get_ns is
+      // CLOCK_MONOTONIC), so the difference is a real age and not two
+      // unrelated numbers subtracted.
+      auto now_ns = static_cast<uint64_t>(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(
+              std::chrono::steady_clock::now().time_since_epoch())
+              .count());
       int fd = e.zone_bundle.nat_fd;
       if (fd >= 0) {
         FwlNatKey key{}, next{};
@@ -364,6 +444,14 @@ auto HandleRequest(Engine& e, const std::string& req_str)
             // outbound snat/masquerade; one that restores the source
             // (SNAT) came from an inbound dnat/port-forward.
             const char* dir = val.nat_type == 2 ? "snat" : "dnat";
+            // How long since the datapath last touched this mapping.
+            // A list of translations with no ages cannot answer the
+            // question an operator is actually asking — "is any of
+            // this still real" — and the reclamation rule is stated in
+            // exactly these terms.
+            uint64_t idle_ns = now_ns > val.last_seen_ns
+                                   ? now_ns - val.last_seen_ns
+                                   : 0;
             arr.push_back({
                 {"proto", ProtoName(next.proto)},
                 {"orig_src", Ipv4Str(next.src_addr)},
@@ -373,6 +461,7 @@ auto HandleRequest(Engine& e, const std::string& req_str)
                 {"new_addr", Ipv4Str(val.new_addr)},
                 {"new_port", val.new_port},
                 {"type", dir},
+                {"idle_s", idle_ns / 1'000'000'000ULL},
             });
           }
           key = next;
@@ -437,6 +526,114 @@ auto HandleRequest(Engine& e, const std::string& req_str)
 }
 
 }  // namespace
+
+auto CountersMapSlots(int counters_fd) -> uint32_t {
+  if (counters_fd < 0) return 0;
+  struct bpf_map_info info = {};
+  uint32_t len = sizeof(info);
+  if (bpf_obj_get_info_by_fd(counters_fd, &info, &len) != 0) {
+    // A descriptor we hold and cannot describe. Returning a guessed
+    // bound here is how the 256 got in; the callers report it.
+    return 0;
+  }
+  return info.max_entries;
+}
+
+auto HandleControlRequest(Engine& e, const std::string& req)
+    -> std::string {
+  return HandleRequest(e, req);
+}
+
+auto AttachRouteMgr(Engine& e) -> void {
+  e.route.stats_fd = e.zone_bundle.route_stats_fd;
+  e.route.enabled = e.route.stats_fd >= 0;
+  // POLICY-lifetime map: the pin is discarded on a reload and the new
+  // bundle counts from zero, so the "already reported" watermarks have
+  // to reset with it. Otherwise the first drops after a reload sit
+  // below the old mark and are never logged — the daemon goes quiet
+  // about exactly the event it exists to shout about.
+  e.route.reported_no_route = 0;
+  e.route.reported_no_neigh = 0;
+  bool redirects = false;
+  for (const auto& p : e.zone_bundle.programs) {
+    if (!p.redirects_to.empty()) redirects = true;
+  }
+  e.route.CheckForwarding(redirects);
+}
+
+auto AttachEgressMgr(Engine& e, std::string_view bundle_dir) -> void {
+  e.egress.stats_fd = e.zone_bundle.egress.stats_fd;
+  // Attachment, not loading. The tracker's object can be perfectly
+  // loaded and on no interface at all, and that box's DNS is broken —
+  // this is the same distinction the datapath's own "1 zone program(s)"
+  // line failed to make.
+  e.egress.enabled = e.zone_bundle.egress.Attached();
+  e.egress.interfaces = e.zone_bundle.egress.interfaces;
+  e.egress.ifindexes = e.zone_bundle.egress.ifindexes;
+  e.egress.prog_id = e.zone_bundle.egress.prog_id;
+  // From the manifest — the compiler's own answer — not from the map's
+  // presence. Every NAT bundle carries `conntrack` whether or not its
+  // policy ever reads the state, so `conntrack_fd >= 0` said yes for a
+  // masquerade-only policy and produced a red status row and an ERROR
+  // per load on a box with nothing wrong with it.
+  e.egress.tracker_declared = BundleDeclaresEgressTracker(bundle_dir);
+  e.egress.bundle_predates_tracker =
+      !ManifestHasEgressField(bundle_dir);
+  // POLICY-lifetime map, so the pin is discarded on a reload and the
+  // counters restart from zero; the watermark has to restart with them
+  // or the first refusals after a reload sit under the old mark and are
+  // never logged.
+  e.egress.reported_refusals = 0;
+  if (e.egress.tracker_declared && !e.egress.enabled) {
+    // Should be unreachable — a declared tracker that will not attach
+    // fails the load — so this is a belt against a future path that
+    // forgets that, not a routine condition. Nothing else about such a
+    // box would look wrong: the firewall filters, every counter climbs,
+    // and its own DNS resolves nothing.
+    spdlog::error(
+        "This bundle declares an egress conntrack tracker and none is "
+        "attached, so flows this box ORIGINATES (DNS forwarding, NTP, "
+        "updates) create no conntrack entry and their replies read "
+        "NEW.");
+  }
+}
+
+auto AttachNatMgr(Engine& e) -> void {
+  e.nat.map_fd = e.zone_bundle.nat_fd;
+  e.nat.stats_fd = e.zone_bundle.nat_stats_fd;
+  // One conntrack fd, held in two places, taken from one source: a
+  // mapping is reclaimed on the say-so of the conntrack entry behind
+  // it, so the two managers must be looking at the same table.
+  e.nat.conntrack_fd = e.conntrack.map_fd;
+  e.nat.enabled = e.nat.map_fd >= 0;
+  // `fwl_nat_stats` is POLICY-lifetime: its pin is discarded on a
+  // reload and the new bundle starts counting from zero. The mirror of
+  // "refusals already reported" has to reset with it, or after a
+  // reload the first refusals sit below the old high mark and are
+  // never logged — the daemon would go quiet about exactly the event
+  // it exists to shout about. The table's own numbers (high_water,
+  // total_reclaimed) are the daemon's observations of a FLOW-lifetime
+  // map that survives the reload, so they carry over.
+  e.nat.reported_refusals = 0;
+  if (!e.nat.enabled) {
+    e.nat.max_entries = 0;
+    return;
+  }
+  // Read the cap from the map rather than assume 65536: occupancy is
+  // only meaningful as a fraction of the real limit, and a hard-coded
+  // one silently reports the wrong percentage the day the emitter
+  // changes it.
+  struct bpf_map_info info = {};
+  uint32_t len = sizeof(info);
+  if (bpf_obj_get_info_by_fd(e.nat.map_fd, &info, &len) == 0) {
+    e.nat.max_entries = info.max_entries;
+  }
+  spdlog::info(
+      "NAT mapping GC enabled: {} entries max, reclaimed when the "
+      "flow's conntrack entry is gone and the mapping has been idle "
+      "{}s; swept every {}s with conntrack.",
+      e.nat.max_entries, e.nat.grace_s, e.conntrack.gc_interval_s);
+}
 
 auto EngineInit(Engine& e,
                 std::string_view sock_addr,
@@ -525,6 +722,9 @@ auto EngineInit(Engine& e,
           "Conntrack GC enabled (timeout {}s, sweep every {}s).",
           e.conntrack.timeout_s, e.conntrack.gc_interval_s);
     }
+    AttachNatMgr(e);
+    AttachRouteMgr(e);
+    AttachEgressMgr(e, current_dir);
     // Record the attached interfaces for status reporting.
     for (const auto& prog : e.zone_bundle.programs) {
       for (int idx : prog.ifindexes) {
@@ -539,8 +739,14 @@ auto EngineInit(Engine& e,
         e.ifaces.count++;
       }
     }
-    spdlog::info("Multi-zone bundle loaded: {} zone program(s).",
-                 e.zone_bundle.programs.size());
+    // Both numbers, because the first one alone was the whole
+    // problem: "1 zone program(s)" was true of a bundle attached to
+    // no interface at all. The program count comes from the manifest;
+    // the interface count comes from what the kernel accepted. Only
+    // the second says the firewall is in the path.
+    spdlog::info("Multi-zone bundle loaded: {} zone program(s), "
+                 "attached to {} interface(s).",
+                 e.zone_bundle.programs.size(), e.ifaces.count);
   }
 
   // Load BPF program. When the operator has staged a bundle at
@@ -775,6 +981,20 @@ auto EngineRun(Engine& e, std::stop_token stop)
       spdlog::debug("conntrack gc: evicted {} entries",
                     evicted);
     }
+    // NAT mappings are reclaimed AFTER conntrack, never before: a
+    // mapping is freed when its flow is over, and the conntrack entry
+    // behind it is what says so. Sweeping the other way round would
+    // read anchors this tick was about to delete and keep every dead
+    // mapping for one extra interval.
+    e.nat.MaybeRunGc(now_ns, e.conntrack.gc_interval_s);
+    // Not a sweep — nothing to collect. Routing failures are
+    // counted by the datapath and are invisible everywhere
+    // else, so this is where they become a log line.
+    e.route.Report();
+    // Same reason, one hook over: an insert the egress tracker
+    // could not make is a flow of this box's own whose reply
+    // this policy will drop, and it has no other symptom.
+    e.egress.Report();
   }
 
   spdlog::info("Engine stopping.");
@@ -868,26 +1088,6 @@ auto ApplyConfig(Engine& e, const ConfigMsg& msg,
   return inserted;
 }
 
-auto GetCounters(const Engine& e, uint32_t rule_count)
-    -> std::expected<std::vector<RuleCounter>,
-                     Error<EngineError>> {
-  std::vector<RuleCounter> out(rule_count);
-  for (uint32_t i = 0; i < rule_count; i++) {
-    int ncpus = libbpf_num_possible_cpus();
-    if (ncpus < 1) ncpus = 1;
-    std::vector<RuleCounter> per_cpu(ncpus);
-    if (bpf_map_lookup_elem(
-            e.bpf.counters_fd, &i,
-            per_cpu.data()) == 0) {
-      for (int c = 0; c < ncpus; c++) {
-        out[i].packets += per_cpu[c].packets;
-        out[i].bytes += per_cpu[c].bytes;
-      }
-    }
-  }
-  return out;
-}
-
 auto GetRules(const Engine& e)
     -> std::expected<
         std::vector<std::pair<RuleKey, RuleValue>>,
@@ -943,6 +1143,23 @@ auto GetFullState(const Engine& e) -> nlohmann::json {
   j["rules"] = e.rules.GetState();
   j["interfaces"] = e.ifaces.GetState();
   j["conntrack"] = e.conntrack.GetState();
+  // The NAT table had no section here at all, which is why a map with
+  // no collector behind it was also the one an operator could not
+  // watch. l11_02 measured the consequence: 65536 mappings, "new
+  // connections hang, old ones are fine", and nothing in the CLI to
+  // see it in.
+  j["nat"] = e.nat.GetState();
+  // Whether a redirect re-addressed the frame to a next hop or handed
+  // it on with the MAC it arrived carrying. Not visible in any capture
+  // — a frame addressed to the wrong MAC is still on the cable — so
+  // this section is the only place the difference is written down.
+  j["route"] = e.route.GetState();
+  // Whether flows the BOX ITSELF starts are tracked. Without the hook
+  // this section reports, `conntrack(pkt).state` answers NEW for the
+  // reply to the appliance's own DNS query and `default drop` eats it
+  // — a box that filters perfectly and cannot resolve a name, with
+  // every counter climbing and nothing anywhere saying why (l12_01).
+  j["egress"] = e.egress.GetState();
 
   // Slow path stats.
   j["slow_path"] = {

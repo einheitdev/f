@@ -32,7 +32,18 @@ RestrictSUIDSGID=true
 SystemCallArchitectures=native
 
 ReadWritePaths=/sys/fs/bpf /usr/share/f/compiled /var/log/f
+
+# /run/f is shared: fd puts control.sock there and f-confd puts
+# confd.sock there. systemd deletes a RuntimeDirectory when the unit
+# that declares it stops, so without Preserve a restart of fd removes
+# the whole directory and takes f-confd's live socket with it — and
+# f-confd, still running and still bound to the unlinked inode, never
+# notices. The visible symptom is that `apply system confirmed` starts
+# refusing with "f-confd is not running" on a box where it is, i.e.
+# the anti-lockout rollback is silently disarmed by the very restart
+# the handbook prescribes as a recovery step.
 RuntimeDirectory=f
+RuntimeDirectoryPreserve=yes
 
 LimitMEMLOCK=infinity
 Restart=on-failure

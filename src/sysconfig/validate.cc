@@ -29,6 +29,7 @@ class Validator {
     CheckServiceZones();
     CheckDhcp();
     CheckDns();
+    CheckNtp();
     CheckIpv6();
     return {std::move(diags_)};
   }
@@ -239,6 +240,77 @@ class Validator {
     for (const auto& d : cfg_.dns) {
       CheckBinding(d.bind, "dns forwarder");
     }
+    for (const auto& n : cfg_.ntp) {
+      // A client-only entry has no placement, so it has nothing to
+      // check. Only the server half is bound to anywhere.
+      if (n.serve) CheckBinding(n.bind, "ntp server");
+    }
+  }
+
+  auto CheckNtp() -> void {
+    std::set<std::string> zones_served;
+    bool any_upstream = false;
+    for (const auto& n : cfg_.ntp) {
+      if (!n.upstreams.empty()) any_upstream = true;
+      for (const auto& u : n.upstreams) {
+        // Hostnames are legitimate here — pool.ntp.org is the normal
+        // answer — so only obvious nonsense is refused.
+        if (u.empty() || u.find(' ') != std::string::npos) {
+          Err("SC040", n.bind.span,
+              std::format("ntp upstream '{}' is not an address or "
+                          "hostname",
+                          u));
+        }
+      }
+      if (!n.serve) continue;
+      const auto& zone = n.bind.zone;
+      if (zone.empty() || cfg_.FindZone(zone) == nullptr) continue;
+      if (!zones_served.insert(zone).second) {
+        Err("SC041", n.bind.span,
+            std::format("more than one ntp server bound to zone "
+                        "'{}'",
+                        zone));
+      }
+      // The rogue-service check, in the shape SC022 gave it for DHCP.
+      // A zone whose port takes its own address from somebody else's
+      // server is a zone we are a guest on; answering time queries
+      // there makes us a second authority on somebody's network.
+      for (const auto* i : cfg_.InterfacesInZone(zone)) {
+        if (i->mode == AddressMode::kDhcpClient) {
+          Err("SC042", n.bind.span,
+              std::format(
+                  "ntp server is bound to zone '{}', but interface "
+                  "'{}' in that zone is a dhcp *client*",
+                  zone, i->name),
+              "we would be answering on a network we are a guest "
+              "of; set `serve: false`, or move the uplink to its "
+              "own zone");
+        }
+      }
+      if (!ZoneSubnet(zone)) {
+        Err("SC043", n.bind.span,
+            std::format("ntp server on zone '{}' has no statically "
+                        "addressed interface to answer from",
+                        zone),
+            "give one interface in the zone a static address — a "
+            "server with no address to bind is a service that "
+            "silently does nothing");
+      }
+    }
+    // Not an error: a box with no upstream is a legitimate,
+    // deliberate configuration. It is a *warning* because the
+    // consequence is invisible — conntrack timeouts, rate-limit
+    // windows and every log line are stated in a clock that will
+    // never be set, and on a board with no battery-backed RTC that
+    // means logs stamped 1970.
+    if (!cfg_.ntp.empty() && !any_upstream) {
+      Warn("SC044", cfg_.ntp.front().bind.span,
+           "no ntp upstream is configured, so nothing will ever set "
+           "this box's clock",
+           "add `upstream: [...]` — log timestamps, conntrack "
+           "timeouts and rate-limit windows all depend on it, and a "
+           "board with no battery-backed RTC boots at 1970");
+    }
   }
 
   /// The zone's own address on the segment it serves. A DHCP server
@@ -372,11 +444,69 @@ class Validator {
                           u));
         }
       }
+      // Rebind protection with nothing exempted is the configuration
+      // that makes every internal name in the building fail. It is a
+      // legitimate thing to ask for on a zone that resolves only
+      // public names, so it is a warning rather than a refusal — but
+      // it is never allowed to be silent, because the symptom is an
+      // empty answer with no error and one journal line.
+      if (d.stop_dns_rebind && d.rebind_ok.empty()) {
+        Warn("SC045", d.bind.span,
+             std::format(
+                 "zone '{}' discards upstream answers that point into "
+                 "private address space, and exempts no domain",
+                 zone),
+             "an office's internal names are private-addressed by "
+             "definition, so they will resolve to an empty answer "
+             "with no error. List the internal domains under "
+             "`rebind_ok:`, or drop `stop_dns_rebind`");
+      }
+      if (!d.stop_dns_rebind && !d.rebind_ok.empty()) {
+        Warn("SC046", d.bind.span,
+             std::format("zone '{}' lists `rebind_ok` domains but "
+                         "rebind protection is off, so they exempt "
+                         "nothing",
+                         zone),
+             "remove `rebind_ok`, or set `stop_dns_rebind: true`");
+      }
     }
+  }
+
+  /// The zone's own v6 prefix, if any interface in it carries one.
+  auto ZonePrefix6(const std::string& zone) const -> std::string {
+    for (const auto* i : cfg_.InterfacesInZone(zone)) {
+      if (i->address6.empty()) continue;
+      auto p = ParseCidr6(i->address6);
+      if (p) return i->address6;
+    }
+    return "";
   }
 
   auto CheckIpv6() -> void {
     for (const auto& z : cfg_.zones) {
+      // `full` is representable so that the refusal can name it. The
+      // reason is not "unimplemented": the datapath forwards v6 today
+      // and would forward it here too. It is that the datapath cannot
+      // classify an ICMPv6 error as `related`, and IPv6 routers never
+      // fragment — PMTU discovery is the ONLY mechanism there is — so
+      // a path with a smaller MTU anywhere along it fails completely,
+      // with no drop counter and no log, presenting as "the network
+      // is slow". Offering the stance and letting the operator find
+      // that at the office is the failure mode this whole model
+      // exists to refuse.
+      if (z.ipv6 == Ipv6Stance::kFull) {
+        Err("SC030", z.span,
+            std::format("zone '{}' asks for full IPv6, which this "
+                        "build refuses",
+                        z.name),
+            "the datapath cannot classify an ICMPv6 error as "
+            "`related`, so Packet Too Big cannot reach a host in "
+            "this zone; IPv6 routers never fragment, so path-MTU "
+            "discovery is the only mechanism and a large transfer "
+            "would hang with nothing logged. Use ipv6: off, or "
+            "ipv6: ra if this box is the router here");
+        continue;
+      }
       if (z.ipv6 != Ipv6Stance::kRouterAdvertise) continue;
       if (!cfg_.ZoneServesDhcp(z.name)) {
         Err("SC029", z.span,
@@ -386,6 +516,46 @@ class Validator {
                         z.name),
             "router advertisements come from the same daemon; bind "
             "a dhcp service to this zone or set ipv6: off");
+      }
+      // dnsmasq advertises a prefix taken from the interface's own v6
+      // address. Without one, `enable-ra` is a line in a config file
+      // that sends nothing — a stance that reads as configured and is
+      // not, which is the shape of every bug this week.
+      if (ZonePrefix6(z.name).empty()) {
+        Err("SC031", z.span,
+            std::format("zone '{}' asks for IPv6 router "
+                        "advertisements but no interface in it "
+                        "carries a v6 prefix to advertise",
+                        z.name),
+            "give one interface in the zone an `address6:`, e.g. "
+            "fd00:10:10::1/64 — without a prefix the advertisement "
+            "would be generated and send nothing");
+      }
+    }
+
+    // The other direction: a v6 address on a port whose zone says v6
+    // is off is a contradiction, and the resolution must not be
+    // "quietly ignore one of them".
+    for (const auto& i : cfg_.interfaces) {
+      if (i.address6.empty()) continue;
+      if (!ParseCidr6(i.address6)) {
+        Err("SC032", i.span,
+            std::format("interface '{}': '{}' is not an IPv6 "
+                        "address with a prefix length",
+                        i.name, i.address6),
+            "e.g. fd00:10:10::1/64");
+        continue;
+      }
+      if (cfg_.StanceOf(i) == Ipv6Stance::kOff) {
+        Err("SC032", i.span,
+            std::format("interface '{}' has a v6 address but its "
+                        "zone '{}' is ipv6: off",
+                        i.name,
+                        i.zone.empty() ? "(none)" : i.zone),
+            "either drop the address6, or set the zone to ipv6: ra "
+            "— an address on a port the stance says has no v6 is a "
+            "disagreement, and the resolution must not be to "
+            "silently pick one");
       }
     }
   }

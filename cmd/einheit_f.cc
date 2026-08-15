@@ -20,13 +20,31 @@
 #include "einheit/cli/render/terminal_caps.h"
 #include "einheit/cli/render/theme.h"
 #include "einheit/cli/shell.h"
+#include "f/lease/journal.h"
+#include "f/lease/lease.h"
 
 namespace {
 
+/// Build the command surface.
+///
+/// The framework's candidate-config family is **not** registered
+/// wholesale. It advertises twenty-one verbs, and this product
+/// implements five of them: the rest either answered
+/// `Unknown command` or — worse — answered `ok`. `set <path> <value>`
+/// and `delete <path>` parsed their arguments, reported `set`, and
+/// wrote nothing anywhere, which is how the CLI came to look like two
+/// rival configuration systems when one of the two was not a system
+/// at all.
+///
+/// So `config_verbs` is off and the adapter contributes the five it
+/// really has, under names that say which document each one governs.
+/// `configure`/`commit`/`rollback` are the **policy** candidate; the
+/// system configuration is `apply system` and has been all along.
 auto BuildTree(einheit::cli::CommandTree& tree,
                einheit::cli::ProductAdapter& adapter)
     -> void {
-  (void)einheit::cli::RegisterGlobals(tree);
+  (void)einheit::cli::RegisterGlobals(
+      tree, einheit::cli::GlobalsOptions{.config_verbs = false});
   for (auto& spec : adapter.Commands()) {
     (void)einheit::cli::Register(
         tree, std::move(spec));
@@ -40,7 +58,26 @@ auto main(int argc, char** argv) -> int {
   app.option_defaults()->ignore_case();
   app.allow_extras();
 
+  // The command list belongs in `--help`.
+  //
+  // It used to exist only inside the interactive shell, so
+  // `einheit-f --help` printed option flags and nothing an operator
+  // could act on — and the first thing anybody does with an unfamiliar
+  // CLI is ask it what it can do. The tree is built here, before the
+  // parse, because CLI11 answers `--help` from inside `parse()`.
+  auto adapter = einheit::adapters::fw::NewFwAdapter();
+  einheit::cli::CommandTree tree;
+  BuildTree(tree, *adapter);
+  app.footer(
+      "Commands:\n" + einheit::cli::FormatHelpIndex(tree) +
+      "\n"
+      "Run `einheit-f <command>` for one answer, or `einheit-f` with "
+      "no command\nfor a shell with completion and history. In the "
+      "shell, `help <command>`\nand `explain <command>` say what a "
+      "command takes and what it needs.\n");
+
   std::string color = "auto";
+  std::string format = "table";
   bool ascii = false;
   int width = 0;
   std::string pin_path = "/sys/fs/bpf/f";
@@ -50,9 +87,16 @@ auto main(int argc, char** argv) -> int {
   std::string dnsmasq_conf = "/etc/f/generated/dnsmasq.conf";
   std::string confd_socket = "ipc:///run/f/confd.sock";
   std::string networkd_dir = "/etc/systemd/network";
+  std::string sysctl_dir = "/etc/sysctl.d";
+  std::string lease_file = f::lease::kLeaseFilePath;
+  std::string device_journal = f::lease::kJournalPath;
   bool locked = false;
 
   app.add_option("--color", color, "always|never|auto");
+  app.add_option("--format", format,
+                 "table|json|yaml|set — machine-readable output for "
+                 "scripts and for pasting somewhere that has no "
+                 "80-column terminal");
   app.add_flag("--ascii", ascii, "Force ASCII borders");
   app.add_option("--width", width,
                  "Override detected width");
@@ -67,11 +111,17 @@ auto main(int argc, char** argv) -> int {
                  "services");
   app.add_option("--dnsmasq-conf", dnsmasq_conf,
                  "Where the generated dnsmasq config lives");
+  app.add_option("--sysctl-dir", sysctl_dir,
+                 "Where the generated sysctl drop-in is installed");
   app.add_option("--networkd-dir", networkd_dir,
                  "Where generated networkd units are installed");
   app.add_option("--confd-socket", confd_socket,
                  "f-confd control socket (owns the commit-confirm "
                  "revert timer)");
+  app.add_option("--lease-file", lease_file,
+                 "dnsmasq's lease database");
+  app.add_option("--device-journal", device_journal,
+                 "Where device arrival history is recorded");
   app.add_flag("--locked", locked,
                "Restricted mode — no shell escapes");
 
@@ -92,8 +142,6 @@ auto main(int argc, char** argv) -> int {
   const auto caps = cli::render::ApplyOverrides(
       cli::render::DetectTerminal(), ov);
 
-  auto adapter = adapters::fw::NewFwAdapter();
-
   adapters::fw::FLocalConfig tcfg;
   tcfg.pin_path = pin_path;
   tcfg.fd_socket = fd_socket;
@@ -101,7 +149,10 @@ auto main(int argc, char** argv) -> int {
   tcfg.system_config = system_config;
   tcfg.dnsmasq_conf = dnsmasq_conf;
   tcfg.networkd_dir = networkd_dir;
+  tcfg.sysctl_dir = sysctl_dir;
   tcfg.confd_socket = confd_socket;
+  tcfg.lease_file = lease_file;
+  tcfg.device_journal = device_journal;
   auto tx_result = adapters::fw::NewFLocalTransport(tcfg);
   if (!tx_result) {
     std::cerr << std::format("transport: {}\n",
@@ -115,10 +166,26 @@ auto main(int argc, char** argv) -> int {
     return 1;
   }
 
+  using cli::render::OutputFormat;
+  auto out_format = OutputFormat::Table;
+  if (format == "json") {
+    out_format = OutputFormat::Json;
+  } else if (format == "yaml") {
+    out_format = OutputFormat::Yaml;
+  } else if (format == "set") {
+    out_format = OutputFormat::Set;
+  } else if (format != "table") {
+    std::cerr << std::format(
+        "unknown --format '{}': expected table, json, yaml or set\n",
+        format);
+    return 1;
+  }
+
   cli::shell::Shell s;
   s.tx = std::move(tx);
   s.caps = caps;
   s.locked = locked;
+  s.format = out_format;
   s.theme = cli::render::PickTheme(caps, false);
 
   // On the appliance, every SSH session is admin.
@@ -128,7 +195,7 @@ auto main(int argc, char** argv) -> int {
     s.caller.user = id->user;
   }
 
-  BuildTree(s.tree, *adapter);
+  s.tree = std::move(tree);
   s.adapter = std::move(adapter);
 
   const auto leftovers = app.remaining();

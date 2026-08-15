@@ -1,0 +1,21 @@
+name: "alloc first fallback 10.0.0.8 to 8.8.8.8 443"
+source_fw: |
+  @xdp(lan)
+  masquerade if pkt.src_ip in [10.0.0.0/8]
+  allow if pkt.proto == tcp and pkt.tcp.syn
+  allow if conntrack(pkt).state == established
+  default drop
+state:
+  nat:
+    masq_ip: "203.0.113.5"
+    mappings:
+      - { proto: tcp, src_ip: "8.8.8.8", dst_ip: "203.0.113.5", src_port: 443, dst_port: 40000, new_ip: "10.0.0.99", new_port: 40000, nat_type: dnat }
+test_packet:
+  builder: tcp(src_ip="10.0.0.8", dst_ip="8.8.8.8", src_port=40000, dst_port=443, syn=true)
+expected:
+  compiles: true
+  bpf_action: allow
+  output_packet:
+    src_ip: "203.0.113.5"
+    dst_ip: "8.8.8.8"
+    src_port: 63820

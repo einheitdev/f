@@ -127,13 +127,18 @@ endif()
 # ============================================================================
 add_library(libf-sysconfig STATIC
   src/sysconfig/artifact.cc
+  src/sysconfig/chrony.cc
   src/sysconfig/dnsmasq.cc
   src/sysconfig/edit.cc
+  src/sysconfig/ipv6.cc
   src/sysconfig/model.cc
   src/sysconfig/net.cc
   src/sysconfig/networkd.cc
+  src/sysconfig/observe.cc
   src/sysconfig/parse.cc
   src/sysconfig/service_status.cc
+  src/sysconfig/sysctl.cc
+  src/sysconfig/storage.cc
   src/sysconfig/validate.cc
 )
 
@@ -146,6 +151,45 @@ target_link_libraries(libf-sysconfig PUBLIC
 )
 
 # ============================================================================
+# Policy source editing
+#
+# The shape of a `.fw` document — zone blocks and the statements in
+# them — and nothing about what a rule means. The compiler stays the
+# authority; this is what lets the CLI number a rule, remove one, and
+# put a new one where it can still match.
+# ============================================================================
+add_library(libf-policy STATIC
+  src/policy/edit.cc
+)
+
+target_include_directories(libf-policy PUBLIC
+  ${PROJECT_SOURCE_DIR}/include
+)
+
+# ============================================================================
+# Lease / device visibility
+#
+# Observed state, not configuration: what dnsmasq handed out, when each
+# device first appeared, and the join of the two with the model. Kept
+# apart from libf-sysconfig because the model is what we declare and
+# this is what actually turned up.
+# ============================================================================
+add_library(libf-lease STATIC
+  src/lease/journal.cc
+  src/lease/lease.cc
+  src/lease/view.cc
+)
+
+target_include_directories(libf-lease PUBLIC
+  ${PROJECT_SOURCE_DIR}/include
+)
+
+target_link_libraries(libf-lease PUBLIC
+  libf-sysconfig
+  nlohmann_json::nlohmann_json
+)
+
+# ============================================================================
 # Engine library (BPF + ZMQ, no HTTP)
 # ============================================================================
 add_library(libf-engine STATIC
@@ -155,6 +199,10 @@ add_library(libf-engine STATIC
   src/reload.cc
   src/slow_path.cc
   src/components.cc
+  src/egress_mgr.cc
+  src/nat_mgr.cc
+  src/route_mgr.cc
+  src/tc_egress.cc
   src/watcher.cc
 )
 
@@ -165,6 +213,7 @@ target_include_directories(libf-engine PUBLIC
 )
 
 target_link_libraries(libf-engine PUBLIC
+  libf-sysconfig
   ${BPF_LIB}
   nlohmann_json::nlohmann_json
   cppzmq
@@ -307,6 +356,15 @@ target_compile_definitions(einheit-f-ui PRIVATE
 
 # ============================================================================
 # Install rules
+#
+# `deploy/manifest.yaml` is the authority on what a box needs; these
+# rules are the convenience path for a native build on a development
+# machine, and `deploy/tests/test_manifest_covers_build.py` fails if the
+# two ever disagree about which binaries ship. For a cross build or a
+# real appliance, use the manifest:
+#
+#   deploy/f_install.py stage --build-dir build-aarch64 --root <rootfs>
+#   deploy/f_install.py verify
 # ============================================================================
 install(TARGETS fd fctl f-sysconf f-confd einheit-f einheit-f-ui f-api
   RUNTIME DESTINATION bin
@@ -319,18 +377,33 @@ install(FILES
   deploy/systemd/einheit-f-ui.service
   deploy/systemd/f-firstboot.service
   deploy/systemd/f-dnsmasq.service
+  deploy/systemd/f-chrony.service
   deploy/systemd/f-confd.service
   DESTINATION lib/systemd/system
 )
 install(FILES deploy/system.yaml.example
   DESTINATION share/f
 )
+install(FILES deploy/firstboot/f-provision.yaml.example
+  DESTINATION share/f
+)
+# Reference only. Deliberately NOT installed into /etc/systemd/network:
+# `10-eth0.network` sorts before the model's own `10-f-eth0.network` and
+# would silently win, configuring the uplink from a v0.1 example instead
+# of from /etc/f/system.yaml.
 install(FILES
   deploy/networkd/10-eth0.network
   deploy/networkd/20-lan.network
   DESTINATION share/f/networkd
 )
-install(PROGRAMS deploy/firstboot/firstboot.sh
+install(FILES deploy/manifest.yaml
+  DESTINATION share/f
+)
+install(PROGRAMS deploy/f_install.py
+  DESTINATION bin
+  RENAME f-install
+)
+install(PROGRAMS deploy/firstboot/firstboot.py
   DESTINATION share/f
 )
 

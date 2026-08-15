@@ -1,0 +1,46 @@
+name: "moved flow keeps its new port 10.1.2.3 behind 10.0.0.8 to 93.184.216.34 8080"
+source_fw: |
+  @xdp(lan)
+  masquerade if pkt.src_ip in [10.0.0.0/8]
+  allow if pkt.proto == tcp and pkt.tcp.syn
+  allow if conntrack(pkt).state == established
+  default drop
+state:
+  nat:
+    masq_ip: "198.51.100.9"
+sequence:
+  - name: host A claims the shared ephemeral port
+    builder: tcp(src_ip="10.0.0.8", dst_ip="93.184.216.34", src_port=40000, dst_port=8080, syn=true)
+    expected:
+      bpf_action: allow
+      output_packet:
+        src_ip: "198.51.100.9"
+        src_port: 40000
+  - name: host B collides and is moved to the first free port in the NAT range
+    builder: tcp(src_ip="10.1.2.3", dst_ip="93.184.216.34", src_port=40000, dst_port=8080, syn=true)
+    expected:
+      bpf_action: allow
+      output_packet:
+        src_ip: "198.51.100.9"
+        src_port: 50700
+  - name: host B's SECOND packet finds its own moved mapping and reuses that port — it must NOT walk to 65469, or one collision costs a port per packet and the flow dies after the probe budget
+    builder: tcp(src_ip="10.1.2.3", dst_ip="93.184.216.34", src_port=40000, dst_port=8080, ack=true)
+    expected:
+      bpf_action: allow
+      output_packet:
+        src_ip: "198.51.100.9"
+        src_port: 50700
+  - name: and a third, to make the stability of the choice the assertion rather than a coincidence of two
+    builder: tcp(src_ip="10.1.2.3", dst_ip="93.184.216.34", src_port=40000, dst_port=8080, ack=true)
+    expected:
+      bpf_action: allow
+      output_packet:
+        src_ip: "198.51.100.9"
+        src_port: 50700
+  - name: the reply on that one port still reaches host B
+    builder: tcp(src_ip="93.184.216.34", dst_ip="198.51.100.9", src_port=8080, dst_port=50700, ack=true)
+    expected:
+      bpf_action: allow
+      output_packet:
+        dst_ip: "10.1.2.3"
+        dst_port: 40000

@@ -66,6 +66,8 @@ auto main(int argc, char** argv) -> int {
                  "Where the generated dnsmasq config is installed");
   app.add_option("--networkd-dir", opts.networkd_dir,
                  "Where generated networkd units are installed");
+  app.add_option("--sysctl-dir", opts.sysctl_dir,
+                 "Where the generated sysctl drop-in is installed");
   app.add_flag("--force", opts.force,
                "Overwrite artifacts that were edited by hand");
   app.add_flag("--no-activate", no_activate,

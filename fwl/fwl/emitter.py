@@ -143,6 +143,53 @@ _MAP_KINDS: tuple[_MapKind, ...] = (
     ),
   ),
   _MapKind(
+    r"fwl_nat_stats", MapScope.SHARED,
+    "counts events of the one bundle-wide fwl_nat table, so it has to "
+    "be the one bundle-wide tally: a per-zone copy would report the "
+    "refusals of whichever zone happened to translate, not of the "
+    "table. Slots are numbered by the emitter's own header, not by a "
+    "policy, so the same slot means the same event in every zone",
+    lifetime=MapLifetime.POLICY,
+    lifetime_why=(
+      "a counter, and counters restart from zero across a reload for "
+      "the same reason every other one does — a number carried over "
+      "from a policy that is no longer running is attributed to rules "
+      "that never produced it. The mappings themselves are FLOW and "
+      "are inherited; the tally of what happened to them is not"
+    ),
+  ),
+  _MapKind(
+    r"fwl_egress_stats", MapScope.SHARED,
+    "counts what the ONE egress tracker did at the qdisc layer. The "
+    "tracker is a single object attached to every interface the bundle "
+    "attaches XDP to, so a per-zone copy would have no zone to belong "
+    "to; slots are numbered by the emitter's own header, so a slot "
+    "means the same event whatever the policy",
+    lifetime=MapLifetime.POLICY,
+    lifetime_why=(
+      "a counter, like every other one here: a number carried over "
+      "from a policy that is no longer running is attributed to flows "
+      "it never tracked. The conntrack entries the tracker created "
+      "are FLOW and ARE inherited; the tally of how they got there "
+      "is not"
+    ),
+  ),
+  _MapKind(
+    r"fwl_route_stats", MapScope.SHARED,
+    "counts what the ONE routing table under this box did to forwarded "
+    "frames. Routing is a property of the host, not of a zone, so a "
+    "per-zone copy would report whichever zone happened to forward "
+    "rather than what the box does; slots are numbered by the "
+    "emitter's own header, so a slot means the same event everywhere",
+    lifetime=MapLifetime.POLICY,
+    lifetime_why=(
+      "a counter, and every other counter restarts from zero across a "
+      "reload for the same reason: a number carried over from a policy "
+      "that is no longer running is attributed to a redirect that "
+      "never produced it"
+    ),
+  ),
+  _MapKind(
     r"fwl_nat_cfg", MapScope.SHARED,
     "one unit-wide masquerade address, written once by the daemon",
     lifetime=MapLifetime.POLICY,
@@ -465,6 +512,37 @@ struct fwl_icmphdr {
   __u8 code;
 };
 
+// ICMPv4 types that carry the datagram that provoked them (RFC 792):
+// destination unreachable, source quench, redirect, time exceeded,
+// parameter problem. The same five Linux treats as errors when it
+// tracks connections. Every other type is a query — its body is its
+// own, not a copy of somebody else's packet — so it names no flow.
+#define FWL_ICMP_IS_ERROR(t) \\
+  ((t) == 3 || (t) == 4 || (t) == 5 || (t) == 11 || (t) == 12)
+
+// The full 8-byte ICMP header, declared alongside the 2-byte one
+// because reading a type is not writing a checksum: a struct that
+// stops before the checksum field cannot address it, and the ICMP
+// checksum covers the embedded datagram an error translation rewrites.
+// For type 3 code 4 the second half of `rest` is the next-hop MTU
+// (RFC 1191) — read by the host that receives the error, never here.
+struct fwl_icmp_err {
+  __u8  type;
+  __u8  code;
+  __u16 check;
+  __u32 rest;
+};
+
+// The 8 bytes of embedded transport header an ICMP error is required
+// to carry ("the first 64 bits of the original datagram's data"). The
+// ports sit at the same two offsets in TCP and UDP, which is the only
+// reason one struct serves both.
+struct fwl_inner_l4 {
+  __be16 source;
+  __be16 dest;
+  __u32 rest;
+};
+
 struct fwl_rl_state {
   __u64 ts;
   __u32 count;
@@ -484,6 +562,12 @@ struct fwl_vlanhdr {
 // -1 never collides with a real XDP_* code (XDP_ABORTED..XDP_REDIRECT
 // are 0..4).
 #define FWL_CONTINUE (-1)
+
+// bpf_fib_lookup wants an address family and <linux/bpf.h> does not
+// carry one; <sys/socket.h> does not compile under `clang -target bpf`.
+#ifndef AF_INET
+#define AF_INET 2
+#endif
 """
 
 
@@ -513,9 +597,12 @@ _TERMINAL_ACTION_TO_RETURN = {
 
 # Numeric encoding of conntrack states in the emitted C. NEW is 0 so an
 # unparsed (non-IP / IPv6) frame's zero-initialized `ct_state` reads as
-# NEW for free. ESTABLISHED/RELATED/INVALID follow; RELATED is never
-# produced in v0.4 (deferred), but the keyword is encoded for the rare
-# `== related` comparison (which thus never matches).
+# NEW for free. ESTABLISHED/RELATED/INVALID follow. RELATED is produced
+# by `fwl_ct_icmp_related`: an ICMP error whose EMBEDDED datagram names
+# a tracked flow. Until that existed no packet was ever classified 2,
+# so `in [established, related]` was a longer spelling of
+# `== established` and path-MTU discovery had no rule that could admit
+# it (measured on the rig, l11_05).
 _CT_STATE_TO_INT = {
   ast.CtState.NEW: 0,
   ast.CtState.ESTABLISHED: 1,
@@ -556,6 +643,63 @@ struct {
 """
 
 
+# The RELATED classifier. Emitted with the conntrack map (it is a
+# conntrack property, not a NAT one — a policy with no NAT anywhere
+# still has to admit the errors its own outbound flows provoke).
+_CONNTRACK_HELPERS = """\
+// RELATED (FWL_V04_SPEC.md § 4.3): an ICMP error carries no ports of
+// its own, so the 5-tuple probe above finds nothing and the packet
+// reads NEW — which a `default drop` policy drops, before any NAT gets
+// the chance to translate it. That is not a policy mistake to be
+// worked around: `conntrack(pkt).state == established` CANNOT match an
+// ICMP error, and the only rule that admits one is
+// `allow if pkt.proto == icmp`, which admits every ICMP from anywhere.
+//
+// An error names its flow in the datagram it carries. Probe conntrack
+// with that inner tuple, forward and reverse, so an error is RELATED
+// whichever end of the flow provoked it. For a translated flow the
+// embedded packet is the POST-NAT one, which is the tuple conntrack
+// was keyed on — this runs in the prelude, BEFORE de-NAT rewrites it,
+// and that ordering is what makes the key match.
+//
+// Nothing is created and nothing is refreshed: an error is evidence
+// ABOUT a flow, not traffic belonging to one, so a flood of them must
+// not be able to hold a dead entry open.
+static __always_inline int fwl_ct_icmp_related(
+    struct iphdr *ip, void *data_end) {
+  // A non-first fragment carries no ICMP header, only payload — the
+  // same tiny-fragment reasoning the L4 parse is gated on.
+  if ((bpf_ntohs(ip->frag_off) & 0x1FFF) != 0) return 0;
+  __u32 hlen = ip->ihl * 4;
+  if (hlen < sizeof(struct iphdr)) return 0;
+  struct fwl_icmp_err *ic = (void *)ip + hlen;
+  if ((void *)(ic + 1) > data_end) return 0;
+  if (!FWL_ICMP_IS_ERROR(ic->type)) return 0;
+  struct iphdr *in_ip = (void *)(ic + 1);
+  if ((void *)(in_ip + 1) > data_end) return 0;
+  if (in_ip->ihl != 5) return 0;
+  struct fwl_inner_l4 *in_l4 = (void *)(in_ip + 1);
+  if ((void *)(in_l4 + 1) > data_end) return 0;
+  __u16 sp = 0, dp = 0;
+  if (in_ip->protocol == IPPROTO_TCP ||
+      in_ip->protocol == IPPROTO_UDP) {
+    sp = bpf_ntohs(in_l4->source);
+    dp = bpf_ntohs(in_l4->dest);
+  }
+  struct fwl_conn_key _f = {
+    .src_addr = in_ip->saddr, .dst_addr = in_ip->daddr,
+    .src_port = sp, .dst_port = dp, .proto = in_ip->protocol,
+  };
+  if (bpf_map_lookup_elem(&conntrack, &_f)) return 1;
+  struct fwl_conn_key _r = {
+    .src_addr = in_ip->daddr, .dst_addr = in_ip->saddr,
+    .src_port = dp, .dst_port = sp, .proto = in_ip->protocol,
+  };
+  return bpf_map_lookup_elem(&conntrack, &_r) != 0;
+}
+"""
+
+
 # Phase 5 NAT mapping table + masquerade config. The key byte-matches
 # the conntrack 5-tuple (network-order addresses, host-order ports). The
 # value records what a *return* packet must rewrite: FWL_NAT_DNAT
@@ -564,9 +708,43 @@ struct {
 # Emitted (and bpffs-pinned in a bundle) only when the program uses NAT
 # — or, for a bundle, when any zone does, so return traffic de-NATs on
 # whichever zone it lands.
+#
+# `last_seen_ns` is what makes the table collectable. Every datapath
+# touch of a mapping stamps it — the egress rewrite that keeps using it
+# and the de-NAT of its replies — so the daemon can age it on exactly
+# conntrack's rule (idle longer than `timeout_s`, swept every
+# `gc_interval_s`) instead of a second policy of its own. Without it
+# the map is monotone: 65536 entries is a LIFETIME budget of translated
+# flows rather than a concurrency budget, measured on the rig at
+# 3613 entries/h from ~1 new flow/s (l11_02).
+#
+# `fwl_nat_stats` is the visibility half. Every failure this table can
+# produce used to be silent — a refused allocation, a full table, a
+# reallocated port — which is why a 48 h soak, a NAT soak and 1434
+# corpus cases all passed over a defect that breaks a network in a day.
+# Slot numbering is fixed HERE, by this header, not by the policy: slot
+# i means the same thing under every compilation, which is what lets
+# `fctl status` name them.
 _NAT_DECL = """\
 #define FWL_NAT_SNAT 1
 #define FWL_NAT_DNAT 2
+
+#define FWL_NAT_STAT_INSTALLED  0
+#define FWL_NAT_STAT_REALLOC    1
+#define FWL_NAT_STAT_REFUSED    2
+#define FWL_NAT_STAT_TABLE_FULL 3
+#define FWL_NAT_STAT_DENAT      4
+#define FWL_NAT_STAT_ICMPERR    5
+#define FWL_NAT_STAT_SLOTS      6
+
+// The port range the NAT owns. A source port is reallocated out of it
+// only when the port the guest chose is already spoken for by a
+// DIFFERENT flow toward the same peer; the preference is still to
+// preserve. RFC 6335 dynamic range, 16384 ports, masked rather than
+// divided so the selection is a single AND.
+#define FWL_NAT_PORT_BASE   49152u
+#define FWL_NAT_PORT_MASK   0x3fffu
+#define FWL_NAT_ALLOC_TRIES 8
 
 struct fwl_nat_key {
   __u32 src_addr;
@@ -578,6 +756,7 @@ struct fwl_nat_key {
 };
 
 struct fwl_nat_value {
+  __u64 last_seen_ns;
   __u32 new_addr;
   __u16 new_port;
   __u8  nat_type;
@@ -590,6 +769,13 @@ struct {
   __type(key, struct fwl_nat_key);
   __type(value, struct fwl_nat_value);
 } fwl_nat SEC(".maps");
+
+struct {
+  __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+  __uint(max_entries, FWL_NAT_STAT_SLOTS);
+  __type(key, __u32);
+  __type(value, __u64);
+} fwl_nat_stats SEC(".maps");
 
 struct fwl_nat_cfg {
   __u32 masq_addr;
@@ -669,82 +855,255 @@ static __always_inline __u16 fwl_l4_fix(
   return ~sum;
 }
 
-// SNAT/masquerade egress: rewrite source -> new_saddr (port-preserving),
-// fix L3 + L4 checksums, install the reply mapping so return traffic
-// de-NATs the destination back to the original source.
-static __always_inline void fwl_snat_egress(
+// Incremental ones-complement arithmetic (RFC 1624), split into a
+// delta accumulator and a single application. `fwl_l4_fix` folds one
+// address+port pair, which is all a TCP/UDP rewrite ever changes; an
+// ICMP error's checksum covers FOUR changed words at once — the two
+// halves of the embedded address, the embedded port, and the embedded
+// IP header's own checksum — so the parts are separated here and
+// folded once at the end.
+static __always_inline __u32 fwl_csum_delta16(__be16 old_w, __be16 new_w) {
+  return (__u32)(__u16)~old_w + (__u32)(__u16)new_w;
+}
+
+static __always_inline __u32 fwl_csum_delta32(__be32 old_w, __be32 new_w) {
+  __u16 *o = (__u16 *)&old_w;
+  __u16 *n = (__u16 *)&new_w;
+  return fwl_csum_delta16(o[0], n[0]) + fwl_csum_delta16(o[1], n[1]);
+}
+
+// Two folds are enough: the accumulated delta of five 16-bit words
+// cannot exceed 6 * 0xffff, so the first fold leaves at most 0x10000.
+static __always_inline __u16 fwl_csum_apply(__u16 check, __u32 delta) {
+  __u32 sum = (__u32)(__u16)~check + delta;
+  sum = (sum & 0xffff) + (sum >> 16);
+  sum = (sum & 0xffff) + (sum >> 16);
+  return ~sum;
+}
+
+static __always_inline void fwl_nat_stat(__u32 slot) {
+  __u64 *c = bpf_map_lookup_elem(&fwl_nat_stats, &slot);
+  if (c) __sync_fetch_and_add(c, 1);
+}
+
+// Spread a flow over the NAT-owned port range. Only ever used to pick a
+// REPLACEMENT port, so the requirement is that two flows colliding on
+// one guest port diverge immediately, not that the sequence be
+// unguessable. FNV-1a-ish mix over the parts of the tuple that differ
+// between the colliding flows.
+//
+// The addresses are bpf_ntohl'd first so the sequence is a function of
+// the ADDRESS and not of the machine's byte order: the interpreter
+// oracle recomputes this exact sequence from host-order integers, and
+// both oracles assert the translated port that reaches the wire.
+static __always_inline __u32 fwl_nat_hash(
+    __be32 a, __be32 b, __u16 p, __u16 q) {
+  __u32 h = 2166136261u;
+  h = (h ^ bpf_ntohl(a)) * 16777619u;
+  h = (h ^ bpf_ntohl(b)) * 16777619u;
+  h = (h ^ (__u32)p) * 16777619u;
+  h = (h ^ (__u32)q) * 16777619u;
+  h ^= h >> 15;
+  return h;
+}
+
+// Claim a reply mapping for one translated flow.
+//
+// `rk` carries the mapping key with the PREFERRED translated port
+// already in `dst_port`; `rv` the value a reply must be rewritten to.
+// On success the port actually claimed is written to `*got` (host
+// order) and 0 is returned; on refusal nothing is installed and -1 is
+// returned so the caller can drop the packet instead of translating it
+// into someone else's mapping.
+//
+// v0.4 installed with BPF_ANY and ignored the result, which made a
+// collision an OVERWRITE: two guests picking the same ephemeral port
+// toward one destination produced one key, and the second guest's
+// egress packet silently redirected the first guest's inbound TCP
+// payload to itself (l11_01, measured on the wire 20/20 each way).
+// BPF_NOEXIST turns that into a detection: the insert either claims
+// the key or tells us somebody else holds it.
+static __always_inline int fwl_nat_claim(
+    struct fwl_nat_key *rk, struct fwl_nat_value *rv,
+    int may_realloc, __u16 *got) {
+  __u16 want = rk->dst_port;
+  long rc = bpf_map_update_elem(&fwl_nat, rk, rv, BPF_NOEXIST);
+  if (rc == 0) {
+    *got = want;
+    fwl_nat_stat(FWL_NAT_STAT_INSTALLED);
+    return 0;
+  }
+  if (rc == -7) {  // -E2BIG: the table is at max_entries
+    fwl_nat_stat(FWL_NAT_STAT_TABLE_FULL);
+    fwl_nat_stat(FWL_NAT_STAT_REFUSED);
+    return -1;
+  }
+  // Somebody holds the key. If it is this same flow, the mapping is
+  // already right — refresh its lifetime stamp and keep the port.
+  struct fwl_nat_value *ex = bpf_map_lookup_elem(&fwl_nat, rk);
+  if (ex && ex->new_addr == rv->new_addr
+      && ex->new_port == rv->new_port
+      && ex->nat_type == rv->nat_type) {
+    ex->last_seen_ns = rv->last_seen_ns;
+    *got = want;
+    return 0;
+  }
+  // A different flow owns it. `dnat to <ip>:<port>` names its port, so
+  // moving it would translate to an endpoint the operator never wrote;
+  // a source port is ours to choose, so try the NAT-owned range.
+  if (may_realloc) {
+    __u32 h = fwl_nat_hash(rv->new_addr, rk->src_addr,
+                           rv->new_port, rk->src_port);
+    #pragma unroll
+    for (int i = 0; i < FWL_NAT_ALLOC_TRIES; i++) {
+      __u16 cand = (__u16)(FWL_NAT_PORT_BASE
+                           + ((h + (__u32)i * 2654435761u)
+                              & FWL_NAT_PORT_MASK));
+      rk->dst_port = cand;
+      rc = bpf_map_update_elem(&fwl_nat, rk, rv, BPF_NOEXIST);
+      if (rc == 0) {
+        *got = cand;
+        fwl_nat_stat(FWL_NAT_STAT_INSTALLED);
+        fwl_nat_stat(FWL_NAT_STAT_REALLOC);
+        return 0;
+      }
+      if (rc == -7) {
+        fwl_nat_stat(FWL_NAT_STAT_TABLE_FULL);
+        fwl_nat_stat(FWL_NAT_STAT_REFUSED);
+        return -1;
+      }
+      // The candidate may be OUR OWN earlier reallocation. Without this
+      // check every subsequent packet of a moved flow walks one probe
+      // further and claims another port, so a single collision costs a
+      // port per packet and the flow is dropped after
+      // FWL_NAT_ALLOC_TRIES of them. Measured on the rig: 20 identical
+      // SYNs from the colliding host produced 8 mappings and 8
+      // reallocations where one of each was correct.
+      struct fwl_nat_value *cx = bpf_map_lookup_elem(&fwl_nat, rk);
+      if (cx && cx->new_addr == rv->new_addr
+          && cx->new_port == rv->new_port
+          && cx->nat_type == rv->nat_type) {
+        cx->last_seen_ns = rv->last_seen_ns;
+        *got = cand;
+        return 0;
+      }
+    }
+  }
+  rk->dst_port = want;
+  fwl_nat_stat(FWL_NAT_STAT_REFUSED);
+  return -1;
+}
+
+// SNAT/masquerade egress: rewrite source -> new_saddr, fix L3 + L4
+// checksums, install the reply mapping so return traffic de-NATs the
+// destination back to the original source.
+//
+// The translated port is the original whenever that is free; when it is
+// not, one is taken from the NAT-owned range and the source port is
+// rewritten with it. Returns -1 when no mapping could be claimed, and
+// then nothing in the frame has been touched: the caller drops. There
+// is no third outcome — a translated packet always has a mapping.
+static __always_inline int fwl_snat_egress(
     struct xdp_md *ctx, __be32 new_saddr) {
   __u32 ip_off;
   struct iphdr *ip = fwl_find_ipv4(ctx, &ip_off);
-  if (!ip) return;
+  if (!ip) return 0;
   __be32 old_saddr = ip->saddr;
-  if (old_saddr == new_saddr) return;
+  if (old_saddr == new_saddr) return 0;
   __be32 daddr = ip->daddr;
   __u8 proto = ip->protocol;
   void *data = (void *)(long)ctx->data;
   void *data_end = (void *)(long)ctx->data_end;
   __u32 l4_off = ip_off + sizeof(struct iphdr);
   __be16 sport = 0, dport = 0;
+  int has_ports = 0;
   if (proto == IPPROTO_TCP) {
     struct tcphdr *t = (void *)((__u8 *)data + l4_off);
-    if ((void *)(t + 1) > data_end) return;
-    sport = t->source; dport = t->dest;
+    if ((void *)(t + 1) > data_end) return 0;
+    sport = t->source; dport = t->dest; has_ports = 1;
   } else if (proto == IPPROTO_UDP) {
     struct udphdr *u = (void *)((__u8 *)data + l4_off);
-    if ((void *)(u + 1) > data_end) return;
-    sport = u->source; dport = u->dest;
+    if ((void *)(u + 1) > data_end) return 0;
+    sport = u->source; dport = u->dest; has_ports = 1;
   }
+  __u64 now = bpf_ktime_get_ns();
   struct fwl_nat_key rk = {
     .src_addr = daddr, .dst_addr = new_saddr,
     .src_port = bpf_ntohs(dport), .dst_port = bpf_ntohs(sport),
     .proto = proto,
   };
   struct fwl_nat_value rv = {
+    .last_seen_ns = now,
     .new_addr = old_saddr, .new_port = bpf_ntohs(sport),
     .nat_type = FWL_NAT_DNAT,
   };
-  bpf_map_update_elem(&fwl_nat, &rk, &rv, BPF_ANY);
+  __u16 got = 0;
+  // A frame with no L4 ports (ICMP, anything else) has no port to
+  // reallocate: its mapping is keyed on ports 0 and the only honest
+  // answer to a collision is to refuse it.
+  if (fwl_nat_claim(&rk, &rv, has_ports, &got) != 0) return -1;
+  __be16 new_sport = has_ports ? bpf_htons(got) : sport;
   // Track the flow: insert the post-NAT forward 5-tuple so the reply
   // (its reverse 5-tuple) reads `established`, letting a stateful WAN
-  // program redirect return traffic back in. BPF_NOEXIST is idempotent.
+  // program redirect return traffic back in. On a packet of a flow
+  // already tracked, refresh the stamp instead — an entry the GC ages
+  // on `last_seen_ns` must actually see the traffic that keeps it
+  // alive, or a busy flow is collected out from under itself at
+  // `timeout_s` after its FIRST packet.
   struct fwl_conn_key _ct_nk = {
     .src_addr = new_saddr, .dst_addr = daddr,
-    .src_port = bpf_ntohs(sport), .dst_port = bpf_ntohs(dport),
+    .src_port = got, .dst_port = bpf_ntohs(dport),
     .proto = proto,
   };
-  struct fwl_conn_value _ct_nv = {
-    .last_seen_ns = bpf_ktime_get_ns(), .packets = 1, .state = 1,
-  };
-  bpf_map_update_elem(&conntrack, &_ct_nk, &_ct_nv, BPF_NOEXIST);
+  struct fwl_conn_value *_ct_ev = bpf_map_lookup_elem(&conntrack, &_ct_nk);
+  if (_ct_ev) {
+    _ct_ev->last_seen_ns = now;
+    _ct_ev->packets += 1;
+  } else {
+    struct fwl_conn_value _ct_nv = {
+      .last_seen_ns = now, .packets = 1, .state = 1,
+    };
+    bpf_map_update_elem(&conntrack, &_ct_nk, &_ct_nv, BPF_NOEXIST);
+  }
   ip->saddr = new_saddr;
   fwl_fix_ip_csum(ip);
   if (proto == IPPROTO_TCP) {
     struct tcphdr *t = (void *)((__u8 *)data + l4_off);
-    if ((void *)(t + 1) <= data_end)
-      t->check = fwl_l4_fix(t->check, old_saddr, new_saddr, sport, sport);
+    if ((void *)(t + 1) <= data_end) {
+      t->check = fwl_l4_fix(t->check, old_saddr, new_saddr,
+                            sport, new_sport);
+      t->source = new_sport;
+    }
   } else if (proto == IPPROTO_UDP) {
     struct udphdr *u = (void *)((__u8 *)data + l4_off);
-    if ((void *)(u + 1) <= data_end && u->check != 0) {
-      __u16 c = fwl_l4_fix(u->check, old_saddr, new_saddr, sport, sport);
-      u->check = c ? c : 0xffff;
+    if ((void *)(u + 1) <= data_end) {
+      if (u->check != 0) {
+        __u16 c = fwl_l4_fix(u->check, old_saddr, new_saddr,
+                             sport, new_sport);
+        u->check = c ? c : 0xffff;
+      }
+      u->source = new_sport;
     }
   }
+  return 0;
 }
 
-static __always_inline void fwl_masquerade(struct xdp_md *ctx) {
+static __always_inline int fwl_masquerade(struct xdp_md *ctx) {
   __u32 k = 0;
   struct fwl_nat_cfg *cfg = bpf_map_lookup_elem(&fwl_nat_cfg, &k);
-  if (cfg && cfg->masq_addr) fwl_snat_egress(ctx, cfg->masq_addr);
+  if (cfg && cfg->masq_addr) return fwl_snat_egress(ctx, cfg->masq_addr);
+  return 0;
 }
 
 // DNAT ingress: rewrite destination -> new_daddr:new_dport, fix L3 + L4
 // checksums, install the reply mapping so return traffic de-NATs the
-// source back to the original (public) destination.
-static __always_inline void fwl_dnat_ingress(
+// source back to the original (public) destination. Returns -1 (and
+// leaves the frame untouched) when no mapping could be claimed.
+static __always_inline int fwl_dnat_ingress(
     struct xdp_md *ctx, __be32 new_daddr, __be16 new_dport) {
   __u32 ip_off;
   struct iphdr *ip = fwl_find_ipv4(ctx, &ip_off);
-  if (!ip) return;
+  if (!ip) return 0;
   __be32 old_daddr = ip->daddr;
   __be32 saddr = ip->saddr;
   __u8 proto = ip->protocol;
@@ -754,25 +1113,49 @@ static __always_inline void fwl_dnat_ingress(
   __be16 sport = 0, old_dport = 0;
   if (proto == IPPROTO_TCP) {
     struct tcphdr *t = (void *)((__u8 *)data + l4_off);
-    if ((void *)(t + 1) > data_end) return;
+    if ((void *)(t + 1) > data_end) return 0;
     sport = t->source; old_dport = t->dest;
   } else if (proto == IPPROTO_UDP) {
     struct udphdr *u = (void *)((__u8 *)data + l4_off);
-    if ((void *)(u + 1) > data_end) return;
+    if ((void *)(u + 1) > data_end) return 0;
     sport = u->source; old_dport = u->dest;
   } else {
-    return;
+    return 0;
   }
+  __u64 now = bpf_ktime_get_ns();
   struct fwl_nat_key rk = {
     .src_addr = new_daddr, .dst_addr = saddr,
     .src_port = bpf_ntohs(new_dport), .dst_port = bpf_ntohs(sport),
     .proto = proto,
   };
   struct fwl_nat_value rv = {
+    .last_seen_ns = now,
     .new_addr = old_daddr, .new_port = bpf_ntohs(old_dport),
     .nat_type = FWL_NAT_SNAT,
   };
-  bpf_map_update_elem(&fwl_nat, &rk, &rv, BPF_ANY);
+  __u16 got = 0;
+  // No reallocation for a destination NAT: the key's free field is the
+  // CLIENT's source port, which belongs to the client, not to us.
+  if (fwl_nat_claim(&rk, &rv, 0, &got) != 0) return -1;
+  // Track the post-NAT forward tuple, exactly as the source-NAT side
+  // does, so the internal server's reply reads `established` on the way
+  // back out. Without it a stateful inside zone drops every reply to a
+  // port-forwarded connection — the l11_04 defect in its DNAT form.
+  struct fwl_conn_key _ct_nk = {
+    .src_addr = saddr, .dst_addr = new_daddr,
+    .src_port = bpf_ntohs(sport), .dst_port = bpf_ntohs(new_dport),
+    .proto = proto,
+  };
+  struct fwl_conn_value *_ct_ev = bpf_map_lookup_elem(&conntrack, &_ct_nk);
+  if (_ct_ev) {
+    _ct_ev->last_seen_ns = now;
+    _ct_ev->packets += 1;
+  } else {
+    struct fwl_conn_value _ct_nv = {
+      .last_seen_ns = now, .packets = 1, .state = 1,
+    };
+    bpf_map_update_elem(&conntrack, &_ct_nk, &_ct_nv, BPF_NOEXIST);
+  }
   ip->daddr = new_daddr;
   fwl_fix_ip_csum(ip);
   if (proto == IPPROTO_TCP) {
@@ -793,6 +1176,122 @@ static __always_inline void fwl_dnat_ingress(
       u->dest = new_dport;
     }
   }
+  return 0;
+}
+
+// RFC 5508 § 4.2: translate an ICMP error off the datagram embedded in
+// it. Returns 1 when the frame was translated, 0 when it was not an
+// ICMP error, was truncated below the embedded datagram, or named a
+// flow this NAT holds no mapping for — the caller then falls through
+// to the ordinary lookup.
+//
+// An ICMP error carries no ports of its own, so its flow identity is
+// the header of the packet that provoked it. For a translated flow
+// that embedded packet is what THIS NAT put on the wire, so reversing
+// its tuple yields the reply mapping's own key — the same key the
+// flow's TCP reply would use. No new state and no second table: the
+// mapping that de-NATs the reply de-NATs the error about it.
+//
+// The rewrite happens in two places at once, and either alone is
+// useless. The outer destination is re-addressed to the host behind
+// the NAT — without it the error stops at the firewall. The embedded
+// header is put back the way that host sent it — without it the error
+// arrives describing a connection the host never opened, and every
+// stack on earth discards it in silence, which is the same black hole
+// as never delivering it at all.
+//
+// The embedded TRANSPORT checksum is deliberately not touched. Only 8
+// bytes of that header travel, so its checksum covers a payload the
+// error does not carry: no receiver can validate it, and neither can
+// an oracle. A rewrite nothing can check is a rewrite nothing holds to
+// account. Linux's nf_nat skips it for the same reason — for TCP the
+// checksum field is not even among the 8 bytes.
+static __always_inline int fwl_nat_denat_icmp_error(
+    struct xdp_md *ctx, __u32 ip_off) {
+  void *data = (void *)(long)ctx->data;
+  void *data_end = (void *)(long)ctx->data_end;
+  struct iphdr *ip = (void *)((__u8 *)data + ip_off);
+  if ((void *)(ip + 1) > data_end) return 0;
+  struct fwl_icmp_err *ic =
+      (void *)((__u8 *)data + ip_off + sizeof(struct iphdr));
+  if ((void *)(ic + 1) > data_end) return 0;
+  if (!FWL_ICMP_IS_ERROR(ic->type)) return 0;
+  struct iphdr *in_ip = (void *)(ic + 1);
+  if ((void *)(in_ip + 1) > data_end) return 0;
+  // Same restriction the outer parse takes: an embedded header with
+  // options would move the ports, and nothing here would find them.
+  if (in_ip->ihl != 5) return 0;
+  struct fwl_inner_l4 *in_l4 = (void *)(in_ip + 1);
+  if ((void *)(in_l4 + 1) > data_end) return 0;
+  __u8 in_proto = in_ip->protocol;
+  __be16 in_sport = 0, in_dport = 0;
+  int in_has_ports = 0;
+  if (in_proto == IPPROTO_TCP || in_proto == IPPROTO_UDP) {
+    in_sport = in_l4->source;
+    in_dport = in_l4->dest;
+    in_has_ports = 1;
+  }
+  // The embedded tuple, reversed: what the reply to that flow looks
+  // like, which is exactly how the mapping is keyed.
+  struct fwl_nat_key k = {
+    .src_addr = in_ip->daddr, .dst_addr = in_ip->saddr,
+    .src_port = bpf_ntohs(in_dport), .dst_port = bpf_ntohs(in_sport),
+    .proto = in_proto,
+  };
+  struct fwl_nat_value *v = bpf_map_lookup_elem(&fwl_nat, &k);
+  if (!v) return 0;
+  // Every datapath touch of a mapping stamps it — this is the de-NAT
+  // of a reply like any other, and a flow whose errors are arriving is
+  // a flow that has not gone idle.
+  v->last_seen_ns = bpf_ktime_get_ns();
+  fwl_nat_stat(FWL_NAT_STAT_DENAT);
+  fwl_nat_stat(FWL_NAT_STAT_ICMPERR);
+  __be32 new_a = v->new_addr;
+  __be16 new_p = bpf_htons(v->new_port);
+  __u32 d = 0;
+  if (v->nat_type == FWL_NAT_DNAT) {
+    // The error is coming back to a masqueraded host: the embedded
+    // packet is the one it SENT, so its source is the translated one.
+    __be32 old_in = in_ip->saddr;
+    in_ip->saddr = new_a;
+    d += fwl_csum_delta32(old_in, new_a);
+    if (in_has_ports) {
+      d += fwl_csum_delta16(in_l4->source, new_p);
+      in_l4->source = new_p;
+    }
+    __be16 old_ck = in_ip->check;
+    in_ip->check = fwl_csum_apply(old_ck, fwl_csum_delta32(old_in, new_a));
+    // The embedded IP header's checksum is itself inside the ICMP
+    // checksum, so its change folds in too.
+    d += fwl_csum_delta16(old_ck, in_ip->check);
+    ic->check = fwl_csum_apply(ic->check, d);
+    ip->daddr = new_a;
+    fwl_fix_ip_csum(ip);
+  } else if (v->nat_type == FWL_NAT_SNAT) {
+    // The error is heading out to a client of a port forward: the
+    // embedded packet is the one the CLIENT sent, so its destination
+    // is the translated one.
+    __be32 old_in = in_ip->daddr;
+    in_ip->daddr = new_a;
+    d += fwl_csum_delta32(old_in, new_a);
+    if (in_has_ports) {
+      d += fwl_csum_delta16(in_l4->dest, new_p);
+      in_l4->dest = new_p;
+    }
+    __be16 old_ck = in_ip->check;
+    in_ip->check = fwl_csum_apply(old_ck, fwl_csum_delta32(old_in, new_a));
+    d += fwl_csum_delta16(old_ck, in_ip->check);
+    ic->check = fwl_csum_apply(ic->check, d);
+    // The outer source is rewritten to the mapping's public address
+    // whatever it was. An error about a forwarded connection may come
+    // from the server itself or from a router inside the network, and
+    // the client can only accept one address as the peer it is
+    // talking to — sending it any other leaks an internal address and
+    // is discarded at the far end anyway.
+    ip->saddr = new_a;
+    fwl_fix_ip_csum(ip);
+  }
+  return 1;
 }
 
 // Return-traffic de-NAT, run before any rule: if this packet matches an
@@ -807,6 +1306,23 @@ static __always_inline void fwl_nat_denat(struct xdp_md *ctx) {
   void *data_end = (void *)(long)ctx->data_end;
   __u32 l4_off = ip_off + sizeof(struct iphdr);
   __be16 sport = 0, dport = 0;
+  // An ICMP error is tried against its EMBEDDED datagram first. It has
+  // no ports of its own, so the outer key below reads (router,
+  // firewall, 0, 0, icmp) — a key belonging to a ping the guest may
+  // have sent to the router, not to the flow the error is about. Which
+  // header identifies the flow is not a preference: for an error it is
+  // the inner one, and only when there is no mapping for it does the
+  // outer tuple (a plain echo reply) get its turn.
+  if (proto == IPPROTO_ICMP && fwl_nat_denat_icmp_error(ctx, ip_off))
+    return;
+  // A frame with no L4 ports still has a mapping — fwl_snat_egress
+  // installs one keyed on ports 0 — and de-NAT used to return here
+  // without consuming it. That combination is incoherent: the egress
+  // half translated an ICMP echo and the return half left the reply
+  // addressed to the firewall, so a masqueraded host could ping out and
+  // never hear back. Ports stay 0 and only the address is rewritten;
+  // ICMP's checksum does not cover the IP header, so nothing else has
+  // to change.
   if (proto == IPPROTO_TCP) {
     struct tcphdr *t = (void *)((__u8 *)data + l4_off);
     if ((void *)(t + 1) > data_end) return;
@@ -815,8 +1331,6 @@ static __always_inline void fwl_nat_denat(struct xdp_md *ctx) {
     struct udphdr *u = (void *)((__u8 *)data + l4_off);
     if ((void *)(u + 1) > data_end) return;
     sport = u->source; dport = u->dest;
-  } else {
-    return;
   }
   struct fwl_nat_key k = {
     .src_addr = ip->saddr, .dst_addr = ip->daddr,
@@ -825,6 +1339,12 @@ static __always_inline void fwl_nat_denat(struct xdp_md *ctx) {
   };
   struct fwl_nat_value *v = bpf_map_lookup_elem(&fwl_nat, &k);
   if (!v) return;
+  // The reply half of a live flow. Stamping here is what makes the
+  // daemon's sweep an IDLE timeout rather than a lifetime cap: a flow
+  // that is still carrying traffic keeps its mapping, and one that
+  // stopped loses it at `timeout_s`.
+  v->last_seen_ns = bpf_ktime_get_ns();
+  fwl_nat_stat(FWL_NAT_STAT_DENAT);
   __be16 new_p = bpf_htons(v->new_port);
   if (v->nat_type == FWL_NAT_DNAT) {
     __be32 old_d = ip->daddr;
@@ -836,7 +1356,7 @@ static __always_inline void fwl_nat_denat(struct xdp_md *ctx) {
         t->check = fwl_l4_fix(t->check, old_d, v->new_addr, dport, new_p);
         t->dest = new_p;
       }
-    } else {
+    } else if (proto == IPPROTO_UDP) {
       struct udphdr *u = (void *)((__u8 *)data + l4_off);
       if ((void *)(u + 1) <= data_end) {
         if (u->check != 0) {
@@ -856,7 +1376,7 @@ static __always_inline void fwl_nat_denat(struct xdp_md *ctx) {
         t->check = fwl_l4_fix(t->check, old_s, v->new_addr, sport, new_p);
         t->source = new_p;
       }
-    } else {
+    } else if (proto == IPPROTO_UDP) {
       struct udphdr *u = (void *)((__u8 *)data + l4_off);
       if ((void *)(u + 1) <= data_end) {
         if (u->check != 0) {
@@ -868,6 +1388,179 @@ static __always_inline void fwl_nat_denat(struct xdp_md *ctx) {
     }
   }
 }
+"""
+
+
+# Routed-forward state (v0.4 § 6.3). Declared by any program that can
+# `redirect to <zone>`, whether or not it also translates addresses.
+#
+# A redirect used to be one `bpf_redirect_map()`, which forwards the
+# frame with the Ethernet header it arrived with. That is correct for a
+# zone-to-zone hop on ONE L2 segment and wrong for every hop that
+# crosses a subnet boundary: the destination MAC is still the firewall's
+# own, so the next hop's NIC reports PACKET_OTHERHOST and its IP stack
+# discards the frame before any socket sees it. Masquerade toward an
+# upstream gateway is that second case by definition — you cannot
+# translate the source to your own address and then hand the frame to a
+# MAC you never addressed — so it never worked, and a promiscuous
+# AF_PACKET witness could not tell (it counts frames a real stack
+# drops).
+_ROUTE_DECL = """\
+#define FWL_ROUTE_STAT_ROUTED    0
+#define FWL_ROUTE_STAT_BRIDGED   1
+#define FWL_ROUTE_STAT_NO_ROUTE  2
+#define FWL_ROUTE_STAT_NO_NEIGH  3
+#define FWL_ROUTE_STAT_TTL       4
+#define FWL_ROUTE_STAT_OFF_ZONE  5
+#define FWL_ROUTE_STAT_SLOTS     6
+
+struct {
+  __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+  __uint(max_entries, FWL_ROUTE_STAT_SLOTS);
+  __type(key, __u32);
+  __type(value, __u64);
+} fwl_route_stats SEC(".maps");
+"""
+
+
+# `fwl_route_l2` returns this when the box does not route this packet
+# out this zone, and the caller forwards the frame unchanged — exactly
+# what a redirect did before routing existed. That fallback is what
+# keeps a genuine L2 zone hop (and every bridged test, and the corpus,
+# where no devmap is populated at all) behaving as it always has.
+_ROUTE_HELPERS = """\
+#define FWL_ROUTE_BRIDGE (-1)
+
+static __always_inline void fwl_route_stat(__u32 slot) {
+  __u64 *c = bpf_map_lookup_elem(&fwl_route_stats, &slot);
+  if (c) __sync_fetch_and_add(c, 1);
+}
+
+// RFC 1141 incremental checksum update for a TTL decrement. Written out
+// rather than recomputed with bpf_csum_diff because the route helpers
+// are emitted for programs that carry no NAT, where fwl_fix_ip_csum
+// does not exist.
+static __always_inline void fwl_ip_decrease_ttl(struct iphdr *ip) {
+  __u32 check = (__u32)ip->check;
+  check += (__u32)bpf_htons(0x0100);
+  ip->check = (__u16)(check + (check >= 0xFFFF));
+  ip->ttl--;
+}
+
+// Resolve the next hop for an IPv4 frame and address the frame to it.
+//
+// `zone_ifindex` is the egress interface the policy named (devmap slot
+// 0 of the destination zone). The FIB's answer is only usable when it
+// agrees: a box with a default route resolves EVERY destination, so
+// without this check a zone-to-zone hop on an unrouted segment would be
+// stamped with the MACs of the default gateway — which sits on a
+// different interface entirely. Route through the zone the policy
+// named, or do not route.
+//
+// Returns an XDP action, or FWL_ROUTE_BRIDGE for "this box does not
+// route this packet out this zone" — the caller then forwards the frame
+// with the header it arrived with, which is what a redirect has always
+// done.
+static __always_inline int fwl_route_l2(struct xdp_md *ctx,
+                                        __u32 zone_ifindex) {
+  void *data = (void *)(long)ctx->data;
+  void *data_end = (void *)(long)ctx->data_end;
+  struct ethhdr *eth = data;
+  if ((void *)(eth + 1) > data_end) return FWL_ROUTE_BRIDGE;
+  // A tagged frame's next hop is a property of its VLAN, and rewriting
+  // the MACs without touching the tag addresses the right host on the
+  // wrong segment. v0.4 routes untagged IPv4 only; everything else
+  // keeps the L2-adjacent behaviour. (IPv6 has no conntrack and no NAT
+  // here either — same version boundary, stated once.)
+  if (eth->h_proto != bpf_htons(ETH_P_IP)) return FWL_ROUTE_BRIDGE;
+  struct iphdr *ip = (void *)(eth + 1);
+  if ((void *)(ip + 1) > data_end) return FWL_ROUTE_BRIDGE;
+
+  struct bpf_fib_lookup fib = {};
+  fib.family = AF_INET;
+  fib.l4_protocol = ip->protocol;
+  fib.tot_len = bpf_ntohs(ip->tot_len);
+  fib.ipv4_src = ip->saddr;
+  fib.ipv4_dst = ip->daddr;
+  fib.ifindex = ctx->ingress_ifindex;
+
+  long rc = bpf_fib_lookup(ctx, &fib, sizeof(fib), 0);
+  if (rc != BPF_FIB_LKUP_RET_SUCCESS) {
+    // The three the kernel documents as droppable: a routing table
+    // exists, was consulted, and said no. Everything else means "this
+    // box is not routing this packet" (no route, forwarding disabled,
+    // an encapsulating route, a bad argument) and falls back to the
+    // L2-adjacent forward.
+    if (rc == BPF_FIB_LKUP_RET_BLACKHOLE ||
+        rc == BPF_FIB_LKUP_RET_UNREACHABLE ||
+        rc == BPF_FIB_LKUP_RET_PROHIBIT) {
+      fwl_route_stat(FWL_ROUTE_STAT_NO_ROUTE);
+      return XDP_DROP;
+    }
+    // The route is known and the next hop's MAC is not. XDP cannot
+    // resolve it; the stack can, so hand the frame over and let it send
+    // the ARP. Counted because for a SOURCE-TRANSLATED frame the stack
+    // will discard it (its source is one of our own addresses, which
+    // fib_validate_source rejects as martian) — the resolution happens,
+    // this packet does not survive it, and the counter is the only
+    // trace.
+    if (rc == BPF_FIB_LKUP_RET_NO_NEIGH) {
+      fwl_route_stat(FWL_ROUTE_STAT_NO_NEIGH);
+      return XDP_PASS;
+    }
+    return FWL_ROUTE_BRIDGE;
+  }
+
+  if (fib.ifindex != zone_ifindex) {
+    fwl_route_stat(FWL_ROUTE_STAT_OFF_ZONE);
+    return FWL_ROUTE_BRIDGE;
+  }
+
+  // Re-derive the packet pointers before touching the frame. The
+  // verifier accepts the originals here (bpf_fib_lookup does not move
+  // the packet), so this is belt and braces rather than a requirement —
+  // but a rewrite through a stale pointer is the kind of bug that shows
+  // up as one corrupted frame in a million, and nothing above this line
+  // depends on the pointers surviving.
+  data = (void *)(long)ctx->data;
+  data_end = (void *)(long)ctx->data_end;
+  eth = data;
+  if ((void *)(eth + 1) > data_end) return FWL_ROUTE_BRIDGE;
+  ip = (void *)(eth + 1);
+  if ((void *)(ip + 1) > data_end) return FWL_ROUTE_BRIDGE;
+
+  // A router decrements. Below 2 the packet dies here and the ICMP
+  // time-exceeded that says so is the stack's job, not ours.
+  if (ip->ttl <= 1) {
+    fwl_route_stat(FWL_ROUTE_STAT_TTL);
+    return XDP_PASS;
+  }
+
+  fwl_ip_decrease_ttl(ip);
+  __builtin_memcpy(eth->h_dest, fib.dmac, ETH_ALEN);
+  __builtin_memcpy(eth->h_source, fib.smac, ETH_ALEN);
+  return XDP_REDIRECT;
+}
+"""
+
+
+# One per redirect-destination zone: the devmap name has to be a
+# compile-time constant at the bpf_redirect_map() call site, so the
+# zone's redirect is a function of its own rather than an argument.
+_ROUTE_ZONE_TEMPLATE = """\
+static __always_inline int fwl_redirect_{zone}(struct xdp_md *ctx) {{
+  __u32 _rk = 0;
+  __u32 *_rif = bpf_map_lookup_elem(&fwl_devmap_{zone}, &_rk);
+  int _ra = _rif ? fwl_route_l2(ctx, *_rif) : FWL_ROUTE_BRIDGE;
+  if (_ra == FWL_ROUTE_BRIDGE) {{
+    fwl_route_stat(FWL_ROUTE_STAT_BRIDGED);
+  }} else if (_ra == XDP_REDIRECT) {{
+    fwl_route_stat(FWL_ROUTE_STAT_ROUTED);
+  }} else {{
+    return _ra;
+  }}
+  return bpf_redirect_map(&fwl_devmap_{zone}, 0, 0);
+}}
 """
 
 
@@ -1436,6 +2129,10 @@ def _emit_parse_prelude(
         if (!_ct_v) _ct_v = bpf_map_lookup_elem(&conntrack, &_ct_r);
         if (_ct_v) {
           ct_state = 1;
+          _ct_v->last_seen_ns = bpf_ktime_get_ns();
+          _ct_v->packets += 1;
+        } else if (proto == IPPROTO_ICMP) {
+          ct_state = fwl_ct_icmp_related(ip, data_end) ? 2 : 0;
         } else if (proto == IPPROTO_TCP && !tcp_syn) {
           ct_state = 3;
         }"""
@@ -2040,14 +2737,19 @@ def _emit_ct_create(indent: str = "    ") -> str:
 
 
 def _redirect_return(zone: str) -> str:
-  """C expression that redirects out the destination zone (v0.4 § 6.3).
+  """C expression that forwards out the destination zone (v0.4 § 6.3).
 
-  Uses bpf_redirect_map() against the zone's devmap (key 0 = the
-  zone's first/representative egress ifindex, which the daemon
-  populates at load time). For a multi-interface zone the switch chip's
-  FDB picks the physical egress port. Returns XDP_REDIRECT.
+  `fwl_redirect_<zone>` routes when this box's own routing table says
+  the destination is reachable through that zone — next-hop MAC from
+  `bpf_fib_lookup`, TTL decremented — and otherwise forwards the frame
+  with the Ethernet header it arrived with, which is all a redirect
+  ever did. Egress is still the zone's devmap (key 0 = the zone's
+  first/representative ifindex, populated by the daemon at load time);
+  for a multi-interface zone the switch chip's FDB picks the physical
+  port. Returns XDP_REDIRECT, or XDP_DROP/XDP_PASS when the route
+  lookup says the packet must not go out as it is.
   """
-  return f"bpf_redirect_map(&fwl_devmap_{zone}, 0, 0)"
+  return f"fwl_redirect_{zone}(ctx)"
 
 
 def _emit_rule(
@@ -2562,14 +3264,25 @@ def _emit_nat_call(action: ast.Action, nat_addr, nat_port) -> str:
 
   `nat_addr` is the dotted-quad-as-int (big-endian) the parser produced;
   `bpf_htonl` converts it to the __be32 the packet carries. masquerade
-  takes the source from the runtime `fwl_nat_cfg` map instead."""
+  takes the source from the runtime `fwl_nat_cfg` map instead.
+
+  A NAT action is non-terminal — it rewrites and falls through to the
+  next rule — with ONE exception: a rewrite the helper could not claim a
+  reply mapping for terminates the packet with XDP_DROP. Translating
+  without a mapping is what makes a reply arrive at the firewall's own
+  address (a full table, l11_02) or in another guest's socket (a port
+  collision, l11_01), and both were silent. A drop is visible, is
+  counted in `fwl_nat_stats`, and is the only outcome that cannot
+  misdeliver somebody else's payload.
+  """
   if action == ast.Action.MASQUERADE:
-    return "fwl_masquerade(ctx);"
-  if action == ast.Action.SNAT:
-    return f"fwl_snat_egress(ctx, bpf_htonl({nat_addr & 0xffffffff}U));"
-  # DNAT
-  return (f"fwl_dnat_ingress(ctx, bpf_htonl({nat_addr & 0xffffffff}U), "
-          f"bpf_htons({nat_port}));")
+    call = "fwl_masquerade(ctx)"
+  elif action == ast.Action.SNAT:
+    call = f"fwl_snat_egress(ctx, bpf_htonl({nat_addr & 0xffffffff}U))"
+  else:
+    call = (f"fwl_dnat_ingress(ctx, bpf_htonl({nat_addr & 0xffffffff}U), "
+            f"bpf_htons({nat_port}))")
+  return f"if ({call} < 0) return XDP_DROP;"
 
 
 def _emit_devmaps(zones: list[str], pinned: bool) -> str:
@@ -2594,7 +3307,23 @@ struct {{
   __uint(max_entries, 64);{pin}
 }} fwl_devmap_{z} SEC(".maps");
 """)
+  if blocks:
+    blocks.append(_maybe_pin(_ROUTE_DECL, pinned))
   return "\n".join(blocks)
+
+
+def _emit_route_helpers(zones: list[str]) -> str:
+  """The routing helpers, plus one redirect function per destination.
+
+  Emitted only when the object can redirect somewhere. Must follow the
+  devmap declarations (each function names its own map) and precede any
+  `static __noinline` helper body, since a helper may redirect too.
+  """
+  if not zones:
+    return ""
+  return _ROUTE_HELPERS + "\n" + "\n".join(
+    _ROUTE_ZONE_TEMPLATE.format(zone=z) for z in zones
+  )
 
 
 def _walk_calls_in_stmts(stmts):
@@ -2787,6 +3516,7 @@ def _emit_zone_source(
       if z not in redirect_zones:
         redirect_zones.append(z)
   devmaps = _emit_devmaps(redirect_zones, pinned_shared)
+  route_helpers = _emit_route_helpers(redirect_zones)
 
   # Phase 5 NAT. Emit the maps + helpers when this program uses NAT, or
   # when forced (a bundle where some other zone does — so return traffic
@@ -2802,6 +3532,11 @@ def _emit_zone_source(
     _maybe_pin(_CONNTRACK_DECL, pinned_shared)
     if (uses_ct or nat_active) else ""
   )
+  # The RELATED classifier is only referenced by the prelude's ct
+  # block, so it follows `uses_ct` alone — a NAT-only program declares
+  # the map (for the post-NAT insert) but never reads a state.
+  if uses_ct:
+    conntrack_decl += _CONNTRACK_HELPERS
   ct_create = _emit_ct_create() if uses_ct else ""
 
   nat_decl = _maybe_pin(_NAT_DECL, pinned_shared) if nat_active else ""
@@ -2881,7 +3616,7 @@ def _emit_zone_source(
     src = f"""{_HEADER}
 {scratch_struct}
 {maps_block}{scratch_map}{prog_array}
-{nat_helpers}
+{nat_helpers}{route_helpers}
 {helper_protos}{helper_defs}{programs}
 char _license[] SEC("license") = "GPL";
 {counter_table}"""
@@ -2904,7 +3639,7 @@ char _license[] SEC("license") = "GPL";
 
   src = f"""{_HEADER}
 {maps_block}
-{nat_helpers}
+{nat_helpers}{route_helpers}
 {helper_protos}{helper_defs}SEC("xdp")
 int fwl_prog(struct xdp_md *ctx) {{
 {prelude}{nat_denat}{body}  {final_stmt}
@@ -3196,9 +3931,308 @@ def emit_bundle(program: ast.Program) -> dict[str, str]:
       zp, pinned_shared=True, force_nat=bundle_nat,
       helpers=program.helpers,
     )
+  # The egress tracker is part of the bundle's map graph, not an extra
+  # beside it: it declares the same pinned `conntrack`. Emitting it here
+  # is what puts it through `_check_bundle_pinned_maps` below, so a
+  # conntrack declaration that ever drifted between the zone objects
+  # and the tracker fails the COMPILE instead of failing libbpf's pin
+  # reuse at load with nothing but "Invalid argument".
+  if bundle_needs_egress_tracker(program):
+    # A zone called `fwl_egress` would compile to the same filename and
+    # the tracker would silently replace it in this dict — the zone's
+    # object would then be built from the tracker's source, carry no
+    # `fwl_prog`, and fail the load with a message about the wrong
+    # thing. A reserved name is a compile error, like a zone_id
+    # collision, and for the same reason.
+    clash = [
+      zp.zone_name for zp in program.programs
+      if f"{zp.zone_name}.bpf.c" == EGRESS_TRACKER_SOURCE
+    ]
+    if clash:
+      raise _codegen_error(
+        f"zone '{clash[0]}' collides with the bundle's egress "
+        f"conntrack tracker, which is emitted as "
+        f"'{EGRESS_TRACKER_SOURCE}' (v0.4 § 6.9). Rename the zone."
+      )
+    files[EGRESS_TRACKER_SOURCE] = emit_egress_tracker()
   _check_bundle_pinned_maps(files)
   files["fwl_shared.h"] = _emit_shared_header(program)
   return files
+
+
+# The filename of the bundle's egress tracker, in the bundle directory
+# and in the manifest. One per bundle, not one per zone: what it does is
+# a property of the box, not of a policy.
+EGRESS_TRACKER_SOURCE = "fwl_egress.bpf.c"
+
+# The entry program's name; `fd` resolves it by name in the object.
+EGRESS_TRACKER_PROG = "fwl_egress_ct"
+
+
+_EGRESS_STATS_DECL = """\
+#define FWL_EGRESS_STAT_SEEN       0
+#define FWL_EGRESS_STAT_NOT_LOCAL  1
+#define FWL_EGRESS_STAT_UNTRACKED  2
+#define FWL_EGRESS_STAT_TRACKED    3
+#define FWL_EGRESS_STAT_REFRESHED  4
+#define FWL_EGRESS_STAT_REFUSED    5
+#define FWL_EGRESS_STAT_SLOTS      6
+
+struct {
+  __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+  __uint(max_entries, FWL_EGRESS_STAT_SLOTS);
+  __type(key, __u32);
+  __type(value, __u64);
+  __uint(pinning, LIBBPF_PIN_BY_NAME);
+} fwl_egress_stats SEC(".maps");
+
+static __always_inline void fwl_egress_bump(__u32 slot) {
+  __u64 *c = bpf_map_lookup_elem(&fwl_egress_stats, &slot);
+  if (c) *c += 1;
+}
+"""
+
+
+# The whole tracker. Deliberately policy-independent: it asks one
+# question about each packet ("did this box originate this flow?") and
+# writes one kind of answer, so there is nothing in it a rule could
+# change and nothing to recompile when a rule does.
+_EGRESS_TRACKER_BODY = """\
+// <linux/pkt_cls.h> drags in headers that do not compile under
+// `clang -target bpf` on every distro. TC_ACT_OK is 0 and has been
+// since the classifier API existed.
+#define FWL_TC_ACT_OK 0
+
+#ifndef ETH_P_8021Q
+#define ETH_P_8021Q 0x8100
+#endif
+#ifndef ETH_P_8021AD
+#define ETH_P_8021AD 0x88A8
+#endif
+
+// Flows the BOX ITSELF originates (v0.4 § 6.9).
+//
+// XDP conntrack only ever sees INGRESS. The DNS query the forwarder
+// sends upstream, the NTP exchange that sets the clock, the update it
+// fetches — each leaves through the local stack, which no XDP program
+// is attached to, so no entry is created; the reply arrives on the WAN
+// port, reads NEW, and `default drop` eats it. Measured on the rig
+// before this existed (l12_01): 5 requests out, 5 replies at the port
+// by datapath counter, 0 survived, conntrack 0 -> 0. That kills DNS
+// forwarding, which is the entire purpose of the DNS service, and NTP,
+// and every update path.
+//
+// The qdisc layer is where the gap is exactly covered, and the reason
+// is measured rather than assumed: this hook sees 5/5 of what the local
+// stack sends and 0 of 13 frames the XDP datapath forwarded out the
+// same port, because bpf_redirect_map() leaves through ndo_xdp_xmit,
+// below the qdisc entirely. So the forwarding fast path pays nothing
+// for this and cannot be double-counted by it.
+//
+// The alternative — bpf_sk_lookup_udp() from XDP, with no second copy
+// of the state at all — was refuted the same way: it can only tell a
+// reply from an unsolicited arrival when the socket carries a peer, and
+// dnsmasq's upstream sockets are unconnected 2/2. Admitting on an
+// unconnected match would open every bound port to the WAN.
+SEC("tc")
+int fwl_egress_ct(struct __sk_buff *skb) {
+  fwl_egress_bump(FWL_EGRESS_STAT_SEEN);
+
+  // The discriminator, and the whole reason this hook does not change
+  // what the firewall forwards. A packet the LOCAL STACK sent carries
+  // the socket that sent it; a packet this box merely FORWARDED (the
+  // XDP_PASS path plus ip_forward, or the NO_NEIGH fallback) has none.
+  // Without this test the tracker would create an entry for every
+  // forwarded flow and quietly admit its replies — a policy change,
+  // made by a component whose job is to observe.
+  if (skb->sk == NULL) {
+    fwl_egress_bump(FWL_EGRESS_STAT_NOT_LOCAL);
+    return FWL_TC_ACT_OK;
+  }
+
+  void *data = (void *)(long)skb->data;
+  void *data_end = (void *)(long)skb->data_end;
+  struct ethhdr *eth = data;
+  if ((void *)(eth + 1) > data_end) {
+    fwl_egress_bump(FWL_EGRESS_STAT_UNTRACKED);
+    return FWL_TC_ACT_OK;
+  }
+  // 802.1Q, skipped exactly as the XDP prelude skips it. The prelude
+  // advances L3 past the tag and keys conntrack on the INNER header, so
+  // a tracker that rejected every tagged frame would leave every
+  // box-originated flow on a VLAN zone untracked — while the daemon
+  // logged an attach and the CLI rendered a healthy row. (A tag the
+  // NIC inserts is not in the data at this hook and needs nothing: the
+  // EtherType here is already the inner one.)
+  __u16 h_proto = eth->h_proto;
+  void *l3 = (void *)(eth + 1);
+  if (h_proto == bpf_htons(ETH_P_8021Q) ||
+      h_proto == bpf_htons(ETH_P_8021AD)) {
+    struct fwl_vlanhdr *vh = l3;
+    if ((void *)(vh + 1) > data_end) {
+      fwl_egress_bump(FWL_EGRESS_STAT_UNTRACKED);
+      return FWL_TC_ACT_OK;
+    }
+    h_proto = vh->inner_proto;
+    l3 = (void *)(vh + 1);
+  }
+  // v0.4 conntrack is IPv4-only, so a v6 flow the box originates is
+  // still not tracked. Counted here rather than ignored: the row is
+  // what says so.
+  if (h_proto != bpf_htons(ETH_P_IP)) {
+    fwl_egress_bump(FWL_EGRESS_STAT_UNTRACKED);
+    return FWL_TC_ACT_OK;
+  }
+  struct iphdr *ip = l3;
+  if ((void *)(ip + 1) > data_end) {
+    fwl_egress_bump(FWL_EGRESS_STAT_UNTRACKED);
+    return FWL_TC_ACT_OK;
+  }
+  // A non-first fragment carries no L4 header; keying it on ports 0
+  // would make it a different flow from its own first fragment.
+  if ((bpf_ntohs(ip->frag_off) & 0x1FFF) != 0) {
+    fwl_egress_bump(FWL_EGRESS_STAT_UNTRACKED);
+    return FWL_TC_ACT_OK;
+  }
+  __u32 hlen = ip->ihl * 4;
+  if (hlen < sizeof(struct iphdr)) {
+    fwl_egress_bump(FWL_EGRESS_STAT_UNTRACKED);
+    return FWL_TC_ACT_OK;
+  }
+  __u8 proto = ip->protocol;
+  // ICMP is keyed on ports 0, exactly as the XDP prelude keys it and as
+  // fwl_snat_egress installs it, so the box's own ping hears back.
+  //
+  // ONE variable-offset pointer and ONE bounds check for both TCP and
+  // UDP, because the ports sit at the same two offsets in each (which
+  // is the only reason fwl_inner_l4 serves both) and both headers are
+  // at least these 8 bytes long. Written as two branches with a
+  // `struct tcphdr *` and a `struct udphdr *`, clang common-subexpresses
+  // the two `(void *)ip + hlen` computations and the UDP read inherits
+  // the TCP branch's range: the verifier rejects it with "R2 offset is
+  // outside of the packet". Caught by loading it, not by reading it.
+  //
+  // Every other protocol is keyed on ports 0, which is not a
+  // concession: it is what the XDP prelude does. It parses ports for
+  // TCP and UDP and leaves `src_port`/`dst_port` at 0 for everything
+  // else, so a box-originated GRE or IPsec flow HAS a key on the
+  // ingress side — and refusing to write it here would leave the two
+  // disagreeing about a tuple they both compute.
+  __u16 sport = 0, dport = 0;
+  if (proto == IPPROTO_TCP || proto == IPPROTO_UDP) {
+    struct fwl_inner_l4 *l4 = (void *)ip + hlen;
+    if ((void *)(l4 + 1) > data_end) {
+      fwl_egress_bump(FWL_EGRESS_STAT_UNTRACKED);
+      return FWL_TC_ACT_OK;
+    }
+    sport = bpf_ntohs(l4->source);
+    dport = bpf_ntohs(l4->dest);
+  }
+
+  // BOTH directions are probed before anything is created, which is
+  // what keeps the occupancy cost at one entry per flow the box
+  // genuinely originates. A reply the box sends to a LAN client is
+  // egress traffic too, and its forward key is the REVERSE of the entry
+  // the client's own query already created on ingress: probing one
+  // direction only would insert a second entry for every served flow
+  // and double conntrack's fill rate — in a table that is already the
+  // binding constraint at two entries per NAT mapping.
+  struct fwl_conn_key fwd = {
+    .src_addr = ip->saddr, .dst_addr = ip->daddr,
+    .src_port = sport, .dst_port = dport, .proto = proto,
+  };
+  struct fwl_conn_key rev = {
+    .src_addr = ip->daddr, .dst_addr = ip->saddr,
+    .src_port = dport, .dst_port = sport, .proto = proto,
+  };
+  __u64 now = bpf_ktime_get_ns();
+  struct fwl_conn_value *v = bpf_map_lookup_elem(&conntrack, &fwd);
+  if (!v) v = bpf_map_lookup_elem(&conntrack, &rev);
+  if (v) {
+    // Refresh, never re-create. The GC ages on last_seen_ns, so an
+    // entry whose traffic is mostly OUTBOUND (a long upload, a held DNS
+    // socket) has to be stamped from here as well or it is collected
+    // out from under a live flow.
+    v->last_seen_ns = now;
+    v->packets += 1;
+    fwl_egress_bump(FWL_EGRESS_STAT_REFRESHED);
+    return FWL_TC_ACT_OK;
+  }
+  struct fwl_conn_value nv = {
+    .last_seen_ns = now, .packets = 1, .state = 1,
+  };
+  if (bpf_map_update_elem(&conntrack, &fwd, &nv, BPF_NOEXIST) != 0) {
+    // Almost always the table at its cap, and this is the failure that
+    // has no other symptom: the packet still goes out, the reply still
+    // arrives, and `default drop` eats it. "DNS stopped resolving" with
+    // every counter climbing. fd turns this slot into a log line.
+    fwl_egress_bump(FWL_EGRESS_STAT_REFUSED);
+    return FWL_TC_ACT_OK;
+  }
+  fwl_egress_bump(FWL_EGRESS_STAT_TRACKED);
+  return FWL_TC_ACT_OK;
+}
+
+char _license[] SEC("license") = "GPL";
+"""
+
+
+def emit_egress_tracker() -> str:
+  """The bundle's TC clsact egress conntrack tracker (v0.4 § 6.9).
+
+  One object per bundle, attached by `fd` to every interface the
+  bundle's XDP programs are attached to. It creates a conntrack entry
+  for each flow this box ORIGINATES, so the reply reads ESTABLISHED at
+  XDP ingress instead of NEW.
+
+  The `conntrack` declaration is `_CONNTRACK_DECL` itself, not a copy of
+  it: this object and every zone object must present libbpf with a
+  byte-identical definition of the pinned map or the second load fails
+  with -EINVAL and no detail. Two hand-written declarations of the same
+  map is precisely the drift this shares its way out of.
+  """
+  src = (
+    f"{_HEADER}\n"
+    f"{_maybe_pin(_CONNTRACK_DECL, True)}\n"
+    f"{_EGRESS_STATS_DECL}\n"
+    f"{_EGRESS_TRACKER_BODY}"
+  )
+  # The same invariant every zone source runs, on the one object that is
+  # not a zone: each map here must have a row in `_MAP_KINDS` and must
+  # carry the pinning its scope demands. A tracker that quietly got its
+  # OWN copy of `conntrack` would write entries no XDP program can read
+  # — the feature failing in exactly the silent way it exists to close.
+  _check_map_scopes(src, MapNames(zone="fwl_egress"))
+  return src
+
+
+def bundle_needs_egress_tracker(program: ast.Program) -> bool:
+  """True when this bundle's policy reads conntrack anywhere.
+
+  The tracker exists to make `conntrack(pkt).state` answer correctly for
+  a flow the box started. A unit that never asks the question has no
+  conntrack map to write into and needs no tracker — emitting one would
+  pin a map nothing reads, which the daemon would then have to reconcile
+  against a bundle that does not declare it.
+
+  Helpers are searched as well as zone bodies, and that is not an
+  embellishment: `_emit_zone_source` decides `uses_ct` over the zone
+  PLUS its reachable helpers, so a policy whose only conntrack read
+  lives in a `def` emits the lookup, pins the map, and drops NEW — and
+  asking the zone bodies alone answered "no tracker needed" for it. The
+  daemon then reported it as a bundle compiled before the hook existed
+  and told the operator to recompile, which produced the identical
+  bundle. Two answers to one question, in two places, is how the map
+  scope defect got in three times; ask it the way the emitter asks it.
+  """
+  helpers = program.helpers or []
+  for zp in program.programs:
+    units = [zp] + [
+      _synth_unit(zp, h) for h in _reachable_helpers(zp, helpers)
+    ]
+    if any(_program_uses_conntrack(u) for u in units):
+      return True
+  return False
 
 
 def shared_pinned_map_names(files: dict[str, str]) -> list[str]:

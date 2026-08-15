@@ -8,12 +8,15 @@
 #ifndef INCLUDE_ADAPTERS_FW_TRANSPORT_H_
 #define INCLUDE_ADAPTERS_FW_TRANSPORT_H_
 
+#include <chrono>
 #include <expected>
 #include <memory>
 #include <string>
 
 #include "einheit/cli/error.h"
 #include "einheit/cli/transport/transport.h"
+#include "f/lease/journal.h"
+#include "f/lease/lease.h"
 
 namespace einheit::adapters::fw {
 
@@ -39,6 +42,31 @@ struct FLocalConfig {
   std::string dnsmasq_conf = "/etc/f/generated/dnsmasq.conf";
   /// Where the generated networkd units are installed.
   std::string networkd_dir = "/etc/systemd/network";
+  /// Where the generated sysctl drop-in is installed.
+  std::string sysctl_dir = "/etc/sysctl.d";
+  /// Where the live kernel knobs are written. A test points this at a
+  /// temp tree; nothing else should.
+  std::string sysctl_proc_dir = "/proc/sys";
+  /// Where fd deposits compiled bundles. Every reload adds one, so
+  /// this is the directory that grows without a policy unless
+  /// somebody gives it one.
+  std::string compiled_dir = "/usr/share/f/compiled";
+  /// The lease database dnsmasq writes. Generated into the dnsmasq
+  /// artifact from the same constant the reader uses, so the two
+  /// cannot disagree about where it is.
+  std::string lease_file = ::f::lease::kLeaseFilePath;
+  /// Where the device history lives: when each MAC first appeared and
+  /// when it was last seen. Written by whatever looks at the leases.
+  std::string device_journal = ::f::lease::kJournalPath;
+  /// How often a lease watch re-reads the lease file. Short enough
+  /// that plugging a board in and seeing it appear feels immediate,
+  /// long enough not to spin on a file.
+  std::chrono::milliseconds lease_poll{2000};
+  /// The installer, which owns the deployable set. `show install`
+  /// runs it rather than keeping a second list of what a box needs:
+  /// two enumerations that can disagree is the failure this command
+  /// exists to report.
+  std::string install_tool = "/usr/local/bin/f-install";
   /// f-confd's control socket. f-confd owns the commit-confirmed
   /// revert timer, which has to outlive the session that armed it —
   /// so applying the system configuration goes through it whenever it

@@ -1,0 +1,27 @@
+name: "an icmp error about a masqueraded ping — no ports on either header"
+source_fw: |
+  @xdp(lan)
+  masquerade if pkt.src_ip in [10.0.0.0/8]
+  allow if pkt.proto == icmp and pkt.icmp.type == 8
+  allow if conntrack(pkt).state in [established, related]
+  default drop
+sequence:
+  - name: a masqueraded ping goes out, installing a mapping keyed on ports 0
+    builder: icmp(src_ip="10.44.0.3", dst_ip="1.1.1.1", type=8, code=0)
+    expected:
+      bpf_action: allow
+      output_packet:
+        src_ip: "203.0.113.250"
+        dst_ip: "1.1.1.1"
+  - name: a time-exceeded about that ping — the embedded datagram is itself ICMP, so its tuple has ports 0 on both sides, which is exactly the key its mapping was installed under. Nothing but the embedded ADDRESSES can identify it
+    builder: icmperr(src_ip="192.0.2.1", dst_ip="203.0.113.250", type=11, code=0, inner_proto="icmp", inner_src_ip="203.0.113.250", inner_dst_ip="1.1.1.1")
+    expected:
+      bpf_action: allow
+      output_packet:
+        src_ip: "192.0.2.1"
+        dst_ip: "10.44.0.3"
+        inner_src_ip: "10.44.0.3"
+        inner_dst_ip: "1.1.1.1"
+state:
+  nat:
+    masq_ip: "203.0.113.250"

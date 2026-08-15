@@ -342,4 +342,76 @@ TEST_F(CommitReloadTest, ReloadCommandSurfacesDaemonError) {
             std::string::npos);
 }
 
+// --- Counts that must come from the work, not from the intent -------
+//
+// The same shape as the loader defect this file's own first test is
+// about: a number reported from what was enumerated rather than from
+// what was done reads healthy in exactly the case it exists to catch.
+
+// Nothing to validate is not a validated commit. `ListFwFiles` returns
+// {} for a source that holds no .fw file, and the validation loop then
+// ran zero times — so a commit whose sources had gone missing got the
+// same silent pass as a clean check, and nothing but fd's own compile
+// stood between the operator and whatever was on disk.
+TEST_F(CommitReloadTest, CommitWithNoSourcesIsRefusedNotSilentlyOk) {
+  SourceTree tree;
+  std::filesystem::remove(
+      std::filesystem::path(tree.path()) / "rules.fw");
+  FakeFd fd(tree.socket());
+  fd.Answer(kReloadProg,
+            R"({"status":"reloaded","version":"0.4"})");
+  fd.Start();
+
+  auto tx = MakeTransport(tree);
+  auto resp = ConfigureThenCommit(*tx);
+
+  EXPECT_EQ(resp.status, proto::ResponseStatus::Error)
+      << "an empty source set validated nothing and said ok";
+  EXPECT_NE(OperatorText(resp).find("nothing to validate"),
+            std::string::npos)
+      << OperatorText(resp);
+  EXPECT_FALSE(fd.SawCommand(kReloadProg))
+      << "a commit that validated nothing must not reach the daemon";
+}
+
+// `rollback` reported `files_restored` by counting snapshots, throwing
+// away the bool `WriteFile` returns. A rollback that could not write —
+// full disk, read-only mount, i.e. the circumstances under which
+// somebody is rolling back — answered "ok (N files restored)" and left
+// the bad policy in place.
+TEST_F(CommitReloadTest, RollbackThatCannotWriteIsNotReportedAsOk) {
+  if (::geteuid() == 0) {
+    GTEST_SKIP() << "root ignores the file mode this test relies on";
+  }
+  SourceTree tree;
+  FakeFd fd(tree.socket());
+  fd.Answer(kReloadProg, R"({"error":"apply failed"})");
+  fd.Start();
+
+  auto tx = MakeTransport(tree);
+  auto configured = tx->SendRequest(MakeRequest("configure"),
+                                    std::chrono::seconds(5));
+  ASSERT_TRUE(configured.has_value());
+  // The snapshot is taken at `configure`; make the file itself
+  // unwritable afterwards so the restore is the step that fails.
+  auto file = std::filesystem::path(tree.path()) / "rules.fw";
+  std::error_code ec;
+  std::filesystem::permissions(file, std::filesystem::perms::owner_read,
+                               std::filesystem::perm_options::replace,
+                               ec);
+  ASSERT_FALSE(ec) << ec.message();
+
+  auto rolled = tx->SendRequest(MakeRequest("rollback"),
+                                std::chrono::seconds(5));
+  std::filesystem::permissions(file, std::filesystem::perms::owner_all,
+                               std::filesystem::perm_options::replace,
+                               ec);
+  ASSERT_TRUE(rolled.has_value());
+  EXPECT_EQ(rolled->status, proto::ResponseStatus::Error)
+      << "restored nothing and reported success";
+  EXPECT_NE(OperatorText(*rolled).find("FAILED to restore"),
+            std::string::npos)
+      << OperatorText(*rolled);
+}
+
 }  // namespace

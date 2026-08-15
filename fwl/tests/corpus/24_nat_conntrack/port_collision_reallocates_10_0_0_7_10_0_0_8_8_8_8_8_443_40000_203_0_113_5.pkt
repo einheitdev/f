@@ -1,0 +1,43 @@
+name: "port collision reallocates 10.0.0.8 behind 10.0.0.7 to 8.8.8.8 443"
+source_fw: |
+  @xdp(lan)
+  masquerade if pkt.src_ip in [10.0.0.0/8]
+  allow if pkt.proto == tcp and pkt.tcp.syn
+  allow if conntrack(pkt).state == established
+  default drop
+state:
+  nat:
+    masq_ip: "203.0.113.5"
+sequence:
+  - name: guest A goes out first and keeps its own source port
+    builder: tcp(src_ip="10.0.0.7", dst_ip="8.8.8.8", src_port=40000, dst_port=443, syn=true)
+    expected:
+      bpf_action: allow
+      output_packet:
+        src_ip: "203.0.113.5"
+        dst_ip: "8.8.8.8"
+        src_port: 40000
+  - name: guest B picks the SAME ephemeral port to the SAME peer — the key is taken, so it is moved into the NAT-owned range instead of overwriting
+    builder: tcp(src_ip="10.0.0.8", dst_ip="8.8.8.8", src_port=40000, dst_port=443, syn=true)
+    expected:
+      bpf_action: allow
+      output_packet:
+        src_ip: "203.0.113.5"
+        dst_ip: "8.8.8.8"
+        src_port: 63820
+  - name: the reply addressed to the ORIGINAL port still belongs to guest A
+    builder: tcp(src_ip="8.8.8.8", dst_ip="203.0.113.5", src_port=443, dst_port=40000, ack=true)
+    expected:
+      bpf_action: allow
+      output_packet:
+        src_ip: "8.8.8.8"
+        dst_ip: "10.0.0.7"
+        dst_port: 40000
+  - name: and the reply addressed to the reallocated port reaches guest B — two flows, two keys, no ambiguity
+    builder: tcp(src_ip="8.8.8.8", dst_ip="203.0.113.5", src_port=443, dst_port=63820, ack=true)
+    expected:
+      bpf_action: allow
+      output_packet:
+        src_ip: "8.8.8.8"
+        dst_ip: "10.0.0.8"
+        dst_port: 40000

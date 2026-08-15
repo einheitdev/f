@@ -769,6 +769,7 @@ def _build_nat_state(case: pkt.PktCase):
 def _build_nat_map_init(case: pkt.PktCase) -> dict[str, dict[bytes, bytes]]:
   """Seed `fwl_nat` (reply mappings) and `fwl_nat_cfg` (masquerade IP)
   from the .pkt's state.nat block, byte-matching the emitted structs."""
+  import time
   out: dict[str, dict[bytes, bytes]] = {}
   if case.nat_masq_ip is not None:
     out["fwl_nat_cfg"] = {
@@ -782,24 +783,35 @@ def _build_nat_map_init(case: pkt.PktCase) -> dict[str, dict[bytes, bytes]]:
       key = (struct.pack(">I", src) + struct.pack(">I", dst)
              + struct.pack("<H", sport) + struct.pack("<H", dport)
              + struct.pack("<B", proto_num) + b"\x00\x00\x00")
-      value = (struct.pack(">I", new) + struct.pack("<H", new_port)
+      # struct fwl_nat_value: __u64 last_seen_ns, then the rewrite. A
+      # seeded mapping is stamped "now" so it reads as a live flow —
+      # the daemon's sweep is what ages it, and no oracle runs one.
+      value = (struct.pack("<Q", time.monotonic_ns())
+               + struct.pack(">I", new) + struct.pack("<H", new_port)
                + struct.pack("<B", _NAT_TYPE_NUM[kind]) + b"\x00")
       entries[key] = value
     out["fwl_nat"] = entries
   return out
 
 
+def _l3_offset(raw: bytes) -> int | None:
+  """Offset of the IPv4 header (plain frame or one 802.1Q tag)."""
+  if len(raw) < 14:
+    return None
+  off = 18 if ((raw[12] << 8) | raw[13]) == 0x8100 and len(raw) >= 18 else 14
+  return off if len(raw) >= off + 20 else None
+
+
 def _decode_output_packet(raw: bytes) -> dict[str, Any]:
   """Decode an output frame's NAT-relevant fields (IPv4, plain or one
-  802.1Q tag). Returns {src_ip, dst_ip, src_port, dst_port}."""
+  802.1Q tag). Returns {src_ip, dst_ip, src_port, dst_port}, plus the
+  inner_* tuple when the frame is an ICMP error carrying an embedded
+  datagram — a case whose whole point is that the translation happens
+  in two headers, so a decoder that only reads the outer one could not
+  tell a correct rewrite from half of one."""
   out: dict[str, Any] = {}
-  if len(raw) < 14:
-    return out
-  off = 14
-  ethertype = (raw[12] << 8) | raw[13]
-  if ethertype == 0x8100 and len(raw) >= 18:
-    off = 18
-  if len(raw) < off + 20:
+  off = _l3_offset(raw)
+  if off is None:
     return out
   ihl = (raw[off] & 0x0F) * 4
   out["src_ip"] = ".".join(str(b) for b in raw[off + 12:off + 16])
@@ -808,6 +820,47 @@ def _decode_output_packet(raw: bytes) -> dict[str, Any]:
   if len(raw) >= l4 + 4:
     out["src_port"] = (raw[l4] << 8) | raw[l4 + 1]
     out["dst_port"] = (raw[l4 + 2] << 8) | raw[l4 + 3]
+  inner = _decode_embedded_datagram(raw, off, ihl)
+  if inner:
+    # An ICMP error's own "ports" are the first four bytes of its
+    # header — type/code/checksum — not ports at all. Reporting them
+    # would let a case assert nonsense and have it pass.
+    out.pop("src_port", None)
+    out.pop("dst_port", None)
+    out.update(inner)
+  return out
+
+
+# ICMPv4 types that carry the datagram that provoked them (RFC 792).
+_ICMP_ERROR_TYPES = frozenset({3, 4, 5, 11, 12})
+
+
+def _decode_embedded_datagram(
+  raw: bytes, off: int, ihl: int
+) -> dict[str, Any]:
+  """Decode the datagram embedded in an ICMP error, or {}.
+
+  Requires the whole 8-byte ICMP header, the 20-byte embedded IP header
+  and 8 embedded transport bytes — the same single bounds test the
+  emitted program makes."""
+  if raw[off + 9] != 1:
+    return {}  # not ICMP
+  icmp = off + ihl
+  in_ip = icmp + 8
+  in_l4 = in_ip + 20
+  if len(raw) < in_l4 + 8:
+    return {}
+  if raw[icmp] not in _ICMP_ERROR_TYPES:
+    return {}
+  if (raw[in_ip] & 0x0F) != 5:
+    return {}
+  out: dict[str, Any] = {
+    "inner_src_ip": ".".join(str(b) for b in raw[in_ip + 12:in_ip + 16]),
+    "inner_dst_ip": ".".join(str(b) for b in raw[in_ip + 16:in_ip + 20]),
+  }
+  if raw[in_ip + 9] in (6, 17):
+    out["inner_src_port"] = (raw[in_l4] << 8) | raw[in_l4 + 1]
+    out["inner_dst_port"] = (raw[in_l4 + 2] << 8) | raw[in_l4 + 3]
   return out
 
 
@@ -850,6 +903,24 @@ def _checksum_diag(raw: bytes) -> str | None:
   proto = raw[off + 9]
   l4 = off + ihl
   seg = raw[l4:]
+  if proto == 1:
+    # ICMP has no pseudo-header: its checksum covers the ICMP header
+    # and everything after it, which for an error is the whole embedded
+    # datagram. That is what makes an ICMP-error translation a
+    # three-layer rewrite — outer IP, embedded IP, and this one over
+    # both of the changes made inside it. Bounded by the IP header's
+    # own total length so trailing Ethernet padding is excluded.
+    total = (raw[off + 2] << 8) | raw[off + 3]
+    if total < ihl or off + total > len(raw):
+      return None  # frame shorter than its header claims; not our call
+    if _ones_sum(raw[l4:off + total]) != 0xFFFF:
+      return "ICMP checksum invalid after rewrite"
+    in_ip = l4 + 8
+    if (len(raw) >= in_ip + 20 and raw[l4] in _ICMP_ERROR_TYPES
+        and (raw[in_ip] & 0x0F) == 5):
+      if _ones_sum(raw[in_ip:in_ip + 20]) != 0xFFFF:
+        return "embedded IP header checksum invalid after rewrite"
+    return None
   if proto == 6 and len(seg) >= 20 or proto == 17 and len(seg) >= 8:
     if proto == 17:
       stored = (seg[6] << 8) | seg[7]

@@ -18,6 +18,7 @@
 #include "f/sysconfig/model.h"
 #include "f/sysconfig/networkd.h"
 #include "f/sysconfig/parse.h"
+#include "f/sysconfig/sysctl.h"
 #include "f/sysconfig/validate.h"
 
 namespace f::confd {
@@ -136,7 +137,35 @@ auto DefaultActivator() -> Activator {
             out));
       }
       if (!report.empty()) report += "; ";
-      report += "f-dnsmasq restarted";
+      // `try-restart` is a no-op that exits 0 when the unit is not
+      // running, so its exit code says the command was issued and
+      // nothing about the unit. Reporting "restarted" from it meant a
+      // dnsmasq that was `failed` when its config was rewritten stayed
+      // failed and the operator was told otherwise. Ask what the unit
+      // is NOW.
+      auto [srv_rc, srv_out] = RunCommand(
+          {"systemctl", "is-active", "f-dnsmasq.service"});
+      std::string state = srv_out;
+      while (!state.empty() &&
+             (state.back() == '\n' || state.back() == '\r')) {
+        state.pop_back();
+      }
+      if (state == "active") {
+        report += "f-dnsmasq restarted (active)";
+      } else if (state == "inactive") {
+        // Legitimate on a box that serves neither DHCP nor DNS: the
+        // config was written and nothing is running to read it. Said
+        // plainly, because "restarted" implies something is serving.
+        report += "f-dnsmasq config written, unit not running "
+                  "(inactive)";
+      } else {
+        report += std::format(
+            "f-dnsmasq config written but the unit is '{}' — it is "
+            "NOT serving the configuration that was just applied "
+            "(`systemctl status f-dnsmasq` for why)",
+            state.empty() ? "unknown" : state);
+      }
+      (void)srv_rc;
     }
     if (report.empty()) report = "nothing needed reloading";
     return report;
@@ -287,8 +316,26 @@ auto SystemBackend::Apply(const cc::Candidate& candidate)
         Fail(cc::ApplyError::HardwareRejected, net.error()));
   }
 
+  // Forwarding travels with the interfaces. A rollback does not need
+  // to undo it: `net.ipv4.ip_forward` is a property of the box being a
+  // router, not of any one revision of its configuration, and a
+  // rollback that turns routing off would cut the session it exists to
+  // protect.
+  sc::SysctlOptions sysctl_opts;
+  sysctl_opts.dir = opts_.sysctl_dir;
+  sysctl_opts.proc_dir = opts_.sysctl_proc_dir;
+  sysctl_opts.refuse_on_drift = !force;
+  auto sysctl = sc::ApplySysctl(*parsed, sysctl_opts);
+  if (!sysctl) {
+    return std::unexpected(
+        Fail(cc::ApplyError::HardwareRejected, sysctl.error()));
+  }
+
   Activation activation;
   activation.networkd_changed = net->changed;
+  if (sysctl->changed) {
+    activation.networkd_changed.push_back(sysctl->unit.path);
+  }
 
   auto plan = sc::PlanDnsmasq(*parsed);
   std::string dnsmasq_note = "no service is bound to a zone";

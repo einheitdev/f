@@ -1,0 +1,23 @@
+name: "forged icmp query not related 10.44.0.3 via 200.100.50.25 from 151.101.0.1 443"
+source_fw: |
+  @xdp(lan)
+  masquerade if pkt.src_ip in [10.0.0.0/8]
+  allow if pkt.proto == tcp and pkt.tcp.syn
+  allow if conntrack(pkt).state in [established, related]
+  default drop
+state:
+  nat:
+    masq_ip: "200.100.50.25"
+sequence:
+  - name: outbound SYN — the flow is open and its header is now public knowledge, having crossed the wire
+    builder: tcp(src_ip="10.44.0.3", dst_ip="151.101.0.1", src_port=33333, dst_port=443, syn=true)
+    expected:
+      bpf_action: allow
+      output_packet:
+        src_ip: "200.100.50.25"
+        dst_ip: "151.101.0.1"
+        src_port: 33333
+  - name: an echo REQUEST carrying a copy of that header as its payload. Everything an error-reader looks at is there and correct; only the type says query. It is not RELATED to anything, and default drop takes it
+    builder: icmperr(src_ip="151.101.0.1", dst_ip="200.100.50.25", type=8, code=0, mtu=1400, inner_proto="tcp", inner_src_ip="200.100.50.25", inner_dst_ip="151.101.0.1", inner_src_port=33333, inner_dst_port=443)
+    expected:
+      bpf_action: drop

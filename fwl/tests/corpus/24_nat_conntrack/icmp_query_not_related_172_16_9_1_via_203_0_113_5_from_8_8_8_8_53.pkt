@@ -1,0 +1,23 @@
+name: "icmp query not related 172.16.9.1 via 203.0.113.5 from 8.8.8.8 53"
+source_fw: |
+  @xdp(lan)
+  masquerade if pkt.src_ip in [172.16.0.0/12]
+  allow if pkt.proto == tcp and pkt.tcp.syn
+  allow if conntrack(pkt).state in [established, related]
+  default drop
+state:
+  nat:
+    masq_ip: "203.0.113.5"
+sequence:
+  - name: outbound SYN — the flow IS open, so a wrong classifier has something to match against
+    builder: tcp(src_ip="172.16.9.1", dst_ip="8.8.8.8", src_port=51000, dst_port=53, syn=true)
+    expected:
+      bpf_action: allow
+      output_packet:
+        src_ip: "203.0.113.5"
+        dst_ip: "8.8.8.8"
+        src_port: 51000
+  - name: an echo reply from the same peer — carries no datagram, names no flow, and default drop takes it
+    builder: icmp(src_ip="8.8.8.8", dst_ip="203.0.113.5", type=0, code=0)
+    expected:
+      bpf_action: drop

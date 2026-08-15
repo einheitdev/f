@@ -32,6 +32,7 @@ cp "$FW" /etc/f/rules.fw
 sleep 6
 
 CURRENT_BEFORE=$(readlink "$BUNDLE_ROOT/current")
+hw::journal_mark
 
 cat > /etc/f/rules.fw <<EOF
 zone t = [$RECV_IF]
@@ -51,7 +52,7 @@ if [ "$CURRENT_BEFORE" = "$CURRENT_AFTER" ]; then
 else
   fail "current moved: $CURRENT_BEFORE -> $CURRENT_AFTER"
 fi
-journalctl -u fd --since "-30s" --no-pager \
+hw::journal_since \
   | grep -qiE "compile|error|fail" \
   && pass "compile failure surfaced in the journal" \
   || fail "no compile-failure log line"

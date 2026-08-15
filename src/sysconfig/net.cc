@@ -3,6 +3,9 @@
 
 #include "f/sysconfig/net.h"
 
+#include <arpa/inet.h>
+
+#include <array>
 #include <cctype>
 #include <cstdlib>
 #include <format>
@@ -153,6 +156,44 @@ auto NormalizeMac(const std::string& s) -> std::string {
         std::tolower(static_cast<unsigned char>(c))));
   }
   return out;
+}
+
+auto Prefix6::NetworkString() const -> std::string {
+  std::array<std::uint8_t, 16> net = addr;
+  for (int i = 0; i < 16; ++i) {
+    int lo = i * 8;
+    if (bits >= lo + 8) continue;
+    if (bits <= lo) {
+      net[i] = 0;
+    } else {
+      net[i] = static_cast<std::uint8_t>(
+          net[i] & (0xFF << (8 - (bits - lo))));
+    }
+  }
+  std::array<char, INET6_ADDRSTRLEN> buf{};
+  if (::inet_ntop(AF_INET6, net.data(), buf.data(), buf.size()) ==
+      nullptr) {
+    return "";
+  }
+  return std::string(buf.data());
+}
+
+auto ParseCidr6(const std::string& s) -> std::optional<Prefix6> {
+  auto slash = s.find('/');
+  // A bare address is refused: this prefix is advertised to clients,
+  // and a length nobody wrote down is a length somebody guesses at.
+  if (slash == std::string::npos) return std::nullopt;
+  auto bits = ParseDecimal(s.substr(slash + 1), 128);
+  if (!bits) return std::nullopt;
+  auto host = s.substr(0, slash);
+  // inet_pton is strict about v6 and has none of inet_aton's octal
+  // and short-form surprises, so it is safe to lean on here.
+  Prefix6 p;
+  if (::inet_pton(AF_INET6, host.c_str(), p.addr.data()) != 1) {
+    return std::nullopt;
+  }
+  p.bits = static_cast<int>(*bits);
+  return p;
 }
 
 }  // namespace f::sysconfig

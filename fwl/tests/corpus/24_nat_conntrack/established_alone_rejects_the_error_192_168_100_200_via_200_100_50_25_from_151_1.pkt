@@ -1,0 +1,23 @@
+name: "established alone rejects the error 192.168.100.200 via 200.100.50.25 from 151.101.0.1 443"
+source_fw: |
+  @xdp(lan)
+  masquerade if pkt.src_ip in [192.168.0.0/16]
+  allow if pkt.proto == tcp and pkt.tcp.syn
+  allow if conntrack(pkt).state == established
+  default drop
+state:
+  nat:
+    masq_ip: "200.100.50.25"
+sequence:
+  - name: outbound SYN — the flow is open and tracked
+    builder: tcp(src_ip="192.168.100.200", dst_ip="151.101.0.1", src_port=33333, dst_port=443, syn=true)
+    expected:
+      bpf_action: allow
+      output_packet:
+        src_ip: "200.100.50.25"
+        dst_ip: "151.101.0.1"
+        src_port: 33333
+  - name: its frag-needed under a policy that lists only `established` — the error is RELATED, which that list does not contain, so default drop takes it
+    builder: icmperr(src_ip="192.0.2.1", dst_ip="200.100.50.25", type=3, code=4, mtu=1400, inner_proto="tcp", inner_src_ip="200.100.50.25", inner_dst_ip="151.101.0.1", inner_src_port=33333, inner_dst_port=443)
+    expected:
+      bpf_action: drop

@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "f/sysconfig/model.h"
+#include "f/sysconfig/observe.h"
 
 namespace f::sysconfig {
 
@@ -61,10 +62,31 @@ struct ServiceStatus {
   bool expected = false;
   /// Zones the service is bound to.
   std::vector<std::string> zones;
-  /// Interfaces it may answer on, derived from those zones.
+  /// Interfaces it *should* answer on, derived from those zones. This
+  /// is intent. It is re-derived from the same model that generated
+  /// the config, so it can never disagree with the config and is
+  /// therefore not evidence that the config worked.
   std::vector<std::string> interfaces;
+  /// Where the daemon is *actually* listening, read from the kernel.
+  /// This is the column an operator is entitled to trust, and the one
+  /// that told the truth when a config named a port that did not
+  /// exist.
+  BindingReport observed;
   /// The last thing the service said, when it said something bad.
   std::string detail;
+
+  /// Interfaces the model expects but the kernel does not show a
+  /// socket for. Empty when the observation is unavailable — an
+  /// unanswerable question is not a mismatch.
+  auto MissingInterfaces() const -> std::vector<std::string>;
+
+  /// True when the service is running, the model binds it somewhere,
+  /// and it is demonstrably not answering there. The whole reason this
+  /// struct carries two lists instead of one.
+  auto Mismatched() const -> bool;
+
+  /// One sentence naming the mismatch, or empty when there is none.
+  auto MismatchDetail() const -> std::string;
 };
 
 /// How to reach systemd. Injected so the query is testable without a
@@ -89,9 +111,21 @@ struct ServiceProbe {
   /// Command that prints recent log lines for a unit.
   std::string log_cmd =
       "journalctl -u {} -n 5 --no-pager -o cat";
+  /// Command that prints the unit's main PID. Everything about where
+  /// the daemon is actually listening hangs off this one number.
+  std::string main_pid_cmd = "systemctl show {} -p MainPID --value";
+  /// Where the socket observation reads from. Injected together with
+  /// the port table so the whole "green while broken" case can be
+  /// reproduced from a fixture.
+  ListenerSource listeners;
+  /// The port table, used to turn a listening address into the port it
+  /// answers on. Injected for the same reason.
+  PortSource ports;
 };
 
-/// Ask systemd about every service the model can express.
+/// Ask systemd about every service the model can express, and then ask
+/// the kernel where each one is actually bound. Two different
+/// questions, deliberately not answered from one source.
 auto QueryServices(const SystemConfig& cfg,
                    const ServiceProbe& probe = {})
     -> std::vector<ServiceStatus>;

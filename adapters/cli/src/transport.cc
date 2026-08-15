@@ -14,14 +14,23 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cerrno>
+#include <chrono>
+#include <condition_variable>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <filesystem>
 #include <format>
 #include <fstream>
+#include <mutex>
+#include <set>
 #include <sstream>
 #include <string>
+#include <string_view>
+#include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include <nlohmann/json.hpp>
@@ -29,13 +38,23 @@
 
 #include "einheit/cli/transport/zmq_local.h"
 #include "f/confd/system_backend.h"
+#include "f/lease/journal.h"
+#include "f/lease/lease.h"
+#include "f/lease/view.h"
+#include "f/policy/edit.h"
 #include "f/sysconfig/artifact.h"
+#include "f/sysconfig/chrony.h"
 #include "f/sysconfig/dnsmasq.h"
+#include "f/sysconfig/ipv6.h"
 #include "f/sysconfig/edit.h"
 #include "f/sysconfig/model.h"
+#include "f/sysconfig/net.h"
 #include "f/sysconfig/networkd.h"
+#include "f/sysconfig/sysctl.h"
+#include "f/sysconfig/observe.h"
 #include "f/sysconfig/parse.h"
 #include "f/sysconfig/service_status.h"
+#include "f/sysconfig/storage.h"
 #include "f/sysconfig/validate.h"
 
 namespace fd_cmd {
@@ -62,6 +81,74 @@ using json_t = nlohmann::json;
 using Error_t = cli::Error<cli::transport::TransportError>;
 namespace proto = cli::protocol;
 namespace sc = ::f::sysconfig;
+namespace lease = ::f::lease;
+namespace policy = ::f::policy;
+
+/// Unix seconds. The lease file and the journal are both stamped in
+/// wall-clock time, because a lease expiry is a wall-clock fact.
+auto NowSeconds() -> std::int64_t {
+  return std::chrono::duration_cast<std::chrono::seconds>(
+             std::chrono::system_clock::now().time_since_epoch())
+      .count();
+}
+
+/// The daemon stamps conntrack with bpf_ktime_get_ns(), which is
+/// CLOCK_MONOTONIC — so an idle time is computed against the same
+/// clock, not against the wall.
+auto MonotonicNs() -> std::uint64_t {
+  return static_cast<std::uint64_t>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now().time_since_epoch())
+          .count());
+}
+
+/// Render a device report as the wire body `show leases` renders.
+///
+/// Note what travels next to the list: `leases` and `journal` carry
+/// *why* the list looks the way it does. The renderer is not allowed
+/// to infer that from the list being empty, so it is sent whether or
+/// not anything went wrong.
+auto DeviceReportToJson(const lease::DeviceReport& r,
+                        std::int64_t now) -> json {
+  json devices = json::array();
+  for (const auto& d : r.devices) {
+    devices.push_back({
+        {"mac", d.mac},
+        {"address", d.address},
+        {"hostname", d.hostname},
+        {"zone", d.zone},
+        {"first_seen", d.first_seen},
+        {"first_seen_age", now - d.first_seen},
+        {"first_seen_exact",
+         d.precision == lease::FirstSeenPrecision::kObserved},
+        {"last_seen", d.last_seen},
+        {"last_seen_age", now - d.last_seen},
+        {"last_arrival", d.last_arrival},
+        {"expiry", d.expiry},
+        {"expires_in", d.expiry > 0 ? d.expiry - now : 0},
+        {"active", d.active},
+        {"new", d.IsNew(now, lease::kNewWindowSeconds)},
+        {"reserved", d.reserved},
+        {"reserved_address", d.reserved_address},
+        {"address_changes", d.address_changes},
+    });
+  }
+  return {
+      {"devices", devices},
+      {"active", r.ActiveCount()},
+      {"leases", lease::LeaseAvailabilityName(r.leases)},
+      {"journal", lease::JournalAvailabilityName(r.journal)},
+      {"detail", r.detail},
+      {"lease_path", r.lease_path},
+      {"journal_path", r.journal_path},
+      {"unparsable", r.unparsable},
+      {"ipv6_skipped", r.ipv6_skipped},
+      {"arrived", r.changes.arrived},
+      {"departed", r.changes.departed},
+      {"readdressed", r.changes.readdressed},
+      {"now", now},
+  };
+}
 
 auto MakeOk(const std::string& id, json data)
     -> proto::Response {
@@ -214,15 +301,83 @@ auto SaveCliConfig(const std::string& path,
   return f.good();
 }
 
-auto ResolveEditor(const FLocalConfig& cfg) -> std::string {
+/// The absolute path of `name` on PATH, or empty.
+///
+/// An appliance image is not a workstation. `vim` is the CLI's shipped
+/// default and is not installed on one; `nano` is. Asking the
+/// filesystem before the exec is the difference between "there is no
+/// editor called vim on this box" and `vim exited with code 127`,
+/// which reads as a program that ran and failed.
+auto WhichBinary(const std::string& name) -> std::string {
+  if (name.empty()) return "";
+  if (name.find('/') != std::string::npos) {
+    return ::access(name.c_str(), X_OK) == 0 ? name : "";
+  }
+  const char* path = std::getenv("PATH");
+  std::string dirs = path ? path : "/usr/local/bin:/usr/bin:/bin";
+  std::istringstream ss(dirs);
+  std::string dir;
+  while (std::getline(ss, dir, ':')) {
+    if (dir.empty()) dir = ".";
+    auto candidate = dir + "/" + name;
+    if (::access(candidate.c_str(), X_OK) == 0) return candidate;
+  }
+  return "";
+}
+
+/// Editors this box might have, in the order an appliance is likely
+/// to carry them. `nano` first because it is what a Debian base
+/// installs and what a person who has never used vi can leave again.
+constexpr std::array<const char*, 4> kEditorFallbacks = {
+    "nano", "vi", "vim", "ed"};
+
+/// What `edit` will run, and whether it is there.
+struct EditorChoice {
+  /// The name asked for — configured, or from the environment.
+  std::string asked;
+  /// Where it came from, for the refusal message.
+  std::string source;
+  /// The name that will actually be run; empty when nothing is.
+  std::string chosen;
+  /// Editors found on this box, whether or not one was picked.
+  std::vector<std::string> available;
+};
+
+auto ResolveEditorChoice(const FLocalConfig& cfg) -> EditorChoice {
+  EditorChoice out;
   auto conf_path = cfg.config_path.empty()
                        ? DefaultConfigPath()
                        : cfg.config_path;
   auto cli_cfg = LoadCliConfig(conf_path);
   if (cli_cfg.contains("editor")) {
-    return cli_cfg["editor"].get<std::string>();
+    out.asked = cli_cfg["editor"].get<std::string>();
+    out.source = "`set editor`";
+  } else if (const char* v = std::getenv("VISUAL"); v && *v) {
+    out.asked = v;
+    out.source = "$VISUAL";
+  } else if (const char* e = std::getenv("EDITOR"); e && *e) {
+    out.asked = e;
+    out.source = "$EDITOR";
+  } else {
+    out.asked = cfg.editor;
+    out.source = "the shipped default";
   }
-  return cfg.editor;
+  for (const char* candidate : kEditorFallbacks) {
+    if (!WhichBinary(candidate).empty()) {
+      out.available.emplace_back(candidate);
+    }
+  }
+  if (!WhichBinary(out.asked).empty()) {
+    out.chosen = out.asked;
+  } else if (!out.available.empty()) {
+    out.chosen = out.available.front();
+  }
+  return out;
+}
+
+auto ResolveEditor(const FLocalConfig& cfg) -> std::string {
+  auto choice = ResolveEditorChoice(cfg);
+  return choice.chosen.empty() ? choice.asked : choice.chosen;
 }
 
 auto RunSubprocess(const std::vector<std::string>& argv)
@@ -371,23 +526,21 @@ class FLocalTransport final
   explicit FLocalTransport(FLocalConfig cfg)
       : cfg_(std::move(cfg)) {}
 
+  /// A joinable poller thread at destruction would call terminate, so
+  /// the watch is always stopped here as well as on Disconnect.
+  ~FLocalTransport() override { StopWatch(); }
+
   auto Connect()
       -> std::expected<void, Error_t> override {
-    try {
-      zmq_ctx_ = std::make_unique<zmq::context_t>(1);
-      zmq_sock_ = std::make_unique<zmq::socket_t>(
-          *zmq_ctx_, zmq::socket_type::req);
-      zmq_sock_->set(zmq::sockopt::linger, 0);
-      zmq_sock_->set(zmq::sockopt::rcvtimeo, 3000);
-      zmq_sock_->set(zmq::sockopt::sndtimeo, 3000);
-      zmq_sock_->connect(cfg_.fd_socket);
-      fd_connected_ = true;
-    } catch (const zmq::error_t&) {
-    }
+    // Connecting to a dead ipc:// path succeeds, so this proves
+    // nothing about fd being up; every command finds that out for
+    // itself and says so.
+    (void)OpenFdSocket();
     return {};
   }
 
   auto Disconnect() -> void override {
+    StopWatch();
     zmq_sock_.reset();
     zmq_ctx_.reset();
     fd_connected_ = false;
@@ -416,6 +569,18 @@ class FLocalTransport final
     }
     if (req.command == "show_counters") {
       return HandleShowCounters(req);
+    }
+    if (req.command == "show_leases") {
+      return HandleShowLeases(req);
+    }
+    if (req.command == "show_device") {
+      return HandleShowDevice(req);
+    }
+    if (req.command == "set_reservation") {
+      return HandleSetReservation(req);
+    }
+    if (req.command == "no_reservation") {
+      return HandleNoReservation(req);
     }
     if (req.command == "show_zones") {
       return FdQuery(req.id, fd_cmd::kGetZones);
@@ -477,6 +642,45 @@ class FLocalTransport final
     if (req.command == "iface_set_address") {
       return HandleIfaceSetAddress(req);
     }
+    if (req.command == "show_policy") {
+      return HandleShowPolicy(req);
+    }
+    if (req.command == "set_rule") {
+      return HandleSetRule(req);
+    }
+    if (req.command == "no_rule") {
+      return HandleNoRule(req);
+    }
+    if (req.command == "set_forward") {
+      return HandleSetForward(req);
+    }
+    if (req.command == "no_forward") {
+      return HandleNoForward(req);
+    }
+    if (req.command == "dhcp_set") {
+      return HandleDhcpSet(req);
+    }
+    if (req.command == "dhcp_delete") {
+      return HandleDhcpDelete(req);
+    }
+    if (req.command == "dns_set") {
+      return HandleDnsSet(req);
+    }
+    if (req.command == "dns_delete") {
+      return HandleDnsDelete(req);
+    }
+    if (req.command == "zone_set") {
+      return HandleZoneSet(req);
+    }
+    if (req.command == "zone_delete") {
+      return HandleZoneDelete(req);
+    }
+    if (req.command == "iface_set_zone") {
+      return HandleIfaceSetZone(req);
+    }
+    if (req.command == "iface_del_zone") {
+      return HandleIfaceDelZone(req);
+    }
     if (req.command == "iface_del_address") {
       return HandleIfaceDelAddress(req);
     }
@@ -492,6 +696,18 @@ class FLocalTransport final
     if (req.command == "show_system") {
       return HandleShowSystem(req);
     }
+    if (req.command == "show_ipv6") {
+      return HandleShowIpv6(req);
+    }
+    if (req.command == "show_time") {
+      return HandleShowTime(req);
+    }
+    if (req.command == "show_storage") {
+      return HandleShowStorage(req);
+    }
+    if (req.command == "show_install") {
+      return HandleShowInstall(req);
+    }
     if (req.command == "show_services") {
       return HandleShowServices(req);
     }
@@ -504,6 +720,9 @@ class FLocalTransport final
     if (req.command == "apply_system_confirmed") {
       return HandleApplySystemConfirmed(req);
     }
+    if (req.command == "rollback_system") {
+      return HandleRollbackSystem(req);
+    }
     if (req.command == "confirm_system") {
       return HandleConfirmSystem(req);
     }
@@ -511,18 +730,53 @@ class FLocalTransport final
                    "Unknown command: " + req.command);
   }
 
-  auto Subscribe(const std::string& /*topic_prefix*/,
-                 cli::transport::EventCallback /*cb*/)
+  /// Subscribe to an event topic.
+  ///
+  /// This used to return success for anything and then deliver
+  /// nothing, which made `watch` sit there looking like a quiet
+  /// network. A topic with no source behind it is now refused by name.
+  auto Subscribe(const std::string& topic_prefix,
+                 cli::transport::EventCallback cb)
       -> std::expected<void, Error_t> override {
+    if (topic_prefix != kLeaseTopic) {
+      return std::unexpected(Error_t{
+          cli::transport::TransportError::InvalidState,
+          std::format(
+              "nothing on this box publishes '{}'; the only live "
+              "topic is '{}'",
+              topic_prefix, kLeaseTopic)});
+    }
+    {
+      std::lock_guard<std::mutex> lk(watch_mu_);
+      if (watch_thread_.joinable()) {
+        return std::unexpected(Error_t{
+            cli::transport::TransportError::InvalidState,
+            "already watching leases"});
+      }
+      watch_stop_ = false;
+    }
+    watch_thread_ = std::thread([this, cb = std::move(cb)] {
+      PollLeases(cb);
+    });
     return {};
   }
 
-  auto Unsubscribe(const std::string& /*topic_prefix*/)
+  auto Unsubscribe(const std::string& topic_prefix)
       -> std::expected<void, Error_t> override {
+    if (topic_prefix != kLeaseTopic) {
+      return std::unexpected(Error_t{
+          cli::transport::TransportError::InvalidState,
+          std::format("not subscribed to '{}'", topic_prefix)});
+    }
+    StopWatch();
     return {};
   }
 
  private:
+  /// The one topic this transport can actually publish. Named here so
+  /// the adapter and the transport agree on the spelling.
+  static constexpr const char* kLeaseTopic = "leases";
+
   FLocalConfig cfg_;
   std::unique_ptr<zmq::context_t> zmq_ctx_;
   std::unique_ptr<zmq::socket_t> zmq_sock_;
@@ -534,6 +788,85 @@ class FLocalTransport final
   std::unique_ptr<cli::transport::Transport> confd_;
   bool confd_probed_ = false;
   bool confd_up_ = false;
+
+  // The lease poller behind `watch show leases`.
+  std::thread watch_thread_;
+  std::mutex watch_mu_;
+  std::condition_variable watch_cv_;
+  bool watch_stop_ = false;
+
+  auto StopWatch() -> void {
+    {
+      std::lock_guard<std::mutex> lk(watch_mu_);
+      watch_stop_ = true;
+    }
+    watch_cv_.notify_all();
+    if (watch_thread_.joinable()) watch_thread_.join();
+  }
+
+  /// Re-read the lease file until told to stop, publishing an event on
+  /// the first pass and thereafter only when something changed.
+  ///
+  /// Repainting a still screen every two seconds would bury the one
+  /// line the operator is waiting for, so a quiet segment stays quiet
+  /// — but the first paint is immediate, because a watch that shows
+  /// nothing until something happens is indistinguishable from a watch
+  /// that is broken.
+  auto PollLeases(const cli::transport::EventCallback& cb) -> void {
+    bool first = true;
+    for (;;) {
+      auto now = NowSeconds();
+      auto parsed = sc::ParseSystemConfigFile(SystemConfigPath());
+      json body;
+      if (!parsed) {
+        // The watch keeps running: a system config being edited
+        // underneath it is exactly when an operator is watching.
+        body = {
+            {"devices", json::array()},
+            {"leases", "no-dhcp-configured"},
+            {"journal", "unknown"},
+            {"detail",
+             std::format("{} does not parse", SystemConfigPath())},
+            {"now", now},
+        };
+      } else {
+        auto report =
+            lease::CollectDevices(*parsed, ViewOptions(), now);
+        const bool quiet = report.changes.Quiet();
+        if (!first && quiet) {
+          if (WaitOrStop()) return;
+          continue;
+        }
+        body = DeviceReportToJson(report, now);
+      }
+      proto::Event ev;
+      ev.topic = kLeaseTopic;
+      ev.timestamp = Rfc3339(now);
+      auto s = body.dump();
+      ev.data.assign(s.begin(), s.end());
+      cb(ev);
+      first = false;
+      if (WaitOrStop()) return;
+    }
+  }
+
+  /// Sleep for the poll interval. Returns true when asked to stop, so
+  /// Ctrl-C does not have to wait out the interval.
+  auto WaitOrStop() -> bool {
+    std::unique_lock<std::mutex> lk(watch_mu_);
+    watch_cv_.wait_for(lk, cfg_.lease_poll,
+                       [this] { return watch_stop_; });
+    return watch_stop_;
+  }
+
+  static auto Rfc3339(std::int64_t epoch) -> std::string {
+    auto t = static_cast<std::time_t>(epoch);
+    std::tm tm{};
+    ::gmtime_r(&t, &tm);
+    char buf[32] = {};
+    std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%S.000Z", &tm);
+    return buf;
+  }
 
   /// Connect to f-confd and prove it answers. The connection alone
   /// proves nothing — a ZMQ connect to a dead ipc:// path succeeds.
@@ -581,12 +914,37 @@ class FLocalTransport final
     return *resp;
   }
 
+  /// Whether fd's control socket exists on disk.
+  ///
+  /// A ZMQ connect to a missing `ipc://` path succeeds and then times
+  /// out three seconds later with "recv timeout", which reads as a
+  /// slow daemon rather than an absent one. The socket file is a
+  /// cheap, exact answer to "is fd there at all", so ask it first and
+  /// keep the timeout for the case it is meant for: fd running and
+  /// not answering.
+  auto FdSocketPresent() const -> bool {
+    constexpr std::string_view kIpc = "ipc://";
+    if (!cfg_.fd_socket.starts_with(kIpc)) return true;
+    auto path = cfg_.fd_socket.substr(kIpc.size());
+    std::error_code ec;
+    return std::filesystem::exists(path, ec);
+  }
+
   auto RequireFd(const std::string& id)
       -> std::optional<proto::Response> {
-    if (!fd_connected_) {
+    if (!FdSocketPresent()) {
+      fd_connected_ = false;
       return MakeErr(id, "no_daemon",
-          "fd is not running",
+          std::format("fd is not running (no socket at {})",
+                      cfg_.fd_socket),
           "Start fd: sudo systemctl start fd");
+    }
+    // The socket is there; fd may have been restarted since our last
+    // exchange failed, so rebuild the client side if we dropped it.
+    if ((!fd_connected_ || !zmq_sock_) && !OpenFdSocket()) {
+      return MakeErr(id, "no_daemon",
+          "fd's control socket exists but could not be opened",
+          "Check permissions on " + cfg_.fd_socket);
     }
     return std::nullopt;
   }
@@ -606,15 +964,61 @@ class FLocalTransport final
 
   /// Send `cmd` (with optional payload) and classify the answer.
   /// The single place that decides whether fd succeeded.
+  /// Build the REQ socket onto fd's control endpoint.
+  ///
+  /// A ZMQ REQ socket enforces strict send/recv alternation: once a
+  /// send has gone out and the reply has not come back, the next send
+  /// throws. A connect to a dead `ipc://` path still succeeds, so the
+  /// *first* command against a stopped fd times out — and every
+  /// command after it in the same session used to die with
+  /// "Operation cannot be accomplished in current state", which names
+  /// nothing an operator can act on. So a failed exchange throws the
+  /// socket away and makes a new one: one timeout, one honest message,
+  /// and the session recovers by itself the moment fd comes back.
+  auto OpenFdSocket() -> bool {
+    try {
+      if (!zmq_ctx_) zmq_ctx_ = std::make_unique<zmq::context_t>(1);
+      zmq_sock_ = std::make_unique<zmq::socket_t>(
+          *zmq_ctx_, zmq::socket_type::req);
+      zmq_sock_->set(zmq::sockopt::linger, 0);
+      zmq_sock_->set(zmq::sockopt::rcvtimeo, 3000);
+      zmq_sock_->set(zmq::sockopt::sndtimeo, 3000);
+      zmq_sock_->connect(cfg_.fd_socket);
+      fd_connected_ = true;
+      return true;
+    } catch (const zmq::error_t&) {
+      zmq_sock_.reset();
+      fd_connected_ = false;
+      return false;
+    }
+  }
+
   auto AskFd(uint8_t cmd, const std::string& payload = "")
       -> FdReply {
     FdReply out;
-    if (!fd_connected_ || !zmq_sock_) {
-      out.error = "fd is not running";
+    if (!FdSocketPresent()) {
+      fd_connected_ = false;
+      out.error = std::format("fd is not running (no socket at {})",
+                              cfg_.fd_socket);
       return out;
     }
-    auto resp = SendRawToFd(*zmq_sock_, cmd, payload);
+    if ((!fd_connected_ || !zmq_sock_) && !OpenFdSocket()) {
+      // A previous exchange failed and dropped the socket; fd may
+      // have been restarted since, so this is a retry, not a state.
+      out.error = "fd's control socket could not be opened";
+      return out;
+    }
+    std::expected<std::string, std::string> resp;
+    try {
+      resp = SendRawToFd(*zmq_sock_, cmd, payload);
+    } catch (const zmq::error_t& e) {
+      resp = std::unexpected(e.what());
+    }
     if (!resp) {
+      // The socket is now mid-transaction and unusable; replace it so
+      // the next command starts clean.
+      zmq_sock_.reset();
+      fd_connected_ = false;
       out.error = std::format("fd did not answer: {}",
                               resp.error());
       return out;
@@ -726,8 +1130,24 @@ class FLocalTransport final
           "No configure session active");
     }
     // Validate all .fw files with fwl check.
-    for (const auto& path :
-         ListFwFiles(cfg_.fw_source)) {
+    //
+    // Nothing to validate is not a validated commit. `ListFwFiles`
+    // returns {} for a source directory holding no .fw file and for a
+    // path that is neither a file nor a directory, and the loop below
+    // then ran zero times — so a commit whose sources had gone missing
+    // reported the same "validated" it reports for a clean check, and
+    // the only thing left standing between the operator and a broken
+    // policy was fd's own compile.
+    auto sources = ListFwFiles(cfg_.fw_source);
+    if (sources.empty()) {
+      return MakeErr(req.id, "no_sources",
+          std::format("no .fw source found at {} — there is nothing "
+                      "to validate and nothing to commit",
+                      cfg_.fw_source),
+          "check the configured source path exists and holds at "
+          "least one .fw file");
+    }
+    for (const auto& path : sources) {
       auto [rc, out] = RunSubprocess(
           {cfg_.fwl_path, "check", path});
       if (rc != 0) {
@@ -742,10 +1162,11 @@ class FLocalTransport final
     // The sources are valid. They are not yet *live*: fd has to
     // recompile and swap them in, and that is a second outcome with
     // its own way of failing. There is exactly one mechanism that
-    // applies a change — the kReloadProg command below. fd starts no
-    // file watcher (nothing calls WatcherStart), and a cold start
-    // loads the last compiled bundle rather than the source, so a
-    // commit fd did not apply is not applied at all.
+    // applies a change on demand — the kReloadProg command below —
+    // and a cold start loads the last compiled bundle rather than the
+    // source, so a commit fd did not apply is not applied at all.
+    // (fd does configure a file watcher at cmd/fd.cc; it is off by
+    // default and is not what `commit` relies on.)
     auto reload = AskFd(fd_cmd::kReloadProg);
     if (!reload.ok) {
       // Leave the session open: the snapshots are the only way back to
@@ -785,14 +1206,37 @@ class FLocalTransport final
       return MakeErr(req.id, "no_session",
           "No configure session active");
     }
+    // Count the writes that succeeded, not the snapshots that were
+    // attempted. `WriteFile` returns bool and this loop used to throw
+    // it away, so a rollback that could not write a single file — a
+    // full disk, a read-only mount, the exact circumstances under
+    // which somebody is rolling back — answered "ok (N files
+    // restored)" and left the bad policy on disk.
     int restored = 0;
+    std::vector<std::string> failed;
     for (const auto& [path, content] :
          candidate_.snapshots) {
-      WriteFile(path, content);
-      restored++;
+      if (WriteFile(path, content)) {
+        restored++;
+      } else {
+        failed.push_back(path);
+      }
     }
     candidate_.active = false;
     candidate_.snapshots.clear();
+    if (!failed.empty()) {
+      std::string names;
+      for (const auto& p : failed) {
+        names += (names.empty() ? "" : ", ") + p;
+      }
+      return MakeErr(req.id, "rollback_incomplete",
+          std::format("restored {} file(s); FAILED to restore {}: {}. "
+                      "The configuration on disk is neither the "
+                      "candidate nor the previous state — fix the "
+                      "write error and restore those files by hand "
+                      "before committing.",
+                      restored, failed.size(), names));
+    }
     return MakeOk(req.id, {
         {"status", "rolled back"},
         {"files_restored", restored},
@@ -834,20 +1278,47 @@ class FLocalTransport final
         candidate_.snapshots.end()) {
       candidate_.snapshots[target] = ReadFile(target);
     }
-    auto editor = ResolveEditor(cfg_);
-    int rc = RunInteractive({editor, target});
+    auto choice = ResolveEditorChoice(cfg_);
+    if (choice.chosen.empty()) {
+      return MakeErr(req.id, "no_editor",
+          std::format(
+              "there is no editor called '{}' on this box ({}), and "
+              "none of {} is installed either",
+              choice.asked, choice.source,
+              [] {
+                std::string list;
+                for (const char* e : kEditorFallbacks) {
+                  if (!list.empty()) list += ", ";
+                  list += e;
+                }
+                return list;
+              }()),
+          "`set rule` and `set forward` compose a policy without an "
+          "editor; otherwise install one");
+    }
+    json fell_back;
+    if (choice.chosen != choice.asked) {
+      // Silently running a different program than the one configured
+      // is how an operator ends up in vi believing they are in nano.
+      fell_back = std::format(
+          "'{}' ({}) is not installed; using {}", choice.asked,
+          choice.source, choice.chosen);
+    }
+    int rc = RunInteractive({choice.chosen, target});
     if (rc != 0) {
       return MakeErr(req.id, "editor_failed",
-          std::format("{} exited with code {}",
-                      editor, rc));
+          std::format("{} exited with code {}", choice.chosen, rc));
     }
     auto current = ReadFile(target);
     auto& snapshot = candidate_.snapshots[target];
     bool changed = (current != snapshot);
-    return MakeOk(req.id, {
+    json j = {
         {"file", target},
         {"changed", changed},
-    });
+        {"editor", choice.chosen},
+    };
+    if (!fell_back.is_null()) j["warning"] = fell_back;
+    return MakeOk(req.id, j);
   }
 
   auto ResolveFwPath(const std::string& name)
@@ -1002,31 +1473,35 @@ class FLocalTransport final
     });
   }
 
+  /// The schema-path `set` / `delete` pair, refused by name.
+  ///
+  /// These used to parse their arguments, answer `status: set`, and
+  /// write nothing anywhere — `show diff` said "no changes" on the
+  /// next line. Two config systems is confusing; one config system
+  /// and one impostor is worse, because the impostor is the one whose
+  /// name an operator reaches for first. They are no longer
+  /// registered as commands (see `BuildTree`), and the handler stays
+  /// so that anything still sending the wire verb is told where the
+  /// real ones are instead of being told it worked.
   auto HandleSet(const proto::Request& req)
       -> proto::Response {
-    // Schema-based set — store in the candidate config
-    // file (fd.yaml). Minimal: just acknowledge.
-    if (req.args.size() < 2) {
-      return MakeErr(req.id, "missing_args",
-          "Usage: set <path> <value>");
-    }
-    return MakeOk(req.id, {
-        {"path", req.args[0]},
-        {"value", req.args[1]},
-        {"status", "set"},
-    });
+    return MakeErr(req.id, "no_such_surface",
+        "there is no schema-path candidate on this product — `set "
+        "<path> <value>` reported success and changed nothing",
+        "the system configuration is `set address` / `set zone` / "
+        "`set interface zone` / `set reservation`, applied with "
+        "`apply system`; the policy is `set rule` / `set forward`, "
+        "applied with `commit` or on the spot");
   }
 
   auto HandleDelete(const proto::Request& req)
       -> proto::Response {
-    if (req.args.empty()) {
-      return MakeErr(req.id, "missing_args",
-          "Usage: delete <path>");
-    }
-    return MakeOk(req.id, {
-        {"path", req.args[0]},
-        {"status", "deleted"},
-    });
+    return MakeErr(req.id, "no_such_surface",
+        "there is no schema-path candidate on this product — "
+        "`delete <path>` reported success and changed nothing",
+        "the `no ...` verbs remove things: `no address`, `no zone`, "
+        "`no interface zone`, `no reservation`, `no rule`, "
+        "`no forward`");
   }
 
   auto HandleShowConfig(const proto::Request& req)
@@ -1057,10 +1532,47 @@ class FLocalTransport final
     return MakeOk(req.id, {{"diff", diff}});
   }
 
+  /// The system-configuration revisions f-confd has recorded.
+  ///
+  /// This used to return an empty array unconditionally, on a box
+  /// where `apply system` had been answering with a `commit_id` all
+  /// along. An empty history and no history at all are different
+  /// facts, and only one of them was ever being reported.
   auto HandleShowCommits(const proto::Request& req)
       -> proto::Response {
+    if (!ConfdAvailable()) {
+      return MakeErr(req.id, "no_confd",
+          "f-confd is not running, and it is what records "
+          "revisions — this box cannot say what has been applied to "
+          "it",
+          "systemctl start f-confd");
+    }
+    auto resp = ConfdRequest(req, "show_commits");
+    if (!resp) {
+      return MakeErr(req.id, "confd_error", resp.error());
+    }
+    if (resp->status != proto::ResponseStatus::Ok) {
+      return MakeErr(req.id, "confd_error",
+          resp->error ? resp->error->message
+                      : "f-confd refused the query");
+    }
+    // `commit_id=3 by=karl at=...` per line.
+    json commits = json::array();
+    std::istringstream lines(
+        std::string(resp->data.begin(), resp->data.end()));
+    std::string line;
+    while (std::getline(lines, line)) {
+      if (line.empty()) continue;
+      auto kv = ParseKv(line);
+      commits.push_back({
+          {"id", kv.value("commit_id", "")},
+          {"by", kv.value("by", "")},
+          {"at", kv.value("at", "")},
+      });
+    }
     return MakeOk(req.id, {
-        {"commits", json::array()},
+        {"commits", commits},
+        {"scope", "system configuration"},
     });
   }
 
@@ -1126,6 +1638,7 @@ class FLocalTransport final
       (*out)["via"] = "f-confd";
       (*out)["commit_id"] = body.value("commit_id", "");
       (*out)["live"] = true;
+      (*out)["activated"] = true;
       return std::nullopt;
     }
 
@@ -1140,6 +1653,64 @@ class FLocalTransport final
     (*out)["via"] = "direct";
     json written = json::array();
     for (const auto& p : net->changed) written.push_back(p);
+    // Addresses without forwarding is a box that answers pings and
+    // routes nothing. It ships in the same apply as the interfaces
+    // because it is the same fact about the box.
+    sc::SysctlOptions sysctl_opts;
+    sysctl_opts.dir = cfg_.sysctl_dir;
+    sysctl_opts.proc_dir = cfg_.sysctl_proc_dir;
+    auto sysctl = sc::ApplySysctl(*parsed, sysctl_opts);
+    if (!sysctl) {
+      (*out)["warning"] = sysctl.error();
+    } else {
+      if (sysctl->changed) written.push_back(sysctl->unit.path);
+      json applied = json::array();
+      for (const auto& k : sysctl->applied) applied.push_back(k);
+      (*out)["sysctl_applied"] = applied;
+    }
+    // dnsmasq is derived from the same document, and it is derived
+    // from the *zones*: a reservation, a zone, or a port moving
+    // between zones all change it. This path used to stop at networkd
+    // and sysctl, so `set reservation` on a box with no f-confd wrote
+    // the reservation into the model, answered `applied: yes`, and
+    // left dnsmasq.conf holding the previous one — the reply was
+    // right about the half it had done and silent about the half it
+    // had not.
+    auto plan = sc::PlanDnsmasq(*parsed);
+    if (plan.needed) {
+      sc::DnsmasqOptions dm_opts;
+      dm_opts.conf_path = cfg_.dnsmasq_conf;
+      // The operator did not ask to discard a hand edit, and a
+      // targeted `set` is not the place to decide that for them.
+      dm_opts.refuse_on_drift = true;
+      auto dm = sc::ApplyDnsmasq(*parsed, dm_opts);
+      if (!dm) {
+        const char* code =
+            dm.error().code == sc::BackendError::kDrift ? "drift"
+            : dm.error().code == sc::BackendError::kToolMissing
+                ? "tool_missing"
+                : "rejected";
+        return MakeErr(req.id, code,
+            std::format("the system configuration was written to {}, "
+                        "but the service configuration derived from "
+                        "it was NOT: {}",
+                        SystemConfigPath(), dm.error().message),
+            "resolve it and run `apply system` — the model and the "
+            "running services disagree until you do");
+      }
+      if (dm->changed) written.push_back(dm->conf_path);
+      (*out)["dhcp_on"] = dm->plan.dhcp_interfaces;
+    }
+    // Written is not running. Nothing here reloads networkd or
+    // restarts dnsmasq; f-confd is what does that, and it is not up.
+    (*out)["activated"] = false;
+    // A separate key from `note`: the caller has its own sentence to
+    // say about the change it made, and one overwriting the other is
+    // how the operator loses whichever half was not the last write.
+    (*out)["activation_note"] =
+        "f-confd is not running: the files were written, but nothing "
+        "was reloaded — run `networkctl reload` and restart "
+        "f-dnsmasq, or start f-confd and `apply system`";
     (*out)["written"] = written;
     return std::nullopt;
   }
@@ -1187,6 +1758,691 @@ class FLocalTransport final
         j["warning"] = out;
       }
     }
+    j["applied"] = true;
+    j["persisted"] = true;
+    return MakeOk(req.id, j);
+  }
+
+  // -- policy content --------------------------------------------------
+  //
+  // `new file` created an empty policy and `edit` shelled out to
+  // $EDITOR, which is not a CLI for a firewall. These verbs compose
+  // the changes an operator makes weekly — open a port, close one,
+  // forward one — and hand the result to the compiler before anything
+  // is written. `fwl check` stays the authority on what a policy
+  // means; nothing here reimplements it.
+
+  /// The `.fw` file holding `@xdp(<zone>)`, or why it cannot be named.
+  ///
+  /// Answering this from the files rather than from configuration is
+  /// what makes the verbs work on a box whose policy is split across
+  /// several sources, and what makes an ambiguous split an error the
+  /// operator is told about instead of a file picked for them.
+  auto FileForZone(const std::string& zone)
+      -> std::expected<std::string, std::string> {
+    auto sources = ListFwFiles(cfg_.fw_source);
+    if (sources.empty()) {
+      return std::unexpected(std::format(
+          "no .fw source found at {}", cfg_.fw_source));
+    }
+    std::vector<std::string> hits;
+    std::set<std::string> zones_seen;
+    for (const auto& path : sources) {
+      auto view = policy::ReadPolicy(ReadFile(path));
+      for (const auto& z : view.zones) zones_seen.insert(z);
+      if (std::find(view.zones.begin(), view.zones.end(), zone) !=
+          view.zones.end()) {
+        hits.push_back(path);
+      }
+    }
+    if (hits.size() == 1) return hits.front();
+    if (hits.empty()) {
+      std::string list;
+      for (const auto& z : zones_seen) {
+        if (!list.empty()) list += ", ";
+        list += z;
+      }
+      return std::unexpected(std::format(
+          "no policy file has an `@xdp({})` block{}", zone,
+          list.empty() ? "" : std::format(" (blocks found: {})",
+                                          list)));
+    }
+    std::string list;
+    for (const auto& p : hits) {
+      if (!list.empty()) list += ", ";
+      list += p;
+    }
+    return std::unexpected(std::format(
+        "zone '{}' has a block in more than one file ({}) — which "
+        "one to edit is not a decision this verb may make for you",
+        zone, list));
+  }
+
+  /// Compile-check `document`, install it over `path`, and reload.
+  ///
+  /// The check happens on a copy, so a policy that does not compile
+  /// never reaches the file that a cold start would load. The reload
+  /// is a second outcome with its own way of failing, and it is
+  /// reported as one: a policy saved but not loaded is a half-applied
+  /// change, and the reply says which half.
+  auto InstallPolicyDocument(const proto::Request& req,
+                             const std::string& path,
+                             const std::string& document, json* out)
+      -> std::optional<proto::Response> {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    auto scratch = fs::temp_directory_path(ec) /
+                   std::format("f-policy-{}", ::getpid());
+    fs::create_directories(scratch, ec);
+    auto probe =
+        scratch / fs::path(path).filename().replace_extension(".fw");
+    if (!WriteFile(probe.string(), document)) {
+      return MakeErr(req.id, "write_failed",
+          std::format("could not write the check copy at {}",
+                      probe.string()));
+    }
+    auto [rc, checked] =
+        RunSubprocess({cfg_.fwl_path, "check", probe.string()});
+    fs::remove_all(scratch, ec);
+    if (rc != 0) {
+      return MakeErr(req.id, "validation_failed",
+          checked.empty()
+              ? std::format("`{} check` refused the edited policy",
+                            cfg_.fwl_path)
+              : checked,
+          std::format("{} is unchanged and the running policy is "
+                      "unchanged",
+                      path));
+    }
+
+    // A configure session is the way back. Snapshot before the write,
+    // so `rollback` restores what was there rather than what this
+    // command left.
+    if (candidate_.active &&
+        candidate_.snapshots.find(path) ==
+            candidate_.snapshots.end()) {
+      candidate_.snapshots[path] = ReadFile(path);
+    }
+
+    auto installed = sc::InstallArtifact(path, document);
+    if (!installed) {
+      return MakeErr(req.id, "write_failed", installed.error(),
+                     "root is needed to change the policy");
+    }
+    (*out)["file"] = path;
+    (*out)["saved"] = true;
+
+    if (candidate_.active) {
+      // Inside a session the operator's own `commit` is what makes it
+      // live, and reloading here would apply half a candidate.
+      (*out)["activated"] = false;
+      (*out)["note"] =
+          "a configure session is open: this is in the candidate, not "
+          "running — `commit` to load it, `rollback` to discard it";
+      return std::nullopt;
+    }
+
+    auto reload = AskFd(fd_cmd::kReloadProg);
+    if (!reload.ok) {
+      return MakeErr(req.id, "not_applied",
+          std::format(
+              "saved to {}, but the running policy is UNCHANGED: {}",
+              path, reload.error),
+          "fix the cause and run `reload firewall`; the edit is on "
+          "disk and will be loaded at the next start");
+    }
+    (*out)["activated"] = true;
+    (*out)["mechanism"] = "fd hot-reload";
+    for (const char* field :
+         {"version", "rules_installed", "program_updated"}) {
+      if (reload.body.contains(field)) {
+        (*out)[field] = reload.body[field];
+      }
+    }
+    return std::nullopt;
+  }
+
+  auto PlacementJson(const policy::EditResult& r) -> json {
+    json j = {
+        {"position", r.placement.index},
+        {"line", r.placement.line},
+    };
+    if (!r.placement.before.empty()) {
+      j["before"] = r.placement.before;
+      j["before_is_unconditional"] =
+          r.placement.before_is_unconditional;
+    }
+    json warnings = json::array();
+    for (const auto& w : r.warnings) warnings.push_back(w);
+    if (!warnings.empty()) j["warnings"] = warnings;
+    json removed = json::array();
+    for (const auto& s : r.removed) removed.push_back(s);
+    if (!removed.empty()) j["removed"] = removed;
+    return j;
+  }
+
+  auto HandleShowPolicy(const proto::Request& req)
+      -> proto::Response {
+    auto sources = ListFwFiles(cfg_.fw_source);
+    if (sources.empty()) {
+      return MakeErr(req.id, "no_sources",
+          std::format("no .fw source found at {}", cfg_.fw_source));
+    }
+    const std::string want =
+        req.args.empty() ? std::string() : req.args[0];
+    json blocks = json::array();
+    bool matched = false;
+    for (const auto& path : sources) {
+      auto view = policy::ReadPolicy(ReadFile(path));
+      for (const auto& zone : view.zones) {
+        if (!want.empty() && zone != want) continue;
+        matched = true;
+        json stmts = json::array();
+        for (const auto* s : view.InZone(zone)) {
+          stmts.push_back({
+              {"index", s->index},
+              {"line", s->line},
+              {"text", s->text},
+              {"verb", policy::VerbName(s->verb)},
+              {"guarded", s->guarded},
+          });
+        }
+        blocks.push_back({
+            {"zone", zone},
+            {"file", path},
+            {"statements", stmts},
+        });
+      }
+    }
+    if (!want.empty() && !matched) {
+      return MakeErr(req.id, "no_such_zone",
+          std::format("no policy file has an `@xdp({})` block",
+                      want));
+    }
+    json j = {
+        {"blocks", blocks},
+        {"source", cfg_.fw_source},
+    };
+    // The source is not the running policy. `fd` loads a compiled
+    // bundle, and a cold start loads the last one compiled — so a
+    // file edited by hand and never reloaded reads exactly like one
+    // that is live. Naming the other command is cheaper than a
+    // comparison this side cannot make honestly.
+    j["caveat"] =
+        "this is the policy source on disk; `show firewall` and "
+        "`show zones` report what fd has loaded and attached";
+    return MakeOk(req.id, j);
+  }
+
+  auto HandleSetRule(const proto::Request& req) -> proto::Response {
+    if (req.args.size() < 2) {
+      return MakeErr(req.id, "missing_args",
+          "Usage: set rule <zone> allow|drop [tcp|udp|icmp] "
+          "[<port>] [from <cidr>] [to <cidr>]");
+    }
+    const auto& zone = req.args[0];
+    const auto& action = req.args[1];
+    policy::RuleSpec spec;
+    for (std::size_t i = 2; i < req.args.size(); ++i) {
+      const auto& a = req.args[i];
+      if (a == "tcp" || a == "udp" || a == "icmp") {
+        spec.proto = a;
+      } else if (a == "from" && i + 1 < req.args.size()) {
+        spec.from = req.args[++i];
+      } else if (a == "to" && i + 1 < req.args.size()) {
+        spec.to = req.args[++i];
+      } else if (a == "port" && i + 1 < req.args.size()) {
+        spec.port = std::atoi(req.args[++i].c_str());
+      } else if (!a.empty() &&
+                 a.find_first_not_of("0123456789") ==
+                     std::string::npos) {
+        spec.port = std::atoi(a.c_str());
+      } else {
+        return MakeErr(req.id, "bad_argument",
+            std::format("'{}' is not part of a rule this verb "
+                        "knows", a),
+            "the vocabulary is: tcp|udp|icmp, a port number, "
+            "`from <cidr>`, `to <cidr>`");
+      }
+    }
+    auto file = FileForZone(zone);
+    if (!file) return MakeErr(req.id, "no_such_zone", file.error());
+
+    auto edited =
+        policy::AddRule(ReadFile(*file), zone, action, spec);
+    if (!edited) {
+      return MakeErr(req.id, "invalid_edit", edited.error());
+    }
+    json j = PlacementJson(*edited);
+    j["zone"] = zone;
+    j["action"] = "add rule";
+    j["statement"] = std::format("{} if {}", action,
+                                 spec.Condition());
+    if (auto fail =
+            InstallPolicyDocument(req, *file, edited->document, &j)) {
+      return *fail;
+    }
+    return MakeOk(req.id, j);
+  }
+
+  auto HandleNoRule(const proto::Request& req) -> proto::Response {
+    if (req.args.size() < 2) {
+      return MakeErr(req.id, "missing_args",
+          "Usage: no rule <zone> <position> — `show policy <zone>` "
+          "numbers them");
+    }
+    const auto& zone = req.args[0];
+    const int index = std::atoi(req.args[1].c_str());
+    auto file = FileForZone(zone);
+    if (!file) return MakeErr(req.id, "no_such_zone", file.error());
+    auto edited = policy::RemoveRule(ReadFile(*file), zone, index);
+    if (!edited) {
+      return MakeErr(req.id, "invalid_edit", edited.error());
+    }
+    json j = PlacementJson(*edited);
+    j["zone"] = zone;
+    j["action"] = "remove rule";
+    j["statement"] =
+        edited->removed.empty() ? "" : edited->removed.front();
+    if (auto fail =
+            InstallPolicyDocument(req, *file, edited->document, &j)) {
+      return *fail;
+    }
+    return MakeOk(req.id, j);
+  }
+
+  /// The zone `address` lives in, according to the system config.
+  ///
+  /// Asked of the model rather than of the operator: a forward whose
+  /// `redirect` names the wrong zone sends frames somewhere they are
+  /// not inspected, and the model already knows which segment an
+  /// address belongs to.
+  auto ZoneHolding(const sc::SystemConfig& cfg,
+                   const std::string& address)
+      -> std::expected<std::string, std::string> {
+    auto want = sc::ParseIpv4(address);
+    if (!want) {
+      return std::unexpected(
+          std::format("'{}' is not an IPv4 address", address));
+    }
+    std::set<std::string> hits;
+    for (const auto& i : cfg.interfaces) {
+      if (i.mode != sc::AddressMode::kStatic) continue;
+      if (i.zone.empty()) continue;
+      auto p = sc::ParseCidr4(i.address);
+      if (p && p->Contains(*want)) hits.insert(i.zone);
+    }
+    if (hits.size() == 1) return *hits.begin();
+    if (hits.empty()) {
+      return std::unexpected(std::format(
+          "{} is not in the subnet of any zone this box has an "
+          "address on — a redirect needs to know which zone to emit "
+          "the frame into",
+          address));
+    }
+    std::string list;
+    for (const auto& z : hits) {
+      if (!list.empty()) list += ", ";
+      list += z;
+    }
+    return std::unexpected(std::format(
+        "{} falls in more than one zone ({})", address, list));
+  }
+
+  auto HandleSetForward(const proto::Request& req)
+      -> proto::Response {
+    if (req.args.size() < 4) {
+      return MakeErr(req.id, "missing_args",
+          "Usage: set forward <zone> tcp|udp <port> "
+          "<ip>:<port> [from <cidr>]");
+    }
+    policy::ForwardSpec spec;
+    const auto& zone = req.args[0];
+    spec.proto = req.args[1];
+    spec.port = std::atoi(req.args[2].c_str());
+    const auto& target = req.args[3];
+    auto colon = target.rfind(':');
+    if (colon == std::string::npos) {
+      return MakeErr(req.id, "bad_argument",
+          std::format("'{}' is not <ip>:<port>", target));
+    }
+    spec.target_ip = target.substr(0, colon);
+    spec.target_port = std::atoi(target.substr(colon + 1).c_str());
+    for (std::size_t i = 4; i < req.args.size(); ++i) {
+      if (req.args[i] == "from" && i + 1 < req.args.size()) {
+        spec.from = req.args[++i];
+      } else {
+        return MakeErr(req.id, "bad_argument",
+            std::format("'{}' is not part of a forward", req.args[i]),
+            "the only extra term is `from <cidr>`");
+      }
+    }
+
+    sc::SystemConfig cfg;
+    std::optional<proto::Response> fail;
+    if (!LoadSystem(req, &cfg, &fail)) return *fail;
+    auto inside = ZoneHolding(cfg, spec.target_ip);
+    if (!inside) {
+      return MakeErr(req.id, "no_zone_for_target", inside.error());
+    }
+    spec.inside_zone = *inside;
+
+    auto file = FileForZone(zone);
+    if (!file) return MakeErr(req.id, "no_such_zone", file.error());
+    auto edited = policy::AddForward(ReadFile(*file), zone, spec);
+    if (!edited) {
+      return MakeErr(req.id, "invalid_edit", edited.error());
+    }
+    json j = PlacementJson(*edited);
+    j["zone"] = zone;
+    j["action"] = "add forward";
+    j["statement"] = std::format(
+        "{}/{} -> {}:{} in {}", spec.proto, spec.port,
+        spec.target_ip, spec.target_port, spec.inside_zone);
+    j["inside_zone"] = spec.inside_zone;
+    if (auto f =
+            InstallPolicyDocument(req, *file, edited->document, &j)) {
+      return *f;
+    }
+    return MakeOk(req.id, j);
+  }
+
+  auto HandleNoForward(const proto::Request& req)
+      -> proto::Response {
+    if (req.args.size() < 3) {
+      return MakeErr(req.id, "missing_args",
+          "Usage: no forward <zone> tcp|udp <port>");
+    }
+    const auto& zone = req.args[0];
+    const auto& proto_name = req.args[1];
+    const int port = std::atoi(req.args[2].c_str());
+    auto file = FileForZone(zone);
+    if (!file) return MakeErr(req.id, "no_such_zone", file.error());
+    auto edited = policy::RemoveForward(ReadFile(*file), zone,
+                                        proto_name, port);
+    if (!edited) {
+      return MakeErr(req.id, "invalid_edit", edited.error());
+    }
+    json j = PlacementJson(*edited);
+    j["zone"] = zone;
+    j["action"] = "remove forward";
+    j["statement"] = std::format("{}/{}", proto_name, port);
+    if (auto f =
+            InstallPolicyDocument(req, *file, edited->document, &j)) {
+      return *f;
+    }
+    return MakeOk(req.id, j);
+  }
+
+  // -- zones -----------------------------------------------------------
+  //
+  // A zone is a system fact — *these ports* — so it is declared in the
+  // same document as the ports, and these verbs edit that document and
+  // then take the ordinary apply path. They inherit validation, the
+  // artifact regeneration and, when f-confd is up, the recorded
+  // revision. Until they existed, firstboot was the only thing on a
+  // box that ever wrote a zone.
+
+  auto HandleZoneSet(const proto::Request& req) -> proto::Response {
+    if (req.args.empty()) {
+      return MakeErr(req.id, "missing_args",
+          "Usage: set zone <name> [off|ra]");
+    }
+    const auto& zone = req.args[0];
+    const std::string stance =
+        req.args.size() > 1 ? req.args[1] : std::string();
+    auto edited =
+        sc::SetZone(ReadFile(SystemConfigPath()), zone, stance);
+    if (!edited) {
+      return MakeErr(req.id, "invalid_edit", edited.error());
+    }
+    json j = {
+        {"zone", zone},
+        {"action", stance.empty() ? "declare zone" : "set ipv6 stance"},
+        {"value", stance.empty() ? "(no ipv6 stance — off)" : stance},
+        {"config", SystemConfigPath()},
+    };
+    if (auto fail = InstallSystemDocument(req, *edited, &j)) {
+      return *fail;
+    }
+    j["applied"] = true;
+    j["persisted"] = true;
+    // A zone with no interfaces attaches no program and carries no
+    // service. Saying so here is what stops the operator concluding,
+    // from a green reply, that the segment is now filtered.
+    auto parsed = sc::ParseSystemConfigString(*edited);
+    if (parsed && parsed->InterfacesInZone(zone).empty()) {
+      j["note"] = std::format(
+          "zone '{}' has no interfaces: nothing is attached to it and "
+          "no service can bind to it yet — `set interface zone "
+          "<port> {}`",
+          zone, zone);
+    }
+    return MakeOk(req.id, j);
+  }
+
+  auto HandleZoneDelete(const proto::Request& req)
+      -> proto::Response {
+    if (req.args.empty()) {
+      return MakeErr(req.id, "missing_args",
+                     "Usage: no zone <name>");
+    }
+    const auto& zone = req.args[0];
+    auto edited = sc::ClearZone(ReadFile(SystemConfigPath()), zone);
+    if (!edited) {
+      return MakeErr(req.id, "invalid_edit", edited.error());
+    }
+    json j = {
+        {"zone", zone},
+        {"action", "remove zone"},
+        {"config", SystemConfigPath()},
+    };
+    if (auto fail = InstallSystemDocument(req, *edited, &j)) {
+      return *fail;
+    }
+    j["applied"] = true;
+    j["persisted"] = true;
+    // The policy is a separate document and this did not touch it.
+    // A `.fw` still naming the zone is a compile error the operator
+    // will otherwise meet at the next reload.
+    j["note"] = std::format(
+        "the firewall policy is not part of this change — a `.fw` "
+        "block still naming zone '{}' will fail to compile",
+        zone);
+    return MakeOk(req.id, j);
+  }
+
+  auto HandleIfaceSetZone(const proto::Request& req)
+      -> proto::Response {
+    if (req.args.size() < 2) {
+      return MakeErr(req.id, "missing_args",
+          "Usage: set interface zone <interface> <zone>");
+    }
+    const auto& iface = req.args[0];
+    const auto& zone = req.args[1];
+    sc::InterfaceSeed seed;
+    if (IfaceExists(iface)) {
+      seed.mac = ReadSysfs(iface, "address");
+    }
+    auto edited = sc::SetInterfaceZone(
+        ReadFile(SystemConfigPath()), iface, zone, seed);
+    if (!edited) {
+      return MakeErr(req.id, "invalid_edit", edited.error());
+    }
+    json j = {
+        {"interface", iface},
+        {"zone", zone},
+        {"action", "set zone"},
+        {"value", zone},
+        {"config", SystemConfigPath()},
+    };
+    // A port the kernel does not have is a declaration, not a move.
+    // The model is happy either way and the operator should not be
+    // left to infer which of the two just happened.
+    if (!IfaceExists(iface)) {
+      j["warning"] = std::format(
+          "no interface named '{}' is present on this box — the "
+          "declaration stands, but nothing is in the zone until the "
+          "port appears (`show system`)",
+          iface);
+    }
+    if (auto fail = InstallSystemDocument(req, *edited, &j)) {
+      return *fail;
+    }
+    j["applied"] = true;
+    j["persisted"] = true;
+    return MakeOk(req.id, j);
+  }
+
+  auto HandleIfaceDelZone(const proto::Request& req)
+      -> proto::Response {
+    if (req.args.empty()) {
+      return MakeErr(req.id, "missing_args",
+          "Usage: no interface zone <interface>");
+    }
+    const auto& iface = req.args[0];
+    auto edited =
+        sc::ClearInterfaceZone(ReadFile(SystemConfigPath()), iface);
+    if (!edited) {
+      return MakeErr(req.id, "invalid_edit", edited.error());
+    }
+    json j = {
+        {"interface", iface},
+        {"action", "remove from zone"},
+        {"value", "(none)"},
+        {"config", SystemConfigPath()},
+    };
+    if (auto fail = InstallSystemDocument(req, *edited, &j)) {
+      return *fail;
+    }
+    j["applied"] = true;
+    j["persisted"] = true;
+    j["note"] =
+        "a port in no zone carries no policy and no service; it is "
+        "not the same as a port that is down";
+    return MakeOk(req.id, j);
+  }
+
+  // -- services --------------------------------------------------------
+  //
+  // A service binds to a zone and names no interface, here as in the
+  // model. There is no argument to get wrong, which is the whole
+  // reason the rogue-DHCP case is unrepresentable rather than merely
+  // discouraged.
+
+  auto HandleDhcpSet(const proto::Request& req) -> proto::Response {
+    if (req.args.size() < 2) {
+      return MakeErr(req.id, "missing_args",
+          "Usage: set dhcp <zone> <first>-<last> [lease]");
+    }
+    const auto& zone = req.args[0];
+    const auto& range = req.args[1];
+    auto dash = range.find('-');
+    if (dash == std::string::npos) {
+      return MakeErr(req.id, "bad_argument",
+          std::format("'{}' is not <first>-<last>", range),
+          "e.g. 10.10.0.100-10.10.0.200");
+    }
+    const std::string lease =
+        req.args.size() > 2 ? req.args[2] : std::string();
+    auto edited = sc::SetDhcpServer(
+        ReadFile(SystemConfigPath()), zone, range.substr(0, dash),
+        range.substr(dash + 1), lease);
+    if (!edited) {
+      return MakeErr(req.id, "invalid_edit", edited.error());
+    }
+    json j = {
+        {"zone", zone},
+        {"action", "serve dhcp"},
+        {"value", lease.empty() ? range
+                                : std::format("{} lease {}", range,
+                                              lease)},
+        {"config", SystemConfigPath()},
+    };
+    if (auto f = InstallSystemDocument(req, *edited, &j)) return *f;
+    j["applied"] = true;
+    j["persisted"] = true;
+    return MakeOk(req.id, j);
+  }
+
+  auto HandleDhcpDelete(const proto::Request& req)
+      -> proto::Response {
+    if (req.args.empty()) {
+      return MakeErr(req.id, "missing_args",
+                     "Usage: no dhcp <zone>");
+    }
+    auto edited =
+        sc::ClearDhcpServer(ReadFile(SystemConfigPath()),
+                            req.args[0]);
+    if (!edited) {
+      return MakeErr(req.id, "invalid_edit", edited.error());
+    }
+    json j = {
+        {"zone", req.args[0]},
+        {"action", "stop serving dhcp"},
+        {"config", SystemConfigPath()},
+    };
+    if (auto f = InstallSystemDocument(req, *edited, &j)) return *f;
+    j["applied"] = true;
+    j["persisted"] = true;
+    j["note"] = "reservations on that zone went with it";
+    return MakeOk(req.id, j);
+  }
+
+  auto HandleDnsSet(const proto::Request& req) -> proto::Response {
+    if (req.args.empty()) {
+      return MakeErr(req.id, "missing_args",
+          "Usage: set dns <zone> [<upstream> ...]");
+    }
+    const auto& zone = req.args[0];
+    std::vector<std::string> upstreams(req.args.begin() + 1,
+                                       req.args.end());
+    auto edited = sc::SetDnsForwarder(ReadFile(SystemConfigPath()),
+                                      zone, upstreams);
+    if (!edited) {
+      return MakeErr(req.id, "invalid_edit", edited.error());
+    }
+    std::string list;
+    for (const auto& u : upstreams) {
+      if (!list.empty()) list += ", ";
+      list += u;
+    }
+    json j = {
+        {"zone", zone},
+        {"action", "forward dns"},
+        {"value", list.empty() ? "the system resolver" : list},
+        {"config", SystemConfigPath()},
+    };
+    if (auto f = InstallSystemDocument(req, *edited, &j)) return *f;
+    j["applied"] = true;
+    j["persisted"] = true;
+    if (upstreams.empty()) {
+      // On a DHCP uplink that is whatever the upstream handed us,
+      // which is a real answer and not the same as "none".
+      j["note"] =
+          "no upstream named: this forwarder inherits the system "
+          "resolver, which on a DHCP uplink is whatever the upstream "
+          "handed us";
+    }
+    return MakeOk(req.id, j);
+  }
+
+  auto HandleDnsDelete(const proto::Request& req) -> proto::Response {
+    if (req.args.empty()) {
+      return MakeErr(req.id, "missing_args",
+                     "Usage: no dns <zone>");
+    }
+    auto edited = sc::ClearDnsForwarder(ReadFile(SystemConfigPath()),
+                                        req.args[0]);
+    if (!edited) {
+      return MakeErr(req.id, "invalid_edit", edited.error());
+    }
+    json j = {
+        {"zone", req.args[0]},
+        {"action", "stop forwarding dns"},
+        {"config", SystemConfigPath()},
+    };
+    if (auto f = InstallSystemDocument(req, *edited, &j)) return *f;
     j["applied"] = true;
     j["persisted"] = true;
     return MakeOk(req.id, j);
@@ -1296,6 +2552,22 @@ class FLocalTransport final
       return MakeOk(req.id, {{"editor", editor}});
     }
     auto name = req.args[0];
+    // Storing a name nothing on the box answers to just moves the
+    // failure to the next `edit`, where it arrives as an exit code.
+    auto found = WhichBinary(name);
+    if (found.empty()) {
+      auto choice = ResolveEditorChoice(cfg_);
+      std::string have;
+      for (const auto& e : choice.available) {
+        if (!have.empty()) have += ", ";
+        have += e;
+      }
+      return MakeErr(req.id, "no_such_editor",
+          std::format("there is no '{}' on this box", name),
+          have.empty()
+              ? "no editor is installed at all"
+              : std::format("installed: {}", have));
+    }
     auto conf_path = cfg_.config_path.empty()
                          ? DefaultConfigPath()
                          : cfg_.config_path;
@@ -1307,6 +2579,7 @@ class FLocalTransport final
     }
     return MakeOk(req.id, {
         {"editor", name},
+        {"path", found},
         {"config", conf_path},
     });
   }
@@ -1434,8 +2707,17 @@ class FLocalTransport final
           {"services", cfg.ZoneHasService(z.name)},
       });
     }
+    // PRESENT is answered from the hardware identity the row already
+    // prints, never from the name. Matching by name reports "no" for
+    // a port that is plugged in, powered and correctly identified —
+    // and it does so at exactly the moment it matters, before a
+    // pending `.link` rename has happened.
+    auto ports = sc::ObservePorts();
+    auto presence = sc::MatchInterfaces(cfg, ports);
     json ifaces = json::array();
-    for (const auto& i : cfg.interfaces) {
+    for (std::size_t idx = 0; idx < cfg.interfaces.size(); ++idx) {
+      const auto& i = cfg.interfaces[idx];
+      const auto& p = presence[idx];
       ifaces.push_back({
           {"name", i.name},
           {"match_kind",
@@ -1445,17 +2727,36 @@ class FLocalTransport final
           {"address", i.address},
           {"gateway", i.gateway},
           {"zone", i.zone},
-          {"present", i.name.empty()
-                          ? false
-                          : IfaceExists(i.name)},
+          {"presence", sc::PortPresenceName(p.presence)},
+          {"present",
+           p.presence == sc::PortPresence::kPresentNamed},
+          {"current_name", p.current_name},
+          {"presence_detail", p.detail},
       });
     }
     auto result = sc::Validate(cfg);
+    json pending = json::array();
+    for (const auto& p : presence) {
+      if (!p.RenamePending() &&
+          p.presence != sc::PortPresence::kNameTakenByOther) {
+        continue;
+      }
+      pending.push_back({
+          {"interface", p.interface},
+          {"current_name", p.current_name},
+          {"identity", p.identity},
+          {"detail", p.detail},
+      });
+    }
     return MakeOk(req.id, {
         {"config", SystemConfigPath()},
         {"ok", !result.HasErrors()},
         {"zones", zones},
         {"interfaces", ifaces},
+        {"ports_read",
+         ports.availability == sc::PortAvailability::kObserved},
+        {"ports_detail", ports.detail},
+        {"pending", pending},
         {"listen", plan.allowed_interfaces},
         {"excluded", plan.excluded_interfaces},
         {"dhcp_on", plan.dhcp_interfaces},
@@ -1466,6 +2767,144 @@ class FLocalTransport final
     });
   }
 
+  /// The v6 stance, as it stands on this box right now.
+  ///
+  /// The question an operator has is not "what does the config say" —
+  /// it is "is anything routing around me". So the answer carries the
+  /// two numbers that settle it together: how many advertisements
+  /// arrived, and how many addresses were formed. A zero on its own
+  /// is ambiguous in exactly the direction that gets someone hurt.
+  auto HandleShowIpv6(const proto::Request& req) -> proto::Response {
+    sc::SystemConfig cfg;
+    std::optional<proto::Response> fail;
+    if (!LoadSystem(req, &cfg, &fail)) return *fail;
+
+    auto report = sc::ObserveIpv6(cfg, sc::Ipv6Source{});
+    json ports = json::array();
+    for (const auto& i : report.interfaces) {
+      ports.push_back({
+          {"interface", i.intent.interface},
+          {"zone", i.intent.zone},
+          {"stance", sc::Ipv6StanceName(i.intent.stance)},
+          {"counters_read", i.counters_read},
+          {"ras_received", i.ras_received},
+          {"v6_received", i.v6_received},
+          {"v6_discarded", i.v6_discarded},
+          {"addresses", i.global_addresses},
+          {"sends_ra", i.intent.sends_ra},
+          {"advertised_prefix", i.intent.advertised_prefix},
+      });
+    }
+    return MakeOk(req.id, {
+        {"availability",
+         sc::Ipv6AvailabilityName(report.availability)},
+        {"observed",
+         report.availability == sc::Ipv6Availability::kObserved},
+        {"forwarding", report.forwarding},
+        {"refused_ras", report.RefusedRas()},
+        {"violations", report.Violations()},
+        {"interfaces", ports},
+    });
+  }
+
+  /// The clock, and whether a timestamp taken now means anything.
+  ///
+  /// Every other view on this box is stamped in this clock — leases,
+  /// the device journal, the log ring, conntrack ages. So the honest
+  /// thing is not to print a time; it is to print the time together
+  /// with how much of it to believe.
+  auto HandleShowTime(const proto::Request& req) -> proto::Response {
+    sc::SystemConfig cfg;
+    std::optional<proto::Response> fail;
+    if (!LoadSystem(req, &cfg, &fail)) return *fail;
+
+    auto t = sc::QueryTime(cfg, sc::TimeSource{});
+    return MakeOk(req.id, {
+        {"trust", sc::TimeTrustName(t.trust)},
+        {"trustworthy", t.Trustworthy()},
+        {"rtc", sc::RtcPresenceName(t.rtc)},
+        {"rtc_name", t.rtc_name},
+        {"wall_seconds", t.wall_seconds},
+        {"uptime_seconds", t.uptime_seconds},
+        {"implausible", t.implausible},
+        {"max_error_us", t.max_error_us},
+        {"reference", t.reference},
+        {"detail", t.detail},
+        {"banner", sc::TimeWarningBanner(t)},
+    });
+  }
+
+  /// Disk, bundles, and — the number this view exists for — how much
+  /// logging has already been thrown away.
+  auto HandleShowStorage(const proto::Request& req)
+      -> proto::Response {
+    sc::StorageSource src;
+    src.retention.compiled_dir = cfg_.compiled_dir;
+    auto r = sc::QueryStorage(src);
+    return MakeOk(req.id, {
+        {"availability",
+         sc::StorageAvailabilityName(r.availability)},
+        {"observed",
+         r.availability == sc::StorageAvailability::kObserved},
+        {"fs_total_bytes", r.fs_total_bytes},
+        {"fs_free_bytes", r.fs_free_bytes},
+        {"tight", r.Tight()},
+        {"bundle_count", r.bundle_count},
+        {"bundle_bytes", r.bundle_bytes},
+        {"bundles_over_policy", r.bundles_over_policy},
+        {"keep", src.retention.keep},
+        {"compiled_dir", src.retention.compiled_dir},
+        {"journal_bytes", r.journal_bytes},
+        {"journal_read", r.journal_read},
+        {"suppressed_messages", r.suppressed_messages},
+        {"suppression_read", r.suppression_read},
+        {"detail", r.detail},
+        {"banner", sc::StorageWarningBanner(r)},
+    });
+  }
+
+  /// What this box has of the deployable set.
+  ///
+  /// The answer comes from `f-install verify`, not from a list kept
+  /// here. A second enumeration of what an appliance needs would be a
+  /// second thing to forget `f-confd` in, which is how the deployable
+  /// set came to be missing three binaries in the first place.
+  ///
+  /// A verifier that is not installed is itself a finding, and it is
+  /// reported as one rather than as an empty, healthy-looking table.
+  auto HandleShowInstall(const proto::Request& req)
+      -> proto::Response {
+    if (!std::filesystem::exists(cfg_.install_tool)) {
+      return MakeErr(
+          req.id, "no_installer",
+          std::format(
+              "{} is not installed, so this box cannot say what else "
+              "it is missing", cfg_.install_tool),
+          "it is part of the deployable set itself; reinstall from "
+          "the build with `f-install install --build-dir <dir>`");
+    }
+    auto [rc, out] = RunSubprocess(
+        {cfg_.install_tool, "verify", "--format", "json"});
+    if (rc < 0) {
+      return MakeErr(req.id, "installer_failed",
+                     std::format("could not run {}: {}",
+                                 cfg_.install_tool, out));
+    }
+    json parsed;
+    try {
+      parsed = json::parse(out);
+    } catch (const std::exception&) {
+      return MakeErr(
+          req.id, "installer_failed",
+          std::format("{} produced no report (exit {}): {}",
+                      cfg_.install_tool, rc, out));
+    }
+    // The exit code is the machine-readable verdict; carry it so the
+    // renderer never has to re-derive one from the rows.
+    parsed["exit_code"] = rc;
+    return MakeOk(req.id, parsed);
+  }
+
   auto HandleShowServices(const proto::Request& req)
       -> proto::Response {
     sc::SystemConfig cfg;
@@ -1474,27 +2913,427 @@ class FLocalTransport final
 
     json services = json::array();
     for (const auto& s : sc::QueryServices(cfg)) {
+      json listening = json::array();
+      for (const auto& l : s.observed.listeners) {
+        listening.push_back(l.Format());
+      }
+      bool observed =
+          s.observed.availability ==
+          sc::BindingAvailability::kObserved;
       services.push_back({
           {"name", s.name},
           {"unit", s.unit},
           {"state", sc::ServiceStateName(s.state)},
           {"expected", s.expected},
-          {"healthy", s.state == sc::ServiceState::kRunning ||
-                          s.state ==
-                              sc::ServiceState::kNotConfigured ||
-                          s.state ==
-                              sc::ServiceState::kActivating},
+          {"healthy", (s.state == sc::ServiceState::kRunning ||
+                       s.state == sc::ServiceState::kNotConfigured ||
+                       s.state == sc::ServiceState::kActivating) &&
+                          !s.Mismatched()},
           {"zones", s.zones},
-          {"interfaces", s.interfaces},
-          {"detail", s.detail},
+          // Intent and observation are two keys, never one. A single
+          // "interfaces" key is what let this view print identical
+          // bytes for a working bind and for a daemon listening on
+          // 127.0.0.1 and nothing else.
+          {"bound_to", s.interfaces},
+          {"observed",
+           sc::BindingAvailabilityName(s.observed.availability)},
+          {"answers_on", observed ? json(s.observed.interfaces)
+                                  : json(json::array())},
+          {"answers_known", observed},
+          {"listening", listening},
+          {"wildcard", s.observed.wildcard},
+          {"loopback_only", s.observed.LoopbackOnly()},
+          {"mismatch", s.Mismatched()},
+          {"mismatch_detail", s.MismatchDetail()},
+          {"detail", s.detail.empty() ? s.observed.detail : s.detail},
       });
     }
+    auto plan = sc::PlanDnsmasq(cfg);
     auto drift = sc::CheckDnsmasqDrift(cfg, cfg_.dnsmasq_conf);
     return MakeOk(req.id, {
         {"services", services},
         {"artifact", cfg_.dnsmasq_conf},
         {"drift", sc::DriftKindName(drift)},
+        // The one DNS setting whose failure mode is a name that
+        // silently does not exist. Surfaced here because no other view
+        // of a healthy-looking box would ever mention it.
+        {"rebind_protection", plan.rebind_protection},
+        {"rebind_exempt", plan.rebind_exempt},
     });
+  }
+
+  // -- device visibility ----------------------------------------------
+  //
+  // Plug something in; find out what it is and what it is talking to.
+  //
+  // The lease view is assembled from three sources that fail
+  // independently — the system configuration, dnsmasq's lease file and
+  // the device journal — plus fd for the flow half. Each one's
+  // availability travels with the answer, because an empty table has
+  // to be able to say which kind of empty it is.
+
+  auto ViewOptions() const -> lease::ViewOptions {
+    lease::ViewOptions o;
+    o.lease_path = cfg_.lease_file;
+    o.journal_path = cfg_.device_journal;
+    return o;
+  }
+
+  /// The device report, or the response that explains why there is
+  /// none. A system configuration that will not parse is not a lease
+  /// view with no devices in it.
+  auto CollectReport(const proto::Request& req,
+                     lease::DeviceReport* out,
+                     std::optional<proto::Response>* fail,
+                     std::int64_t now) -> bool {
+    sc::SystemConfig cfg;
+    if (!LoadSystem(req, &cfg, fail)) return false;
+    *out = lease::CollectDevices(cfg, ViewOptions(), now);
+    return true;
+  }
+
+  auto HandleShowLeases(const proto::Request& req)
+      -> proto::Response {
+    const auto now = NowSeconds();
+    lease::DeviceReport report;
+    std::optional<proto::Response> fail;
+    if (!CollectReport(req, &report, &fail, now)) return *fail;
+
+    bool only_new = false;
+    bool include_gone = false;
+    for (const auto& a : req.args) {
+      if (a == "new") only_new = true;
+      if (a == "all") include_gone = true;
+    }
+    if (only_new || !include_gone) {
+      std::vector<lease::Device> kept;
+      for (const auto& d : report.devices) {
+        if (only_new && !d.IsNew(now, lease::kNewWindowSeconds)) {
+          continue;
+        }
+        if (!include_gone && !only_new && !d.active) continue;
+        kept.push_back(d);
+      }
+      // How many rows were left out is part of the answer: "3 devices"
+      // next to a table of one is a question the operator should not
+      // have to ask.
+      auto hidden = report.devices.size() - kept.size();
+      auto j = DeviceReportToJson(report, now);
+      report.devices = std::move(kept);
+      auto shown = DeviceReportToJson(report, now);
+      shown["hidden"] = hidden;
+      shown["filter"] = only_new ? "new" : "active";
+      shown["active"] = j["active"];
+      return MakeOk(req.id, shown);
+    }
+    auto j = DeviceReportToJson(report, now);
+    j["hidden"] = 0;
+    j["filter"] = "all";
+    return MakeOk(req.id, j);
+  }
+
+  auto HandleShowDevice(const proto::Request& req)
+      -> proto::Response {
+    if (req.args.empty()) {
+      return MakeErr(req.id, "missing_args",
+          "Usage: show device <mac|address|hostname>");
+    }
+    const auto& query = req.args[0];
+    const auto now = NowSeconds();
+    lease::DeviceReport report;
+    std::optional<proto::Response> fail;
+    if (!CollectReport(req, &report, &fail, now)) return *fail;
+
+    auto hits = lease::MatchDevices(report, query);
+    if (hits.empty()) {
+      // Not knowing the device and not being able to read the leases
+      // are different answers, and the hint says which one happened.
+      std::string hint =
+          report.leases == lease::LeaseAvailability::kOk
+              ? "`show leases all` lists every device seen"
+              : std::format("the lease view is unavailable: {}",
+                            lease::LeaseAvailabilityName(
+                                report.leases));
+      return MakeErr(req.id, "no_such_device",
+                     std::format("no device matches '{}'", query),
+                     hint);
+    }
+    if (hits.size() > 1) {
+      std::string names;
+      for (const auto* d : hits) {
+        if (!names.empty()) names += ", ";
+        names += std::format("{} ({})", d->mac, d->address);
+      }
+      return MakeErr(req.id, "ambiguous_device",
+          std::format("'{}' matches {} devices", query, hits.size()),
+          names);
+    }
+    const auto& d = *hits[0];
+
+    json j = {
+        {"mac", d.mac},
+        {"address", d.address},
+        {"hostname", d.hostname},
+        {"zone", d.zone},
+        {"first_seen", d.first_seen},
+        {"first_seen_age", now - d.first_seen},
+        {"first_seen_exact",
+         d.precision == lease::FirstSeenPrecision::kObserved},
+        {"last_seen_age", now - d.last_seen},
+        {"expires_in", d.expiry > 0 ? d.expiry - now : 0},
+        {"active", d.active},
+        {"new", d.IsNew(now, lease::kNewWindowSeconds)},
+        {"reserved", d.reserved},
+        {"reserved_address", d.reserved_address},
+        {"address_changes", d.address_changes},
+        {"leases", lease::LeaseAvailabilityName(report.leases)},
+        {"journal", lease::JournalAvailabilityName(report.journal)},
+    };
+
+    // NAT first, because the flow half needs it.
+    //
+    // Conntrack is keyed on the addresses that are *on the wire*, and
+    // behind a masquerade those are the gateway's, not the device's.
+    // Filtering conntrack by the device's own address therefore finds
+    // nothing on exactly the topology this appliance exists to run,
+    // and reports "tracking no connections" about a device with two.
+    // The NAT table is what makes the two views joinable: it maps
+    // each translated endpoint back to the host that owns it.
+    auto nat = AskFd(fd_cmd::kGetNat);
+    // Endpoints seen on the wire that really belong to this device.
+    struct WireAlias {
+      std::string addr;
+      int port = 0;
+      int local_port = 0;
+    };
+    std::vector<WireAlias> aliases;
+    if (nat.ok) {
+      j["nat_available"] = true;
+      json translations = json::array();
+      for (const auto& t : nat.body.value("translations",
+                                          json::array())) {
+        // `type` is the *original* direction. For an outbound
+        // masquerade the device is behind `new_addr`, and the wire
+        // carries `orig_dst`; for an inbound port-forward it is the
+        // other way round.
+        const auto type = t.value("type", "");
+        std::string device_side;
+        WireAlias alias;
+        if (type == "snat") {
+          device_side = t.value("new_addr", "");
+          alias.addr = t.value("orig_dst", "");
+          alias.port = t.value("orig_dst_port", 0);
+          alias.local_port = t.value("new_port", 0);
+        } else {
+          device_side = t.value("orig_src", "");
+          alias.addr = t.value("new_addr", "");
+          alias.port = t.value("new_port", 0);
+          alias.local_port = t.value("orig_src_port", 0);
+        }
+        if (device_side != d.address) continue;
+        translations.push_back(t);
+        if (!alias.addr.empty()) aliases.push_back(alias);
+      }
+      j["nat"] = translations;
+    } else {
+      j["nat_available"] = false;
+      j["nat_detail"] = nat.error;
+    }
+    j["translated"] = !aliases.empty();
+
+    // The flow half. fd being down is reported as such; it is not the
+    // same picture as a device that is talking to nobody.
+    auto ct = AskFd(fd_cmd::kGetConntrack);
+    if (!ct.ok) {
+      j["flows_available"] = false;
+      j["flows_detail"] = ct.error;
+    } else {
+      j["flows_available"] = true;
+      json flows = json::array();
+      const auto now_ns = MonotonicNs();
+      std::uint64_t packets_total = 0;
+      std::unordered_map<std::string, std::uint64_t> peers;
+      for (const auto& c : ct.body) {
+        auto src = c.value("src", "");
+        auto dst = c.value("dst", "");
+        auto sport = c.value("src_port", 0);
+        auto dport = c.value("dst_port", 0);
+        bool outbound = src == d.address;
+        bool mine = outbound || dst == d.address;
+        bool translated = false;
+        int local_port = outbound ? sport : dport;
+        if (!mine) {
+          for (const auto& a : aliases) {
+            if (src == a.addr && sport == a.port) {
+              mine = true;
+              outbound = true;
+              translated = true;
+              local_port = a.local_port;
+              break;
+            }
+            if (dst == a.addr && dport == a.port) {
+              mine = true;
+              outbound = false;
+              translated = true;
+              local_port = a.local_port;
+              break;
+            }
+          }
+        }
+        if (!mine) continue;
+        auto seen = c.value("last_seen_ns", std::uint64_t{0});
+        std::int64_t idle = -1;
+        if (seen > 0 && now_ns > seen) {
+          idle = static_cast<std::int64_t>((now_ns - seen) /
+                                           1'000'000'000ULL);
+        }
+        auto pkts = c.value("packets", std::uint64_t{0});
+        packets_total += pkts;
+        auto peer = outbound ? dst : src;
+        peers[peer] += pkts;
+        flows.push_back({
+            {"proto", c.value("proto", "any")},
+            {"direction", outbound ? "out" : "in"},
+            {"peer", peer},
+            {"peer_port", outbound ? dport : sport},
+            {"local_port", local_port},
+            // True when this row was found through the NAT table
+            // rather than by the device's own address — worth saying,
+            // because the address conntrack shows is not the
+            // device's.
+            {"translated", translated},
+            {"state", c.value("state", "")},
+            {"packets", pkts},
+            {"idle", idle},
+        });
+      }
+      j["flows"] = flows;
+      j["packets"] = packets_total;
+      json top = json::array();
+      std::vector<std::pair<std::string, std::uint64_t>> ranked(
+          peers.begin(), peers.end());
+      std::sort(ranked.begin(), ranked.end(),
+                [](const auto& a, const auto& b) {
+                  return a.second > b.second;
+                });
+      for (std::size_t i = 0; i < ranked.size() && i < 5; ++i) {
+        top.push_back({{"peer", ranked[i].first},
+                       {"packets", ranked[i].second}});
+      }
+      j["top_peers"] = top;
+    }
+
+    return MakeOk(req.id, j);
+  }
+
+  auto HandleSetReservation(const proto::Request& req)
+      -> proto::Response {
+    if (req.args.size() < 2) {
+      return MakeErr(req.id, "missing_args",
+          "Usage: set reservation <mac> <address> [hostname]");
+    }
+    const auto& mac = req.args[0];
+    const auto& address = req.args[1];
+    const std::string hostname =
+        req.args.size() > 2 ? req.args[2] : std::string();
+
+    sc::SystemConfig cfg;
+    std::optional<proto::Response> fail;
+    if (!LoadSystem(req, &cfg, &fail)) return *fail;
+
+    // Which DHCP server owns this address is a question the model can
+    // answer, so the operator is not made to repeat it. When it cannot
+    // be answered without guessing, say so rather than pick.
+    std::vector<std::string> candidates;
+    auto want = sc::ParseIpv4(address);
+    if (!want) {
+      return MakeErr(req.id, "invalid_address",
+          std::format("'{}' is not an IPv4 address", address));
+    }
+    for (const auto& d : cfg.dhcp) {
+      for (const auto* i : cfg.InterfacesInZone(d.bind.zone)) {
+        if (i->mode != sc::AddressMode::kStatic) continue;
+        auto p = sc::ParseCidr4(i->address);
+        if (p && p->Contains(*want)) {
+          candidates.push_back(d.bind.zone);
+          break;
+        }
+      }
+    }
+    if (candidates.empty()) {
+      std::string zones;
+      for (const auto& d : cfg.dhcp) {
+        if (!zones.empty()) zones += ", ";
+        zones += d.bind.zone;
+      }
+      return MakeErr(req.id, "no_zone_for_address",
+          std::format("{} is not in the subnet of any zone that "
+                      "serves DHCP", address),
+          zones.empty()
+              ? "no DHCP server is configured"
+              : std::format("zones serving DHCP: {}", zones));
+    }
+    if (candidates.size() > 1) {
+      std::string zones;
+      for (const auto& z : candidates) {
+        if (!zones.empty()) zones += ", ";
+        zones += z;
+      }
+      return MakeErr(req.id, "ambiguous_zone",
+          std::format("{} falls in more than one DHCP zone",
+                      address),
+          zones);
+    }
+    const auto& zone = candidates.front();
+
+    auto edited = sc::SetDhcpReservation(
+        ReadFile(SystemConfigPath()), zone, mac, address, hostname);
+    if (!edited) {
+      return MakeErr(req.id, "invalid_edit", edited.error());
+    }
+
+    json j = {
+        {"action", "set reservation"},
+        {"mac", sc::NormalizeMac(mac)},
+        {"address", address},
+        {"hostname", hostname},
+        {"zone", zone},
+        {"config", SystemConfigPath()},
+        {"live", false},
+    };
+    if (auto f = InstallSystemDocument(req, *edited, &j)) return *f;
+    j["applied"] = true;
+    j["persisted"] = true;
+    // A reservation only takes effect on the client's next DHCP
+    // request. Saying so here is the difference between an operator
+    // who waits and one who reboots a board for no reason.
+    j["note"] =
+        "the client keeps its current address until its lease is "
+        "renewed";
+    return MakeOk(req.id, j);
+  }
+
+  auto HandleNoReservation(const proto::Request& req)
+      -> proto::Response {
+    if (req.args.empty()) {
+      return MakeErr(req.id, "missing_args",
+                     "Usage: no reservation <mac>");
+    }
+    auto edited = sc::ClearDhcpReservation(
+        ReadFile(SystemConfigPath()), req.args[0]);
+    if (!edited) {
+      return MakeErr(req.id, "invalid_edit", edited.error());
+    }
+    json j = {
+        {"action", "remove reservation"},
+        {"mac", req.args[0]},
+        {"config", SystemConfigPath()},
+        {"live", false},
+    };
+    if (auto f = InstallSystemDocument(req, *edited, &j)) return *f;
+    j["applied"] = true;
+    j["persisted"] = true;
+    return MakeOk(req.id, j);
   }
 
   auto HandleCheckSystem(const proto::Request& req)
@@ -1602,6 +3441,7 @@ class FLocalTransport final
           "access will not be rolled back");
     }
     bool force = req.args.size() > 1 && req.args[1] == "force";
+    auto stale_before = StaleNetworkdUnits(cfg);
     auto sid = StageSystemConfig(req, force);
     if (!sid) return sid.error();
 
@@ -1625,7 +3465,62 @@ class FLocalTransport final
     body["applied"] = true;
     body["via"] = "f-confd";
     body["confirm_required"] = true;
+    AddArtifactSweep(cfg, stale_before, &body);
+    auto pending = PendingRenames(cfg);
+    body["pending"] = pending;
+    body["pending_note"] = RenameNote(pending);
     body["diagnostics"] = DiagsToJson(result.diagnostics);
+    return MakeOk(req.id, body);
+  }
+
+  /// Go back to a recorded system-configuration revision.
+  ///
+  /// `show commits` was made honest before this existed, which left a
+  /// list of revisions and no way to reach any of them. The targeted
+  /// verbs (`set zone`, `set address`, `set dhcp`) apply on the spot
+  /// with no confirm window, so a recorded revision *is* the way back
+  /// from one of them — and a way back that cannot be taken is not a
+  /// way back.
+  auto HandleRollbackSystem(const proto::Request& req)
+      -> proto::Response {
+    if (!ConfdAvailable()) {
+      return MakeErr(req.id, "no_confd",
+          "f-confd is not running, and it is what holds the "
+          "revisions — there is nothing on this box to roll back to",
+          "systemctl start f-confd; from here the way back is the "
+          "system configuration file itself");
+    }
+    const bool to_named = !req.args.empty();
+    auto resp = ConfdRequest(
+        req, to_named ? "rollback_to" : "rollback_previous",
+        to_named ? std::vector<std::string>{req.args[0]}
+                 : std::vector<std::string>{},
+        {}, std::chrono::seconds(30));
+    if (!resp) {
+      return MakeErr(req.id, "confd_error", resp.error());
+    }
+    if (resp->status != proto::ResponseStatus::Ok) {
+      return MakeErr(req.id, "rollback_failed",
+          resp->error ? resp->error->message
+                      : "f-confd refused the rollback",
+          "the running configuration is unchanged");
+    }
+    auto body = ParseKv(
+        std::string(resp->data.begin(), resp->data.end()));
+    body["action"] = to_named
+                         ? std::format("roll back to revision {}",
+                                       req.args[0])
+                         : "roll back to the previous revision";
+    body["config"] = SystemConfigPath();
+    body["applied"] = true;
+    body["persisted"] = true;
+    body["activated"] = true;
+    body["via"] = "f-confd";
+    // The policy is a separate document with a separate history, and
+    // this did not touch it.
+    body["note"] =
+        "this restored the system configuration only — the firewall "
+        "policy is a separate document and is unchanged";
     return MakeOk(req.id, body);
   }
 
@@ -1688,6 +3583,109 @@ class FLocalTransport final
     return out;
   }
 
+  /// Generated networkd units in the unit directory that the current
+  /// model does not name. Read from the directory, not from a record
+  /// of what we wrote, so the answer survives a previous session, a
+  /// crash, and an `apply` that ran under a different model.
+  auto StaleNetworkdUnits(const sc::SystemConfig& cfg)
+      -> std::vector<std::string> {
+    sc::NetworkdOptions opts;
+    opts.dir = cfg_.networkd_dir;
+    std::set<std::string> planned;
+    for (const auto& u : sc::PlanNetworkd(cfg, opts)) {
+      planned.insert(u.path);
+    }
+    std::vector<std::string> stale;
+    std::error_code ec;
+    std::filesystem::directory_iterator it(cfg_.networkd_dir, ec);
+    if (ec) return stale;
+    for (const auto& entry : it) {
+      auto name = entry.path().filename().string();
+      if (name.rfind("10-f-", 0) != 0) continue;
+      auto ext = entry.path().extension().string();
+      if (ext != ".link" && ext != ".network") continue;
+      auto path = entry.path().string();
+      if (planned.count(path) != 0) continue;
+      stale.push_back(path);
+    }
+    std::sort(stale.begin(), stale.end());
+    return stale;
+  }
+
+  /// Interfaces the model names that the kernel does not have under
+  /// that name yet, because a `.link` rename is still pending.
+  ///
+  /// `apply system` must say this. A reply of "applied, revision 1"
+  /// over a config whose `interface=` lines name ports that will not
+  /// exist until reboot is true about the files and false about the
+  /// box, and the difference is a DHCP server bound to nothing.
+  auto PendingRenames(const sc::SystemConfig& cfg) -> json {
+    auto ports = sc::ObservePorts();
+    json out = json::array();
+    for (const auto& p : sc::MatchInterfaces(cfg, ports)) {
+      if (p.presence != sc::PortPresence::kPendingRename &&
+          p.presence != sc::PortPresence::kNameTakenByOther) {
+        continue;
+      }
+      out.push_back({
+          {"interface", p.interface},
+          {"current_name", p.current_name},
+          {"identity", p.identity},
+          {"detail", p.detail},
+      });
+    }
+    return out;
+  }
+
+  /// The sentence that turns a pending rename into something an
+  /// operator can act on. The handbook says generated files are never
+  /// hand-edited, so the recovery cannot be "edit the unit" — it has
+  /// to be a sequence, and it has to be written down somewhere the
+  /// person reading the apply output can see it.
+  static auto RenameNote(const json& pending) -> std::string {
+    if (pending.empty()) return "";
+    std::string names;
+    std::string first_now;
+    for (const auto& p : pending) {
+      names += (names.empty() ? "" : ", ") +
+               p.value("interface", "") + " (currently " +
+               p.value("current_name", "?") + ")";
+      if (first_now.empty()) first_now = p.value("current_name", "");
+    }
+    return std::format(
+        "PENDING RENAME: {}. Until the rename happens those names "
+        "match no device, so every generated file that mentions them "
+        "binds nothing — dnsmasq will start cleanly and answer on "
+        "loopback. Either reboot, or apply the rename now:\n"
+        "  udevadm control --reload\n"
+        "  ip link set {} down\n"
+        "  udevadm trigger --action=add /sys/class/net/{}\n"
+        "Then `show system` must read PRESENT: yes before this "
+        "configuration is doing anything.",
+        names, first_now.empty() ? "<port>" : first_now,
+        first_now.empty() ? "<port>" : first_now);
+  }
+
+  /// Record what the sweep actually did, by looking twice.
+  ///
+  /// A derived file whose interface left the model is not clutter:
+  /// udev applies `.link` units in filename order, so a leftover whose
+  /// name sorts first wins the rename for a MAC the current model
+  /// pins elsewhere — and the port then never gets its configured
+  /// name, with nothing logged anywhere.
+  auto AddArtifactSweep(const sc::SystemConfig& cfg,
+                        const std::vector<std::string>& before,
+                        json* body) -> void {
+    auto after = StaleNetworkdUnits(cfg);
+    std::set<std::string> still(after.begin(), after.end());
+    json removed = json::array();
+    for (const auto& p : before) {
+      if (still.count(p) == 0) removed.push_back(p);
+    }
+    (*body)["removed"] = removed;
+    (*body)["leftover"] = after;
+  }
+
   auto HandleApplySystem(const proto::Request& req)
       -> proto::Response {
     sc::SystemConfig cfg;
@@ -1705,6 +3703,7 @@ class FLocalTransport final
     }
 
     bool force = !req.args.empty() && req.args[0] == "force";
+    auto stale_before = StaleNetworkdUnits(cfg);
 
     // Prefer f-confd: one writer, a recorded revision, and a box that
     // can be rolled back to a named configuration afterwards.
@@ -1732,6 +3731,10 @@ class FLocalTransport final
           "applied without a confirm window — use `apply system "
           "confirmed <minutes>` when the change could cut your "
           "own access";
+      AddArtifactSweep(cfg, stale_before, &body);
+      auto pending = PendingRenames(cfg);
+      body["pending"] = pending;
+      body["pending_note"] = RenameNote(pending);
       body["diagnostics"] = DiagsToJson(result.diagnostics);
       return MakeOk(req.id, body);
     }
@@ -1748,6 +3751,12 @@ class FLocalTransport final
 
     json written = json::array();
     for (const auto& p : net->changed) written.push_back(p);
+    json removed = json::array();
+    for (const auto& p : net->removed) removed.push_back(p);
+    json conflicts = json::array();
+    for (const auto& p : net->conflicts) conflicts.push_back(p);
+    auto pending = PendingRenames(cfg);
+    auto pending_note = RenameNote(pending);
 
     // Said on every direct apply, because it is the difference
     // between "the files are right" and "the box is running them".
@@ -1765,6 +3774,10 @@ class FLocalTransport final
           {"via", "direct"},
           {"activated", false},
           {"written", written},
+          {"removed", removed},
+          {"leftover", conflicts},
+          {"pending", pending},
+          {"pending_note", pending_note},
           {"dhcp_on", json::array()},
           {"note", "no service is bound to any zone; dnsmasq is "
                    "not needed. " + kDirectNote},
@@ -1793,6 +3806,10 @@ class FLocalTransport final
         {"via", "direct"},
         {"activated", false},
         {"written", written},
+        {"removed", removed},
+        {"leftover", conflicts},
+        {"pending", pending},
+        {"pending_note", pending_note},
         {"dhcp_on", dm->plan.dhcp_interfaces},
         {"note", kDirectNote},
         {"diagnostics", DiagsToJson(result.diagnostics)},

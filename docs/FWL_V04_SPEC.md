@@ -420,6 +420,44 @@ interpreter oracle reads the same values the BPF parser sees. A
 builder call with neither parameter produces an untagged frame
 (unchanged from v0.2).
 
+A seventh builder, `icmperr()`, produces an ICMP **error**: the 8-byte
+ICMP header (whose "unused" word carries the RFC 1191 next-hop MTU for
+type 3 code 4) followed by the embedded datagram — a full 20-byte IP
+header plus the first 8 bytes of its transport header. Nothing else in
+the builder language can produce one: `icmp()` emits an 8-byte header
+over a zero body, which no router has ever sent and which carries no
+flow identity at all.
+
+| Field | Default | Meaning |
+|---|---|---|
+| `src_ip`, `dst_ip` | `1.1.1.1`, `2.2.2.2` | the error's own addresses |
+| `type`, `code` | `3`, `4` | fragmentation needed |
+| `mtu` | `1400` | next-hop MTU (RFC 1191) |
+| `inner_proto` | `tcp` | `tcp`, `udp` or `icmp` |
+| `inner_src_ip` | the error's `dst_ip` | embedded source — an error comes back from the peer a packet went to, so its datagram was addressed *from* the error's destination |
+| `inner_dst_ip` | `2.2.2.2` | embedded destination |
+| `inner_src_port`, `inner_dst_port` | `0` | embedded ports (ignored when `inner_proto` is `icmp`) |
+| `inner_len` | `1500` | the ORIGINAL datagram's total length — the router copies the header it could not forward, and that length is why the error exists |
+
+`vlan_id`, `vlan_priority` and `ihl` apply as to every other v4
+builder. The decoded-fields dict reports `proto: icmp` with
+`icmp_type` / `icmp_code` (an error IS an ICMP packet, and
+`pkt.proto == icmp` matches it), no `src_port` / `dst_port` (an error
+has none), and the embedded tuple under `_inner_proto`,
+`_inner_src_ip`, `_inner_dst_ip`, `_inner_src_port`, `_inner_dst_port`
+— underscored, like `_ihl`, because no rule can name them.
+
+`expected.output_packet` gains `inner_src_ip`, `inner_dst_ip`,
+`inner_src_port` and `inner_dst_port` so a case can assert the
+embedded rewrite. A case that asserted only the outer header would
+pass on a NAT that steered an error to the right host and left it
+describing the wrong connection.
+
+All ICMP frames the builder produces now carry a **correct** checksum
+(they carried a zero placeholder until ICMP-error NAT existed), and the
+BPF oracle validates the ICMP and embedded-IP checksums of every
+asserted `output_packet` alongside the outer IP and L4 ones.
+
 ## Conntrack — `conntrack(pkt).state`
 
 ### Construct
@@ -442,7 +480,7 @@ The four states:
 |-------|---------|
 | `new` | the packet's 5-tuple is absent from the conntrack table |
 | `established` | the 5-tuple was found (forward **or** reverse direction) |
-| `related` | reserved; **never produced in v0.4** (see deferrals) |
+| `related` | an ICMP error whose **embedded datagram** names a tracked flow |
 | `invalid` | a TCP state-machine violation: a non-SYN segment for an untracked flow |
 
 ### Type rules
@@ -482,6 +520,11 @@ The four states:
   second probe on the reverse key (src/dst addresses and ports swapped).
   A hit in **either** direction is `established` — this is what lets a
   reply match the entry its initiating packet created.
+- **Refresh.** A hit stamps the entry's `last_seen_ns` and bumps its
+  packet count. This is what makes the daemon's `timeout_s` an *idle*
+  timeout rather than a lifetime cap: without it an entry was collected
+  `timeout_s` after the flow's FIRST packet, so a busy connection lost
+  its state mid-flight and a stateful policy began dropping it.
 - **Classification.** Forward-or-reverse hit → `established`. Otherwise a
   TCP segment with no SYN flag → `invalid` (data/ACK/RST for a flow whose
   handshake was never seen). Everything else → `new`. `established` takes
@@ -498,6 +541,14 @@ The four states:
      so a stateful gateway can redirect return traffic back in. Without
      it the canonical `masquerade` + `redirect to wan` / `redirect to lan
      if established` gateway would be outbound-only.
+  3. A **destination-NAT** action (`dnat`) that actually rewrites the
+     destination — likewise the post-NAT 5-tuple, so the internal
+     server's reply reads `established` on its way back out. Same
+     argument as (2), same failure without it: a port forward that
+     admits the client and drops every reply.
+
+  These post-NAT entries are also what gives each `fwl_nat` mapping an
+  anchor the daemon can age it against (see § NAT, mapping lifetime).
 
   A `drop` on a `new` packet creates **nothing**, the implicit
   fall-through `XDP_PASS` (no matching rule and no `default`) does
@@ -522,9 +573,26 @@ The four states:
   flag reads never happen).
 - *`established` vs `invalid`.* A non-SYN packet that matches an existing
   entry is `established`, not `invalid` — the table lookup wins.
-- *`related`.* No packet is ever classified `related` in v0.4, so
-  `conntrack(pkt).state == related` never matches and
-  `in [established, related]` is effectively `== established`.
+- *`related`.* An ICMP **error** — types 3, 4, 5, 11 and 12, the five
+  RFC 792 messages that carry the datagram that provoked them — reads
+  `related` when the 5-tuple of that embedded datagram matches a
+  tracked flow in either direction. Nothing else is ever `related`: an
+  ICMP **query** (echo, timestamp, …) carries nobody's packet and reads
+  `new`, however closely its payload resembles one.
+- *`related` creates nothing and refreshes nothing.* An error is
+  evidence ABOUT a flow, not traffic belonging to one, so an allowed
+  `related` packet adds no conntrack entry and does not stop an idle
+  flow from being collected.
+- *`established` does not include `related`.* This is the migration
+  every policy written against v0.4 must make, and it is the same one
+  nftables and iptables require: `allow if conntrack(pkt).state ==
+  established` does **not** admit the ICMP errors your own outbound
+  flows provoke, which for a masquerading gateway means path-MTU
+  discovery is dead and large transfers hang with nothing logged. The
+  idiom is `allow if conntrack(pkt).state in [established, related]`.
+- *Classification is a property of the packet, not of NAT.* A policy
+  with no NAT rule anywhere still classifies errors, because the flows
+  it is protecting still provoke them.
 - *5-tuple specificity.* A packet to a different port (or address, or
   protocol) than a tracked flow does not match it — it reads `new`.
 
@@ -699,11 +767,76 @@ only `allow`/`drop` — so `default redirect to <zone>` is a syntax error.
 #### Semantics
 
 The emitter declares one `BPF_MAP_TYPE_DEVMAP` per destination zone
-(`fwl_devmap_<zone>`) and emits `bpf_redirect_map(&fwl_devmap_<zone>, 0,
-0)`. The daemon populates the devmap with the destination zone's egress
-ifindex(es) at load time; for a multi-interface zone the switch chip's
-FDB/MAC learning picks the physical egress port. `redirect` does not
-open a conntrack entry in v0.4 (NAT-driven flow creation is Phase 5).
+(`fwl_devmap_<zone>`). The daemon populates it with the destination
+zone's egress ifindex(es) at load time; for a multi-interface zone the
+switch chip's FDB/MAC learning picks the physical egress port.
+`redirect` does not open a conntrack entry in v0.4 (NAT-driven flow
+creation is Phase 5).
+
+**`f` routes.** A redirect is not only an egress decision, it is a
+next-hop decision, and the two are not the same question. Through v0.4
+the emitted code was one `bpf_redirect_map()`, which forwards the frame
+with the Ethernet header it arrived carrying. For a zone-to-zone hop on
+one L2 segment that is correct. For a hop across a subnet boundary it
+is not, and **masquerade is that second case by construction**: you
+cannot translate the source to your own address and then hand the frame
+to a MAC you never addressed. The next hop's NIC reports the frame as
+`PACKET_OTHERHOST` and its stack discards it before any socket exists.
+
+So a redirect now resolves the next hop through the kernel's own
+routing table (`bpf_fib_lookup`) and re-addresses the frame to it:
+
+1. Read the destination zone's ifindex from devmap slot 0. If the slot
+   is empty, nothing is known about this zone and the frame is
+   forwarded L2-adjacent (this is also what makes an unpopulated devmap
+   behave exactly as before, which is what the `.pkt` corpus sees).
+2. `bpf_fib_lookup` with the packet's post-NAT addresses and the
+   ingress ifindex.
+3. On `BPF_FIB_LKUP_RET_SUCCESS`, **the egress ifindex the FIB returns
+   must be the zone's own**. A box with a default route resolves every
+   destination, so without this check a zone hop on an unrouted segment
+   would be stamped with the default gateway's MAC, which lives on a
+   different interface. A mismatch is counted (`off_zone`) and the
+   frame is forwarded L2-adjacent.
+4. Otherwise: the destination MAC and source MAC are written from the
+   lookup, the TTL is decremented, and the IP checksum updated. Egress
+   is still the zone's devmap — the policy named a zone and the frame
+   leaves through it.
+
+The failure outcomes follow the kernel's own classification:
+
+| FIB result | Outcome |
+|---|---|
+| `SUCCESS`, ifindex matches | routed (MACs rewritten, TTL decremented) |
+| `SUCCESS`, ifindex differs | forwarded L2-adjacent, counted `off_zone` |
+| `BLACKHOLE` / `UNREACHABLE` / `PROHIBIT` | `XDP_DROP`, counted `no_route` |
+| `NO_NEIGH` | `XDP_PASS` so the stack can ARP, counted `no_neigh` |
+| anything else (incl. `FWD_DISABLED`, no route) | forwarded L2-adjacent |
+| TTL ≤ 1 | `XDP_PASS`; the stack owns the ICMP time-exceeded |
+
+`NO_NEIGH` is the one that does not fully recover: handing the packet to
+the stack is what triggers the ARP, but a **source-translated** packet
+does not survive that trip, because its source is one of this box's own
+addresses and `fib_validate_source` rejects it as a martian. The
+resolution happens; that packet does not. It is counted and logged for
+exactly that reason.
+
+`net.ipv4.ip_forward` is therefore load-bearing rather than advisory:
+with it at 0 the lookup returns `FWD_DISABLED`, no next hop is
+resolved, and every forward degrades to the L2-adjacent behaviour. It is
+generated as part of the appliance system configuration
+(`f-sysconf render sysctl`), not documented as a manual step.
+
+Which of the two a forward took is **not observable on the wire**. Both
+put the same frame on the same cable; only the far side's stack tells
+them apart, and only by dropping one of them. `fwl_route_stats` (one
+per-CPU array per bundle, surfaced as the `route` section of
+`fctl status`) is where the difference is written down.
+
+Routing is IPv4-and-untagged only in v0.4, the same boundary as
+conntrack and NAT. A tagged frame or an IPv6 frame keeps the
+L2-adjacent behaviour, because re-addressing a tagged frame without
+touching its tag addresses the right host on the wrong segment.
 
 #### Edge cases
 
@@ -712,6 +845,19 @@ open a conntrack entry in v0.4 (NAT-driven flow creation is Phase 5).
 - **Redirect destination down**: the kernel drops the frame at
   `xdp_do_redirect`; no crash.
 - **Redirect without prior NAT** is valid — pure L2/L3 forwarding.
+- **Redirect on a segment the box has no route to** keeps working: the
+  lookup fails, the frame is forwarded unchanged, and `bridged` counts
+  it. A bridge does not need a routing table.
+- **A multi-interface zone routes only through devmap slot 0** — the
+  zone's first declared interface. A route whose egress is one of the
+  zone's OTHER interfaces reads as `off_zone` and is forwarded
+  L2-adjacent. That is the safe degradation (it never stamps a next hop
+  from another segment onto a frame leaving the wrong port), but it is a
+  real limitation and it is untested: every zone on the bench has one
+  interface. Lifting it means matching the FIB's egress ifindex against
+  every populated devmap slot and redirecting to the slot that matches,
+  which is a small change and should not be made without a two-port
+  zone to prove it on.
 
 #### Compile errors
 
@@ -1024,6 +1170,131 @@ bundle; `manifest.json` is the machine-readable copy.
 - **One ring buffer per zone.** The shared ring is correct; splitting
   it moves multiplexing into every consumer and buys nothing.
 
+### 6.9 Egress conntrack tracking — flows the box originates
+
+Conntrack in v0.4 is built by the XDP programs, and XDP only ever sees
+INGRESS. A flow the appliance itself starts therefore creates no
+conntrack entry at all: the DNS query its forwarder sends upstream, the
+NTP exchange that sets its clock, the package update it fetches. Each
+one leaves through the local stack, which no XDP program is attached
+to. Its reply arrives on the WAN port, is looked up, reads `new`, and a
+`default drop` policy — the one this whole section teaches — eats it.
+
+Measured on hardware before the fix
+(`fwl/tests/system/hw/l12_01_box_originated_flows.sh`): the box sent 5
+UDP requests from its own WAN address, the datapath counter recorded 5
+replies arriving at the port, 0 survived, conntrack went 0 -> 0. A
+policy drop, not an empty wire. **A firewall that cannot resolve a name
+or set its own clock is not deployable**, so this is not an edge case
+of the language; it is the language's default policy being unusable on
+the box that runs it.
+
+#### The mechanism
+
+Every bundle whose policy reads `conntrack(pkt).state` anywhere also
+carries **one** extra object, `fwl_egress.bpf.c`, holding a single
+`SEC("tc")` program. `fd` attaches it at the **clsact egress** hook of
+every interface the bundle attaches XDP to — those are exactly the
+ports on which a reply to a locally-originated flow would be judged.
+
+Per packet it:
+
+1. returns immediately unless `skb->sk` is set. A packet the local
+   stack SENT carries the socket that sent it; a packet this box merely
+   FORWARDED has none. This gate is what keeps the tracker an observer:
+   without it, a forwarded flow would get an entry and its replies
+   would be admitted, which is a policy change made by a component that
+   has no business making one;
+2. parses IPv4 / first fragment / TCP, UDP or ICMP, and builds the
+   5-tuple exactly as the XDP prelude does (ICMP keyed on ports 0);
+3. probes conntrack in **both** directions. A hit is refreshed
+   (`last_seen_ns`, `packets`), not replaced;
+4. only on a double miss inserts the forward tuple with state
+   `established`, via `BPF_NOEXIST`.
+
+An 802.1Q tag is skipped exactly as the prelude skips it, so the key is
+built from the same inner header on a tagged segment as on an untagged
+one; and every protocol other than TCP and UDP is keyed on ports 0,
+again exactly as the prelude keys it, so a box-originated GRE or IPsec
+flow is tracked rather than left for the two sides to disagree about.
+
+Step 3 is what bounds the cost. A reply the box sends to a client that
+queried it is egress traffic too, and its forward key is the reverse of
+the entry the client's own query already created at ingress; probing
+one direction would insert a second entry for every served flow and
+double conntrack's fill rate. With both, the table grows by **exactly
+one entry per flow the box originates**, and by nothing for the flows
+it serves or forwards.
+
+#### Why the qdisc layer
+
+Measured, not argued. The same hook saw 5/5 of what the local stack
+sent and **0 of 13** frames the XDP datapath forwarded out the same
+port, because `bpf_redirect_map()` leaves through `ndo_xdp_xmit`, below
+the qdisc layer entirely. It therefore covers precisely the gap and
+costs the forwarding fast path nothing — it cannot even see it.
+
+#### Rejected alternative
+
+`bpf_sk_lookup_udp()` from XDP would need no second copy of the state
+at all: ask the kernel's own socket table whether an arriving packet
+belongs to a socket this box has open. It is refuted by measurement.
+The lookup can only tell a reply from an unsolicited arrival when the
+socket carries a **peer**, and a real DNS forwarder's upstream sockets
+do not: dnsmasq's were unconnected 2/2 on the bench. Admitting on an
+unconnected match would open every bound port to the WAN.
+
+#### Visibility
+
+`fwl_egress_stats` is a bundle-wide per-CPU array with six slots:
+`seen`, `not_local`, `untracked`, `tracked`, `refreshed`, `refused`.
+It is `MapScope.SHARED` and `MapLifetime.POLICY` — the entries the
+tracker creates are flow-keyed and inherited across a reload; the tally
+of how they got there is not.
+
+`refused` is the one that matters. It means an insert failed, which in
+practice means conntrack is at its cap: the query still goes out, the
+reply still arrives, and `default drop` eats it — the original symptom,
+restored, by a mechanism working exactly as designed. `fd` logs an
+error naming the count whenever it moves, and `fctl status`'s `egress`
+section reports it alongside a **live** count of the interfaces that
+carry the filter right now.
+
+#### Manifest
+
+```json
+"egress_tracker": {
+  "source": "fwl_egress.bpf.c",
+  "object": "fwl_egress.bpf.o",
+  "program": "fwl_egress_ct"
+}
+```
+
+**Known residual.** A locally-originated datagram large enough to be
+fragmented loses `skb->sk` on the fragments (`ip_copy_metadata` does not
+carry it), so such a flow is counted `not_local` and goes untracked. It
+is narrow — DNS keeps itself under the MTU and TCP does not fragment —
+and it is recorded rather than worked around because the workaround
+(tracking socketless packets) is the policy change the gate exists to
+prevent.
+
+`null` means this policy reads no conntrack and needs no tracker. The
+field being **absent** means something different — a bundle compiled
+before the tracker existed — and `fd` warns about that case, because a
+box running one looks healthy from every other line while dropping the
+replies to its own DNS.
+
+#### Failure policy
+
+A bundle that declares a tracker and cannot attach it is a **failed
+load**, on the same grounds as a bundle attached to zero interfaces:
+loading is not attaching, and a second attach point must never report
+success having attached to nothing. An attach that fails on any one of
+the interfaces is rolled back rather than left partial — every one of
+them demonstrably exists, since XDP just attached to it, so there is no
+benign reason for a strict subset and a strict subset is a box whose
+DNS works through one port and not another.
+
 ### Examples
 
 ```
@@ -1093,13 +1364,29 @@ outside that range is a compile error.
   `masquerade` — to the address the daemon wrote into the per-zone
   `fwl_nat_cfg` map), fixes the IPv4 header checksum and the TCP/UDP
   checksum, and installs a **reply mapping** in the shared `fwl_nat`
-  map so the return packet is de-NAT'd. v0.4 is **port-preserving**:
-  the translated source port equals the original, so two oracles agree
-  deterministically and the only L4-checksum delta is the address
-  change. (Ephemeral-port reallocation on collision is Phase 5.3.)
+  map so the return packet is de-NAT'd.
+- **Port allocation.** Source NAT **prefers to preserve** the source
+  port: when the mapping key that port names is free, the translated
+  port equals the original. When a **different flow already holds that
+  key** — two guests picking the same ephemeral port toward the same
+  destination — the mapping is moved to a port in the NAT-owned range
+  `49152`–`65535`, chosen by a hash of the flow with a bounded probe
+  (8 attempts), and the source port is rewritten to match. The claim is
+  a `BPF_NOEXIST` insert, so a collision is always *detected*: a
+  mapping is never overwritten.
+- **Refusal is terminal.** If no mapping can be claimed — every probe
+  taken, no port to move (a frame with no L4 ports), or `fwl_nat` at
+  its `max_entries` cap — the packet is **dropped**, the frame is left
+  untouched, and the event is counted in `fwl_nat_stats`. This is the
+  one case where a NAT action, normally non-terminal, terminates
+  evaluation. A translated packet without a mapping has nowhere for its
+  reply to go: it is delivered either to the firewall's own address or
+  into another guest's socket, and both used to happen silently.
 - **Destination NAT (`dnat`).** Rewrites the destination address **and**
   port, fixes both checksums, and installs the reply mapping that
-  restores the original (public) destination on return traffic.
+  restores the original (public) destination on return traffic. A
+  `dnat` port is the operator's choice, so a `dnat` mapping is **never
+  reallocated** — a collision is refused.
 - **Return traffic (automatic de-NAT).** Before any rule evaluates,
   each NAT-carrying program probes `fwl_nat` with the packet's forward
   5-tuple; on a hit it rewrites the recorded side (destination for an
@@ -1107,6 +1394,26 @@ outside that range is a compile error.
   endpoint, fixing checksums. In a bundle, **every** zone program emits
   this de-NAT pass and the shared `fwl_nat` map, so the egress zone
   installs the mapping and the ingress zone consumes it.
+- **Mapping lifetime.** A mapping lives exactly as long as its flow.
+  Every translated flow gets a conntrack entry carrying its **post-NAT**
+  5-tuple (see § Conntrack, entry creation), and that entry is the
+  mapping's own key with both endpoints swapped — so the daemon can ask
+  conntrack, one lookup per mapping, whether the flow is still there.
+  `fd` sweeps `fwl_nat` immediately after each conntrack sweep and frees
+  every mapping whose entry is gone **and** which has itself carried no
+  traffic for a grace window (default 30 s). The second condition exists
+  because the anchor can be missing without the flow being over — a
+  conntrack table at its own cap refuses the insert silently — and a
+  mapping that is carrying traffic is never freed whatever conntrack
+  says. Nothing evicts a live mapping to make room: at the cap, new
+  allocations are refused and logged.
+- **Occupancy is observable.** `fctl status` carries a `nat` section:
+  live mappings, the cap, occupancy percentage, high-water mark, total
+  reclaimed, and the datapath's own tally (`installed`,
+  `port_reallocated`, `refused`, `table_full`, `denat`,
+  `icmp_error`). `fd` logs a
+  warning as the table crosses 80 % and an error naming the count
+  whenever refusals move.
 - **Checksums.** XDP has no `bpf_l3/l4_csum_replace` (skb-only), so the
   IPv4 header checksum is recomputed with `bpf_csum_diff` and the L4
   checksum is updated incrementally (RFC 1624) in native byte order.
@@ -1123,6 +1430,50 @@ outside that range is a compile error.
   no mapping. Only the no-IP-options common case (`ihl == 5`) is
   rewritten.
 
+### ICMP-error translation (RFC 5508 § 4.2)
+
+An ICMP error carries no ports, so its own 5-tuple identifies nothing.
+The flow it is about is named in the datagram it **carries** — the IP
+header of the packet that provoked it plus the first 8 bytes of that
+packet's transport header. For a translated flow, that embedded packet
+is the one this NAT put on the wire, so reversing its tuple yields the
+reply mapping's own key. No new state and no second table: the mapping
+that de-NATs a flow's replies de-NATs the errors about it.
+
+- **Which errors.** Types 3, 4, 5, 11 and 12 — the five RFC 792
+  messages that carry an embedded datagram. A query type carries
+  nobody's packet and is never treated as an error, whatever its
+  payload contains.
+- **Two rewrites, and either alone is useless.** The outer header is
+  re-addressed to the host behind the NAT (destination for a
+  masquerade reply, source for a port-forward reply); the embedded
+  header is put back the way that host sent it, address and port. An
+  error left addressed to the firewall never reaches the host; an error
+  delivered to the host still describing the translated connection is
+  discarded by that host's own stack — the same black hole, reached the
+  quiet way.
+- **Three checksums.** The embedded IP header's checksum is updated for
+  its changed address; the ICMP checksum, which covers the embedded
+  datagram, is updated for every word changed inside it (including that
+  embedded checksum); the outer IP checksum is recomputed. Note that
+  the embedded IP checksum absorbs an address change **exactly**, so an
+  address-only translation leaves the ICMP checksum unmoved — only a
+  changed embedded PORT makes that update observable.
+- **The embedded tuple wins.** It is consulted before the error's own
+  5-tuple, which is `(error-sender, us, 0, 0, icmp)` — a key that a
+  ports-0 ICMP mapping (a guest's ping to that same router) can hold.
+  Reading the outer header first delivers one host's path-MTU error to
+  whichever host last pinged the sender.
+- **Bounds.** The whole 8-byte ICMP header, 20-byte embedded IP header
+  and 8 embedded transport bytes must be present, and the embedded
+  header must have `ihl == 5`. Anything less names no flow: the error
+  is neither `related` nor translated.
+- **Counted.** `icmp_error` in the `nat` section of `fctl status`, a
+  subset of `denat`. It is reported even at zero: a masquerading
+  gateway carrying return traffic and translating no ICMP errors is a
+  path-MTU black hole, and that failure produces no drop, no log, and
+  no other counter movement.
+
 ### Edge cases
 
 - *Guard miss.* `snat to <ip> if pkt.proto == tcp` leaves a UDP frame
@@ -1130,7 +1481,23 @@ outside that range is a compile error.
 - *IPv6 frame.* No rewrite, no mapping (NAT is IPv4-only).
 - *UDP with checksum 0.* Left as 0 ("no checksum"); a computed checksum
   that folds to 0 is stored as `0xffff`.
-- *ICMP.* v0.4 NAT does not rewrite ICMP (ICMP-error NAT is Phase 5.3).
+- *Same flow, later packet.* Finds its own mapping, not a collision:
+  the port does not move and the mapping's lifetime stamp is refreshed.
+- *ICMP.* A source NAT translates an ICMP frame's address and installs a
+  mapping keyed on **ports 0**, and de-NAT consumes it, so a masqueraded
+  host's echo replies come home. Because the key has no port field to
+  move, two hosts pinging the same peer collide, and the second is
+  **refused and dropped** rather than silently taking over the first's
+  mapping. `dnat` does not touch ICMP at all (there is no port to
+  rewrite).
+- *ICMP error.* An ICMP error (types 3, 4, 5, 11, 12) is translated
+  off the datagram **embedded** in it, per RFC 5508 § 4.2 — see
+  § ICMP-error translation below. The embedded tuple is consulted
+  **before** the error's own 5-tuple, because that tuple is
+  (error-sender, us, 0, 0, icmp) and can belong to an unrelated ping.
+- *Table at its cap.* Refused and dropped, never evicted. Freeing is
+  driven by flow end, so reaching the cap means flows are genuinely
+  live, not that the table failed to drain.
 
 ### Compile errors
 
@@ -1150,13 +1517,19 @@ zone wan = [wan0]
 zone lan = [lan0, lan1]
 
 @xdp(lan)
+allow if pkt.proto == udp and pkt.dst_port == 67   # DHCP, to us
+allow if pkt.dst_ip == 10.0.0.1                    # our own address
 masquerade
 redirect to wan
 
 @xdp(wan)
-redirect to lan if conntrack(pkt).state == established
+redirect to lan if conntrack(pkt).state in [established, related]
 drop
 ```
+
+**`masquerade` + `redirect` swallows traffic addressed to the box itself.** Both are unconditional, so anything reaching them is source-NATed and emitted on the other port — including packets that were never going anywhere, because their destination was the appliance. The case that finds this is DHCP: a client with no lease addresses its DISCOVER to `255.255.255.255`, since it has neither an address of its own nor yours. Without a terminal `allow` ahead of the rewrite the request is masqueraded onto the uplink and arrives on the far side as `<gateway>.68 > 255.255.255.255.67`, while the appliance's own DHCP server — correctly bound, correctly contained — never sees it. `allow` is terminal, so a rule that matches it never reaches `masquerade`.
+
+The same reasoning covers the segment's own broadcast and multicast (`224.0.0.0/4`, `255.255.255.255`, the directed broadcast, NetBIOS): none of it is routable, and all of it would otherwise be masqueraded onto the uplink one frame at a time. `fwl/examples/storm_shield.fw` is the worked example.
 
 ```
 # Port forward TCP/80 on the WAN address to an internal web server.
@@ -1223,9 +1596,6 @@ behaviour on every packet is unchanged.
   — v0.4 matches on the numeric byte only. Named constants are a future
   ergonomics item.
 - No ICMP `id`/`sequence` field matching — only `type` and `code`.
-- No `related` conntrack state keyed on the ICMP error's embedded
-  5-tuple (deferred to Phase 4.3 conntrack, which builds on this
-  construct).
 - No extension-header chasing for ICMPv6 — a packet behind an extension
   header has no readable `pkt.icmp6.*` (same conservatism as v0.2 L4
   fields).
@@ -1234,13 +1604,21 @@ behaviour on every packet is unchanged.
 - The DEI bit as a readable field.
 - VLAN rewriting / pushing / popping (read-only matching only).
 - `0x88A8` TPID recognition (only `0x8100` triggers VLAN parsing).
-- **Conntrack `related`** — ICMP-error tracking (an ICMP error whose
-  embedded 5-tuple matches an established flow) is deferred. The
-  `related` keyword is accepted in the language, but no packet is ever
-  classified `related` in v0.4, so `== related` never matches.
 - **IPv6 conntrack** — v0.4 tracks IPv4 flows only (the daemon's
   `ConnKey` is 32-bit). IPv6 packets read `new` and create no entry.
 - **Conntrack on fragments** — no special handling; only the first
   fragment carries the L4 header that the 5-tuple needs.
 - **Configurable UDP/TCP conntrack timeouts in the language** — timeouts
   live in the daemon (`fd.yaml`) and its GC, not the `.fw` surface.
+- **ICMP-error translation for IPv6 / ICMPv6** — RFC 5508 covers IPv4
+  only here, as all of v0.4's NAT and conntrack do.
+- **Rewriting the embedded transport checksum.** An ICMP error carries
+  8 bytes of the transport header, so that header's checksum covers a
+  payload the error does not carry: no receiver can validate it and no
+  oracle can check it, and for TCP the checksum field is not even among
+  the 8 bytes. Linux's `nf_nat` skips it for the same reason.
+- **Errors about a flow whose outer header carries IP options.** Every
+  NAT rewrite in v0.4 bails on `ihl != 5`; an ICMP error is no
+  exception. It is still classified `related` (classification walks a
+  variable IHL) and so is admitted, but it stops at the firewall's own
+  address.

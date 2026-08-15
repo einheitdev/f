@@ -45,6 +45,21 @@ struct DnsmasqPlan {
   /// Interfaces on which DHCP may answer. A strict subset of
   /// `allowed_interfaces`.
   std::vector<std::string> dhcp_interfaces;
+  /// Interfaces into which we advertise a v6 prefix — the zones whose
+  /// stance is `ra`, and only those.
+  std::vector<std::string> ra_interfaces;
+  /// Interfaces into which we explicitly refuse to advertise. Every
+  /// declared interface is in exactly one of these two lists, so the
+  /// artifact states its v6 containment rather than implying it by
+  /// omission.
+  std::vector<std::string> ra_refused_interfaces;
+  /// True when any bound DNS forwarder discards upstream answers that
+  /// point into private address space. Carried out of the plan
+  /// because its failure mode is a name that silently does not exist,
+  /// which no other view of the box would show.
+  bool rebind_protection = false;
+  /// Domains exempted from that discard.
+  std::vector<std::string> rebind_exempt;
 };
 
 /// Render the model as a dnsmasq config. Pure: no I/O, no clock, no

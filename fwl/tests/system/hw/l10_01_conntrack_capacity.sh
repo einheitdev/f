@@ -125,7 +125,7 @@ full conntrack table degrades stateful policy silently — the SYN \
 still passes, only the return path breaks. Worth an operator alarm \
 on conntrack.entries approaching 65536."
 else
-  pass "the new flow was tracked even under pressure (reply \
+  record "the new flow was tracked even under pressure (reply \
 passed $REPLY/20)"
 fi
 
