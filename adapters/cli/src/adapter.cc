@@ -502,6 +502,18 @@ auto RenderShowFirewallRules(const Response& resp,
     auto action = r.value("action", "");
     auto sp = r.value("src_port", 0);
     auto dp = r.value("dst_port", 0);
+    // "-", not "0", when fd sends no per-rule count. The datapath
+    // behind these rules keys its counters by MATCH TIER, not by
+    // rule, so there is no per-rule number to show — and a defaulted
+    // 0 in this column is a claim that the rule matched nothing,
+    // which is exactly the kind of confident wrong number this
+    // column used to carry.
+    auto count_cell = [&](const char* key) -> Cell {
+      if (!r.contains(key)) return Cell{"-", Semantic::Dim};
+      return std::string(key) == "bytes"
+                 ? Cell{FormatBytes(r.value(key, 0ULL))}
+                 : Cell{std::to_string(r.value(key, 0ULL))};
+    };
     AddRow(t, {
         Cell{std::to_string(r.value("idx", 0)),
              Semantic::Dim},
@@ -511,8 +523,8 @@ auto RenderShowFirewallRules(const Response& resp,
         Cell{sp == 0 ? "*" : std::to_string(sp)},
         Cell{dp == 0 ? "*" : std::to_string(dp)},
         Cell{action, SemanticForAction(action)},
-        Cell{std::to_string(r.value("packets", 0))},
-        Cell{FormatBytes(r.value("bytes", 0ULL))},
+        count_cell("packets"),
+        count_cell("bytes"),
     });
   }
   RenderFormatted(t, renderer);

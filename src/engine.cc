@@ -11,6 +11,7 @@
 #include <sys/un.h>
 #include <unistd.h>
 
+#include <cerrno>
 #include <cstddef>
 #include <chrono>
 #include <cstring>
@@ -124,6 +125,29 @@ auto XdpMode(int ifindex) -> std::string {
   }
 }
 
+// What the daemon says when a handler is asked about the v0.1
+// single-program datapath and that datapath is not loaded.
+//
+// `rules_a`/`rules_b`, `config` and `counters` belong to
+// bpf/fw.bpf.c. Every v0.4 deployment is a bundle: EngineInit takes
+// the multi-zone branch, never assigns `e.bpf`, and every descriptor
+// in it stays at its -1 default. The handlers below then read a
+// descriptor nothing ever opened and answered "no rules loaded",
+// "no counters active", "cleared 0" — success, on a box whose
+// `fwl_counters_<zone>` map is counting every frame on the wire.
+// An empty answer from a datapath that was never asked is the same
+// defect as a wrong number: it is confident and it is not about
+// anything.
+constexpr const char* kNoLegacyDatapath =
+    "this daemon is running a v0.4 zone bundle, which has no "
+    "single-program rule table and no `counters` map — the per-zone "
+    "counters live in fwl_counters_<zone>; read them with "
+    "`fctl status` or `f show status`";
+
+auto NoLegacyDatapath() -> std::string {
+  return json({{"error", kNoLegacyDatapath}}).dump();
+}
+
 auto HandleRequest(Engine& e, const std::string& req_str)
     -> std::string {
   if (req_str.empty()) {
@@ -144,6 +168,15 @@ auto HandleRequest(Engine& e, const std::string& req_str)
     case Cmd::kApplyConfig: {
       if (req_str.size() <= 1) {
         return R"({"error":"missing config payload"})";
+      }
+      // ApplyConfig writes into `e.bpf.rules_a_fd` / `config_fd`.
+      // With no single-program datapath those are -1, every
+      // bpf_map_update_elem fails EBADF, the loop's `continue`
+      // swallows it and the reply is `{"rules_installed":0}` with no
+      // error — a 200 from `PUT /api/v1/rules` for a write that
+      // reached nothing. Refuse instead of counting to zero.
+      if (e.bpf.rules_a_fd < 0 || e.bpf.config_fd < 0) {
+        return NoLegacyDatapath();
       }
       try {
         auto j = json::parse(
@@ -202,27 +235,37 @@ auto HandleRequest(Engine& e, const std::string& req_str)
       return j.dump();
     }
     case Cmd::kGetRules: {
+      // No single-program datapath, no single-program rule table.
+      // The old answer was `[]`, which the CLI renders as "no rules
+      // loaded" — a statement about the operator's policy, made by a
+      // handler that never looked at it.
+      if (e.bpf.rules_a_fd < 0 && e.bpf.rules_b_fd < 0) {
+        return NoLegacyDatapath();
+      }
       auto rules_res = GetRules(e);
       if (!rules_res) {
         return json({{"error",
             rules_res.error().message}}).dump();
       }
-      auto status = GetStatus(e);
-      int ncpus = libbpf_num_possible_cpus();
-      if (ncpus < 1) ncpus = 1;
       json arr = json::array();
       uint32_t idx = 0;
       for (const auto& [key, val] : *rules_res) {
-        uint64_t pkts = 0, bytes = 0;
-        std::vector<RuleCounter> per_cpu(ncpus);
-        if (bpf_map_lookup_elem(
-                e.bpf.counters_fd, &idx,
-                per_cpu.data()) == 0) {
-          for (int c = 0; c < ncpus; c++) {
-            pkts += per_cpu[c].packets;
-            bytes += per_cpu[c].bytes;
-          }
-        }
+        // No `packets`/`bytes` here, and that is the fix rather than
+        // a gap in it. This handler used to report `counters[idx]`
+        // beside the rule at iteration position `idx`, but
+        // bpf/fw.bpf.c never keys `counters` by a rule index: it
+        // increments `counters[0]` for every packet it sees and
+        // `counters[k+1]` for the MATCH TIER k (0 = full 5-tuple,
+        // 1 = wildcard source port, ...). So rule 0 carried the
+        // total-traffic count, rules 1..5 carried per-tier counts
+        // aggregated over whichever rules matched at that tier, and
+        // every rule from the sixth on read zero. Nine numbers, each
+        // beside the wrong rule, each looking authoritative.
+        //
+        // There is no per-rule count in this datapath to report, so
+        // reporting none is the honest answer; `kGetCounters` gives
+        // the tier counters under their own ids, which is what they
+        // are.
         char src[INET_ADDRSTRLEN], dst[INET_ADDRSTRLEN];
         inet_ntop(AF_INET, &key.src_addr, src,
                   sizeof(src));
@@ -251,23 +294,38 @@ auto HandleRequest(Engine& e, const std::string& req_str)
             {"proto", proto_str},
             {"action", action_str},
             {"action_semantic", action_sem},
-            {"packets", pkts},
-            {"bytes", bytes},
         });
         idx++;
       }
       return arr.dump();
     }
     case Cmd::kGetCounters: {
+      // The bound comes from the map. A literal 256 here against a
+      // map declared with 10000 slots hid every counter from 256 up:
+      // it accrued packets and bytes that no status and no counters
+      // request could surface. Deriving it is what stops the two
+      // disagreeing again — there is one number now and the kernel
+      // owns it.
+      uint32_t slots = CountersMapSlots(e.bpf.counters_fd);
+      if (slots == 0) {
+        return NoLegacyDatapath();
+      }
       int ncpus = libbpf_num_possible_cpus();
       if (ncpus < 1) ncpus = 1;
       json arr = json::array();
-      for (uint32_t i = 0; i < 256; i++) {
+      for (uint32_t i = 0; i < slots; i++) {
         std::vector<RuleCounter> per_cpu(ncpus);
         if (bpf_map_lookup_elem(
                 e.bpf.counters_fd, &i,
                 per_cpu.data()) != 0) {
-          break;
+          // Every in-range lookup on a per-CPU array succeeds, so
+          // this is an anomaly, not the end of the map. Breaking
+          // here is what truncation looks like from the inside;
+          // say so and keep reading.
+          spdlog::warn(
+              "counters: slot {} of {} could not be read: {}",
+              i, slots, std::strerror(errno));
+          continue;
         }
         uint64_t pkts = 0, bytes = 0;
         for (int c = 0; c < ncpus; c++) {
@@ -283,17 +341,32 @@ auto HandleRequest(Engine& e, const std::string& req_str)
       return arr.dump();
     }
     case Cmd::kClearCounters: {
+      uint32_t slots = CountersMapSlots(e.bpf.counters_fd);
+      if (slots == 0) {
+        return NoLegacyDatapath();
+      }
       int ncpus = libbpf_num_possible_cpus();
       if (ncpus < 1) ncpus = 1;
       std::vector<RuleCounter> zeros(ncpus);
       uint32_t cleared = 0;
-      for (uint32_t i = 0; i < 256; i++) {
+      uint32_t failed = 0;
+      for (uint32_t i = 0; i < slots; i++) {
         if (bpf_map_update_elem(
                 e.bpf.counters_fd, &i, zeros.data(),
                 BPF_ANY) != 0) {
-          break;
+          failed++;
+          continue;
         }
         cleared++;
+      }
+      // A partial clear reported as `{"cleared": N}` is an operator
+      // told the counters are zero while some of them are not. If
+      // any slot kept its value, that is the answer.
+      if (failed > 0) {
+        return json({{"error",
+            std::format("cleared {} of {} counter slots; {} could "
+                        "not be written",
+                        cleared, slots, failed)}}).dump();
       }
       return json({{"cleared", cleared}}).dump();
     }
@@ -453,6 +526,23 @@ auto HandleRequest(Engine& e, const std::string& req_str)
 }
 
 }  // namespace
+
+auto CountersMapSlots(int counters_fd) -> uint32_t {
+  if (counters_fd < 0) return 0;
+  struct bpf_map_info info = {};
+  uint32_t len = sizeof(info);
+  if (bpf_obj_get_info_by_fd(counters_fd, &info, &len) != 0) {
+    // A descriptor we hold and cannot describe. Returning a guessed
+    // bound here is how the 256 got in; the callers report it.
+    return 0;
+  }
+  return info.max_entries;
+}
+
+auto HandleControlRequest(Engine& e, const std::string& req)
+    -> std::string {
+  return HandleRequest(e, req);
+}
 
 auto AttachRouteMgr(Engine& e) -> void {
   e.route.stats_fd = e.zone_bundle.route_stats_fd;
@@ -996,26 +1086,6 @@ auto ApplyConfig(Engine& e, const ConfigMsg& msg,
   spdlog::info("Applied {} rules, table={}.",
                inserted, standby);
   return inserted;
-}
-
-auto GetCounters(const Engine& e, uint32_t rule_count)
-    -> std::expected<std::vector<RuleCounter>,
-                     Error<EngineError>> {
-  std::vector<RuleCounter> out(rule_count);
-  for (uint32_t i = 0; i < rule_count; i++) {
-    int ncpus = libbpf_num_possible_cpus();
-    if (ncpus < 1) ncpus = 1;
-    std::vector<RuleCounter> per_cpu(ncpus);
-    if (bpf_map_lookup_elem(
-            e.bpf.counters_fd, &i,
-            per_cpu.data()) == 0) {
-      for (int c = 0; c < ncpus; c++) {
-        out[i].packets += per_cpu[c].packets;
-        out[i].bytes += per_cpu[c].bytes;
-      }
-    }
-  }
-  return out;
 }
 
 auto GetRules(const Engine& e)
