@@ -155,3 +155,26 @@ A broken symlink, a directory with no `manifest.json`, and a manifest naming no 
 ## Soak procedure
 
 For Phase 2 dogfood soak (`dogfood_v02.fw`, ≥ 48h on a dev VM), follow the runbook in `f-hone/deploy/staging/SOAK_RUNBOOK.md`. The runbook handles bundle staging, unit install, and the 1-hour smoke watch before walking away.
+
+## Building an image, and booting one without a board
+
+`deploy/image/build_image.py` debootstraps a Debian arm64 rootfs, installs the packages the appliance needs, and hands the question of *what f consists of* to the manifest. It must be run as root — everything it writes lives in a root-owned rootfs — and it will not write an archive for a rootfs whose binaries cannot load, which it establishes by running `ldd` inside the chroot rather than trusting the package list.
+
+```sh
+sudo apt-get install -y debootstrap qemu-user-static binfmt-support qemu-system-arm
+cmake --preset aarch64 && cmake --build --preset aarch64
+deploy/image/vm.py check     # names any missing prerequisite at once
+sudo deploy/image/build_image.py --build-dir build-aarch64 --out /tmp/img
+```
+
+`--mirror` exists because the default is not always reachable: debootstrap fetches with `wget`, which has no happy-eyeballs fallback, so it takes the AAAA of `deb.debian.org`'s anycast address and waits out its timeout per package if that POP is unreachable over IPv6.
+
+You do not need an aarch64 board to boot the result. `deploy/image/vm.py` turns the rootfs into a disk (adding a generic Debian kernel, which the appliance image does not carry — on the product board it comes from the vendor BSP), boots it under `qemu-system-aarch64`, and builds a bench around it: three NICs, two of them on host taps whose bridges carry **no address on the host**, each reaching a real Linux host in its own namespace. The only path from one side to the other is through the appliance, which is what makes "nothing was forwarded" a measurement rather than a hope.
+
+```sh
+deploy/image/firstboot_walk.py --rootfs /tmp/img/rootfs --out /tmp/vm
+```
+
+That walks three boots: the factory shape with no provisioning file, a gateway with traffic put through it both ways, and the same disk with its bundle removed — where `fd` must refuse and the traffic the healthy box carried must stop. Every check in the third boot is paired with a control that must still pass, because an image that failed to boot produces the same silence on the wire as an appliance refusing correctly.
+
+Emulation is TCG. A boot takes about a minute and a `fwl compile` about seven seconds; do not measure throughput on it.

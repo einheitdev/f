@@ -410,6 +410,22 @@ components:
       loads. Without it a compile still "succeeds" and writes a bundle
       with no objects in it.
 
+  - id: ext-bpf-headers
+    group: external
+    kind: external
+    dest: /usr/include/bpf/bpf_helpers.h
+    requirement: required
+    needed_by: fwl compile
+    provided_by: libbpf-dev
+    why: >-
+      Every program fwl emits opens with `#include <bpf/bpf_helpers.h>`,
+      and libbpf1 does not ship it — libbpf-dev does. The first image
+      ever booted had clang, had libbpf1, and had no header: the
+      compile failed with `file not found`, `fwl` reported "0/1 zone
+      program(s) compiled", firstboot stopped at the bundle with no
+      .bpf.o in it, and clang being present was what every check on
+      the box had been asking about.
+
   - id: ext-networkctl
     group: external
     kind: external

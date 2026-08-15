@@ -10,12 +10,37 @@ ConditionPathExists=!/etc/f/.provisioned
 
 After=local-fs.target systemd-networkd.service
 
-# Before everything it configures. fd is the one that matters: it
-# cold-boots into whatever `current` points at, so it must not start
-# until a bundle has been compiled and linked. f-confd and f-dnsmasq
-# read files this script writes.
-Before=fd.service f-confd.service einheit-f-ui.service
-Before=f-dnsmasq.service f-chrony.service
+# THERE IS DELIBERATELY NO `Before=fd.service ...` HERE, and removing
+# it is the fix for a deadlock that hangs a first boot forever.
+#
+# It used to read `Before=fd.service f-confd.service
+# einheit-f-ui.service` and `Before=f-dnsmasq.service
+# f-chrony.service`, on the reasoning that fd cold-boots into whatever
+# `current` points at and must not start before a bundle exists. But
+# firstboot.py is what enables and starts those units, from inside
+# this unit's own ExecStart, and it waits for each one — so systemd
+# was asked to run a job it had been ordered to run only after the job
+# that was waiting for it. Measured on the first image that got far
+# enough to reach the step:
+#
+#   JOB UNIT                TYPE  STATE
+#   108 f-firstboot.service start running
+#   137 fd.service          start waiting
+#
+# and `TimeoutStartUSec=infinity`, because that is systemd's default
+# for Type=oneshot. Nothing breaks the cycle: multi-user.target is
+# never reached, the marker is never written, and the box sits there.
+#
+# The ordering is not needed to get what it was protecting. Nothing
+# enables fd, f-confd, einheit-f-ui, f-dnsmasq or f-chrony in the
+# image — `build_image.py` enables systemd-networkd, this unit and
+# ssh, and no others — so on a first boot the only thing that can
+# start them is firstboot.py, which does it after it has written
+# everything they read. And on every boot after the first, the marker
+# exists and this unit is skipped by its own condition.
+#
+# `deploy/tests/test_firstboot_unit.py` fails if a Before= naming any
+# of them comes back.
 
 [Service]
 Type=oneshot

@@ -186,16 +186,28 @@ class Firstboot:
       return self.record("verify install", Outcome.FAILED,
                          f"f-install produced no report: "
                          f"{self._tail(proc)}")
+    # `unusable` belongs in this list and was not in it, so a required
+    # binary that is present, executable, the right size and dies at
+    # exec did not stop provisioning. That is not hypothetical: the
+    # first image ever built had six of them, because the package list
+    # had no libzmq5 and no libyaml-cpp0.8, and this step passed it.
+    # `Report.missing_required` has always counted the four states
+    # together; this is the same list, and the message below names
+    # which one each item is rather than calling them all missing.
     missing = [i for i in report["items"]
                if i["requirement"] == "required"
-               and i["state"] in ("missing", "wrong-kind", "empty")]
+               and i["state"] in ("missing", "wrong-kind", "empty",
+                                  "unusable")]
     if missing:
       lines = "; ".join(
-        f"{i['id']} ({i['dest']}, needed by {i['needed_by']})"
+        f"{i['id']} ({i['state']}: {i['dest']}"
+        + (f" — {i['detail']}" if i.get("detail") else "")
+        + f", needed by {i.get('needed_by', 'nothing named')})"
         for i in missing)
       return self.record(
         "verify install", Outcome.FAILED,
-        f"{len(missing)} required item(s) missing: {lines}",
+        f"{len(missing)} required item(s) unusable or missing: "
+        f"{lines}",
         "Nothing was provisioned and the box is not marked "
         "provisioned, so fixing the install and rebooting runs this "
         "again. `f-install verify` prints the full list.")

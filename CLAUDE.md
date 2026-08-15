@@ -91,8 +91,9 @@ manifest or in `not_deployed`.
 - `deploy/firstboot/firstboot.py` — runs once per device and decides
   what a new box is. Zones, MAC-pinned interface names, a `default drop`
   starting policy, a compiled bundle, and the units the model implies.
-- `deploy/image/build_image.py` — debootstrap plus the manifest.
-  Unwalked; no aarch64 board on the bench.
+- `deploy/image/build_image.py` — debootstrap plus the manifest. Must be root (`build_image.py:main`); refuses a rootfs whose binaries do not load (`check_binaries_load`).
+- `deploy/image/vm.py` — boots the image under `qemu-system-aarch64`, with a namespace host on each side of it and no address on the host bridges, so "nothing was forwarded" is a measurement. No board needed.
+- `deploy/image/firstboot_walk.py` — the acceptance walk: factory boot, gateway boot with traffic through it, and the same disk with its bundle removed.
 - `docs/install.md` — the operator path, walked on a real target.
 - `einheit-f show install` runs `f-install verify` rather than keeping a
   second list (`adapters/cli/src/transport.cc` `HandleShowInstall`).
@@ -100,5 +101,8 @@ manifest or in `not_deployed`.
 ```bash
 deploy/f_install.py verify          # what this box has of the set
 sudo deploy/f_install.py install --build-dir build
-pytest -q deploy/tests              # 72 tests, no build needed
+pytest -q deploy/tests              # 78 tests, no build needed
+deploy/image/vm.py check            # emulation prerequisites
 ```
+
+**The image boots and firstboot is proven on one** (2026-08-15, `f-rig`): seven defects between `build_image.py` and a provisioned box, none of them previously reachable, the worst a permanent deadlock between `f-firstboot.service` and `fd.service`. `fd` refuses a missing and a corrupt bundle and attaches nothing — **and the box forwards anyway**, because `ip_forward` stays 1 and the kernel has connected routes on both zones. Measured both ways on real sockets. The evidence, and two open findings, are in `~/dev/workspaces/f-rig/context/image-boot-2026-08-15.md`.

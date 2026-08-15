@@ -650,3 +650,30 @@ def test_a_console_run_is_not_obstructed(tmp_path):
   assert code == 0
   step = next(s for s in boot.steps if s.name == "session")
   assert step.outcome is Outcome.DONE
+def test_a_binary_that_cannot_load_stops_the_run(tmp_path):
+  """`present` is not the same question as `will start`.
+
+  The first image ever built had all six binaries installed,
+  executable and the right size, and every one of them died at exec
+  because the package list had no libzmq5 and no libyaml-cpp0.8.
+  `f-install verify` says `unusable` for exactly that, and this step
+  used to count only `missing`, `wrong-kind` and `empty` — so the box
+  would have been provisioned and marked.
+  """
+  root = make_box(tmp_path)
+  report = json.dumps({
+    "verdict": "incomplete",
+    "items": [
+      {"id": "fd", "requirement": "required", "state": "unusable",
+       "dest": "/usr/local/bin/fd", "needed_by": "fd.service",
+       "detail": "will not start: no libzmq5.so.5 on this box"},
+    ]})
+  runner = FakeRunner(outputs={"f-install verify --format": report})
+  boot = provisioner(root, runner)
+  boot.f_install = root / "usr/local/bin/f-install"
+  assert boot.run_all() == 1
+  assert boot.steps[0].outcome is Outcome.FAILED
+  assert "unusable" in boot.steps[0].detail
+  assert "libzmq5" in boot.steps[0].detail
+  assert not (root / "etc/f/.provisioned").exists()
+  assert not runner.systemctl_enabled()
