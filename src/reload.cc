@@ -278,6 +278,21 @@ auto ApplyBundle(Engine& e, std::string_view bundle_dir)
         e.ifaces.count++;
       }
     }
+    // Third site of the defect the two calls above document, and it
+    // was the one still open: RouteMgr was attached at cold boot only.
+    // After a reload `stats_fd` pointed into the object
+    // `CloseZoneBundle` had just closed, so every routed/bridged
+    // number in `fctl status` read 0 for the rest of the process's
+    // life and `Report()` could never fire — and routed-versus-bridged
+    // is invisible in a capture, so nothing else would have said so.
+    // It also resets the watermarks, which a POLICY-lifetime map needs
+    // (the new bundle counts from zero).
+    AttachRouteMgr(e);
+    // The datapath just changed shape, so the forwarding decision is
+    // re-taken from the interface count above. A reload that ends up
+    // attached to nothing closes the box; there is no reload path that
+    // leaves a stale "yes" behind.
+    SetForwardingFromDatapath(e, "reload");
     ReloadResult out{};
     out.version = manifest["version"].get<std::string>();
     out.program_updated = true;

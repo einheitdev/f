@@ -400,10 +400,19 @@ auto main(int argc, char** argv) -> int {
                                u.path);
       drifted = drifted || ud == DriftKind::kHandEdited;
     }
-    // The drop-in AND the live value, because they fail apart: a
-    // correct file the kernel has not read yet is a box that forwards
-    // after the next reboot and not now, which is the version of this
-    // fault that survives a test.
+    // The drop-in is checked for drift; the live value is REPORTED
+    // and is not drift, because it is not this program's to set.
+    //
+    // It used to be: `live != "1"` counted as drift, on the reading
+    // that a correct file the kernel had not read yet is a box that
+    // forwards after the next reboot and not now. That reading died
+    // with the unconditional 1. The live knob is fd's — raised while
+    // a bundle is in the packet path, lowered whenever one is not —
+    // so a box reading 0 here is either not filtering (correct, and
+    // `fctl status` says why) or has been closed by hand. Calling
+    // either of those "system configuration drift" would send an
+    // operator to re-run `apply`, which cannot fix it and does not
+    // try.
     {
       auto u = PlanSysctl(*cfg, sysctl_opts);
       auto sd = CheckSysctlDrift(u);
@@ -413,10 +422,12 @@ auto main(int argc, char** argv) -> int {
       auto live = ReadLiveSysctl(sysctl_opts.proc_dir,
                                  "net.ipv4.ip_forward");
       std::cout << std::format(
-          "  {:<12} {:<9} net.ipv4.ip_forward = {}\n",
-          live == "1" ? "live" : "NOT-APPLIED", "sysctl",
-          live.empty() ? "(unreadable)" : live);
-      if (live != "1") drifted = true;
+          "  {:<12} {:<9} net.ipv4.ip_forward = {} ({})\n",
+          "owned-by-fd", "sysctl",
+          live.empty() ? "(unreadable)" : live,
+          live == "1" ? "this box is routing"
+                      : "this box is NOT routing — `fctl status` "
+                        "says why");
     }
     {
       auto cd = CheckChronyDrift(*cfg, chrony_opts.conf_path);
@@ -564,8 +575,11 @@ auto main(int argc, char** argv) -> int {
     networkd_opts.refuse_on_drift = !force;
 
     sysctl_opts.refuse_on_drift = !force;
-    // Before the interfaces, because it costs nothing and because a
-    // box that comes up addressed but not forwarding looks healthy.
+    // Before the interfaces, because it costs nothing. It no longer
+    // touches the running kernel at all — the drop-in it writes is
+    // the boot-time floor (0) and the live value is fd's. `applied`
+    // is therefore empty, and prints nothing, which is the honest
+    // report rather than a smaller one.
     auto sysctl = ApplySysctl(*cfg, sysctl_opts);
     if (!sysctl) {
       std::cerr << sysctl.error() << "\n";

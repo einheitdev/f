@@ -3,8 +3,12 @@
 
 #include "f/route_mgr.h"
 
+#include <filesystem>
+#include <format>
 #include <fstream>
 #include <string>
+#include <string_view>
+#include <system_error>
 #include <vector>
 
 #include <bpf/bpf.h>
@@ -51,26 +55,144 @@ auto RouteMgr::Forwarding() const -> bool {
   return value == "1";
 }
 
-auto RouteMgr::CheckForwarding(bool policy_redirects) -> void {
-  if (!policy_redirects || Forwarding()) return;
-  // Not a warning. This policy forwards packets between zones and this
-  // kernel will not route them, so every forward leaves carrying the
-  // destination MAC it arrived with and the far side drops it. The
-  // symptom is "the firewall passes nothing" with every FWL counter
-  // climbing, which is why it has to be said here rather than inferred
-  // from a capture.
-  spdlog::error(
-      "route: this policy redirects between zones but "
-      "net.ipv4.ip_forward is 0, so no next hop can be resolved and "
-      "every forwarded frame keeps the destination MAC it arrived "
-      "with. Run `einheit-f apply system` (or `f-sysconf apply`) to "
-      "install and apply the forwarding drop-in.");
+auto RouteMgr::WriteForwarding(bool on) const
+    -> std::expected<void, std::string> {
+  std::string path = proc_dir + "/net/ipv4/ip_forward";
+  // A no-op against a real /proc/sys. It is here so `proc_dir` is a
+  // seam a test can point at a temp tree — the whole reason this knob
+  // was previously written by a component with no test seam is how it
+  // came to be written unconditionally.
+  std::error_code ec;
+  std::filesystem::create_directories(
+      std::filesystem::path(path).parent_path(), ec);
+  std::ofstream out(path, std::ios::trunc);
+  if (!out) {
+    return std::unexpected(
+        std::format("cannot open {} for writing", path));
+  }
+  out << (on ? "1" : "0") << "\n";
+  out.close();
+  if (!out) {
+    return std::unexpected(std::format("write to {} failed", path));
+  }
+  return {};
+}
+
+auto RouteMgr::SetForwarding(bool on, std::string_view why) -> void {
+  desired_forwarding = on;
+  forwarding_reason = std::string(why);
+  bool was = Forwarding();
+  auto wrote = WriteForwarding(on);
+  if (!wrote) {
+    // Refusing to forward is the safe half of this and refusing to
+    // STOP forwarding is not, so the two failures are not the same
+    // event and are not logged as one.
+    if (on) {
+      spdlog::error(
+          "forwarding: could not raise net.ipv4.ip_forward ({}). The "
+          "datapath is armed but this box will not route between "
+          "zones.",
+          wrote.error());
+      forwarding_reason = std::format(
+          "COULD NOT RAISE net.ipv4.ip_forward: {}", wrote.error());
+    } else {
+      spdlog::critical(
+          "forwarding: could not lower net.ipv4.ip_forward ({}). This "
+          "box may still be FORWARDING WITHOUT FILTERING. Set it by "
+          "hand: sysctl -w net.ipv4.ip_forward=0",
+          wrote.error());
+      forwarding_reason = std::format(
+          "COULD NOT LOWER net.ipv4.ip_forward: {}", wrote.error());
+    }
+    return;
+  }
+  if (was == on) return;
+  if (on) {
+    spdlog::info(
+        "forwarding: net.ipv4.ip_forward 0 -> 1 ({}).", why);
+  } else {
+    // Not a warning. A box that has stopped forwarding is a visible
+    // fault by design, and this line is the thing that makes it
+    // visible — the operator's alternative is a silence that looks
+    // exactly like a cable problem.
+    spdlog::error(
+        "forwarding: net.ipv4.ip_forward 1 -> 0 ({}). This box is NOT "
+        "routing between zones. It fails CLOSED: f not filtering must "
+        "not mean traffic forwarded unfiltered.",
+        why);
+  }
+}
+
+auto RouteMgr::MaybeReassertForwarding(uint64_t now_ns) -> void {
+  if (last_forwarding_check_ns != 0 &&
+      now_ns - last_forwarding_check_ns <
+          forwarding_recheck_s * 1000000000ULL) {
+    return;
+  }
+  last_forwarding_check_ns = now_ns;
+  bool live = Forwarding();
+  if (live == desired_forwarding) {
+    forwarding_overridden = false;
+    return;
+  }
+
+  if (live && !desired_forwarding) {
+    // The unsafe direction, and the only one this daemon corrects.
+    // Something raised the knob on a box whose datapath is not armed,
+    // which is the entire finding this fail-closed work exists for:
+    // an unfiltered router that looks like a firewall.
+    forwarding_corrections++;
+    spdlog::error(
+        "forwarding: net.ipv4.ip_forward was raised to 1 by something "
+        "other than fd while the datapath is NOT armed ({}). Putting "
+        "it back to 0 — this box must not forward what it is not "
+        "filtering. Correction #{}; look for another sysctl drop-in.",
+        forwarding_reason, forwarding_corrections);
+    auto wrote = WriteForwarding(false);
+    if (!wrote) {
+      spdlog::critical("forwarding: re-assert failed: {}",
+                       wrote.error());
+    }
+    return;
+  }
+
+  // The safe direction, and it is REPORTED rather than fought.
+  //
+  // fd wants forwarding and something turned it off. Writing it back
+  // would make this daemon un-overridable — an operator (or a test's
+  // own control, which is how several hardware scenarios prove frames
+  // reached the wire and no socket took them) could not hold the box
+  // non-routing while fd runs. So it stands, and the ONLY thing that
+  // matters is that it is not silent: the original objection to
+  // deriving this knob was never "the box might not route", it was
+  // "the box might not route and nothing says why". This says why,
+  // once per occurrence, and `fctl status` carries it continuously.
+  if (!forwarding_overridden) {
+    forwarding_overridden = true;
+    spdlog::error(
+        "forwarding: this daemon raised net.ipv4.ip_forward when the "
+        "datapath came up and something has since set it to 0. The "
+        "datapath is armed and filtering, and this box is NOT routing "
+        "between zones: every redirect leaves carrying the MAC it "
+        "arrived with and the far side drops it. fd does not override "
+        "this — restore it with `sysctl -w net.ipv4.ip_forward=1`, or "
+        "find what set it to 0.");
+  }
 }
 
 auto RouteMgr::GetState() const -> nlohmann::json {
   return {
       {"enabled", enabled},
       {"ip_forward", Forwarding()},
+      // The live knob above answers "is this box routing"; these three
+      // answer "and is that what the firewall decided". They differ
+      // for exactly as long as it takes the sweep to notice, and an
+      // operator staring at a box that has stopped passing traffic
+      // needs the reason more than the bit.
+      {"forwarding_desired", desired_forwarding},
+      {"forwarding_reason", forwarding_reason},
+      {"forwarding_corrections", forwarding_corrections},
+      {"forwarding_overridden", forwarding_overridden},
       // The two that matter, and they are reported together because
       // either one alone is unreadable: 1000 routed / 0 bridged is a
       // gateway, 0 routed / 1000 bridged is a bridge, and a

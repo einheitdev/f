@@ -139,7 +139,27 @@ auto GetFullState(const Engine& e)
 auto AttachNatMgr(Engine& e) -> void;
 
 /// Point RouteMgr at the loaded bundle's routing tally.
+///
+/// Called from the same two places, and it was NOT — cold boot only.
+/// After any hot reload (which is what every `commit` performs)
+/// `e.route.stats_fd` still pointed into the object `CloseZoneBundle`
+/// had just closed, so `fctl status` reported `0 routed / 0 bridged`
+/// for the rest of the process's life and `RouteMgr::Report()` could
+/// never fire. Routed-versus-bridged is the entire difference between
+/// a working gateway and a silent one and it is invisible in a
+/// capture, so this component going blind has no other symptom. Third
+/// site of the same defect, after NAT and egress.
 auto AttachRouteMgr(Engine& e) -> void;
+
+/// Decide `net.ipv4.ip_forward` from what is actually in the packet
+/// path, and write it. `when` names the moment for the journal and for
+/// `fctl status` ("cold boot", "reload", "shutdown").
+///
+/// Fail-closed: this box forwards only while it filters. See
+/// `RouteMgr`'s header for the invariant and for why the periodic
+/// check is asymmetric.
+auto SetForwardingFromDatapath(Engine& e, std::string_view when)
+    -> void;
 
 /// Point EgressMgr at the loaded bundle's egress tracker.
 ///

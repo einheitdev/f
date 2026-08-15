@@ -11,11 +11,14 @@
 /// datapath silently degrades to forwarding frames with the destination
 /// MAC they arrived carrying.
 ///
-/// The half that these tests are really about is `applied`. A drop-in
-/// on disk that nobody has read is a box that forwards after the next
-/// reboot and not now — which is the version of the fault that survives
-/// a commissioning test, because the person who wrote the file also
-/// rebooted at some point and never saw the gap.
+/// The half these tests used to be about was `applied` — a drop-in on
+/// disk that nobody has read is a box that forwards after the next
+/// reboot and not now. That is no longer what this artifact does, and
+/// the reversal is the thing under test now: the planned value is 0,
+/// the drop-in is the BOOT-TIME FLOOR, and the live knob belongs to
+/// `fd`, which raises it only while a compiled bundle is in the packet
+/// path. See `f/sysconfig/sysctl.h` for the measurement that decided
+/// it and `f/route_mgr.h` for the invariant.
 
 #include <filesystem>
 #include <fstream>
@@ -80,17 +83,26 @@ class SysctlTest : public ::testing::Test {
   SysctlOptions opts_;
 };
 
-TEST_F(SysctlTest, TheModelSaysTheBoxForwards) {
+/// The reversal, in one assertion. This planned 1 unconditionally
+/// until a provisioned box with its bundle removed was measured
+/// forwarding un-masqueraded traffic while `fd` refused to start and
+/// said so in the journal. A box that does not forward is a visible
+/// fault; a box that forwards unfiltered is an invisible one.
+TEST_F(SysctlTest, TheBootTimeFloorIsClosed) {
   auto values = PlanSysctlValues(cfg_);
   ASSERT_EQ(values.size(), 1U);
   EXPECT_EQ(values[0].first, "net.ipv4.ip_forward");
-  EXPECT_EQ(values[0].second, "1");
+  EXPECT_EQ(values[0].second, "0");
 }
 
-/// Deriving it from the zone count was considered and rejected: it
-/// creates a second way for the box to be silently non-routing. A
-/// config with one zone and no services still says forward.
-TEST_F(SysctlTest, ForwardingIsNotConditionalOnTheZoneCount) {
+/// Still not derived from the zone count — that derivation was
+/// rejected for creating a second way to be silently non-routing and
+/// it is still rejected. What replaced the unconditional 1 is not a
+/// cleverer plan here; it is `fd` setting the LIVE value from a fact
+/// it establishes rather than infers (how many interfaces the kernel
+/// accepted an XDP program on). This file plans the same floor for
+/// every shape of box.
+TEST_F(SysctlTest, TheFloorIsNotConditionalOnTheZoneCount) {
   auto bare = ParseSystemConfigString(
       "zones:\n  wan:\n\ninterfaces:\n  wan0:\n"
       "    mac: \"52:54:00:aa:bb:01\"\n    address: dhcp\n"
@@ -98,31 +110,56 @@ TEST_F(SysctlTest, ForwardingIsNotConditionalOnTheZoneCount) {
   ASSERT_TRUE(bare.has_value());
   auto values = PlanSysctlValues(*bare);
   ASSERT_EQ(values.size(), 1U);
-  EXPECT_EQ(values[0].second, "1");
+  EXPECT_EQ(values[0].second, "0");
 }
 
 TEST_F(SysctlTest, TheDropInIsADerivedArtifactLikeEveryOther) {
   auto unit = PlanSysctl(cfg_, opts_);
   EXPECT_EQ(unit.path, (root_ / "sysctl.d" / "10-f-forwarding.conf"));
-  EXPECT_NE(unit.content.find("net.ipv4.ip_forward = 1"),
+  EXPECT_NE(unit.content.find("net.ipv4.ip_forward = 0"),
             std::string::npos);
+  // The file has to say what it is, because an operator who finds a
+  // box passing no traffic WILL find this file and WILL try setting
+  // it to 1. It tells them where the real answer is instead.
+  EXPECT_NE(unit.content.find("BOOT-TIME FLOOR"), std::string::npos);
+  EXPECT_NE(unit.content.find("fctl status"), std::string::npos);
   // Nothing on disk yet, so the drift kind is kAbsent — not kNone,
   // which would say "identical to the model".
   EXPECT_EQ(CheckSysctlDrift(unit), DriftKind::kAbsent);
 }
 
-/// The whole point. Installed AND live, in one call, because a box
-/// that has one without the other looks correct in exactly one of the
-/// two states somebody will test it in.
-TEST_F(SysctlTest, ApplyInstallsTheFileAndWritesTheLiveValue) {
+/// Installs the file and touches NO kernel knob, and that is the
+/// second half of the reversal.
+///
+/// It used to write both, on the reasoning that a drop-in nobody
+/// applies until the next reboot is the same silent failure with a
+/// longer fuse. That was right while this file decided whether the
+/// box forwards. Now that the floor is 0, pushing it into a RUNNING
+/// kernel would stop a healthy filtering box from routing — and fd
+/// deliberately does not fight a lowered knob, so it would stay
+/// stopped. `apply system` is what an operator runs to change a DNS
+/// server; it must not be able to take the office offline.
+TEST_F(SysctlTest, ApplyInstallsTheFileAndTouchesNoLiveKnob) {
   auto r = ApplySysctl(cfg_, opts_);
   ASSERT_TRUE(r.has_value()) << (r ? "" : r.error());
   EXPECT_TRUE(r->changed);
   EXPECT_TRUE(std::filesystem::exists(r->unit.path));
-  ASSERT_EQ(r->applied.size(), 1U);
-  EXPECT_EQ(r->applied[0], "net.ipv4.ip_forward");
-  EXPECT_EQ(Read(LivePath()), "1\n");
-  EXPECT_EQ(ReadLiveSysctl(opts_.proc_dir, "net.ipv4.ip_forward"), "1");
+  EXPECT_TRUE(r->applied.empty());
+  EXPECT_FALSE(std::filesystem::exists(LivePath()));
+}
+
+/// The case that names the danger directly: a box that IS forwarding,
+/// because fd armed it, must still be forwarding after an unrelated
+/// `apply system`.
+TEST_F(SysctlTest, ApplyDoesNotCloseABoxThatFdHasOpened) {
+  std::filesystem::create_directories(LivePath().parent_path());
+  {
+    std::ofstream out(LivePath(), std::ios::trunc);
+    out << "1\n";
+  }
+  ASSERT_TRUE(ApplySysctl(cfg_, opts_).has_value());
+  EXPECT_EQ(ReadLiveSysctl(opts_.proc_dir, "net.ipv4.ip_forward"),
+            "1");
 }
 
 TEST_F(SysctlTest, ASecondApplyChangesNothingAndSaysSo) {
@@ -130,11 +167,7 @@ TEST_F(SysctlTest, ASecondApplyChangesNothingAndSaysSo) {
   auto again = ApplySysctl(cfg_, opts_);
   ASSERT_TRUE(again.has_value());
   EXPECT_FALSE(again->changed);
-  // ...but the live value is still written, because the file being
-  // unchanged says nothing about what the running kernel holds. A
-  // reboot into a kernel that ignored the drop-in, or an operator who
-  // set it to 0 by hand, both land here.
-  EXPECT_EQ(again->applied.size(), 1U);
+  EXPECT_TRUE(again->applied.empty());
 }
 
 TEST_F(SysctlTest, AHandEditIsRefusedRatherThanOverwritten) {
@@ -155,9 +188,10 @@ TEST_F(SysctlTest, AHandEditIsRefusedRatherThanOverwritten) {
   EXPECT_EQ(CheckSysctlDrift(PlanSysctl(cfg_, opts_)), DriftKind::kNone);
 }
 
-/// The live write is separable so a caller that only wants the file
-/// (a packaging step, an image build) can say so — and it has to be
-/// visible in the report, or "applied nothing" reads as "applied".
+/// `apply_live` is kept as a seam even though nothing here is applied
+/// live any more, and the report has to keep saying "applied nothing"
+/// either way — a report that said "applied" for a knob it did not
+/// write is the shape of defect this project keeps finding.
 TEST_F(SysctlTest, ApplyLiveOffInstallsTheFileAndTouchesNoKnob) {
   auto opts = opts_;
   opts.apply_live = false;
@@ -173,6 +207,7 @@ TEST_F(SysctlTest, AnUnreadableKnobReadsAsEmptyRatherThanAsZero) {
   // "forwarding is off" from "I could not look" is worse than none.
   EXPECT_EQ(ReadLiveSysctl(opts_.proc_dir, "net.ipv4.ip_forward"), "");
   ASSERT_TRUE(ApplySysctl(cfg_, opts_).has_value());
+  std::filesystem::create_directories(LivePath().parent_path());
   {
     std::ofstream out(LivePath(), std::ios::trunc);
     out << "0\n";

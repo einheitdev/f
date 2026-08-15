@@ -14,6 +14,21 @@ Type=notify
 NotifyAccess=main
 ExecStart=/usr/local/bin/fd -c /etc/f/fd.yaml run
 
+# Fail closed on the path fd cannot cover from inside itself.
+#
+# fd lowers net.ipv4.ip_forward on its way in and on its way out, so a
+# clean stop, a refused bundle and a failed attach all leave the box
+# non-routing without help. SIGKILL, a segfault and an OOM kill do not
+# — EngineStop never runs, the XDP programs stay attached, and the
+# knob stays at 1 with no daemon behind it. systemd runs ExecStopPost
+# after the main process dies however it died, including after an
+# ExecStart that never started, which is exactly the gap.
+#
+# Written with the same binary rather than `sh -c 'echo 0 > ...'` so
+# the reason is journalled under this unit's own identity, and so
+# there is one place that knows the path.
+ExecStopPost=-/usr/local/bin/fd close-forwarding
+
 CapabilityBoundingSet=CAP_BPF CAP_NET_ADMIN CAP_PERFMON CAP_SYS_RESOURCE
 AmbientCapabilities=CAP_BPF CAP_NET_ADMIN CAP_PERFMON CAP_SYS_RESOURCE
 

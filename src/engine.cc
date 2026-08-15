@@ -382,11 +382,25 @@ auto AttachRouteMgr(Engine& e) -> void {
   // about exactly the event it exists to shout about.
   e.route.reported_no_route = 0;
   e.route.reported_no_neigh = 0;
-  bool redirects = false;
-  for (const auto& p : e.zone_bundle.programs) {
-    if (!p.redirects_to.empty()) redirects = true;
+}
+
+auto SetForwardingFromDatapath(Engine& e, std::string_view when)
+    -> void {
+  // One fact, one knob. Not the zone count, not whether any zone
+  // redirects — the number of interfaces the KERNEL accepted an XDP
+  // program on. A policy analysis can be wrong about whether this box
+  // routes; this cannot be wrong about whether it filters.
+  if (e.ifaces.count > 0) {
+    e.route.SetForwarding(
+        true, std::format("{}: datapath armed on {} interface(s)",
+                          when, e.ifaces.count));
+  } else {
+    e.route.SetForwarding(
+        false,
+        std::format("{}: NO interface is running an f program, so "
+                    "nothing is being filtered",
+                    when));
   }
-  e.route.CheckForwarding(redirects);
 }
 
 auto AttachEgressMgr(Engine& e, std::string_view bundle_dir) -> void {
@@ -472,6 +486,21 @@ auto EngineInit(Engine& e,
   e.pin_path = std::string(pin_path);
   e.start_time_s = CurrentTimeS();
   e.state.store(EngineState::kStarting);
+
+  // Close the box before doing anything else, and do not depend on
+  // systemd or on the sysctl drop-in to have done it.
+  //
+  // Every path out of the rest of this function that is not "the
+  // datapath is armed" ends with the process exiting, and until the
+  // attach succeeds there is no firewall in the packet path. If the
+  // previous instance was SIGKILLed it never ran EngineStop, so the
+  // knob can be at 1 with the XDP programs from a policy this daemon
+  // is about to replace. Lowering here costs a forwarding gap that
+  // already exists (EngineStop detaches XDP) and buys the guarantee
+  // that fd's own refusal to start is enough, on its own, to stop the
+  // box routing.
+  e.route.SetForwarding(
+      false, "fd is starting: the datapath is not armed yet");
 
   // v0.4 § 6.2 cold-boot: load every zone program in the bundle staged
   // at <bundle_dir>/current and attach them per-zone from the
@@ -592,6 +621,11 @@ auto EngineInit(Engine& e,
     spdlog::info("Multi-zone bundle loaded: {} zone program(s), "
                  "attached to {} interface(s).",
                  e.zone_bundle.programs.size(), e.ifaces.count);
+    // ...and only now does this box get to route. The count above is
+    // the same number the readiness notification is gated on, taken
+    // from the same place, so "systemd says ready" and "the kernel
+    // forwards" cannot disagree.
+    SetForwardingFromDatapath(e, "cold boot");
   }
 
 
@@ -689,11 +723,14 @@ auto EngineRun(Engine& e, std::stop_token stop)
     // — the failure mode is otherwise invisible: active, green, and
     // forwarding everything.
     spdlog::error(
-        "No interfaces attached — the datapath is NOT armed. "
-        "Refusing to report readiness; check the bundle's zone "
-        "interfaces exist and that XDP attach succeeded.");
+        "No interfaces attached — the datapath is NOT armed, and this "
+        "box is therefore not forwarding either "
+        "(net.ipv4.ip_forward=0). Refusing to report readiness; check "
+        "the bundle's zone interfaces exist and that XDP attach "
+        "succeeded.");
     NotifySystemd(
-        "STATUS=datapath NOT armed: 0 interfaces attached\n");
+        "STATUS=datapath NOT armed: 0 interfaces attached, "
+        "forwarding off\n");
   } else {
     NotifySystemd(
         std::format("READY=1\nSTATUS=datapath armed on {} "
@@ -775,6 +812,10 @@ auto EngineRun(Engine& e, std::stop_token stop)
     // counted by the datapath and are invisible everywhere
     // else, so this is where they become a log line.
     e.route.Report();
+    // The one knob this daemon owns, checked against what the kernel
+    // actually holds. Corrects an unarmed box that somebody opened;
+    // reports, and does not fight, an armed box that somebody closed.
+    e.route.MaybeReassertForwarding(now_ns);
     // Same reason, one hook over: an insert the egress tracker
     // could not make is a flow of this box's own whose reply
     // this policy will drop, and it has no other symptom.
@@ -788,6 +829,14 @@ auto EngineRun(Engine& e, std::stop_token stop)
 
 auto EngineStop(Engine& e) -> void {
   WatcherStop(e.watcher);
+  // Before the detach, not after, and this ordering is the whole
+  // point. Between "no XDP program on any port" and "the kernel stops
+  // routing" there must be no window in which this box is a plain
+  // unfiltered router — and `systemctl stop fd` is the FIRST step in
+  // the handbook's own recovery procedure, so that window is a thing
+  // an operator is told to open.
+  e.route.SetForwarding(
+      false, "fd is stopping: XDP is being detached from every port");
   spdlog::info("Detaching XDP.");
   // Detach what is actually attached, not what was attached at
   // startup. `e.ifaces` is populated once in EngineInit; a reload

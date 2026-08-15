@@ -314,6 +314,58 @@ auto RenderShowStatus(const Response& resp,
   // NIC before any socket sees it — so this row is the operator's only
   // view of it. Shown from the first forward onward, including when
   // `routed` is zero, because zero-routed is the failure.
+  // Forwarding, and it is rendered UNCONDITIONALLY — outside the
+  // `enabled` gate below, before the counters, and whichever way it
+  // reads.
+  //
+  // This box fails closed: it forwards only while a compiled bundle
+  // is in the packet path. That means "not forwarding" is now a state
+  // an operator will meet, and the entire operator decision behind it
+  // was that such a box must be a VISIBLE fault rather than a silent
+  // one. A row that appears only when a policy happens to redirect,
+  // or only when something has already gone wrong, would put the
+  // explanation exactly where it cannot be found: on the box that is
+  // passing no traffic and saying nothing.
+  if (j.contains("route")) {
+    auto& rt = j["route"];
+    bool live = rt.value("ip_forward", false);
+    bool want = rt.value("forwarding_desired", false);
+    auto why = rt.value("forwarding_reason", std::string{});
+    if (live && want) {
+      row("forwarding", std::format("on ({})", why), Semantic::Good);
+    } else if (!live && !want) {
+      // The fail-closed state working as designed. Bad, not Warn: no
+      // traffic is crossing this box and the operator needs to know
+      // that before they read anything else on this screen.
+      row("forwarding",
+          std::format("OFF — this box is not routing ({})", why),
+          Semantic::Bad);
+    } else if (!live && want) {
+      row("forwarding",
+          std::format("OFF, and fd did not do it — the datapath is "
+                      "armed ({}) but net.ipv4.ip_forward is 0. "
+                      "Something else set it; fd does not override "
+                      "it. Restore with: sysctl -w "
+                      "net.ipv4.ip_forward=1",
+                      why),
+          Semantic::Bad);
+    } else {
+      row("forwarding",
+          std::format("ON WITHOUT A DATAPATH — this box is routing "
+                      "and not filtering ({}). fd will close it "
+                      "within {}s.",
+                      why, 5),
+          Semantic::Bad);
+    }
+    auto corrections = rt.value("forwarding_corrections", uint64_t{0});
+    if (corrections > 0) {
+      row("forwarding_corrections",
+          std::format("{} (something else on this box writes "
+                      "net.ipv4.ip_forward)",
+                      corrections),
+          Semantic::Warn);
+    }
+  }
   if (j.contains("route") && j["route"].value("enabled", false)) {
     auto& rt = j["route"];
     auto routed = rt.value("routed", uint64_t{0});

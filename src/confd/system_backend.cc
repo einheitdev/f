@@ -316,11 +316,17 @@ auto SystemBackend::Apply(const cc::Candidate& candidate)
         Fail(cc::ApplyError::HardwareRejected, net.error()));
   }
 
-  // Forwarding travels with the interfaces. A rollback does not need
-  // to undo it: `net.ipv4.ip_forward` is a property of the box being a
-  // router, not of any one revision of its configuration, and a
-  // rollback that turns routing off would cut the session it exists to
-  // protect.
+  // Forwarding travels with the interfaces, and since 2026-08-15 only
+  // the BOOT-TIME FLOOR does. This installs a drop-in that sets
+  // `net.ipv4.ip_forward = 0`; the running value is `fd`'s, raised
+  // while a compiled bundle is in the packet path and lowered
+  // whenever one is not.
+  //
+  // That is also why a rollback still does not need to undo it, and
+  // the reason is now stronger rather than weaker. Nothing here
+  // touches the live knob, so no revision of this document — applied
+  // or reverted — can turn routing off under an operator whose
+  // session depends on it.
   sc::SysctlOptions sysctl_opts;
   sysctl_opts.dir = opts_.sysctl_dir;
   sysctl_opts.proc_dir = opts_.sysctl_proc_dir;

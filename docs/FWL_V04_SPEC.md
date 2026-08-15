@@ -834,9 +834,19 @@ exactly that reason.
 
 `net.ipv4.ip_forward` is therefore load-bearing rather than advisory:
 with it at 0 the lookup returns `FWD_DISABLED`, no next hop is
-resolved, and every forward degrades to the L2-adjacent behaviour. It is
-generated as part of the appliance system configuration
-(`f-sysconf render sysctl`), not documented as a manual step.
+resolved, and every forward degrades to the L2-adjacent behaviour.
+
+It is owned by `fd` rather than configured, and the box **fails
+closed**: the knob is raised only while a compiled bundle is attached
+to at least one interface, and lowered whenever one is not — while
+`fd` starts, when it refuses a bundle, when an attach leaves nothing
+in the packet path, when it stops, and when it is killed. The
+generated drop-in (`f-sysconf render sysctl`) sets it to 0 and is only
+the boot-time floor. The reason: a box that does not forward is a
+visible fault, and a box that forwards what it is not filtering is an
+invisible one — measured, on an image whose bundle had been removed,
+as an inbound connection completing through a box whose daemon was in
+`auto-restart` and whose XDP programs did not exist.
 
 Which of the two a forward took is **not observable on the wire**. Both
 put the same frame on the same cable; only the far side's stack tells

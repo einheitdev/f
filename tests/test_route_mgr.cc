@@ -22,6 +22,8 @@
 namespace f {
 namespace {
 
+constexpr uint64_t kOneSecondNs = 1000000000ULL;
+
 class RouteMgrTest : public ::testing::Test {
  protected:
   void SetUp() override {
@@ -84,21 +86,8 @@ TEST_F(RouteMgrTest, ForwardingOnIsRead) {
 /// off as a control.
 TEST_F(RouteMgrTest, ForwardingIsReReadRatherThanCachedAtLoad) {
   WriteForwarding("1");
-  mgr_.CheckForwarding(true);
   ASSERT_TRUE(mgr_.GetState()["ip_forward"].get<bool>());
   WriteForwarding("0");
-  EXPECT_FALSE(mgr_.GetState()["ip_forward"].get<bool>());
-}
-
-/// The condition the whole A2 finding is about: a policy that
-/// redirects between zones, on a kernel that will not forward. The
-/// datapath cannot resolve a next hop (bpf_fib_lookup answers
-/// FWD_DISABLED) and degrades to forwarding frames with the MAC they
-/// arrived carrying, which nothing on the wire reports.
-TEST_F(RouteMgrTest, ForwardingOffIsSeenAndRecorded) {
-  WriteForwarding("0");
-  mgr_.CheckForwarding(true);
-  EXPECT_FALSE(mgr_.Forwarding());
   EXPECT_FALSE(mgr_.GetState()["ip_forward"].get<bool>());
 }
 
@@ -110,13 +99,138 @@ TEST_F(RouteMgrTest, AnUnreadableKnobIsNotTakenAsForwardingOn) {
   EXPECT_FALSE(mgr_.GetState()["ip_forward"].get<bool>());
 }
 
-/// A policy with no redirect at all does not need forwarding, and the
-/// value is still read — the status line reports the box, not the
-/// policy.
-TEST_F(RouteMgrTest, APolicyThatCannotRedirectStillReportsTheKnob) {
-  WriteForwarding("1");
-  mgr_.CheckForwarding(false);
+// ---------------------------------------------------------------
+// Fail closed. The box forwards only while it filters.
+//
+// The measurement behind these: a provisioned box with its compiled
+// bundle removed refused to start `fd`, attached nothing, said so —
+// and forwarded anyway, because the sysctl drop-in had set the knob
+// once at provisioning time and systemd reapplied it every boot. An
+// unsolicited inbound connection the healthy box refused with zero
+// frames on the inside wire completed with four.
+// ---------------------------------------------------------------
+
+/// The default is closed, before anything has been loaded or asked.
+/// A manager that defaulted to wanting forwarding would open the box
+/// for the whole window between construction and the attach failing.
+TEST_F(RouteMgrTest, AFreshManagerWantsForwardingOffAndSaysWhy) {
+  EXPECT_FALSE(mgr_.desired_forwarding);
+  EXPECT_FALSE(mgr_.forwarding_reason.empty());
+  auto j = mgr_.GetState();
+  EXPECT_FALSE(j["forwarding_desired"].get<bool>());
+  EXPECT_FALSE(j["forwarding_reason"].get<std::string>().empty());
+}
+
+TEST_F(RouteMgrTest, RaisingWritesTheKnobAndKeepsTheReason) {
+  WriteForwarding("0");
+  mgr_.SetForwarding(true, "cold boot: datapath armed on 3 "
+                           "interface(s)");
+  EXPECT_TRUE(mgr_.Forwarding());
+  EXPECT_TRUE(mgr_.desired_forwarding);
+  EXPECT_NE(mgr_.forwarding_reason.find("3 interface"),
+            std::string::npos);
   EXPECT_TRUE(mgr_.GetState()["ip_forward"].get<bool>());
+}
+
+/// The reason survives even when the write changed nothing. An
+/// operator reading `fctl status` on a box that is already in the
+/// right state still needs to know which state that is and why.
+TEST_F(RouteMgrTest, TheReasonIsKeptEvenWhenTheKnobDidNotMove) {
+  WriteForwarding("0");
+  mgr_.SetForwarding(false, "fd is stopping: XDP detached");
+  EXPECT_FALSE(mgr_.Forwarding());
+  EXPECT_NE(mgr_.GetState()["forwarding_reason"].get<std::string>()
+                .find("XDP detached"),
+            std::string::npos);
+}
+
+TEST_F(RouteMgrTest, LoweringClosesABoxThatWasForwarding) {
+  WriteForwarding("1");
+  ASSERT_TRUE(mgr_.Forwarding());
+  mgr_.SetForwarding(false, "no interface is running an f program");
+  EXPECT_FALSE(mgr_.Forwarding());
+  EXPECT_FALSE(mgr_.GetState()["forwarding_desired"].get<bool>());
+}
+
+/// The finding itself, in one case: nothing is filtering and
+/// something has opened the box. That must not stand, whoever did it.
+TEST_F(RouteMgrTest, AnUnarmedBoxThatSomethingOpenedIsClosedAgain) {
+  mgr_.SetForwarding(false, "datapath not armed");
+  WriteForwarding("1");
+  mgr_.MaybeReassertForwarding(kOneSecondNs);
+  EXPECT_FALSE(mgr_.Forwarding());
+  EXPECT_EQ(mgr_.forwarding_corrections, 1U);
+  EXPECT_EQ(mgr_.GetState()["forwarding_corrections"].get<uint64_t>(),
+            1U);
+}
+
+/// And the other direction is NOT symmetric, deliberately. An armed
+/// box whose forwarding somebody turned off is left alone and
+/// reported. Writing it back would make the daemon un-overridable by
+/// the operator whose box it is, and would break the controls in the
+/// hardware scenarios, several of which prove "these frames were on
+/// the wire and no socket took one" by holding forwarding down under
+/// a running fd.
+TEST_F(RouteMgrTest, AnArmedBoxSomebodyClosedIsReportedNotFought) {
+  WriteForwarding("0");
+  mgr_.SetForwarding(true, "cold boot: datapath armed on 2 "
+                           "interface(s)");
+  ASSERT_TRUE(mgr_.Forwarding());
+  WriteForwarding("0");
+  mgr_.MaybeReassertForwarding(kOneSecondNs);
+  EXPECT_FALSE(mgr_.Forwarding());
+  EXPECT_EQ(mgr_.forwarding_corrections, 0U);
+  EXPECT_TRUE(mgr_.forwarding_overridden);
+  EXPECT_TRUE(mgr_.GetState()["forwarding_overridden"].get<bool>());
+}
+
+/// ...and the flag clears again, so a box that was closed by hand and
+/// reopened by hand does not carry the alarm forever.
+TEST_F(RouteMgrTest, TheOverrideFlagClearsWhenTheKnobComesBack) {
+  WriteForwarding("0");
+  mgr_.SetForwarding(true, "armed");
+  WriteForwarding("0");
+  mgr_.MaybeReassertForwarding(kOneSecondNs);
+  ASSERT_TRUE(mgr_.forwarding_overridden);
+  WriteForwarding("1");
+  mgr_.MaybeReassertForwarding(kOneSecondNs + 10 * kOneSecondNs);
+  EXPECT_FALSE(mgr_.forwarding_overridden);
+}
+
+/// The re-check is rate limited, so the sweep may call it every
+/// iteration. Without the limit this is an open/read/close of a proc
+/// file ten times a second forever.
+TEST_F(RouteMgrTest, TheRecheckIsRateLimited) {
+  mgr_.SetForwarding(false, "datapath not armed");
+  mgr_.MaybeReassertForwarding(kOneSecondNs);
+  WriteForwarding("1");
+  // Well inside forwarding_recheck_s of the call above.
+  mgr_.MaybeReassertForwarding(kOneSecondNs + 100000000ULL);
+  EXPECT_TRUE(mgr_.Forwarding());
+  EXPECT_EQ(mgr_.forwarding_corrections, 0U);
+  // ...and past it, the correction happens.
+  mgr_.MaybeReassertForwarding(kOneSecondNs +
+                               6 * kOneSecondNs);
+  EXPECT_FALSE(mgr_.Forwarding());
+  EXPECT_EQ(mgr_.forwarding_corrections, 1U);
+}
+
+/// A knob that cannot be written is not a knob that was written. The
+/// reason has to say so, because the status row built from it is the
+/// only thing standing between an operator and a box they believe is
+/// closed.
+TEST_F(RouteMgrTest, AWriteThatFailsIsReportedRatherThanAssumed) {
+  RouteMgr broken;
+  broken.proc_dir = (root_ / "no" / "such").string();
+  // create_directories will make the parent, so make the target a
+  // directory instead: it exists and cannot be opened for writing.
+  std::filesystem::create_directories(
+      root_ / "no" / "such" / "net" / "ipv4" / "ip_forward");
+  auto wrote = broken.WriteForwarding(false);
+  EXPECT_FALSE(wrote.has_value());
+  broken.SetForwarding(false, "fd is stopping");
+  EXPECT_NE(broken.forwarding_reason.find("COULD NOT LOWER"),
+            std::string::npos);
 }
 
 /// The watermarks exist so a drop is logged once rather than every

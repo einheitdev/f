@@ -61,6 +61,27 @@ class NoFallbackTest : public ::testing::Test {
     fs::create_directories(dir);
     std::ofstream(dir / "manifest.json") << manifest.dump();
   }
+  /// An Engine whose forwarding knob is a file in the scratch tree.
+  ///
+  /// Not a convenience. `EngineInit` now WRITES
+  /// `<proc_dir>/net/ipv4/ip_forward`, and a test that left the
+  /// default pointing at /proc/sys would turn forwarding off on
+  /// whatever machine ran it — silently, if it happened to run as
+  /// root, and this suite is run as root on the rig.
+  auto MakeEngine(Engine* e) -> void {
+    e->route.proc_dir = (scratch_ / "proc-sys").string();
+    fs::create_directories(scratch_ / "proc-sys" / "net" / "ipv4");
+    std::ofstream(scratch_ / "proc-sys" / "net" / "ipv4" /
+                  "ip_forward") << "1\n";
+  }
+  auto LiveForwarding() const -> std::string {
+    std::ifstream in(scratch_ / "proc-sys" / "net" / "ipv4" /
+                     "ip_forward");
+    std::string v;
+    std::getline(in, v);
+    return v;
+  }
+
   // A socket address no test binds; every case below must fail before
   // EngineInit reaches the ZMQ step.
   static constexpr const char* kSock = "ipc:///tmp/f-no-fallback.sock";
@@ -69,6 +90,7 @@ class NoFallbackTest : public ::testing::Test {
 
 TEST_F(NoFallbackTest, NoBundleDirIsRefused) {
   Engine e;
+  MakeEngine(&e);
   auto res = EngineInit(e, kSock, "/sys/fs/bpf/f-test", "");
   ASSERT_FALSE(res);
   EXPECT_EQ(res.error().code, EngineError::kInvalidConfig);
@@ -78,6 +100,7 @@ TEST_F(NoFallbackTest, AbsentCurrentIsRefused) {
   // The exact shape of the deb-03 experiment: a configured bundle root
   // with no `current` in it. This used to load `/usr/lib/f/fw.bpf.o`.
   Engine e;
+  MakeEngine(&e);
   auto res = EngineInit(e, kSock, "/sys/fs/bpf/f-test",
                         scratch_.string());
   ASSERT_FALSE(res);
@@ -95,6 +118,7 @@ TEST_F(NoFallbackTest, AV01ManifestIsRefused) {
                      {"has_program", true},
                      {"program", {{"path", "main.bpf.o"}}}});
   Engine e;
+  MakeEngine(&e);
   auto res = EngineInit(e, kSock, "/sys/fs/bpf/f-test",
                         scratch_.string());
   ASSERT_FALSE(res);
@@ -106,6 +130,7 @@ TEST_F(NoFallbackTest, AManifestWithNoProgramsIsRefused) {
                      {"zones", json::array()},
                      {"programs", json::array()}});
   Engine e;
+  MakeEngine(&e);
   auto res = EngineInit(e, kSock, "/sys/fs/bpf/f-test",
                         scratch_.string());
   ASSERT_FALSE(res);
@@ -117,6 +142,7 @@ TEST_F(NoFallbackTest, TheRefusalNamesTheDirectoryAndTheCompiler) {
   // reading the source. It must say which directory was looked at and
   // what would put a bundle there.
   Engine e;
+  MakeEngine(&e);
   auto res = EngineInit(e, kSock, "/sys/fs/bpf/f-test",
                         scratch_.string());
   ASSERT_FALSE(res);
@@ -124,6 +150,73 @@ TEST_F(NoFallbackTest, TheRefusalNamesTheDirectoryAndTheCompiler) {
   EXPECT_NE(m.find((scratch_ / "current").string()),
             std::string::npos) << m;
   EXPECT_NE(m.find("fwl compile"), std::string::npos) << m;
+}
+
+// --- and the box does not forward what it is not filtering ----------
+//
+// The other half of the same finding, measured on a booted image on
+// 2026-08-15: `fd` refused a missing bundle exactly as the cases above
+// require, attached nothing, went to auto-restart, left
+// /sys/fs/bpf/f/ empty — and the box went on ROUTING, because
+// `f-sysconf apply` had written net.ipv4.ip_forward=1 once at
+// provisioning time and systemd-sysctl reapplied it every boot. An
+// unsolicited inbound TCP connection the healthy box refused with zero
+// frames on the inside wire completed with four, and outbound flows
+// left un-masqueraded carrying inside addresses, because the NAT lived
+// in the XDP program that was not there.
+//
+// A refusal that leaves the box forwarding is not a refusal.
+
+TEST_F(NoFallbackTest, ARefusedBundleLeavesTheBoxNotForwarding) {
+  Engine e;
+  MakeEngine(&e);
+  ASSERT_EQ(LiveForwarding(), "1");
+  auto res = EngineInit(e, kSock, "/sys/fs/bpf/f-test",
+                        scratch_.string());
+  ASSERT_FALSE(res);
+  EXPECT_EQ(LiveForwarding(), "0");
+  EXPECT_FALSE(e.route.desired_forwarding);
+}
+
+TEST_F(NoFallbackTest, AnAbsentBundleDirectoryClosesTheBoxToo) {
+  // The earliest refusal there is — no bundle root configured at all.
+  // It returns before any bundle is looked at, which is exactly the
+  // path on which a "lower it once we know what we loaded" version of
+  // this would have been skipped.
+  Engine e;
+  MakeEngine(&e);
+  auto res = EngineInit(e, kSock, "/sys/fs/bpf/f-test", "");
+  ASSERT_FALSE(res);
+  EXPECT_EQ(LiveForwarding(), "0");
+}
+
+TEST_F(NoFallbackTest, TheRefusedBoxSaysWhyItIsNotForwarding) {
+  // Loudness is half the operator decision: a box that has stopped
+  // forwarding must be a VISIBLE fault. The reason travels in the
+  // state the CLI renders, not only in a log line that has scrolled.
+  Engine e;
+  MakeEngine(&e);
+  (void)EngineInit(e, kSock, "/sys/fs/bpf/f-test", scratch_.string());
+  auto j = GetFullState(e);
+  ASSERT_TRUE(j["route"].contains("forwarding_reason")) << j.dump();
+  EXPECT_FALSE(j["route"]["forwarding_desired"].get<bool>());
+  EXPECT_FALSE(j["route"]["ip_forward"].get<bool>());
+  EXPECT_FALSE(
+      j["route"]["forwarding_reason"].get<std::string>().empty());
+}
+
+TEST_F(NoFallbackTest, StoppingClosesTheBoxBeforeDetachingXdp) {
+  // `systemctl stop fd` is the first step in the handbook's own
+  // recovery procedure, and it detaches XDP from every port. Between
+  // that and the kernel giving up routing there must be no window in
+  // which this box is a plain unfiltered router.
+  Engine e;
+  MakeEngine(&e);
+  e.route.SetForwarding(true, "test: pretend the datapath is armed");
+  ASSERT_EQ(LiveForwarding(), "1");
+  EngineStop(e);
+  EXPECT_EQ(LiveForwarding(), "0");
+  EXPECT_FALSE(e.route.desired_forwarding);
 }
 
 // --- the control surface the removal leaves behind ------------------

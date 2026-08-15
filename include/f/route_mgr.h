@@ -5,6 +5,7 @@
 #define INCLUDE_F_ROUTE_MGR_H_
 
 #include <cstdint>
+#include <expected>
 #include <string>
 
 #include "f/component.h"
@@ -40,6 +41,40 @@ namespace f {
 /// check a zone-to-zone hop on an unrouted segment would be stamped
 /// with the default gateway's MAC — a different segment entirely.
 /// `off_zone` counts exactly that near-miss.
+///
+/// ## And who decides whether this kernel forwards at all
+///
+/// This component also OWNS `net.ipv4.ip_forward` rather than merely
+/// reading it, and that is a reversal of an earlier decision recorded
+/// in `sysconfig/sysctl.h`. The invariant it now keeps is one line:
+///
+///   **the kernel forwards if and only if this daemon has a bundle in
+///   the packet path on at least one interface.**
+///
+/// It is not derived from the policy — not from the zone count, not
+/// from whether any zone redirects. That derivation was rejected, and
+/// is still rejected, because a box can be silently non-routing for a
+/// reason nobody can see in the source. What replaced it is a FACT the
+/// daemon establishes rather than infers: the attach either happened
+/// or it did not, and `e.ifaces.count` is the kernel's own answer.
+///
+/// The periodic check is ASYMMETRIC, and that asymmetry is the whole
+/// answer to the objection the old unconditional setting was raised
+/// against. A knob found at 1 on an unarmed box is put back to 0 —
+/// that is the unfiltered router, and nothing may hold it open. A knob
+/// found at 0 on an ARMED box is left exactly where it is and REPORTED
+/// — loudly, in the journal and in every `fctl status` from then on.
+///
+/// Writing that one back too would read as symmetry and would be
+/// wrong twice over: it would make the daemon un-overridable by the
+/// operator whose box it is, and it would break the controls in the
+/// hardware scenarios, several of which prove "these frames were on
+/// the wire and no socket took one" precisely by holding forwarding
+/// down under a running fd. The original objection to deriving this
+/// knob was never "the box might not route"; it was "the box might
+/// not route and nothing anywhere says why". A box that does not
+/// forward is a visible fault — so make it visible, and do not make
+/// it unreachable.
 struct RouteMgr : Component {
   /// `fwl_route_stats` — the datapath's per-CPU tally. -1 when the
   /// loaded policy contains no redirect at all.
@@ -68,9 +103,58 @@ struct RouteMgr : Component {
   /// off as a control and expects the status line to follow.)
   auto Forwarding() const -> bool;
 
-  /// Read `net.ipv4.ip_forward` and log about it when this policy can
-  /// redirect. Called once per bundle load.
-  auto CheckForwarding(bool policy_redirects) -> void;
+  // There is no `CheckForwarding(policy_redirects)` any more. It read
+  // the knob at load time and told the operator to run `f-sysconf
+  // apply` if it was 0 — advice that is now wrong in both halves.
+  // Nobody but this daemon sets the live value, and at the moment it
+  // used to be called the value is ALWAYS 0, because fd lowers it on
+  // the way in and does not raise it until the attach has succeeded.
+  // Kept as a comment rather than deleted silently: the old rationale
+  // is quoted in half a dozen places and this is where it stops being
+  // true.
+
+  /// What this daemon has decided the knob should be. False until a
+  /// bundle is attached to at least one interface, and false again the
+  /// moment one is not — including while `fd` is still starting up.
+  bool desired_forwarding = false;
+
+  /// Why it is where it is, in words an operator can act on. Carried
+  /// into `fctl status` so that a box which has stopped forwarding
+  /// SAYS SO rather than merely stopping.
+  std::string forwarding_reason =
+      "fd has not armed the datapath yet";
+
+  /// How many times this daemon has had to put the knob back DOWN.
+  /// Nonzero means something else on the box raised it while nothing
+  /// was filtering.
+  uint64_t forwarding_corrections = 0;
+
+  /// True while the live knob is 0 and this daemon wants 1: forwarding
+  /// was turned off behind fd's back and fd is not fighting it. The
+  /// one state in which a healthy, filtering box passes nothing.
+  bool forwarding_overridden = false;
+
+  /// Steady-clock ns of the last re-assert check. 0 = never.
+  uint64_t last_forwarding_check_ns = 0;
+
+  /// How often the knob is re-read and put back. Short enough that a
+  /// box does not sit non-routing for long, long enough to be free.
+  uint64_t forwarding_recheck_s = 5;
+
+  /// Decide the knob and write it. `why` is kept for reporting whether
+  /// or not the write was needed, so the status line explains a state
+  /// this daemon merely agrees with as well as one it just caused.
+  auto SetForwarding(bool on, std::string_view why) -> void;
+
+  /// Check the live knob against the decision, correct it downward,
+  /// and report an upward override. Called from the engine's periodic
+  /// sweep; rate-limited to `forwarding_recheck_s`.
+  auto MaybeReassertForwarding(uint64_t now_ns) -> void;
+
+  /// The raw write. Separate so a test can point `proc_dir` at a temp
+  /// tree and so the failure has one place to be reported from.
+  auto WriteForwarding(bool on) const
+      -> std::expected<void, std::string>;
 
   auto GetState() const -> nlohmann::json override;
   auto SetState(const nlohmann::json& j) -> bool override;

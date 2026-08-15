@@ -20,6 +20,7 @@
 #include <yaml-cpp/yaml.h>
 
 #include "f/engine.h"
+#include "f/route_mgr.h"
 
 namespace {
 
@@ -200,6 +201,11 @@ int main(int argc, char** argv) {
 
   app.add_subcommand("run", "Run in foreground");
   app.add_subcommand("start", "Daemonize and run");
+  app.add_subcommand(
+      "close-forwarding",
+      "Set net.ipv4.ip_forward=0 and exit. Run by fd.service's "
+      "ExecStopPost so that a SIGKILLed or crashed daemon still "
+      "leaves the box non-routing.");
 
   CLI11_PARSE(app, argc, argv);
 
@@ -238,14 +244,37 @@ int main(int argc, char** argv) {
   else if (log_level == "error")
     spdlog::set_level(spdlog::level::err);
 
+  auto* sub = app.get_subcommands().front();
+
+  // Before the already-running check, on purpose. This runs as
+  // fd.service's ExecStopPost, and the daemon it is cleaning up after
+  // may have been SIGKILLed with its pid file still on disk. Refusing
+  // to close the box because a stale pid file looks like a running
+  // engine is the failure this subcommand exists to prevent.
+  if (sub->get_name() == "close-forwarding") {
+    f::RouteMgr route;
+    auto wrote = route.WriteForwarding(false);
+    if (!wrote) {
+      spdlog::critical(
+          "forwarding: could not lower net.ipv4.ip_forward ({}). This "
+          "box may be FORWARDING WITHOUT FILTERING — no f program is "
+          "guaranteed to be attached. Set it by hand: sysctl -w "
+          "net.ipv4.ip_forward=0",
+          wrote.error());
+      return 1;
+    }
+    spdlog::info(
+        "forwarding: net.ipv4.ip_forward = 0 (fd is not running, so "
+        "nothing on this box is filtering).");
+    return 0;
+  }
+
   int existing = f::ReadPidFile(f::kEnginePidPath);
   if (f::IsProcessRunning(existing)) {
     spdlog::error("Engine already running (pid {}).",
                   existing);
     return 1;
   }
-
-  auto* sub = app.get_subcommands().front();
 
   if (sub->get_name() == "start") {
     if (daemon(1, 1) != 0) {

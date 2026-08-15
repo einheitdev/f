@@ -32,14 +32,15 @@ auto KeyToPath(const std::string& proc_dir, const std::string& key)
 
 auto PlanSysctlValues(const SystemConfig&)
     -> std::vector<std::pair<std::string, std::string>> {
-  // Unconditional, and that is the decision rather than an oversight.
+  // 0, and it used to be 1. See the header for the reversal in full.
   //
-  // Deriving it — "forward only when two zones carry interfaces" —
-  // reads well and creates a second way for the box to be silently
-  // non-routing, which is the exact fault this file exists to remove.
-  // A single-zone box that forwards nothing is not harmed by being
-  // able to.
-  return {{"net.ipv4.ip_forward", "1"}};
+  // This is the BOOT-TIME FLOOR, not the running value. The running
+  // value belongs to `fd`, which raises it when a bundle is in the
+  // packet path and lowers it whenever one is not. What this drop-in
+  // guarantees is the state of the box in the window before fd has
+  // spoken, and the state of a box on which fd never starts at all: a
+  // box that is not filtering does not forward.
+  return {{"net.ipv4.ip_forward", "0"}};
 }
 
 auto PlanSysctl(const SystemConfig& cfg, const SysctlOptions& opts)
@@ -47,13 +48,20 @@ auto PlanSysctl(const SystemConfig& cfg, const SysctlOptions& opts)
   std::ostringstream o;
   o << kBanner;
   o << "#\n";
-  o << "# This box routes: a policy that sends a packet from one zone\n";
-  o << "# to another sends it to a next hop, and Linux will not resolve\n";
-  o << "# a next hop with forwarding off. The XDP datapath asks the\n";
-  o << "# same kernel: bpf_fib_lookup() returns FWD_DISABLED and the\n";
-  o << "# redirect falls back to forwarding the frame with the\n";
-  o << "# destination MAC it arrived carrying, which the far side\n";
-  o << "# discards as PACKET_OTHERHOST. Nothing on the wire says so.\n";
+  o << "# THE BOOT-TIME FLOOR, NOT THE RUNNING VALUE.\n";
+  o << "#\n";
+  o << "# This box routes — a policy that sends a packet from one\n";
+  o << "# zone to another sends it to a next hop, and Linux will not\n";
+  o << "# resolve one with forwarding off — but it routes only while\n";
+  o << "# it is filtering. `fd` raises this knob when a compiled\n";
+  o << "# bundle is attached to at least one interface and lowers it\n";
+  o << "# again the moment one is not, including while it is starting\n";
+  o << "# and when it is stopping.\n";
+  o << "#\n";
+  o << "# So do NOT set this to 1 to 'fix' a box that is not passing\n";
+  o << "# traffic. It will be back at 0 within seconds and the reason\n";
+  o << "# is in `fctl status` under forwarding, and in the journal:\n";
+  o << "#   journalctl -u fd | grep forwarding\n";
   o << "\n";
   for (const auto& [k, v] : PlanSysctlValues(cfg)) {
     o << k << " = " << v << "\n";
@@ -101,34 +109,26 @@ auto ApplySysctl(const SystemConfig& cfg, const SysctlOptions& opts)
 
   if (!opts.apply_live) return report;
 
-  // The drop-in is what survives a reboot; this is what makes the box
-  // forward before one. Both, or the box works in exactly one of the
-  // two states an operator will test in.
-  for (const auto& [k, v] : PlanSysctlValues(cfg)) {
-    std::string path = KeyToPath(opts.proc_dir, k);
-    // A no-op against a real /proc/sys, where every directory already
-    // exists. It is here so `proc_dir` is a seam a test can point at a
-    // temp tree — an untestable "and then we write the kernel knob" is
-    // how this setting went missing in the first place.
-    std::error_code ec;
-    std::filesystem::create_directories(
-        std::filesystem::path(path).parent_path(), ec);
-    std::ofstream out(path, std::ios::trunc);
-    if (!out) {
-      return std::unexpected(std::format(
-          "cannot write {} (need root, or the kernel does not have "
-          "this knob): the drop-in is installed and will take effect "
-          "at the next boot, but this box is not forwarding yet",
-          path));
-    }
-    out << v << "\n";
-    if (!out) {
-      return std::unexpected(
-          std::format("write to {} failed", path));
-    }
-    out.close();
-    report.applied.push_back(k);
-  }
+  // `report.applied` is empty, always, and that emptiness is the
+  // decision rather than an omission.
+  //
+  // This function used to push every planned value into the running
+  // kernel as well as onto disk, on the reasoning that "a drop-in
+  // nobody applies until the next reboot is the same silent failure
+  // with a longer fuse". That was right while this file decided
+  // whether the box forwards. It no longer does: `fd` owns the live
+  // value and takes it from whether a bundle is in the packet path.
+  //
+  // Pushing the floor (0) into a RUNNING kernel would therefore stop
+  // a healthy, filtering box from routing — and fd would not put it
+  // back, because it deliberately does not fight an operator who
+  // lowers this knob. `apply system` is a command an operator runs to
+  // change a DNS server; it must not be able to take the office
+  // offline as a side effect.
+  //
+  // Nothing is lost at provisioning time. firstboot applies the
+  // system config and then starts fd, and fd's first act is to lower
+  // the knob and its last act before readiness is to raise it.
   return report;
 }
 

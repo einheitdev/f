@@ -98,19 +98,39 @@ If nobody confirms, the previous configuration — the exact document, not a re-
 
 Without `f-confd`, `apply system` still works as a direct apply, and says so: no revision is recorded, no revert timer is armed, and nothing is reloaded. `apply system confirmed` is *refused* rather than performed, because a confirmed apply with no timer behind it is the one thing worse than no timer at all.
 
-### 5. Forwarding — generated, not a step you perform
+### 5. Forwarding — the box fails CLOSED, and nothing here is a step you perform
 
 `f` routes. A policy that sends a packet from one zone to another sends it to a next hop, and Linux will not resolve one with `net.ipv4.ip_forward` at 0 — the XDP datapath asks the same kernel, so `bpf_fib_lookup` answers `FWD_DISABLED`, the redirect falls back to forwarding the frame with the destination MAC it arrived carrying, and the far side discards it as `PACKET_OTHERHOST`. Nothing on the wire says so.
 
-So it is **not** a line in this guide that you are expected to remember. It is derived from the system configuration model like the networkd units, installed as `/etc/sysctl.d/10-f-forwarding.conf`, and written to the running kernel in the same apply — because a drop-in nobody has read is a box that forwards after the next reboot and not now.
+**It routes only while it is filtering.** `fd` owns the running value of `net.ipv4.ip_forward`: it lowers it on the way in, raises it once a compiled bundle is attached to at least one interface, and lowers it again when it stops, when an attach leaves nothing in the packet path, and — via `ExecStopPost` — when it is killed. `/etc/sysctl.d/10-f-forwarding.conf` sets it to **0** and is only the boot-time floor, for the window before `fd` has spoken and for a box on which it never starts.
+
+This reverses an earlier decision, and the measurement that reversed it is worth knowing before you meet it. A provisioned box with its compiled bundle removed refused to start `fd` — correctly, loudly, `activating/auto-restart`, no XDP program anywhere — and **went on routing**, because the drop-in had set forwarding once at provisioning time and `systemd-sysctl` reapplied it every boot. An unsolicited inbound TCP connection the healthy box refused with zero frames on the inside wire completed with four, and outbound traffic left un-masqueraded carrying inside addresses, because the NAT lived in the XDP program that was not there. A box that does not forward is a fault you can see; a box that forwards unfiltered is one you cannot.
+
+**So do not "fix" a box that is passing no traffic by setting the sysctl.** It will be back at 0 within seconds, and the reason is written down in two places:
 
 ```sh
-f-sysconf render sysctl     # what it generates
-f-sysconf apply             # install it and apply it now
-f-sysconf status            # says NOT-APPLIED when the kernel disagrees
+fctl status | grep forwarding      # the row, and why it reads what it reads
+journalctl -u fd | grep forwarding # every raise and every lower, with its reason
 ```
 
-`einheit-f apply system` (and f-confd's commit path) do the same thing as part of applying the configuration. `fctl status` reports the live value in its `route` section, and `fd` logs an error at policy load when a policy that redirects meets a kernel that will not forward.
+The `forwarding` row is rendered on every `fctl status`, in every state, and reads one of four ways:
+
+| Row | What it means | What to do |
+|-----|---------------|------------|
+| `on (cold boot: datapath armed on N interface(s))` | Healthy. | — |
+| `OFF — this box is not routing (…)` | `fd` closed it: nothing is in the packet path. | Fix the reason it names — usually a bundle that will not load or a zone interface that does not exist. `journalctl -u fd`. |
+| `OFF, and fd did not do it` | The datapath IS armed and something else set the knob to 0. `fd` reports this and deliberately does not override it. | `sysctl -w net.ipv4.ip_forward=1`, then find what set it. |
+| `ON WITHOUT A DATAPATH` | Seen only in the seconds before `fd` closes it. | Nothing; it closes itself. If it persists, `fd` is not running. |
+
+`f-sysconf` still generates and installs the drop-in, and no longer writes the running kernel at all — `apply system` is what you run to change a DNS server and must not be able to take the office offline as a side effect:
+
+```sh
+f-sysconf render sysctl     # what it generates (the floor: 0)
+f-sysconf apply             # install it; touches no running knob
+f-sysconf status            # reports the live value as `owned-by-fd`
+```
+
+**Recovery: "it stopped forwarding, now what".** Read the `forwarding` row first. If it says `OFF — this box is not routing`, the firewall is not in the packet path and that is the fault to chase; `fctl status` above the row says how many interfaces are attached, and `journalctl -u fd` says why the load or the attach failed. Restoring forwarding by hand fixes nothing and hides the fault: an armed box is one `systemctl restart fd` away, and an unarmed one must not forward.
 
 ## Capabilities
 

@@ -18,6 +18,37 @@
 /// manual sysctl to pass traffic will be set up wrong, and the failure
 /// it produces is silent everywhere except this file.
 ///
+/// ## The value is 0, and it was 1. The reversal, 2026-08-15.
+///
+/// This file used to plan `ip_forward = 1` unconditionally, and said
+/// so: deriving it — "forward only when two zones carry interfaces" —
+/// creates a second way for the box to be silently non-routing, which
+/// is the fault this file exists to remove.
+///
+/// That reasoning was not wrong; it was outranked. A box was measured
+/// with its compiled bundle removed: `fd` correctly refused to start,
+/// attached nothing, and logged why — and the box went on routing,
+/// because this drop-in had set the knob at provisioning time and
+/// `systemd-sysctl` reapplied it every boot. An unsolicited inbound
+/// TCP connection that the healthy box refused with ZERO frames on the
+/// inside wire completed with four, and outbound flows left
+/// un-masqueraded with inside addresses on them, because the NAT lived
+/// in the XDP program that was not there. The operator's call:
+///
+///   **a box that does not forward is a VISIBLE fault; a box that
+///   forwards unfiltered is an INVISIBLE one.**
+///
+/// The replacement is not the derivation that was rejected. Nothing
+/// here counts zones or reads a policy. `fd` sets the live value from
+/// one fact it establishes rather than infers — how many interfaces
+/// the kernel accepted an XDP program on — and this drop-in is reduced
+/// to the boot-time floor for the window before fd has spoken and for
+/// the box on which it never starts. The old concern is answered by
+/// `RouteMgr` being LOUD rather than by being unconditional: see
+/// `f/route_mgr.h` for the invariant, for why the periodic check is
+/// asymmetric, and for the `fctl status` row that says why a box has
+/// stopped forwarding instead of leaving it to be guessed.
+///
 /// IPv4 only, on purpose. v0.4's conntrack, NAT and now its routed
 /// forward are all IPv4; enabling v6 forwarding here would claim a
 /// capability the datapath does not have, and it changes RA behaviour
@@ -48,9 +79,10 @@ struct SysctlOptions {
   /// temp tree instead of the running kernel.
   std::string proc_dir = "/proc/sys";
   bool refuse_on_drift = true;
-  /// Write the values to the running kernel as well as to disk. A
-  /// drop-in nobody applies until the next reboot is the same silent
-  /// failure with a longer fuse.
+  /// Whether this apply may touch the running kernel at all. It
+  /// currently touches nothing: every key planned here is owned live
+  /// by `fd`, and pushing the boot-time floor into a running kernel
+  /// would stop a healthy box routing. See `ApplySysctl`.
   bool apply_live = true;
 };
 
@@ -67,13 +99,15 @@ auto CheckSysctlDrift(const SysctlUnit& unit) -> DriftKind;
 struct SysctlReport {
   SysctlUnit unit;
   bool changed = false;
-  /// Keys written to the running kernel by this apply.
+  /// Keys written to the running kernel by this apply. Empty, and
+  /// that is a statement: the live value of every key here belongs to
+  /// `fd`. See `ApplySysctl`.
   std::vector<std::string> applied;
 };
 
-/// Install the drop-in and (unless disabled) push the values into the
-/// running kernel, so the box forwards now and after a reboot rather
-/// than only after one of the two.
+/// Install the boot-time drop-in. Does not touch the running kernel:
+/// the live value of `ip_forward` is fd's, taken from whether a bundle
+/// is in the packet path.
 auto ApplySysctl(const SystemConfig& cfg, const SysctlOptions& opts)
     -> std::expected<SysctlReport, std::string>;
 

@@ -1697,7 +1697,11 @@ class FLocalTransport final
     for (const auto& p : net->changed) written.push_back(p);
     // Addresses without forwarding is a box that answers pings and
     // routes nothing. It ships in the same apply as the interfaces
-    // because it is the same fact about the box.
+    // because it is the same fact about the box — but only the
+    // boot-time floor does. `sysctl_applied` is empty by design: the
+    // live value of net.ipv4.ip_forward belongs to fd, which raises it
+    // only while a bundle is in the packet path. See
+    // f/sysconfig/sysctl.h.
     sc::SysctlOptions sysctl_opts;
     sysctl_opts.dir = cfg_.sysctl_dir;
     sysctl_opts.proc_dir = cfg_.sysctl_proc_dir;
