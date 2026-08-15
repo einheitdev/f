@@ -365,6 +365,29 @@ def listen(ns, port=PROBE_PORT):
   return subprocess.Popen(
     ["sudo", "ip", "netns", "exec", ns, "python3", "-c", program],
     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+def stop_listener(proc):
+  """Stop a listener started through `sudo`, and mean it.
+
+  `Popen.kill()` sends SIGKILL to the `sudo` wrapper, which is the one
+  signal sudo cannot forward: the wrapper dies, `poll()` reports an
+  exit, and the `python3` it started keeps running with PROBE_PORT
+  still bound. The next `listen()` then fails to bind, dies printing a
+  traceback into a pipe nobody reads, and its caller reports that the
+  far side saw nobody — a red belonging to this file and not to the
+  appliance. That is exactly what `commit/reaches-the-far-side` was on
+  the walk of 2026-08-15, with the client reporting `OPEN f-appliance`
+  in the same breath.
+
+  Measured on ksys, both ways: after `terminate()` the port is free;
+  after `kill()` it is still held and `ss` still names the survivor.
+  """
+  proc.terminate()
+  try:
+    proc.wait(timeout=10)
+  except subprocess.TimeoutExpired:
+    # SIGTERM is the one that works; this is only so a wedged listener
+    # cannot hang the walk, and it is on the path that leaves debris.
+    proc.kill()
 def connect(ns, host, port=PROBE_PORT, timeout=8):
   """Try to complete a TCP exchange from a namespace."""
   program = (
@@ -459,7 +482,7 @@ def wire_probe(walk, phase, expect_forward):
   try:
     stdout, _ = server.communicate(timeout=45)
   except subprocess.TimeoutExpired:
-    server.kill()
+    stop_listener(server)
     stdout = ""
   accepted = stdout.startswith("PEER")
   peer = stdout.split()[1] if accepted else "(nobody)"
@@ -486,7 +509,7 @@ def wire_probe(walk, phase, expect_forward):
   try:
     stdout, _ = inside.communicate(timeout=45)
   except subprocess.TimeoutExpired:
-    inside.kill()
+    stop_listener(inside)
     stdout = ""
   time.sleep(2)
   watcher.terminate()

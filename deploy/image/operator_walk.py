@@ -238,11 +238,14 @@ def resolve_a_name(walk, phase):
   return answer
 
 
-def reach_the_far_side(walk, phase, expect=True, source=None):
+def probe_the_far_side(walk, phase, name):
   """Open a real TCP flow from the inside to the far side.
 
+  The measurement without the verdict, so a phase can probe more than
+  once and say what each probe was for.
+
   Returns:
-    The peer address the far side reported, or "".
+    The (accepted, peer) pair; `peer` is "" when nobody accepted.
   """
   server = fw.listen(vm.RIGHT_NS)
   time.sleep(2)
@@ -250,13 +253,22 @@ def reach_the_far_side(walk, phase, expect=True, source=None):
   try:
     stdout, _ = server.communicate(timeout=45)
   except subprocess.TimeoutExpired:
-    server.kill()
+    fw.stop_listener(server)
     stdout = ""
   accepted = stdout.startswith("PEER")
-  peer = stdout.split()[1] if accepted else ""
-  walk.fact(phase, "far_side", {"client": client.stdout.strip(),
-                                "server": stdout.strip(),
-                                "inside_source": source or ""})
+  walk.fact(phase, name, {"client": client.stdout.strip(),
+                          "server": stdout.strip()})
+  return accepted, (stdout.split()[1] if accepted else "")
+
+
+def reach_the_far_side(walk, phase, expect=True, source=None):
+  """Open a real TCP flow from the inside to the far side.
+
+  Returns:
+    The peer address the far side reported, or "".
+  """
+  accepted, peer = probe_the_far_side(walk, phase, "far_side")
+  walk.facts[phase]["far_side"]["inside_source"] = source or ""
   saw = f"accepted a flow from {peer}" if accepted else "saw nobody"
   walk.check(
     phase, "reaches-the-far-side", accepted == expect,
@@ -268,6 +280,42 @@ def reach_the_far_side(walk, phase, expect=True, source=None):
       f"the far side's own kernel reports the peer as {peer}; this "
       f"box's uplink address is {vm.WAN_BOX}")
   return peer
+
+
+# The route stages a frame can be accounted for at. `routed` and
+# `bridged` are the two ways one leaves; the rest are the ways one
+# stops, and which of them moved is the whole diagnosis when a flow
+# does not cross.
+ROUTE_STAGES = ("routed", "bridged", "no_route", "no_neigh",
+                "off_zone", "ttl_expired")
+
+
+def route_tally(walk, key, phase, label):
+  """Read the datapath's own routing tally, whole and as numbers.
+
+  `forwarding_row` greps one line out of `fctl status`, which is the
+  right instrument for the knob and useless for this: the counters are
+  in the same JSON and a post-mortem needs all of them at a known
+  moment.
+
+  Returns:
+    A dict of stage -> count, or {} when the daemon could not answer.
+  """
+  _, raw, _ = box(walk, key, phase, "fctl status")
+  try:
+    route = json.loads(raw).get("route", {})
+  except (TypeError, ValueError):
+    route = {}
+  tally = {stage: int(route.get(stage, 0)) for stage in ROUTE_STAGES}
+  walk.fact(phase, f"route_tally_{label}", tally)
+  return tally
+
+
+def tally_delta(before, after):
+  """What the datapath counted between two readings."""
+  return {stage: after[stage] - before[stage]
+          for stage in ROUTE_STAGES
+          if after.get(stage, 0) != before.get(stage, 0)}
 
 
 def forwarding_row(walk, key, phase):
@@ -554,30 +602,18 @@ def phase_reboot(out, walk, proc, key):
              f"net.ipv4.ip_forward = {live} after a cold boot with no "
              f"manual intervention; the drop-in on disk says 0")
   walk.fact("reboot", "status_row", row)
-  # Warm the neighbour table before asking the wire anything, the way
-  # `firstboot_walk.wire_probe` does. A cold box has no ARP entries,
-  # and a SOURCE-TRANSLATED packet does not survive the trip to the
-  # stack that resolves them — its source is one of the box's own
-  # addresses and `fib_validate_source` rejects it as a martian. So
-  # the first flow after a reboot is lost, `route.no_neigh` counts it,
-  # and it is a documented gap rather than a fail-closed regression.
-  # Measured here without the warm-up: `reaches-the-far-side` went red
-  # on the run of 2026-08-15, on a box whose forwarding was correctly
-  # open. A phase that cannot tell that from a routing failure is
-  # measuring the ARP cache.
-  fw.warm_neighbours(key, walk, "reboot")
   # The state a post-reboot forwarding failure has to be diagnosed
-  # from, captured BEFORE the probe rather than guessed at after it.
+  # from, captured BEFORE anything is warmed or probed. The neighbour
+  # table in particular: warming it is what the phase does next, so a
+  # capture taken afterwards could never show the table the first flow
+  # actually met.
   #
   # On the run of 2026-08-15 this phase's flow timed out while
-  # `routed`, `bridged` AND `no_neigh` were all 0 — so the datapath
-  # saw nothing to forward, which rules out the documented cold-ARP
-  # gap (that one COUNTS, in no_neigh) and rules out a policy drop
-  # (bridged would move). Nothing else recorded was enough to say
-  # which of "the box lost its addresses", "the frames never arrived"
-  # and "conntrack came back empty and the reply was dropped" it was,
-  # and the box was shut down by the time anybody looked. These four
-  # answer that next time.
+  # `routed`, `bridged` and `no_neigh` all read 0 — which was written
+  # up as "the datapath saw nothing to forward" and was not evidence
+  # of anything: that reading was taken HERE, six seconds into the
+  # boot, before a single probe frame existed. The tally either side
+  # of the cold probe below is what that claim needed.
   for what, cmd in (("addresses", "ip -br addr"),
                     ("neighbours", "ip neigh"),
                     ("xdp", "ip -d link show | grep -c prog/xdp"),
@@ -595,20 +631,204 @@ def phase_reboot(out, walk, proc, key):
   walk.check("reboot", "the-floor-on-disk-is-closed",
              "= 0" in dropin,
              f"the boot-time drop-in reads: {dropin.strip()}")
+  cold_probe(walk, key)
+  # Warm the neighbour table and probe again. A cold box has no ARP
+  # entries, and a SOURCE-TRANSLATED packet does not survive the trip
+  # to the stack that would resolve them — its source is one of the
+  # box's own addresses and `fib_validate_source` rejects it as a
+  # martian. Warming it from the box's OWN stack is the one thing that
+  # does resolve the next hop, so this pair separates "the box cannot
+  # route" from "the box has never spoken to its next hop".
+  fw.warm_neighbours(key, walk, "reboot")
+  _, warmed, _ = box(walk, key, "reboot", "ip neigh")
+  walk.fact("reboot", "neighbours_after_warming", warmed)
   reach_the_far_side(walk, "reboot", expect=True)
+  route_tally(walk, key, "reboot", "after_warm_probe")
   return proc, key
+
+
+def cold_probe(walk, key):
+  """The first flow after a reboot, and where the datapath stopped it.
+
+  The whole of finding 13 of the 2026-08-15 walk is here. That run
+  measured a timed-out flow and a routing tally read before the flow
+  existed, concluded "the datapath saw nothing to forward", and could
+  not say which stage ate the frames. This probes with the box exactly
+  as the reboot left it — nothing warmed, nothing typed — and reads
+  the tally on BOTH sides of the probe, so the answer is a delta and
+  not a level.
+
+  The delta names the stage on its own: `no_neigh` is the next hop
+  never having been resolved, `bridged` is the frame leaving unrouted,
+  `no_route` is the routing table saying no, and nothing at all moving
+  is the only reading that means the frames never reached the program.
+  The far side's own wire is sniffed at the same time, because "the
+  datapath dropped it" and "it left and nobody wanted it" are opposite
+  findings that look identical from the listener.
+  """
+  before = route_tally(walk, key, "reboot", "before_cold_probe")
+  watcher = fw.sniff(vm.RIGHT_NS, f"{vm.RIGHT_VETH}n",
+                     f"tcp and dst port {fw.PROBE_PORT}")
+  time.sleep(2)
+  accepted, peer = probe_the_far_side(walk, "reboot", "cold_far_side")
+  time.sleep(2)
+  watcher.terminate()
+  frames = len([ln for ln in watcher.stdout.read().splitlines()
+                if "IP" in ln])
+  walk.fact("reboot", "cold_probe_frames_on_the_far_wire", frames)
+  # Whether the box even TRIED to resolve the next hop. The datapath's
+  # comment beside FWL_ROUTE_STAT_NO_NEIGH says the frame is handed to
+  # the stack "so it can ARP" and that only that packet is lost — if
+  # that were so, the next hop would be in this table, resolved or
+  # failed. An empty table here means no resolution was attempted at
+  # all, and the gap is not one lost flow but every flow.
+  _, neigh, _ = box(walk, key, "reboot", "ip neigh")
+  walk.fact("reboot", "neighbours_after_cold_probe", neigh)
+  after = route_tally(walk, key, "reboot", "after_cold_probe")
+  moved = tally_delta(before, after)
+  walk.fact("reboot", "cold_probe_route_delta", moved)
+  # The oracle. A probe whose frames are in none of the datapath's
+  # stages and on none of the far side's wire is the alarming reading
+  # — the program was never entered — and it is the one thing here
+  # that no other check in this walk can go red for.
+  walk.check(
+    "reboot", "the-first-flow-is-accounted-for",
+    accepted or bool(moved) or frames > 0,
+    f"the first flow after the reboot "
+    f"{'crossed' if accepted else 'did NOT cross'}; the datapath "
+    f"counted {moved or 'NOTHING AT ALL'} and {frames} frame(s) "
+    f"reached the far side's wire")
+  if not accepted:
+    walk.friction(
+      "reboot", "the first flow after a reboot does not cross",
+      f"a box that has just booted forwards nothing until its own "
+      f"stack has resolved the next hop: the datapath counted {moved} "
+      f"and every status field reads healthy. peer={peer or 'none'}")
+
+
+# The two ends of a flow that is opened before a reload and read
+# after it. The far side sends one byte every half second, so the
+# inside end can say WHEN it last heard from it — and a flow the
+# reload broke is then a last byte older than the reload's own
+# completion, which needs no threshold and no guess at how long a
+# reload takes on an emulated board.
+HOLD_SERVER = """
+import socket, sys, time
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(('0.0.0.0', {port}))
+s.listen(1)
+s.settimeout(60)
+try:
+  c, a = s.accept()
+except OSError:
+  print('NOBODY', flush=True)
+  sys.exit(0)
+print('PEER', a[0], flush=True)
+while True:
+  try:
+    c.sendall(b'.')
+  except OSError as exc:
+    print('BROKEN', exc, flush=True)
+    sys.exit(0)
+  time.sleep(0.5)
+"""
+
+HOLD_CLIENT = """
+import socket, sys, time
+try:
+  s = socket.create_connection(('{host}', {port}), 15)
+except OSError as exc:
+  print('REFUSED', exc, flush=True)
+  sys.exit(1)
+print('OPEN', flush=True)
+s.settimeout(120)
+got = 0
+last = 0.0
+while True:
+  try:
+    chunk = s.recv(64)
+  except OSError:
+    break
+  if not chunk:
+    break
+  got += len(chunk)
+  last = time.time()
+print('HELD %d %.3f' % (got, last), flush=True)
+"""
+
+
+def hold_a_flow_open():
+  """Open a flow from the inside and leave it running.
+
+  Returns:
+    The (server, client) pair, to be read after the reload.
+  """
+  port = fw.PROBE_PORT + 1
+  server = subprocess.Popen(
+    ["sudo", "ip", "netns", "exec", vm.RIGHT_NS, "python3", "-c",
+     HOLD_SERVER.format(port=port)],
+    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+  time.sleep(2)
+  client = subprocess.Popen(
+    ["sudo", "ip", "netns", "exec", vm.LEFT_NS, "python3", "-c",
+     HOLD_CLIENT.format(host=vm.RIGHT_HOST, port=port)],
+    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+  return server, client
+
+
+def read_held_flow(walk, server, client, reloaded_at):
+  """Close the held flow and say whether the reload interrupted it."""
+  # A few seconds on the far side of the reload, so that there are
+  # bytes to have arrived after it. Without this the check would be
+  # about the moment the flow was stopped rather than about the
+  # reload.
+  time.sleep(5)
+  fw.stop_listener(server)
+  try:
+    out, err = client.communicate(timeout=60)
+  except subprocess.TimeoutExpired:
+    client.kill()
+    out, err = "", "the inside end never finished"
+  walk.fact("commit", "held_flow", {"client": out.strip(),
+                                    "client_err": err.strip()[:200]})
+  # Two checks, not one. A flow that was never established and a flow
+  # the reload killed are different findings, and a single check would
+  # report the first as the second — the cascade this walk's own
+  # friction list records twice.
+  established = out.startswith("OPEN")
+  walk.check("commit", "a-flow-was-open-before-the-reload", established,
+             out.splitlines()[0] if out else
+             (err.strip()[:120] or "the inside end said nothing"))
+  if not established:
+    return
+  held = [ln for ln in out.splitlines() if ln.startswith("HELD")]
+  parts = held[0].split() if held else []
+  last = float(parts[2]) if len(parts) == 3 else 0.0
+  count = int(parts[1]) if len(parts) == 3 else 0
+  walk.check(
+    "commit", "an-established-flow-survives-the-reload",
+    last > reloaded_at,
+    f"the inside end took {count} byte(s) and last heard from the far "
+    f"side {last - reloaded_at:+.1f}s relative to the reload "
+    f"returning; a flow the reload broke stops before 0")
 
 
 def phase_commit(walk, key):
   """A policy change, through the candidate and `commit`."""
-  # An established flow has to survive it, so open one first and hold
-  # it across the reload.
-  server = fw.listen(vm.RIGHT_NS)
-  time.sleep(2)
+  # An established flow has to survive the reload, so one is opened
+  # and HELD across it. Until this run the phase opened a LISTENER
+  # that nothing ever connected to and killed it again — a check that
+  # could not go red, whose orphaned process then held the port the
+  # real probe below needed and turned `reaches-the-far-side` red for
+  # a reason that was entirely this file's.
+  server, client = hold_a_flow_open()
   rc, out, err = cli(walk, key, "commit",
                      "set rule lan drop tcp 4444", timeout=600)
+  reloaded_at = time.time()
   walk.check("commit", "set-rule-accepted", rc == 0,
              ((out or err).splitlines() or ["no reply"])[-1])
+  read_held_flow(walk, server, client, reloaded_at)
   cli(walk, key, "commit", "show policy lan")
   live, row = forwarding_row(walk, key, "commit")
   walk.check("commit", "forwarding-survives-a-reload", live == "1",
@@ -617,7 +837,6 @@ def phase_commit(walk, key):
   # cold boot only, so after any reload every routed/bridged number
   # read 0 for the rest of the process's life. The counters have to
   # move again on the far side of a commit.
-  server.kill()
   reach_the_far_side(walk, "commit", expect=True)
   _, status, _ = cli(walk, key, "commit", "show status")
   walk.fact("commit", "status_after_reload", status)
