@@ -1,6 +1,8 @@
 # `system.yaml` reference
 
-`/etc/f/system.yaml` is the one file you edit. Everything else the box runs is generated from it. `deploy/system.yaml.example` is this document as a commented file.
+`/etc/f/system.yaml` is the one place the appliance's own network is described. Everything else the box runs — the networkd units, the dnsmasq config, the chrony config, the forwarding sysctl — is generated from it. `deploy/system.yaml.example` is this document as a commented file.
+
+You can edit it directly, and you can edit it with the CLI: `set zone`, `set interface zone`, `set address`, `set dhcp`, `set dns`, `set reservation` and their `no` counterparts change the one line they are about and leave your comments, your ordering and your formatting exactly as they were. Both are the same document; there is no second copy. See [cli.md](cli.md#the-system-configuration) for which keys have a verb and which do not — `services.ntp`, `gateway:` and `address6:` are the three that still need you to open the file.
 
 Validate with `einheit-f check system`; every diagnostic code is in [error-codes.md](error-codes.md).
 

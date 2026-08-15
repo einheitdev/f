@@ -44,7 +44,9 @@ The two lifecycles are not symmetric, and it is worth knowing how. The **system 
 
 ## The system configuration
 
-`/etc/f/system.yaml`. Every verb here edits that file and applies it: through `f-confd` when it is running — which means a recorded revision, and `apply system confirmed`'s anti-lockout timer available for the same change — and directly onto the generated artifacts when it is not. The reply always says which of the two happened, and a direct apply says in as many words that nothing was reloaded.
+`/etc/f/system.yaml`. Every verb here edits that file and applies it: through `f-confd` when it is running, which means the change gets a recorded revision you can return to with `rollback system` — and directly onto the generated artifacts when it is not, in which case the files are written and nothing is reloaded. The reply always says which of the two happened, and the direct case says in as many words what did not.
+
+**These verbs apply on the spot; there is no confirm window on any of them.** For a change that could sever your own session, edit the file and use `apply system confirmed <minutes>`, which is what has the timer. See [howto/change-something-safely.md](../howto/change-something-safely.md).
 
 | Command | Question it answers |
 |---|---|
