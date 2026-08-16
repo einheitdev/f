@@ -481,3 +481,298 @@ def test_the_policy_declares_every_counter_the_report_names():
            if ln.strip() and not ln.lstrip().startswith("#")]
   assert not [ln for ln in rules if "redirect to ina" in ln]
   assert not [ln for ln in rules if "redirect to inb" in ln]
+
+
+# --- epoch 2: the Tier 2 half -----------------------------------------
+#
+# `gwsoak.py append` widens a RUNNING soak onto the Tier 2 emission
+# path by a deliberate hot reload. Two things have to hold for that to
+# be safe, and both are checked here rather than argued: the Tier 1
+# half of the policy does not change at all, and the report can tell
+# the two halves apart and still go red on drift inside either.
+
+def _policy(name):
+  with open(os.path.join(HW, name)) as fh:
+    return fh.read()
+
+
+def test_the_epoch_2_policy_contains_the_epoch_1_zones_verbatim():
+  """The append must not change what is already being measured.
+
+  Not "looks the same": the three `@xdp` blocks of the running policy
+  have to appear as one unbroken run of bytes inside the epoch-2 file.
+  `tier2_gateway_netns.py` takes this the rest of the way and compares
+  the EMITTED objects on a VM; this is the cheap half that runs in CI.
+  """
+  one, two = _policy("gwsoak_policy.fw"), _policy("gwsoak_policy_t2.fw")
+  body = one[one.index("# --- inside zone A"):]
+  assert body in two, "the epoch-1 zones are not verbatim in epoch 2"
+  # And the Tier 2 half is genuinely additive: everything after the
+  # epoch-1 body is new, and nothing before it was deleted.
+  assert two.index(body) < two.index("@xdp(inc)")
+  for zone in ("ina", "inb", "wanz"):
+    assert two.count(f"@xdp({zone})") == 1
+
+
+def test_the_epoch_2_policy_avoids_what_tier_2_cannot_do():
+  """Constructs the language forbids, or emits as a stub, stay out."""
+  two = _policy("gwsoak_policy_t2.fw")
+  rules = [ln for ln in two.splitlines()
+           if ln.strip() and not ln.lstrip().startswith("#")]
+  tier2 = rules[rules.index("@xdp(inc)"):]
+  body = "\n".join(tier2)
+  # Tier 2 rate_limit emits `(0)`; `chain` is refused in a def body;
+  # `log(sample=N)` has no Tier 2 form. None may appear in the Tier 2
+  # zones, and the shared helper may carry none of rate_limit, geoip
+  # or pkt.zone at all.
+  for forbidden in ("rate_limit", "chain ", "log(", "geoip(",
+                    "pkt.zone"):
+    assert forbidden not in body, forbidden
+  helper = two[two.index("def t2_noise(pkt):"):two.index("@xdp(ina)")]
+  for forbidden in ("rate_limit", "geoip(", "pkt.zone"):
+    assert forbidden not in helper, forbidden
+  # The helper must be declared BEFORE the first @xdp block: a `def`
+  # written after one is absorbed as that zone's own function, with no
+  # diagnostic, and the call would silently vanish.
+  assert two.index("def t2_noise(pkt):") < two.index("@xdp(ina)")
+
+
+def test_the_shared_helper_is_reached_from_more_than_one_zone():
+  """§ 6.5 is only exercised when two zones call the same helper."""
+  two = _policy("gwsoak_policy_t2.fw")
+  rules = [ln.strip() for ln in two.splitlines()
+           if ln.strip() and not ln.lstrip().startswith("#")]
+  assert rules.count("t2_noise(pkt)") == 2
+
+
+def test_the_tier_2_identity_covers_every_leaf_the_policy_counts():
+  """Every counter the Tier 2 zones declare is in the identity.
+
+  The identity is what the report checks every sample, so a leaf left
+  out of it is a branch nothing watches. `c_syn` is deliberately not a
+  leaf — it is a SUBSET of `c_workload`, and adding it would make the
+  sum wrong on purpose — so it is named here rather than excluded by
+  an accident that reads the same.
+  """
+  two = _policy("gwsoak_policy_t2.fw")
+  tier2 = two[two.index("@xdp(inc)"):]
+  declared = {ln.split()[1] for ln in tier2.splitlines()
+              if ln.strip().startswith("count ")}
+  helper = two[two.index("def t2_noise(pkt):"):two.index("@xdp(ina)")]
+  declared |= {ln.split()[1] for ln in helper.splitlines()
+               if ln.strip().startswith("count ")}
+  in_identity = set()
+  for total, leaves in gwsoak.EPOCHS[2]["identities"]:
+    in_identity.add(total)
+    in_identity |= {leaf.split(".")[-1] for leaf in leaves}
+  assert declared - in_identity == {"c_syn", "d_syn"}
+  assert not in_identity - declared
+
+
+def test_the_tier_2_generator_sends_exactly_what_the_identity_expects():
+  """The shipped frame mix, walked against the policy's branches."""
+  frames = traffic.t2_frames(traffic.T2_ZONES["c"], "", "")
+  assert len(frames) == 10
+  for frame in frames:
+    assert sniff.checksums_ok(frame, 14), frame.hex()
+  # One frame per cycle must be OFF-NET, so the source guard is
+  # witnessed rejecting as well as admitting. A guard that stopped
+  # discriminating reads as c_offnet flat at zero.
+  offnet = [f for f in frames
+            if socket.inet_ntoa(f[26:30]) == traffic.OFFNET_SRC]
+  assert len(offnet) == 1
+  guests = [f for f in frames
+            if socket.inet_ntoa(f[26:30]).startswith("10.99.33.")]
+  assert len(guests) == 9
+
+
+def test_a_duplicated_counter_name_is_read_once_per_zone(monkeypatch):
+  """A shared helper's counter lands in EVERY calling zone's map.
+
+  The older reader wrote both zones to one dictionary key and kept
+  whichever it read last, which is exactly the reading that would hide
+  a helper that had stopped working in one object.
+  """
+  slots = {"inc": {"c_total": 0, "t2_mcast": 1},
+           "ind": {"d_total": 0, "t2_mcast": 1}}
+  dumps = {"inc": [{"key": 0, "values": [{"value": 7}]},
+                   {"key": 1, "values": [{"value": 11}]}],
+           "ind": [{"key": 0, "values": [{"value": 9}]},
+                   {"key": 1, "values": [{"value": 13}]}]}
+  monkeypatch.setattr(gwsoak, "counter_slots", lambda current="": slots)
+  monkeypatch.setattr(
+    gwsoak, "out",
+    lambda args, ns=None, timeout=120: json.dumps(
+      dumps[args[-1].rsplit("_", 1)[-1]]))
+  values = gwsoak.read_counters()
+  assert values == {"c_total": 7, "inc.t2_mcast": 11,
+                    "d_total": 9, "ind.t2_mcast": 13}
+  # And the epoch-1 spelling is byte-for-byte the old behaviour, so a
+  # counter can only change name AT a declared boundary.
+  assert gwsoak.read_counters(qualify=False)["t2_mcast"] == 13
+
+
+def test_the_wire_bar_is_a_property_of_the_epoch_not_of_the_probe():
+  """An epoch-1 probe cannot satisfy the epoch-2 bar by omission."""
+  probe = _good_probe()
+  assert gwsoak.verify_probe(probe, 1) == []
+  problems = gwsoak.verify_probe(probe, 2)
+  assert any("zone c" in p for p in problems)
+  assert any("zone d" in p for p in problems)
+
+
+# --- the report across a policy boundary -------------------------------
+
+def _good_probe4():
+  """The epoch-2 probe: four inside zones, one masquerade address."""
+  want = gwsoak.CONNS_PER_ZONE
+  probe = _good_probe()
+  probe.update({
+    "epoch": 2,
+    "c": {"completed": want, "connected": want},
+    "d": {"completed": want, "connected": want},
+    "srv": {"accepted": want * 4, "echoed": want * 4,
+            "peer_addrs": [gwsoak.MASQ_ADDR]},
+  })
+  return probe
+
+
+def _t2_counters(step):
+  """Epoch-2 counters that satisfy the identity by construction."""
+  values = {"a_masq": 100 * step, "b_masq": 90 * step,
+            "w_est": 50 * step, "a_total": 500 * step}
+  for zone, prefix in (("inc", "c"), ("ind", "d")):
+    values.update({
+      f"{prefix}_total": 10 * step, f"{prefix}_workload": 6 * step,
+      f"{prefix}_syn": 6 * step, f"{prefix}_web": 0,
+      f"{prefix}_other_tcp": 0, f"{prefix}_udp": step,
+      f"{prefix}_other_proto": 0, f"{prefix}_offnet": step,
+      f"{zone}.t2_mcast": step, f"{zone}.t2_nbns": step,
+    })
+  return values
+
+
+def _sample2(index, **over):
+  """One epoch-2 sample. Every POLICY-lifetime tally restarts at the
+  boundary, exactly as a hot reload leaves them; everything that is
+  one fact about fd carries straight on."""
+  sample = _sample(index)
+  step = index - 19
+  sample.update({
+    "epoch": 2,
+    "policy_sha": "deadbeef" * 8,
+    "counters": _t2_counters(step),
+    "probe": _good_probe4(),
+    "xdp_ifaces": 5,
+    "traffic_active": ["active"] * 5,
+  })
+  sample["egress"] = {"attached": 5, "tracked": step, "refused": 0}
+  sample["route"] = {"routed": 1000 * step, "bridged": 0,
+                     "no_neigh": 1, "forwarding_overridden": False}
+  sample["nat"] = {"entries": 1500, "total_reclaimed": 10 * step,
+                   "refused": 0, "table_full": 0, "occupancy_pct": 2}
+  sample["conntrack"] = {"entries": 3000, "total_evicted": 20 * step}
+  sample.update(over)
+  return sample
+
+
+def _two_epoch_log(tmp_path, mutate=None, epoch2=20):
+  samples = ([_sample(i) for i in range(epoch2)]
+             + [_sample2(i) for i in range(epoch2, epoch2 + 20)])
+  if mutate:
+    mutate(samples)
+  return _write_log(tmp_path, samples)
+
+
+def test_a_declared_policy_change_is_readable_and_still_a_pass(
+    tmp_path):
+  """The whole point: a hot reload zeroes every POLICY-lifetime map,
+  and a run that says where it happened is still judgeable."""
+  proc = _run_report(_two_epoch_log(tmp_path))
+  assert proc.returncode == 0, proc.stdout + proc.stderr
+  assert "2 epoch(s), CHANGED MID-RUN" in proc.stdout
+  assert "epoch 1:" in proc.stdout and "epoch 2:" in proc.stdout
+  # Both halves are named, and the reader is told which numbers are
+  # per-epoch and which are not.
+  assert "judged INSIDE each epoch" in proc.stdout
+  assert "in each of the 2 policy epochs" in proc.stdout
+
+
+def test_an_undeclared_reload_is_not_forgiven(tmp_path):
+  """Counters reset without the epoch moving is still every counter
+  going backwards at once, and still a FAIL. The boundary is a
+  declaration, not an amnesty."""
+  def strip_epoch(samples):
+    for sample in samples[20:]:
+      sample.pop("epoch")
+      sample["counters"] = {k: v for k, v in sample["counters"].items()
+                            if k in ("a_masq", "b_masq", "w_est",
+                                     "a_total")}
+  proc = _run_report(_two_epoch_log(tmp_path, strip_epoch))
+  assert proc.returncode == 1
+  assert "went backwards" in proc.stdout
+
+
+@pytest.mark.parametrize("mutate,expect", [
+  # A daemon fact is judged across the WHOLE run: a policy change must
+  # never become a way to hide one.
+  (lambda s: s["fd"].update(nrestarts=1), "restarted"),
+  (lambda s: s.update(boot_id="b1"), "rebooted"),
+  (lambda s: s["fd"].update(err_5min=4), "at the error level"),
+  (lambda s: s.update(linkup_total=9), "link-up"),
+  # The Tier 2 claims themselves.
+  (lambda s: s["probe"]["c"].update(completed=0), "wire claim"),
+  (lambda s: s["counters"].pop("inc.t2_mcast"), "ABSENT"),
+  (lambda s: s["counters"].update(c_offnet=0), "backwards"),
+  (lambda s: s["counters"].update(c_workload=999), "identity"),
+  (lambda s: s["egress"].update(attached=4), "every interface"),
+], ids=["fd-restart", "reboot", "journal-error", "link-flap",
+        "zone-c-wire", "helper-counter-gone", "counter-backwards",
+        "identity-broken", "egress-short"])
+def test_drift_in_the_second_half_still_fails(tmp_path, mutate,
+                                              expect):
+  """Every plant is applied from sample 25 onward — which is inside
+  epoch 2 — and every one of them must still be named."""
+  def apply(samples):
+    for sample in samples[25:]:
+      mutate(sample)
+  proc = _run_report(_two_epoch_log(tmp_path, apply))
+  assert proc.returncode == 1, f"{expect}: {proc.stdout}"
+  assert expect in proc.stdout, proc.stdout
+
+
+def test_a_counter_that_never_moves_in_the_new_epoch_fails(tmp_path):
+  """A Tier 2 zone that stopped counting is the failure this half of
+  the soak exists to catch. The identity is held intact so that what
+  fails is the stall and not the arithmetic."""
+  def freeze(samples):
+    for sample in samples[20:]:
+      counters = sample["counters"]
+      counters["c_workload"] = 6
+      counters["c_syn"] = 6
+      counters["c_total"] = (counters["inc.t2_mcast"]
+                             + counters["inc.t2_nbns"] + 6
+                             + counters["c_udp"]
+                             + counters["c_offnet"])
+  proc = _run_report(_two_epoch_log(tmp_path, freeze))
+  assert proc.returncode == 1
+  assert "did not move across the epoch" in proc.stdout
+
+
+def test_an_epoch_that_goes_backwards_cannot_support_a_verdict(
+    tmp_path):
+  def scramble(samples):
+    samples[30]["epoch"] = 1
+  proc = _run_report(_two_epoch_log(tmp_path, scramble))
+  assert proc.returncode == 2
+  assert "went backwards or repeated" in proc.stdout
+
+
+def test_the_first_epoch_needs_no_epoch_field(tmp_path):
+  """Samples written before the field existed are epoch 1, and the
+  absence is the marker rather than a default worth arguing about."""
+  assert report.epoch_of({"ts": "x"}) == gwsoak.FIRST_EPOCH
+  assert report.epoch_of({"epoch": 2}) == 2
+  blocks = report.segment([{"a": 1}, {"epoch": 1}, {"epoch": 2}])
+  assert [e for e, _ in blocks] == [1, 2]
+  assert [len(b) for _, b in blocks] == [2, 1]

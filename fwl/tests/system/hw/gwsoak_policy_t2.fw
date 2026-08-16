@@ -1,0 +1,264 @@
+# The office-gateway soak policy, epoch 2: the Tier 2 emission path.
+#
+# READ gwsoak_policy.fw FIRST. This file IS that file — the three
+# `@xdp` blocks below are byte-identical to it, and `test_gwsoak.py`
+# asserts that mechanically rather than by eye — plus two Tier 2 zones
+# and one shared helper. Nothing that was being measured on
+# 2026-08-16 changed meaning; everything here is additive.
+#
+# WHY. The 96 h run this is appended to is Tier 1 only: three `@xdp`
+# zones of rules, no `def` anywhere. Tier 2 bodies compile down a
+# DIFFERENT emitter path — `_emit_tier2_if` lowers an `if` straight
+# into a C conditional, where Tier 1's `_emit_rule` threads the rule's
+# guard and its `limited by` gate into the conjunction — which is why
+# three of the ten near-miss families had to be Tier 2 to reproduce at
+# all. Days of green on Tier 1 say nothing about it.
+#
+# WHAT IS DELIBERATELY NOT HERE.
+#   * `rate_limit` in Tier 2. The emitter returns `(0)` for a Tier 2
+#     `rate_limit(...)` call — a compile-time constant false — and the
+#     interpreter agrees, so all three oracles agree on a stub
+#     (l7_01_tier2_rate_limit_gap is the standing witness). Rate
+#     limiting stays where it works: the Tier 1 zones, unchanged.
+#   * `rate_limit`, `geoip` and `pkt.zone` inside the shared helper.
+#     All three are REFUSED by the analyzer for a helper — a shared
+#     helper has no single ingress zone — so planning around them
+#     would be planning around a diagnostic.
+#   * `chain`. It is a Tier 1 stage boundary between rules and the
+#     analyzer rejects it in a `def` body ("'chain' is a Tier 1 stage
+#     boundary; not valid in a def body"). Checked, not assumed.
+#   * `log`. Tier 2 has no `log(sample=N)` form, only bare `log`, and
+#     every Tier 2 log event is stamped rule_index 0. Sampled logging
+#     stays on the Tier 1 zones where it is already under load.
+#   * a return-path `redirect` on the uplink. Unchanged from epoch 1
+#     and for the same measured reason: the prelude caches `dst_ip`
+#     before `fwl_nat_denat` rewrites it.
+zone ina = [enp1s0f1]
+zone inb = [fs3b]
+zone wanz = [enp1s0f2]
+zone inc = [fs4c]
+zone ind = [fs4d]
+
+# --- the shared helper -----------------------------------------------
+#
+# Reached from BOTH Tier 2 zones, which is the whole of what multi-def
+# is: the emitter puts a `static __noinline int fwl_helper_t2_noise(
+# struct xdp_md *ctx)` into inc.bpf.o AND into ind.bpf.o — two
+# compilations of one source, each with its own prelude, called
+# through a real BPF-to-BPF call whose sentinel the call site checks:
+#
+#   { int _r = fwl_helper_t2_noise(ctx); if (_r != FWL_CONTINUE) return _r; }
+#
+# So "the helper works" is two claims, not one, and the soak reads
+# `inc.t2_mcast` and `ind.t2_mcast` SEPARATELY for that reason. A
+# helper that stopped returning its caller's verdict in one object and
+# not the other would show up nowhere else.
+#
+# The helper carries its OWN proto guard. A caller's `if pkt.proto ==
+# tcp:` does not propagate across the call — each helper type-checks
+# and dominator-checks independently — and this is the line that would
+# fail to compile if that ever changed.
+def t2_noise(pkt):
+  if pkt.dst_ip in 224.0.0.0/4:
+    count t2_mcast
+    drop
+  if pkt.proto == udp and (pkt.dst_port == 137 or pkt.dst_port == 138):
+    count t2_nbns
+    drop
+
+# --- inside zone A — copper, through the EX2300 ----------------------
+#
+# The `drop` matrix runs BEFORE the translation, so the noise never
+# reaches the NAT tables and the rate limiter's budget is spent on the
+# flood rather than on the workload. `count a_masq` is read back by
+# name every sample and paired with a real socket on the far side: on
+# its own it would keep climbing with the rewrite disabled entirely,
+# which is why no counter in this file is evidence by itself.
+@xdp(ina)
+
+count a_total
+count a_masq if pkt.src_ip in 10.99.31.0/24
+count a_flood if pkt.src_ip in 10.99.60.0/24
+count a_mcast if pkt.dst_ip in 224.0.0.0/4
+count a_logged if pkt.proto == udp and pkt.dst_port == 9999
+log(sample=100) if pkt.proto == udp and pkt.dst_port == 9999
+drop if pkt.dst_ip in 224.0.0.0/4
+drop if pkt.proto == udp and (pkt.dst_port == 137 or pkt.dst_port == 138)
+drop if pkt.src_ip in 10.99.60.0/24
+       limited by rate_limit(500, per=src_ip, scope=zone)
+masquerade if pkt.src_ip in 10.99.31.0/24
+redirect to wanz if pkt.src_ip in 10.99.31.0/24
+count a_other
+default drop
+
+# --- inside zone B — the second zone behind the SAME uplink ----------
+#
+# Identical shape on purpose. Two masquerading zones naming one
+# destination is what made the bundle unloadable (two objects declaring
+# one pinned `fwl_devmap_wanz`) and, once it loaded, what made the
+# single bundle-global `fwl_nat_cfg` slot visible. Both zones must
+# resolve the same masquerade address here, and the far side must see
+# that one address from both — which is the assertion, on the wire,
+# every sample.
+@xdp(inb)
+
+count b_total
+count b_masq if pkt.src_ip in 10.99.32.0/24
+count b_flood if pkt.src_ip in 10.99.60.0/24
+count b_mcast if pkt.dst_ip in 224.0.0.0/4
+count b_logged if pkt.proto == udp and pkt.dst_port == 9999
+log(sample=100) if pkt.proto == udp and pkt.dst_port == 9999
+drop if pkt.dst_ip in 224.0.0.0/4
+drop if pkt.proto == udp and (pkt.dst_port == 137 or pkt.dst_port == 138)
+drop if pkt.src_ip in 10.99.60.0/24
+       limited by rate_limit(500, per=src_ip, scope=zone)
+masquerade if pkt.src_ip in 10.99.32.0/24
+redirect to wanz if pkt.src_ip in 10.99.32.0/24
+count b_other
+default drop
+
+# --- the uplink ------------------------------------------------------
+#
+# This is the shape `deploy/firstboot` generates for an uplink, and it
+# is deliberately not the shape this policy started with. `default
+# drop` is what makes the return path a measurement: everything that
+# comes home has to be admitted by `in [established, related]`, so a
+# guest's completed TCP exchange IS the witness that the composition
+# still holds behind masquerade. If it stops composing, nothing comes
+# back and the far side's `completed` goes to zero. The same rule is
+# the box's OWN traffic coming home — flows the appliance originates,
+# whose conntrack entries are made by the TC egress tracker and by
+# nothing else. It is the last rule before `default drop` for that
+# reason: on a box with no tracker this is exactly where DNS died.
+#
+# WHAT IS NOT HERE, AND WHY — finding, 2026-08-16.
+# This zone had `redirect to ina if ... pkt.dst_ip in 10.99.31.0/24`
+# and its `inb` twin. Both are UNREACHABLE and were removed. The
+# emitted program is `{prelude}{nat_denat}{body}`, and the prelude
+# CACHES `dst_ip` out of the header before `fwl_nat_denat(ctx)`
+# rewrites it — the body then tests the cached value. So on any zone
+# that de-NATs, every body rule reading `pkt.dst_ip` sees the address
+# the frame carried ON THE WIRE, never the one de-NAT restored, and a
+# return-path redirect naming an inside host can never match. Behind
+# masquerade there is no pre-de-NAT field that identifies the inside
+# zone either — every reply arrives addressed to the one uplink
+# address — so such a redirect cannot be written at all. Replies get
+# home through `allow` and the Linux stack, which is what
+# `firstboot` already generates and what the office box will run.
+#
+# `l2_08_three_zone_gateway` and `l2_09_two_uplinks` both carry that
+# redirect and both are green: their green comes from `allow` plus the
+# stack, not from the datapath, and their `ip_forward=0` control
+# cannot tell the two apart because it stops both.
+#
+# The three counters below are the finding's continuous witness, and
+# they are a measurement rather than an assertion because one number
+# at zero proves nothing on its own: `w_pre_denat` must stay level
+# with `w_total` while `w_to_a` and `w_to_b` stay at zero, on a wire
+# where EVERY reply is demonstrably de-NAT'd to one of those two
+# subnets. Should that ever invert, the semantics changed under a
+# running soak and somebody should know.
+@xdp(wanz)
+
+count w_total
+count w_est if conntrack(pkt).state in [established, related]
+count w_pre_denat if pkt.dst_ip == 10.99.210.2
+count w_to_a if pkt.dst_ip in 10.99.31.0/24
+count w_to_b if pkt.dst_ip in 10.99.32.0/24
+allow if conntrack(pkt).state in [established, related]
+count w_dropped
+default drop
+
+# --- inside zone C — Tier 2, guards HOISTED into locals --------------
+#
+# A third masquerading zone behind the same uplink, expressed as a
+# `def`. Every counter is placed so the zone's own arithmetic is an
+# assertion rather than a reading: `c_total` is incremented BEFORE the
+# helper call, and every frame that survives the helper lands in
+# exactly one of the leaf counters, so
+#
+#   c_total == t2_mcast + t2_nbns + c_workload + c_web + c_other_tcp
+#              + c_udp + c_other_proto + c_offnet
+#
+# holds at every instant, per zone, whatever rate the wire runs at.
+# That identity is what a mis-threaded Tier 2 conjunction breaks: a
+# guard that stopped gating puts a frame in two leaves, a helper whose
+# `drop` stopped returning the CALLER's verdict puts a dropped frame in
+# a leaf as well as in `t2_mcast`, and a branch that collapsed puts it
+# in none. `gwsoak_report.py` checks it every sample.
+#
+# `c_offnet` is the vacuity guard and it is why the generator sends one
+# off-net frame per cycle: a `pkt.src_ip in ...` that stopped
+# discriminating reads as `c_offnet` flat at 0 with `c_workload`
+# absorbing it, and a counter that is only ever 0 is not a measurement.
+#
+# `guest` and `syn` are Tier 2 LOCALS, and both are read as bare
+# condition primaries — the only bare-primary forms the language has
+# are a bool local, `pkt.tcp.syn`/`pkt.tcp.ack` and a parenthesized
+# sub-condition. `guest` is bound from a comparison (exempt from the
+# dominator rule); `syn` is bound from a flag field and so must sit
+# under `if pkt.proto == tcp:`, which is where it is.
+@xdp(inc)
+
+def inc_filter(pkt):
+  count c_total
+  t2_noise(pkt)
+  guest = pkt.src_ip in [10.99.33.0/24]
+  if guest:
+    if pkt.proto == tcp:
+      dport = pkt.dst_port
+      syn = pkt.tcp.syn
+      if dport == 443:
+        count c_workload
+        if syn:
+          count c_syn
+      elif dport in [80, 8080]:
+        count c_web
+      else:
+        count c_other_tcp
+    elif pkt.proto == udp:
+      count c_udp
+    else:
+      count c_other_proto
+    masquerade
+    redirect to wanz
+  count c_offnet
+  drop
+
+# --- inside zone D — Tier 2, the SAME policy written INLINE ----------
+#
+# Byte for byte the same decisions as zone C with the locals removed:
+# `pkt.src_ip in [...]`, `pkt.dst_port` and `pkt.tcp.syn` read at the
+# point of use instead of hoisted. This is the refactor-invariance
+# claim of FWL_V02_SPEC.md § Tier 2 — hoisting a field into a local
+# must not change the verdict — turned into a continuous measurement
+# rather than a one-shot test, because the two zones carry the same
+# generated load and their identities are checked against each other's
+# shape every sample.
+#
+# It is also the second half of the multi-def claim: `t2_noise` is
+# compiled into THIS object too, and `ind.t2_mcast` is read separately
+# from `inc.t2_mcast` for exactly that reason.
+@xdp(ind)
+
+def ind_filter(pkt):
+  count d_total
+  t2_noise(pkt)
+  if pkt.src_ip in [10.99.34.0/24]:
+    if pkt.proto == tcp:
+      if pkt.dst_port == 443:
+        count d_workload
+        if pkt.tcp.syn:
+          count d_syn
+      elif pkt.dst_port in [80, 8080]:
+        count d_web
+      else:
+        count d_other_tcp
+    elif pkt.proto == udp:
+      count d_udp
+    else:
+      count d_other_proto
+    masquerade
+    redirect to wanz
+  count d_offnet
+  drop

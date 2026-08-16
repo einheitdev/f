@@ -11,6 +11,20 @@ Three roles, one program, selected with `--role`:
            NetBIOS into the drop rules, a sampled-logging flow, and a
            periodic flood from the rate-limited subnet.
 
+  t2inside One Tier 2 zone's workload (epoch 2). The same shape as
+           `inside` minus the two things Tier 2 cannot carry: no churn
+           (the NAT arrival rate is deliberately left exactly where
+           epoch 1 set it, so the occupancy curve stays readable
+           across the boundary) and no rate-limit flood (a Tier 2
+           `rate_limit(...)` emits a constant false — see
+           l7_01_tier2_rate_limit_gap — so flooding a zone that cannot
+           limit would measure nothing). It adds one frame the
+           `inside` role has no use for: an OFF-NET source, so the
+           zone's `pkt.src_ip in ...` guard is witnessed rejecting as
+           well as admitting. A guard that stopped discriminating
+           reads as `c_offnet` flat at zero, and a counter that is
+           only ever zero is not a measurement.
+
   reply    The return half, injected on the far side of the uplink so
            the de-NAT pass, the conntrack composition and the redirect
            back to the inside zone are under load BETWEEN the once-a-
@@ -64,6 +78,21 @@ ZONES = {
   "b": {"net": "10.99.32", "guest": "10.99.32.5", "sport": 42000,
         "churn": 32000},
 }
+# The Tier 2 zones (epoch 2). Kept in a separate table from ZONES on
+# purpose: `run_reply` builds its frame list from ZONES, and the reply
+# injector is a unit that has been running since the soak started. A
+# dict the running process cannot see must not change meaning under
+# it, and there is nothing for the reply role to do here anyway —
+# these zones' return path is witnessed by the once-a-minute real
+# sockets, which is a stronger witness than an injected ACK.
+T2_ZONES = {
+  "c": {"net": "10.99.33", "guest": "10.99.33.5", "sport": 43000},
+  "d": {"net": "10.99.34", "guest": "10.99.34.5", "sport": 44000},
+}
+# Not in any zone's guest subnet, and deliberately not in the flood
+# subnet either — this frame is here to be REJECTED by the Tier 2
+# source guard, not to be dropped by something else first.
+OFFNET_SRC = "10.99.99.7"
 CHURN_SPAN = 28000
 STEADY_FLOWS = 6
 CHURN_EVERY = 4        # cycles between churn frames -> ~5/s at 0.05 s
@@ -233,6 +262,59 @@ def run_inside(args) -> int:
   return 0
 
 
+def t2_frames(zone: dict, dst_mac: str, src_mac: str) -> list:
+  """One Tier 2 zone's whole cycle, as raw frames.
+
+  Named and returned rather than built inline so `test_gwsoak.py` can
+  assert the mix against the policy's counter identity instead of
+  agreeing with a reimplementation of it. Per cycle, exactly:
+
+    6 x tcp/443 syn from the guest  -> c_workload (and c_syn)
+    1 x udp/9999   from the guest   -> c_udp
+    1 x udp/137    from the guest   -> t2_nbns   (helper drops it)
+    1 x mcast      from the guest   -> t2_mcast  (helper drops it)
+    1 x udp/9999   from OFF-NET     -> c_offnet  (the guard rejects)
+
+  which is 10 frames into a zone whose `def` counts `c_total` first,
+  so c_total advances by 10 and the eight leaves by 1+1+6+0+0+1+0+1.
+  """
+  net, guest, sport0 = zone["net"], zone["guest"], zone["sport"]
+  builders = [
+    f'tcp(src_ip="{guest}", dst_ip="{SERVER}", src_port={sport0 + i}, '
+    f'dst_port=443, syn=true)' for i in range(STEADY_FLOWS)
+  ] + [
+    f'udp(src_ip="{net}.201", dst_ip="{SERVER}", dst_port=9999)',
+    f'udp(src_ip="{net}.202", dst_ip="{SERVER}", dst_port=137)',
+    f'udp(src_ip="{net}.203", dst_ip="239.255.255.250", dst_port=1900)',
+    f'udp(src_ip="{OFFNET_SRC}", dst_ip="{SERVER}", dst_port=9999)',
+  ]
+  frames = []
+  for builder in builders:
+    frame = _frame(builder)
+    _set_macs(frame, dst_mac, src_mac)
+    fix_csums(frame)
+    frames.append(bytes(frame))
+  return frames
+
+
+def run_t2inside(args) -> int:
+  """One Tier 2 zone's workload, forever."""
+  frames = t2_frames(T2_ZONES[args.zone], args.dst_mac, args.src_mac)
+  sock = _sock(args.iface)
+  sent = 0
+  for cycle in itertools.count():
+    for frame in frames:
+      try:
+        sock.send(frame)
+        sent += 1
+      except OSError:
+        time.sleep(1)
+    if cycle % 12000 == 0:
+      print(f"t2 zone {args.zone}: {sent} frames", flush=True)
+    time.sleep(CYCLE_S)
+  return 0
+
+
 def run_reply(args) -> int:
   """The return half, injected on the uplink's far side.
 
@@ -270,14 +352,18 @@ def run_reply(args) -> int:
 
 def main() -> int:
   parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-  parser.add_argument("--role", choices=("inside", "reply"),
+  parser.add_argument("--role",
+                      choices=("inside", "t2inside", "reply"),
                       required=True)
   parser.add_argument("--iface", required=True)
-  parser.add_argument("--zone", choices=tuple(ZONES), default="a")
+  parser.add_argument("--zone",
+                      choices=tuple(ZONES) + tuple(T2_ZONES),
+                      default="a")
   parser.add_argument("--dst-mac", default="")
   parser.add_argument("--src-mac", default="")
   args = parser.parse_args()
-  return (run_inside if args.role == "inside" else run_reply)(args)
+  return {"inside": run_inside, "t2inside": run_t2inside,
+          "reply": run_reply}[args.role](args)
 
 
 if __name__ == "__main__":

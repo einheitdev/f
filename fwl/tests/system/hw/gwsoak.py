@@ -100,9 +100,36 @@ Usage, on the rig, as root:
   python3 gwsoak.py status
   python3 gwsoak.py sample            # driven by the systemd timer
   python3 gwsoak.py probe             # the wire witness alone, by hand
+  python3 gwsoak.py append            # add the Tier 2 half, hot
   python3 gwsoak.py stop
+
+Epochs
+------
+A run may change policy while it is running — `append` does exactly
+that, by a deliberate hot reload — and every aggregate in this log
+would be ambiguous across such a change if it were not recorded.
+`fwl_counters` is MapLifetime.POLICY: slot i belongs to the
+compilation that allocated it, so a reload resets every counter to
+zero by design. So does `fwl_nat_stats`, `fwl_route_stats` and
+`fwl_egress_stats`. Read across a boundary without knowing it is
+there, that reads as nineteen counters going backwards at once.
+
+Every sample therefore carries an `epoch`: an integer that only
+`append` moves, alongside the sha256 of the policy that was loaded
+when it moved. `gwsoak_report.py` segments the run on it and judges
+each epoch's counters against that epoch's own baseline. A sample
+with no `epoch` field is epoch 1 by definition — the field did not
+exist before the first append, and its absence is the marker.
+
+The boundary is a DECLARATION and not an amnesty. Anything that is
+genuinely one fact about one process — fd's RSS, its restart count,
+the boot id, link flaps — stays judged across the whole run, so a
+policy change cannot be used to hide a daemon that died. And a reload
+performed WITHOUT bumping the epoch still shows up as every counter
+going backwards, which the report still fails on.
 """
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -120,6 +147,7 @@ LOG = "/var/log/f/gwsoak.jsonl"
 STATE = "/var/log/f/gwsoak.state.json"
 RULES = "/etc/f/rules.fw"
 POLICY = os.path.join(HERE, "gwsoak_policy.fw")
+POLICY_T2 = os.path.join(HERE, "gwsoak_policy_t2.fw")
 BUNDLE = os.path.join(BUNDLE_ROOT, "v-gwsoak")
 
 # Interfaces. Keep in step with gwsoak_policy.fw, which names them
@@ -129,28 +157,107 @@ INA_IF = "enp1s0f1"     # inside zone A — copper
 WAN_IF = "enp1s0f2"     # the uplink — copper
 INB_IF = "fs3b"         # inside zone B — veth, root-ns end
 INB_PEER = "fs3bp"      # its peer, inside netns gwsb
+# The two Tier 2 zones (epoch 2). Veth for the same reason inb is: the
+# i350 has three usable ports and all three are already zones. What a
+# veth leg cannot exercise is the igb driver's ndo_xdp_xmit; what it
+# exercises perfectly well is the question these zones exist for — a
+# Tier 2 `def` body, a real BPF-to-BPF helper call, a Tier 2
+# `masquerade` and a Tier 2 `redirect`, all under continuous load.
+INC_IF = "fs4c"
+INC_PEER = "fs4cp"
+IND_IF = "fs4d"
+IND_PEER = "fs4dp"
 WAN_VLAN = 802
 
 # Addresses.
 INA_ADDR = "10.99.31.1"
 INB_ADDR = "10.99.32.1"
 MASQ_ADDR = "10.99.210.2"   # the uplink's address == masquerade source
+INC_ADDR = "10.99.33.1"
+IND_ADDR = "10.99.34.1"
 GUEST_A = "10.99.31.5"
 GUEST_B = "10.99.32.5"
+GUEST_C = "10.99.33.5"
+GUEST_D = "10.99.34.5"
 SERVER = "10.99.210.9"
 CHURN_NET = "10.99.240.0/22"
 CHURN_GW = "10.99.210.250"
 CHURN_GW_MAC = "02:00:00:00:99:fa"
 
 NS_A, NS_B, NS_S = "gwsa", "gwsb", "gwss"
+NS_C, NS_D = "gwsc", "gwsd"
 PORT_GUEST = 8461     # the guests' far-side listener
 PORT_BOX = 8462       # the box's own far-side listener
 CONNS_PER_ZONE = 3
 
 TRAFFIC_UNITS = ("f-gwsoak-traffic-a", "f-gwsoak-traffic-b",
                  "f-gwsoak-reply")
+T2_TRAFFIC_UNITS = ("f-gwsoak-traffic-c", "f-gwsoak-traffic-d")
 SAMPLE_UNIT = "f-gwsoak-sample"
 DEFAULT_HOURS = 96
+
+# What each epoch claims, in one place, so `append`, `probe`,
+# `verify_probe` and the report cannot disagree about it. The `zones`
+# tuple is the set of inside zones whose delivery must be witnessed by
+# a real socket in a sample taken under that epoch; `identities` are
+# the Tier 2 counter identities the report checks every sample.
+EPOCHS = {
+  1: {
+    "policy": POLICY,
+    "zones": ("a", "b"),
+    "what": "Tier 1 only: three @xdp zones of rules, no `def` anywhere",
+    "identities": (),
+    "must_move": ("a_masq", "b_masq", "w_est"),
+    # Epoch 1 keeps the reading this run started under, DELIBERATELY.
+    # `__rate_limit_overflow` is declared by both rate-limited zones,
+    # so under this spelling it reports whichever zone was read last
+    # — a real defect, and one that is fixed forward rather than
+    # backward: renaming a counter under a measurement in progress
+    # would make it vanish mid-epoch, which the report would fail on,
+    # correctly. From epoch 2 both zones' values are reported.
+    "qualify_duplicates": False,
+  },
+  2: {
+    "policy": POLICY_T2,
+    "zones": ("a", "b", "c", "d"),
+    "what": ("+ two Tier 2 zones (inc hoists its guards into locals, "
+             "ind writes them inline) and one shared helper reached "
+             "from both"),
+    # (total, leaves...) — every frame the zone's `def` sees lands in
+    # exactly one leaf, so the sum IS the total. Written here rather
+    # than in the report because it is a property of the POLICY.
+    "identities": (
+      ("c_total", ("inc.t2_mcast", "inc.t2_nbns", "c_workload",
+                   "c_web", "c_other_tcp", "c_udp", "c_other_proto",
+                   "c_offnet")),
+      ("d_total", ("ind.t2_mcast", "ind.t2_nbns", "d_workload",
+                   "d_web", "d_other_tcp", "d_udp", "d_other_proto",
+                   "d_offnet")),
+    ),
+    # Both halves of each Tier 2 guard, on purpose. `c_workload`
+    # moving says the guard ADMITS; `c_offnet` moving says the same
+    # guard REJECTS. A guard that had stopped discriminating would
+    # keep one of them climbing, which is why neither is enough
+    # alone. `c_syn` is the bool LOCAL read as a bare primary and
+    # `d_syn` the bare flag field — the pair is the refactor-
+    # invariance claim. `inc.t2_mcast`/`ind.t2_mcast` are the one
+    # shared helper compiled into two objects, read separately.
+    "must_move": (
+      "a_masq", "b_masq", "w_est",
+      "c_total", "c_workload", "c_syn", "c_udp", "c_offnet",
+      "d_total", "d_workload", "d_syn", "d_udp", "d_offnet",
+      "inc.t2_mcast", "inc.t2_nbns", "ind.t2_mcast", "ind.t2_nbns",
+    ),
+    # A shared helper's counters land in EVERY calling zone's own
+    # private map, so from here on a duplicated name is reported once
+    # per zone. `__rate_limit_overflow` changes spelling with them,
+    # and that is the point of tying it to the epoch: the rename and
+    # the policy change are the same event, so nothing disappears
+    # inside an epoch and a rollback keeps the old spelling.
+    "qualify_duplicates": True,
+  },
+}
+FIRST_EPOCH = 1
 
 SMOKE_POLICY = """\
 # Layer-0 smoke policy: attach to all three data-plane ports, count
@@ -234,7 +341,7 @@ def fctl_status() -> dict:
     return {}
 
 
-def counter_slots() -> dict:
+def counter_slots(current: str = "") -> dict:
   """{zone: {counter_name: slot}} from the running bundle's own C.
 
   The name->slot mapping is the `fwl_counter_table` comment block the
@@ -242,9 +349,15 @@ def counter_slots() -> dict:
   the point: a slot index is a number that stays valid while the policy
   under it changes, and this soak has to survive being read by somebody
   who did not deploy it.
+
+  `current` overrides the rig's bundle directory. It exists so that
+  `tier2_gateway_netns.py` reads its counters through THIS function
+  rather than through a copy of it — the reader is part of what the
+  VM has to validate, and a bench that reimplements it agrees with
+  itself.
   """
   table: dict[str, dict[str, int]] = {}
-  cur = os.path.join(BUNDLE_ROOT, "current")
+  cur = current or os.path.join(BUNDLE_ROOT, "current")
   try:
     names = sorted(os.listdir(cur))
   except OSError:
@@ -286,7 +399,8 @@ def _as_int(value) -> int:
   return int(value)
 
 
-def read_counters() -> dict:
+def read_counters(current: str = "", pin: str = "",
+                  qualify: bool = True) -> dict:
   """Every declared counter, by name, summed over CPUs.
 
   A counter the running bundle does not declare reads -1, never 0.
@@ -294,11 +408,39 @@ def read_counters() -> dict:
   cannot tell them apart is not checking anything — four assertions in
   the hardware suite were satisfied by a silently renamed counter before
   hw::counter started saying -1.
+
+  A name declared by MORE THAN ONE zone is keyed `<zone>.<name>` and
+  the bare name is not emitted at all. `fwl_counters` is
+  MapScope.PRIVATE — slot i is THIS zone's i-th counter — so one name
+  in two zones is two independent kernel counters, and the earlier
+  spelling of this function wrote them both to one dictionary key and
+  kept whichever zone it read last. That was invisible while every
+  counter in this soak's policy was unique to its zone. It stops being
+  invisible the moment a SHARED HELPER declares one: `t2_noise`'s
+  counters are compiled into inc.bpf.o and ind.bpf.o both, and reading
+  one of them as if it were the pair is exactly the reading that would
+  hide a helper that had stopped working in one object. (`hw::counter`
+  in hwlib.sh has the same shape and takes the FIRST zone instead;
+  named here rather than fixed there, because a shell scenario that
+  deploys a one-zone policy cannot reach the case.)
+
+  `qualify=False` restores the older spelling exactly. It is not a
+  compatibility shim for its own sake: the epoch a sample is taken
+  under decides it (`EPOCHS[n]["qualify_duplicates"]`), so a counter
+  can only change name AT a declared policy boundary and never inside
+  one. A rename inside an epoch reads as a counter that vanished, and
+  the report fails on that — correctly.
   """
   values: dict[str, int] = {}
-  for zone, slots in counter_slots().items():
+  slots_by_zone = counter_slots(current)
+  root = pin or PIN
+  seen: dict[str, int] = {}
+  for slots in slots_by_zone.values():
+    for name in slots:
+      seen[name] = seen.get(name, 0) + 1
+  for zone, slots in slots_by_zone.items():
     dumped = out(["bpftool", "map", "dump", "pinned",
-                  f"{PIN}/fwl_counters_{zone}"], timeout=30)
+                  f"{root}/fwl_counters_{zone}"], timeout=30)
     per_slot: dict[int, int] = {}
     try:
       for entry in json.loads(dumped or "[]"):
@@ -307,8 +449,46 @@ def read_counters() -> dict:
     except (json.JSONDecodeError, KeyError, TypeError, ValueError):
       per_slot = {}
     for name, slot in slots.items():
-      values[name] = per_slot.get(slot, -1) if per_slot else -1
+      key = name if (seen[name] == 1 or not qualify) else \
+          f"{zone}.{name}"
+      values[key] = per_slot.get(slot, -1) if per_slot else -1
   return values
+
+
+def read_state() -> dict:
+  """The run's state file, or {} when there is no run."""
+  try:
+    with open(STATE) as fh:
+      return json.load(fh)
+  except (OSError, json.JSONDecodeError):
+    return {}
+
+
+def current_epoch() -> int:
+  """Which policy this box is soaking, as an integer.
+
+  Only `append` moves it, and it moves only after the reload has been
+  proven to have taken. A sample written before the field existed has
+  no `epoch` key at all, which the report reads as epoch 1.
+  """
+  epoch = read_state().get("epoch", FIRST_EPOCH)
+  return epoch if epoch in EPOCHS else FIRST_EPOCH
+
+
+def traffic_units(epoch: int) -> tuple:
+  """The generator units that must be running under this epoch."""
+  if epoch >= 2:
+    return TRAFFIC_UNITS + T2_TRAFFIC_UNITS
+  return TRAFFIC_UNITS
+
+
+def sha256(path: str) -> str:
+  """The policy's own digest, so a reader can tell one from another."""
+  try:
+    with open(path, "rb") as fh:
+      return hashlib.sha256(fh.read()).hexdigest()
+  except OSError:
+    return ""
 
 
 def map_entries(pin: str) -> int:
@@ -388,11 +568,20 @@ def readings() -> dict:
   nic = hwmon_by_name("i350bb")
   errs = out(["journalctl", "-u", "fd", "--since", "-5min", "-p", "err",
               "--no-pager", "-q"], timeout=30)
+  state = read_state()
+  epoch = current_epoch()
   return {
     "ts": now(),
     "boot_id": out(["cat", "/proc/sys/kernel/random/boot_id"]),
     "uptime_s": int(float(open("/proc/uptime").read().split()[0])),
-    "counters": read_counters(),
+    # Which policy this sample was taken under. Every counter below is
+    # read out of a MapLifetime.POLICY map, so this field is what
+    # makes the numbers either side of an `append` comparable to
+    # themselves and not to each other.
+    "epoch": epoch,
+    "policy_sha": state.get("policy_sha", ""),
+    "counters": read_counters(
+      qualify=EPOCHS[epoch].get("qualify_duplicates", True)),
     "nat": section("nat", "enabled", "entries", "installed",
                    "total_reclaimed", "refused", "table_full",
                    "occupancy_pct", "high_water", "denat",
@@ -426,7 +615,7 @@ def readings() -> dict:
     },
     "linkup_total": link_up_events(),
     "traffic_active": [out(["systemctl", "is-active", u])
-                       for u in TRAFFIC_UNITS],
+                       for u in traffic_units(epoch)],
     "sys": {
       "soc_temp_mC": read_int(soc),
       "i350_die_mC": read_int(nic) if nic else -1,
@@ -497,7 +686,7 @@ def _collect(proc, timeout: float) -> dict:
     return {"error": "no report"}
 
 
-def probe() -> dict:
+def probe(epoch: int = 0) -> dict:
   """One sample's wire witnesses. Real sockets on real stacks only.
 
   The two guest namespaces and the far side are ordinary Linux hosts
@@ -507,9 +696,18 @@ def probe() -> dict:
   three-way handshake. The box's own client runs in the ROOT namespace,
   because the flow this soak needs it to originate is the appliance's
   own.
+
+  `epoch` names the shape to probe and defaults to the running one.
+  `append` passes it explicitly — it has to prove the four-zone wire
+  BEFORE the run is declared to be at epoch 2, and writing a
+  provisional epoch into the state file to arrange that would leave a
+  stray epoch-2 sample in the log if the append then rolled back.
   """
   started = time.monotonic()
-  want = CONNS_PER_ZONE * 2
+  epoch = epoch or current_epoch()
+  zones = EPOCHS[epoch]["zones"]
+  namespaces = {"a": NS_A, "b": NS_B, "c": NS_C, "d": NS_D}
+  want = CONNS_PER_ZONE * len(zones)
   srv_guest = _realsock("server", NS_S, SERVER, PORT_GUEST, want, 14)
   srv_box = _realsock("server", NS_S, SERVER, PORT_BOX, 1, 14)
   time.sleep(0.5)
@@ -529,19 +727,18 @@ def probe() -> dict:
     except (AttributeError, json.JSONDecodeError, IndexError):
       return {"error": "no report"}
 
-  with futures.ThreadPoolExecutor(max_workers=3) as pool:
-    fut_a = pool.submit(client, NS_A)
-    fut_b = pool.submit(client, NS_B)
+  result = {}
+  with futures.ThreadPoolExecutor(max_workers=len(zones) + 1) as pool:
+    guests = {z: pool.submit(client, namespaces[z]) for z in zones}
     fut_box = pool.submit(box_client)
-    result = {
-      "a": parse(fut_a.result()),
-      "b": parse(fut_b.result()),
-      "box": parse(fut_box.result()),
-    }
+    for zone, fut in guests.items():
+      result[zone] = parse(fut.result())
+    result["box"] = parse(fut_box.result())
   result["srv"] = _collect(srv_guest, 18)
   result["boxsrv"] = _collect(srv_box, 18)
   result["want_per_zone"] = CONNS_PER_ZONE
   result["masq_addr"] = MASQ_ADDR
+  result["epoch"] = epoch
   result["elapsed_s"] = round(time.monotonic() - started, 2)
   return result
 
@@ -557,12 +754,77 @@ def _xdp_pass_object() -> str:
   """
   obj = "/run/gwsoak_xdp_pass.o"
   src = os.path.join(HERE, "..", "xdp_pass.bpf.c")
+  # Both multiarch include roots are offered and the missing one is
+  # harmless: this file has to build on the rig (aarch64) and on the
+  # x86_64 VM the Tier 2 additions were validated on, and hard-coding
+  # one triplet made the VM run die on a header rather than on
+  # anything about the firewall.
   proc = run(["clang", "-O2", "-g", "-target", "bpf",
               "-I/usr/include/aarch64-linux-gnu",
+              "-I/usr/include/x86_64-linux-gnu",
               "-c", src, "-o", obj])
   if proc.returncode != 0:
     sys.exit(f"compiling xdp_pass failed: {proc.stderr}")
   return obj
+
+
+def _veth_leg(dev: str, peer: str, ns: str, gw: str, guest: str,
+              obj: str) -> None:
+  """One inside zone on a veth pair, with a host on the far end.
+
+  The offload flags are not optional. A veth pair keeps
+  CHECKSUM_PARTIAL end to end — the header carries the pseudo-header
+  sum and never the final one — so the NAT's incremental update lands
+  on a base that was never valid and the far stack drops the frame
+  with Tcp:InCsumErrors. On copper the sending NIC has computed it
+  already. Neither is the XDP program on the peer: veth's
+  ndo_xdp_xmit needs one on the RECEIVING side or a redirect into the
+  leg is dropped below the peer's stack and no socket ever sees it.
+  """
+  run(["ip", "link", "add", dev, "type", "veth", "peer", "name", peer],
+      check=True)
+  run(["ip", "netns", "add", ns], check=True)
+  run(["ip", "link", "set", peer, "netns", ns], check=True)
+  run(["ip", "link", "set", dev, "up"], check=True)
+  run(["ip", "link", "set", "lo", "up"], ns=ns)
+  run(["ip", "link", "set", peer, "up"], ns=ns)
+  run(["ip", "addr", "add", f"{guest}/24", "dev", peer], ns=ns)
+  run(["ip", "route", "add", "default", "via", gw, "dev", peer], ns=ns)
+  for end, where in ((dev, None), (peer, ns)):
+    run(["ethtool", "-K", end, "tx", "off", "rx", "off", "tso", "off",
+         "gso", "off", "gro", "off"], ns=where)
+  if run(["ip", "link", "set", "dev", peer, "xdpdrv", "obj", obj,
+          "sec", "xdp"], ns=ns).returncode != 0:
+    run(["ip", "link", "set", "dev", peer, "xdp", "obj", obj,
+         "sec", "xdp"], ns=ns, check=True)
+  if "PROMISC" in out(["ip", "link", "show", peer], ns=ns):
+    sys.exit(f"{ns}/{peer} is PROMISC; it would accept frames a real "
+             f"host drops")
+
+
+def topology_t2_up() -> None:
+  """The two Tier 2 legs, built without disturbing anything running.
+
+  Separate from `topology_up` on purpose: this runs on a box that is
+  MID-SOAK. It touches nothing that exists — no address on f0/f1/f2,
+  no route, no neighbour entry, no interface flag — and everything it
+  does create is named `fs4*` or `gwsc`/`gwsd`, so `topology_t2_down`
+  can be exact rather than best-effort.
+  """
+  topology_t2_down()
+  obj = _xdp_pass_object()
+  _veth_leg(INC_IF, INC_PEER, NS_C, INC_ADDR, GUEST_C, obj)
+  _veth_leg(IND_IF, IND_PEER, NS_D, IND_ADDR, GUEST_D, obj)
+  run(["ip", "addr", "add", f"{INC_ADDR}/24", "dev", INC_IF])
+  run(["ip", "addr", "add", f"{IND_ADDR}/24", "dev", IND_IF])
+
+
+def topology_t2_down() -> None:
+  """Take the Tier 2 legs off the box. Idempotent, and exact."""
+  for dev, ns in ((INC_IF, NS_C), (IND_IF, NS_D)):
+    run(["ip", "link", "set", "dev", dev, "xdp", "off"])
+    run(["ip", "link", "del", dev])
+    run(["ip", "netns", "del", ns])
 
 
 def topology_up() -> None:
@@ -656,6 +918,7 @@ def _host_up(ns: str, parent: str, vlan, cidr: str, gw) -> None:
 
 def topology_down() -> None:
   """Take everything this harness made off the box. Idempotent."""
+  topology_t2_down()
   run(["ip", "route", "del", CHURN_NET, "via", CHURN_GW, "dev",
        WAN_IF])
   run(["ip", "neigh", "del", CHURN_GW, "dev", WAN_IF])
@@ -798,7 +1061,7 @@ def cmd_start(args) -> int:
       raise
     print(f"start did not complete ({exc}); restoring the walk-up "
           f"state")
-    for unit in TRAFFIC_UNITS:
+    for unit in TRAFFIC_UNITS + T2_TRAFFIC_UNITS:
       run(["systemctl", "stop", unit])
     run(["systemctl", "stop", SAMPLE_UNIT + ".timer"])
     restore_smoke()
@@ -864,6 +1127,11 @@ def _start(args) -> int:
       "bundle": BUNDLE,
       "masq_addr": MASQ_ADDR,
       "wire_flags_as_found": found,
+      "epoch": FIRST_EPOCH,
+      "policy_sha": sha256(POLICY),
+      "epochs": [{"epoch": FIRST_EPOCH, "from": now(),
+                  "policy": POLICY, "policy_sha": sha256(POLICY),
+                  "what": EPOCHS[FIRST_EPOCH]["what"]}],
       "note": "does not stop itself; `gwsoak.py stop` ends it",
     }, fh, indent=2)
 
@@ -922,34 +1190,44 @@ def _start(args) -> int:
   return 0
 
 
-def verify_probe(result: dict) -> list:
+def verify_probe(result: dict, epoch: int = FIRST_EPOCH) -> list:
   """The wire claims a sample has to satisfy, in one place.
 
   Shared by `start` (which refuses to soak a gateway that does not
-  work) and by gwsoak_report.py (which re-derives the verdict from the
-  log alone). One implementation, so the bar a run is judged against
-  cannot drift from the bar it was admitted on.
+  work), by `append` (which refuses to widen a run onto a gateway that
+  does not work) and by gwsoak_report.py (which re-derives the verdict
+  from the log alone). One implementation, so the bar a run is judged
+  against cannot drift from the bar it was admitted on.
+
+  The bar is a function of the EPOCH and not of the probe. A sample
+  taken under epoch 2 is judged on four inside zones whether or not
+  its probe recorded four, because a bar derived from what the
+  instrument happened to write down is a bar an instrument that wrote
+  nothing down would pass.
   """
   want = result.get("want_per_zone", CONNS_PER_ZONE)
   masq = result.get("masq_addr", MASQ_ADDR)
+  zones = EPOCHS.get(epoch, EPOCHS[FIRST_EPOCH])["zones"]
+  total = want * len(zones)
   bad = []
-  for zone in ("a", "b"):
+  for zone in zones:
     got = result.get(zone, {})
     if got.get("completed", -1) != want:
       bad.append(f"zone {zone} completed "
                  f"{got.get('completed', 'no report')}/{want} "
                  f"end-to-end exchanges")
   srv = result.get("srv", {})
-  if srv.get("accepted", -1) != want * 2:
+  if srv.get("accepted", -1) != total:
     bad.append(f"the far side accepted {srv.get('accepted', 'nothing')}"
-               f" of {want * 2}")
-  if srv.get("echoed", -1) != want * 2:
+               f" of {total}")
+  if srv.get("echoed", -1) != total:
     bad.append(f"the far side echoed {srv.get('echoed', 'nothing')} "
-               f"of {want * 2}")
+               f"of {total}")
   if srv.get("peer_addrs") != [masq]:
     bad.append(f"the far side's own kernel saw peers "
                f"{srv.get('peer_addrs')}, wanted exactly [{masq}] "
-               f"(both zones masquerading to the one uplink address)")
+               f"(all {len(zones)} inside zones masquerading to the "
+               f"one uplink address)")
   box = result.get("box", {})
   if box.get("completed", -1) != 1:
     bad.append("the flow the BOX originated did not complete through "
@@ -964,7 +1242,8 @@ def cmd_sample(args) -> int:
   require_root()
   sample = readings()
   sample["probe"] = probe()
-  sample["wire_problems"] = verify_probe(sample["probe"])
+  sample["wire_problems"] = verify_probe(sample["probe"],
+                                         sample["epoch"])
   with open(LOG, "a") as fh:
     fh.write(json.dumps(sample, sort_keys=True) + "\n")
   return 0
@@ -974,10 +1253,233 @@ def cmd_probe(args) -> int:
   require_root()
   result = probe()
   print(json.dumps(result, indent=2))
-  problems = verify_probe(result)
+  problems = verify_probe(result, result.get("epoch", FIRST_EPOCH))
   for problem in problems:
     print(f"BAD: {problem}")
   return 1 if problems else 0
+
+
+def _hot_reload(policy: str, want_ifaces: int, tag: str) -> bool:
+  """Hand a policy to fd's watcher and wait for it to be adopted.
+
+  This is NOT `deploy`. `deploy` stops fd, moves the `current`
+  symlink and starts it again — a cold restart, which on a running
+  soak would bump NRestarts (the report fails on that, correctly),
+  detach every XDP program, and drop `ip_forward` on the way through.
+  The watcher path is the product's own hot reload: fd recompiles
+  /etc/f/rules.fw, builds a bundle, swaps `current` atomically and
+  reloads without the process going anywhere. It is the same path
+  l3_01 measures zero packet loss across.
+
+  Returns True once `current` has MOVED and the datapath is attached
+  to `want_ifaces` interfaces. A reload that is refused leaves the
+  running bundle intact — that is l3_06 — so a False here means the
+  run is still on the policy it was on.
+  """
+  before = os.path.realpath(os.path.join(BUNDLE_ROOT, "current"))
+  shutil.copyfile(policy, RULES)
+  print(f"handed {tag} to fd's watcher at {RULES}; waiting for the "
+        f"atomic swap")
+  for _ in range(120):
+    time.sleep(1)
+    after = os.path.realpath(os.path.join(BUNDLE_ROOT, "current"))
+    if after == before:
+      continue
+    status = fctl_status()
+    attached = sum(1 for i in status.get("interfaces", {})
+                   .get("interfaces", []) if i.get("xdp_attached"))
+    if attached >= want_ifaces:
+      print(f"adopted: {before} -> {after}, XDP on {attached} "
+            f"interface(s)")
+      return True
+  after = os.path.realpath(os.path.join(BUNDLE_ROOT, "current"))
+  print(f"the watcher did not adopt {tag}: current is {after} "
+        f"(was {before})")
+  print(out(["journalctl", "-u", "fd", "-n", "30", "--no-pager"]))
+  return False
+
+
+def cmd_append(args) -> int:
+  """Widen a RUNNING soak onto the Tier 2 emission path.
+
+  Deliberately not a scenario. Every hardware scenario's EXIT trap
+  calls `hw::restore_smoke`, which would end this run silently; this
+  command touches the policy and nothing else, and every failure path
+  puts the epoch-1 policy back rather than leaving a half-widened
+  bench nobody can read.
+
+  What it does NOT do, and each omission is load-bearing: it does not
+  stop or restart fd, it does not touch the `current` symlink itself,
+  it does not stop the running generators or the sampler, it does not
+  write net.ipv4.ip_forward, it does not touch f0/f1/f2 or any address
+  or flag that already exists, and it does not truncate the log. The
+  run continues; its second half is simply wider.
+  """
+  require_root()
+  state = read_state()
+  if not state:
+    sys.exit(f"no run in progress ({STATE} is missing); `append` "
+             f"widens a soak that is already going")
+  if state.get("epoch", FIRST_EPOCH) >= 2:
+    sys.exit(f"this run is already at epoch {state['epoch']}")
+  for unit in TRAFFIC_UNITS + (SAMPLE_UNIT + ".timer",):
+    if out(["systemctl", "is-active", unit]) != "active":
+      sys.exit(f"{unit} is not active; there is no healthy run to "
+               f"widen — read `gwsoak.py status` first")
+
+  # Refuse to widen a run that is not green. Appending to a failing
+  # soak would put a policy change into the middle of the evidence
+  # somebody is trying to read.
+  verdict = subprocess.run(
+    [sys.executable, os.path.join(HERE, "gwsoak_report.py"), LOG],
+    capture_output=True, text=True)
+  if verdict.returncode != 0:
+    print(verdict.stdout)
+    sys.exit(f"the run is not green (report exit {verdict.returncode});"
+             f" refusing to change policy under it")
+  print("the run is green so far; widening it")
+
+  # Compile FIRST, into a scratch directory, so a policy that cannot
+  # be built never reaches /etc/f/rules.fw and the watcher never sees
+  # it. `fwl check` alone is not enough — it does not clang.
+  scratch = "/run/gwsoak-append-check"
+  shutil.rmtree(scratch, ignore_errors=True)
+  if run(["fwl", "check", POLICY_T2]).returncode != 0:
+    sys.exit(f"the epoch-2 policy is rejected: {POLICY_T2}")
+  built = run(["fwl", "compile", "--bundle", scratch, POLICY_T2],
+              timeout=900)
+  if built.returncode != 0:
+    sys.exit(f"the epoch-2 policy does not compile: {built.stderr}")
+  with open(os.path.join(scratch, "manifest.json")) as fh:
+    if '"object": null' in fh.read():
+      sys.exit("the epoch-2 bundle has uncompiled zone objects")
+  print(f"epoch-2 policy compiles: 5 zone objects in {scratch}")
+
+  # The interfaces have to exist BEFORE the reload: fd attaches to the
+  # interfaces the manifest names, and a zone whose interface is
+  # missing is warned about and skipped, which would leave a
+  # five-zone bundle running as a three-zone one.
+  print("== building the two Tier 2 legs ==")
+  topology_t2_up()
+  for iface, addr in ((INC_IF, GUEST_C), (IND_IF, GUEST_D)):
+    run(["ping", "-c1", "-W2", "-I", iface, addr], timeout=15)
+
+  print("== hot reload ==")
+  if not _hot_reload(POLICY_T2, 5, "the epoch-2 policy"):
+    print("rolling back to the epoch-1 policy")
+    _hot_reload(POLICY, 3, "the epoch-1 policy")
+    topology_t2_down()
+    sys.exit("append failed; the run continues at epoch 1")
+
+  status = fctl_status()
+  nat = status.get("nat", {})
+  sources = sorted(f"{e['zone']}={e['address']}"
+                   for e in nat.get("masq_sources", []))
+  egress = status.get("egress", {})
+  print(f"masquerade sources: {' '.join(sources) or '(none)'}")
+  print(f"egress tracker on {egress.get('attached', -1)} interface(s)")
+  problems = []
+  if len(sources) != 4:
+    problems.append(f"expected four masquerading zones, got {sources}")
+  if not all(s.endswith(MASQ_ADDR) for s in sources):
+    problems.append(f"every zone must resolve {MASQ_ADDR}: {sources}")
+  if egress.get("attached", 0) < 5:
+    problems.append("the egress tracker is not on every interface")
+  names = set(read_counters(qualify=True))
+  for wanted in ("c_total", "d_total", "inc.t2_mcast", "ind.t2_mcast"):
+    if wanted not in names:
+      problems.append(f"counter {wanted} is not in the running bundle")
+
+  print("== proving the wider wire before the epoch moves ==")
+  # The epoch has NOT moved yet — nothing may declare it moved until
+  # the four new zones have been witnessed by a real socket — so the
+  # wider shape is asked for explicitly rather than by writing a
+  # provisional epoch into the state file, which would leave a stray
+  # epoch-2 sample in the log if this rolled back.
+  first = probe(2)
+  problems += verify_probe(first, 2)
+  if problems:
+    print(json.dumps(first, indent=2))
+    for problem in problems:
+      print(f"  BAD: {problem}")
+    print("rolling back to the epoch-1 policy")
+    _hot_reload(POLICY, 3, "the epoch-1 policy")
+    topology_t2_down()
+    sys.exit("the widened gateway does not work; the run continues "
+             "at epoch 1")
+
+  print("== starting the two Tier 2 generators ==")
+  gen = os.path.join(HERE, "gwsoak_traffic.py")
+  jobs = (
+    (T2_TRAFFIC_UNITS[0], NS_C,
+     ["--role", "t2inside", "--iface", INC_PEER, "--zone", "c",
+      "--dst-mac", iface_mac(INC_IF),
+      "--src-mac", iface_mac(INC_PEER, ns=NS_C)]),
+    (T2_TRAFFIC_UNITS[1], NS_D,
+     ["--role", "t2inside", "--iface", IND_PEER, "--zone", "d",
+      "--dst-mac", iface_mac(IND_IF),
+      "--src-mac", iface_mac(IND_PEER, ns=NS_D)]),
+  )
+  for unit, ns, extra in jobs:
+    run(["systemctl", "stop", unit])
+    run(["systemd-run", f"--unit={unit}",
+         "--property=Restart=always", "--property=RestartSec=5",
+         "--setenv=PYTHONPATH=/opt/fwl:/opt/fwl-deps",
+         "ip", "netns", "exec", ns, sys.executable, gen] + extra,
+        check=True)
+  # A generator that silently sends nothing would leave both Tier 2
+  # zones idle for days while every sample still passed, so it is
+  # proven here rather than assumed.
+  before = read_counters(qualify=True)
+  time.sleep(8)
+  after = read_counters(qualify=True)
+  moved = [n for n in ("c_total", "d_total", "inc.t2_mcast",
+                       "ind.t2_mcast")
+           if after.get(n, -1) > before.get(n, -1)]
+  print(f"under the Tier 2 generators, moved in 8 s: {moved}")
+  if len(moved) != 4:
+    print("the Tier 2 generators put nothing through the new zones")
+
+  # A run started before epochs existed has no record of its first
+  # one, and the report would have to fall back on a constant to say
+  # what the samples before the boundary were taken under. Backfill it
+  # from what the state file DOES know, so both halves are described
+  # by the same mechanism.
+  history = list(state.get("epochs", []))
+  if not any(e.get("epoch") == FIRST_EPOCH for e in history):
+    history.insert(0, {
+      "epoch": FIRST_EPOCH,
+      "from": state.get("started", ""),
+      "policy": state.get("policy", POLICY),
+      "policy_sha": sha256(state.get("policy", POLICY)),
+      "what": EPOCHS[FIRST_EPOCH]["what"],
+    })
+  _write_state(dict(
+    state,
+    epoch=2,
+    policy=POLICY_T2,
+    policy_sha=sha256(POLICY_T2),
+    epochs=history + [{
+      "epoch": 2, "from": now(), "policy": POLICY_T2,
+      "policy_sha": sha256(POLICY_T2), "what": EPOCHS[2]["what"],
+    }],
+  ))
+  shutil.rmtree(scratch, ignore_errors=True)
+  cmd_sample(args)
+  print()
+  print(f"APPENDED. Epoch 2 from {now()}.")
+  print("The report marks the boundary and judges each epoch's "
+        "counters against that epoch's own baseline:")
+  print(f"  python3 {HERE}/gwsoak_report.py {LOG}")
+  return 0
+
+
+def _write_state(state: dict) -> None:
+  """Replace the state file atomically."""
+  tmp = STATE + ".new"
+  with open(tmp, "w") as fh:
+    json.dump(state, fh, indent=2)
+  os.rename(tmp, STATE)
 
 
 def cmd_status(args) -> int:
@@ -989,7 +1491,9 @@ def cmd_status(args) -> int:
   non-zero on its own rather than waiting for the log to agree.
   """
   dead = []
-  for unit in TRAFFIC_UNITS + (SAMPLE_UNIT + ".timer",):
+  epoch = current_epoch()
+  print(f"epoch: {epoch} — {EPOCHS[epoch]['what']}")
+  for unit in traffic_units(epoch) + (SAMPLE_UNIT + ".timer",):
     state = out(["systemctl", "is-active", unit])
     print(f"{unit}: {state}")
     if state != "active":
@@ -1005,7 +1509,7 @@ def cmd_status(args) -> int:
 
 def cmd_stop(args) -> int:
   require_root()
-  for unit in TRAFFIC_UNITS:
+  for unit in TRAFFIC_UNITS + T2_TRAFFIC_UNITS:
     run(["systemctl", "stop", unit])
   run(["systemctl", "stop", SAMPLE_UNIT + ".timer"])
   run(["systemctl", "stop", SAMPLE_UNIT])
@@ -1079,11 +1583,13 @@ def main() -> int:
   sub.add_parser("sample", help="append one sample (timer-driven)")
   sub.add_parser("probe", help="the wire witness alone, by hand")
   sub.add_parser("status", help="live glance + verdict so far")
+  sub.add_parser("append", help="widen a running soak onto the Tier 2 "
+                                "emission path, by hot reload")
   sub.add_parser("stop", help="end it and restore the smoke policy")
   args = parser.parse_args()
   return {
     "start": cmd_start, "sample": cmd_sample, "probe": cmd_probe,
-    "status": cmd_status, "stop": cmd_stop,
+    "status": cmd_status, "append": cmd_append, "stop": cmd_stop,
   }[args.cmd](args)
 
 
