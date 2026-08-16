@@ -22,6 +22,7 @@
 #include "f/error.h"
 #include "f/iface_mgr.h"
 #include "f/nat_mgr.h"
+#include "f/neigh_mgr.h"
 #include "f/route_mgr.h"
 #include "f/protocol.h"
 #include "f/types.h"
@@ -71,6 +72,13 @@ struct Engine {
   ConntrackMgr conntrack;
   NatMgr nat;
   RouteMgr route;
+  // Beside RouteMgr and not inside it, because they answer opposite
+  // questions about the same event: RouteMgr REPORTS that forwards were
+  // lost, NeighMgr acts so that the next one is not. Folding the second
+  // into the first is how the report would end up conditional on the
+  // cure — and the whole reason this defect stayed invisible for a week
+  // is that the box had no honest report of it.
+  NeighMgr neigh;
   EgressMgr egress;
 
   // Source file-watcher / hot-reload state (ReloadFromSource reads
@@ -150,6 +158,18 @@ auto AttachNatMgr(Engine& e) -> void;
 /// capture, so this component going blind has no other symptom. Third
 /// site of the same defect, after NAT and egress.
 auto AttachRouteMgr(Engine& e) -> void;
+
+/// Point NeighMgr at the loaded bundle's unresolved-next-hop queue, and
+/// at the interfaces the datapath is on.
+///
+/// Called from the same two places as the three above, and AFTER
+/// `e.ifaces` has been re-derived at each of them, because the
+/// interface list is not decoration here — it is the gate that decides
+/// which interfaces this daemon may put ARP on. A stale list would let
+/// it solicit through a port the current policy has left, and the port
+/// this box is administered over is exactly the one that must never be
+/// reachable that way.
+auto AttachNeighMgr(Engine& e) -> void;
 
 /// Decide `net.ipv4.ip_forward` from what is actually in the packet
 /// path, and write it. `when` names the moment for the journal and for

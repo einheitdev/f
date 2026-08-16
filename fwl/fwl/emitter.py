@@ -219,6 +219,30 @@ _MAP_KINDS: tuple[_MapKind, ...] = (
     ),
   ),
   _MapKind(
+    r"fwl_neigh_wanted", MapScope.SHARED,
+    "the next hops the box could not address a forward to. The "
+    "neighbour table is the HOST's, not a zone's: two zones redirecting "
+    "to one uplink want the same gateway resolved, and resolving it "
+    "once serves both. Keyed by (ifindex, next hop) — kernel facts, not "
+    "anything a zone's analysis produces — and sized from a constant, "
+    "so the shape and the contents are bundle-wide by the same "
+    "argument that puts fwl_route_stats here. It also has to be ONE "
+    "map for a reason the counters do not have: `fd` drains it and "
+    "solicits what is in it, and a per-zone copy would make the queue "
+    "the daemon reads depend on which zone's object it happened to "
+    "open",
+    lifetime=MapLifetime.POLICY,
+    lifetime_why=(
+      "an entry is a demand THIS policy's datapath made. The next "
+      "policy may not redirect there at all, and carrying the queue "
+      "across a reload would have the daemon put ARP on the wire for a "
+      "next hop nothing routes to any more — the one thing a component "
+      "that originates traffic must not do. Nothing is lost by "
+      "dropping it: a next hop the new policy does route to is "
+      "re-recorded by the first frame that needs it"
+    ),
+  ),
+  _MapKind(
     r"fwl_nat_cfg", MapScope.PRIVATE,
     "slot 0 is THIS zone's masquerade source — the address of the "
     "zone it redirects to — and nothing makes two masquerading zones "
@@ -1501,6 +1525,50 @@ struct {
   __type(key, __u32);
   __type(value, __u64);
 } fwl_route_stats SEC(".maps");
+
+// The next hop a forward could not be addressed to, so that something
+// with a socket can ask the kernel to resolve it.
+//
+// A counter says a frame was lost; it cannot say WHICH next hop was
+// missing, and that is the whole difficulty. XDP hands an unresolvable
+// frame to the stack precisely so the stack will ARP for it, and on a
+// SOURCE-TRANSLATED frame the stack never gets that far —
+// `fib_validate_source` discards it as a martian because its source is
+// now one of this box's own addresses, before anything asks for a
+// neighbour. So no ARP is sent, the table stays empty, and every frame
+// after it meets the same empty table. Measured under qemu on
+// 2026-08-15: seven forwarded frames spanning a TCP client's entire
+// retry window, `routed` 0, nothing on the far wire, and afterwards NO
+// neighbour entry of ANY state for that next hop.
+//
+// `bpf_fib_lookup` has already computed the answer by the time it
+// returns NO_NEIGH — `fib.ipv4_dst` holds the next hop (the gateway for
+// a via route, the destination itself when it is on-link) and
+// `fib.ifindex` the egress device — so the address costs nothing to
+// record and cannot be got any other way. `fd` drains this map and asks
+// the KERNEL to resolve what is in it; it puts no IP packet on the wire
+// of its own (src/neigh_mgr.cc).
+//
+// Bounded on purpose. A hash of at most FWL_NEIGH_WANTED_MAX entries,
+// written only from the NO_NEIGH branch and only for a next hop out of
+// the interface the policy's own redirect named — so the set of
+// addresses this box can ever be made to ARP for is the set its
+// datapath demonstrably tried to forward to, and nothing else. An
+// update that does not fit is dropped silently; the counter above is
+// what says a frame was lost, and it is not conditional on this.
+#define FWL_NEIGH_WANTED_MAX 64
+
+struct fwl_nexthop {
+  __u32 ifindex;
+  __be32 addr;
+};
+
+struct {
+  __uint(type, BPF_MAP_TYPE_HASH);
+  __uint(max_entries, FWL_NEIGH_WANTED_MAX);
+  __type(key, struct fwl_nexthop);
+  __type(value, __u64);
+} fwl_neigh_wanted SEC(".maps");
 """
 
 
@@ -1515,6 +1583,25 @@ _ROUTE_HELPERS = """\
 static __always_inline void fwl_route_stat(__u32 slot) {
   __u64 *c = bpf_map_lookup_elem(&fwl_route_stats, &slot);
   if (c) __sync_fetch_and_add(c, 1);
+}
+
+// Record a next hop this box has no neighbour entry for, with the time
+// the datapath last wanted it. The timestamp is what lets `fd` stop
+// soliciting an address nothing is routing to any more: a stale entry
+// is one the datapath has not re-recorded, and an entry nobody deletes
+// would have this daemon ARPing for a dead gateway forever.
+//
+// The failure to insert is deliberately silent. This map is an aid to
+// resolution, not the accounting — FWL_ROUTE_STAT_NO_NEIGH is
+// incremented before this is called and whether or not it succeeds, so
+// a full table makes the box slower to heal and never makes the loss
+// invisible.
+static __always_inline void fwl_want_neigh(__u32 ifindex, __be32 addr) {
+  struct fwl_nexthop k = {};
+  k.ifindex = ifindex;
+  k.addr = addr;
+  __u64 now = bpf_ktime_get_ns();
+  bpf_map_update_elem(&fwl_neigh_wanted, &k, &now, BPF_ANY);
 }
 
 // RFC 1141 incremental checksum update for a TTL decrement. Written out
@@ -1583,9 +1670,7 @@ static __always_inline int fwl_route_l2(struct xdp_md *ctx,
     // thing here that can — and on a SOURCE-TRANSLATED frame it does
     // not: the source is one of our own addresses, fib_validate_source
     // throws it out as a martian BEFORE anything asks for a neighbour,
-    // and no ARP is sent. So this is a DROP that nothing retries into
-    // a success. Every frame after it meets the same empty table, and
-    // the counter is the only trace.
+    // and no ARP is sent. So this frame is lost whatever happens next.
     //
     // Measured under qemu on 2026-08-15, twice, on a box that had just
     // rebooted: 7 forwarded frames spanning a TCP client's entire retry
@@ -1595,8 +1680,22 @@ static __always_inline int fwl_route_l2(struct xdp_md *ctx,
     // box's own stack and the identical flow crossed. A box in this
     // state reads healthy everywhere else, which is why fd escalates
     // the report when routed is 0 (src/route_mgr.cc, adapter.cc).
+    //
+    // What the record below changes is only the SECOND frame's chances:
+    // the address goes into fwl_neigh_wanted, `fd` asks the kernel to
+    // resolve it, and the client's own retransmit finds a neighbour. It
+    // is written ONLY for a next hop out of the interface the policy's
+    // redirect named — the same test `off_zone` makes one branch down —
+    // because that is the only case where resolving it would let this
+    // forward succeed, and because it is what bounds the set of
+    // addresses `fd` can be made to ARP for to the ones a policy in the
+    // packet path routes to. The management port is not in that set on
+    // any box: nothing redirects to it, so no XDP program names it.
     if (rc == BPF_FIB_LKUP_RET_NO_NEIGH) {
       fwl_route_stat(FWL_ROUTE_STAT_NO_NEIGH);
+      if (fib.ifindex == zone_ifindex) {
+        fwl_want_neigh(fib.ifindex, fib.ipv4_dst);
+      }
       return XDP_PASS;
     }
     return FWL_ROUTE_BRIDGE;

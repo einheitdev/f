@@ -395,14 +395,30 @@ auto RenderShowStatus(const Response& resp,
       // routed 0, nothing on the far wire, and the same flow crossed
       // immediately after a ping from the box. If the cure is not on
       // this screen it is on no screen.
+      //
+      // The cure moved into the daemon: the datapath records the
+      // address it could not resolve and fd asks the KERNEL to resolve
+      // it, so on a current bundle the operator's next move is to read
+      // the `next_hop` row rather than to ping anything. On a bundle
+      // compiled before that map existed nothing is asking, and the
+      // hand cure is still the only one — so the sentence is chosen
+      // from a fact about this box rather than written for the case
+      // that was true last week.
+      bool resolving =
+          j.contains("neigh") && j["neigh"].value("enabled", false);
+      std::string cure =
+          resolving ? "fd has asked the kernel to resolve it; see "
+                      "next_hop."
+                    : "Nothing here will: ping the next hop FROM this "
+                      "box.";
       row("route_no_neighbour",
           routed == 0
               ? std::format("{} DROPPED — this box has not resolved "
-                            "its next hop and nothing is crossing. "
-                            "Ping the next hop FROM this box.",
-                            no_neigh)
-              : std::format("{} lost (next hop not in the ARP table)",
-                            no_neigh),
+                            "its next hop and nothing is crossing. {}",
+                            no_neigh, cure)
+              : std::format("{} lost (next hop not in the ARP table). "
+                            "{}",
+                            no_neigh, cure),
           routed == 0 ? Semantic::Bad : Semantic::Warn);
     }
     auto off_zone = rt.value("off_zone", uint64_t{0});
@@ -415,6 +431,66 @@ auto RenderShowStatus(const Response& resp,
     auto ttl = rt.value("ttl_expired", uint64_t{0});
     if (ttl > 0) {
       row("route_ttl_expired", std::to_string(ttl), Semantic::Info);
+    }
+  }
+  // Whether this box has resolved the next hops it forwards through.
+  //
+  // A masquerading box cannot resolve one from the traffic it forwards
+  // — the frame XDP hands the stack carries one of this box's own
+  // addresses as its source and is discarded as a martian before
+  // anything ARPs — so `fd` takes the address the datapath recorded and
+  // asks the kernel for it. That is a daemon putting frames on somebody
+  // else's wire, and it is reported for that reason as much as for the
+  // diagnosis: an operator is entitled to see which addresses their
+  // firewall has been soliciting.
+  //
+  // Hidden when nothing has ever needed resolving, which is most boxes
+  // most of the time. A row that is always on the screen is a row
+  // nobody reads, and the state it would be reporting is the absence of
+  // an event.
+  if (j.contains("neigh")) {
+    auto& ng = j["neigh"];
+    auto unresolved = ng.value("unresolved", json::array());
+    auto solicited = ng.value("solicited", uint64_t{0});
+    auto resolved = ng.value("resolved", uint64_t{0});
+    bool predates = !ng.value("enabled", false) && j.contains("route") &&
+                    j["route"].value("enabled", false);
+    if (!unresolved.empty()) {
+      // The address, not the count. "1 unresolved" sends an operator
+      // looking; "10.10.2.2 on ifindex 3" tells them which cable.
+      std::string names;
+      for (const auto& nh : unresolved) {
+        if (!names.empty()) names += ", ";
+        names += std::format("{} on ifindex {}",
+                             nh.value("address", std::string{"?"}),
+                             nh.value("ifindex", 0));
+      }
+      row("next_hop",
+          std::format("NOT ANSWERING: {} — fd has asked the kernel to "
+                      "resolve {} and it is still unresolved. Nothing "
+                      "forwards through {} until it answers ARP: check "
+                      "the cable, the VLAN, and that the address is "
+                      "right.",
+                      names, solicited == 1 ? "it once" : "it",
+                      unresolved.size() == 1 ? "it" : "them"),
+          Semantic::Bad);
+    } else if (solicited > 0) {
+      row("next_hop",
+          std::format("{} resolved by fd ({} solicitation(s)) — this "
+                      "box asked the kernel for the next hops its "
+                      "datapath could not address and they answered",
+                      resolved, solicited),
+          Semantic::Good);
+    } else if (predates) {
+      // Third state, not a second: this bundle was compiled before the
+      // queue existed, so nothing is asking and nothing will. Such a
+      // box comes back from a reboot forwarding nothing until something
+      // it originates happens to go the same way.
+      row("next_hop",
+          "this bundle predates next-hop resolution, so after a reboot "
+          "a masquerading zone forwards nothing until something on "
+          "this box talks upstream first. Recompile the policy.",
+          Semantic::Warn);
     }
   }
   // Flows the BOX ITSELF starts. Rendered whenever the policy asks a

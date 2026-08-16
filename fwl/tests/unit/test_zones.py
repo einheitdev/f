@@ -424,3 +424,111 @@ class TestBackwardCompat:
     by_name = {z["name"]: z["interfaces"] for z in manifest["zones"]}
     assert by_name["lan"] == ["lan0", "lan1"]
     assert by_name["wan"] == ["wan0"]
+
+
+# --------------------------------------------------------------------
+class TestNextHopQueue:
+  """The next hops a masquerading box could not resolve (§ 6.3).
+
+  A box that masquerades cannot resolve a next hop from the traffic it
+  forwards, at all. `bpf_fib_lookup` answers NO_NEIGH, the datapath
+  hands the frame to the stack precisely so the stack will ARP for it,
+  and the stack discards it as a martian first — its source is one of
+  this box's own addresses now. So no ARP is sent, the table stays
+  empty, and every frame after it meets the same empty table. Measured
+  under qemu on 2026-08-15, twice: seven forwarded frames across a TCP
+  client's whole retry window, `routed` 0, nothing on the far wire, and
+  afterwards no neighbour entry of ANY state for that next hop.
+
+  The address is the one thing the datapath has and nothing else can
+  recover, so it records it and `fd` asks the kernel to resolve it.
+  These hold down what is recorded and, above all, WHEN — the record is
+  what bounds the set of addresses a firewall daemon can be made to put
+  ARP on somebody's wire for.
+  """
+
+  def test_a_redirecting_object_carries_the_queue(self):
+    c = _emit(WL + "@xdp(lan)\nmasquerade\nredirect to wan\n")
+    assert 'fwl_neigh_wanted SEC(".maps")' in c
+    assert "BPF_MAP_TYPE_HASH" in c
+
+  def test_the_counter_is_still_incremented(self):
+    # The report must not become conditional on the cure. `no_neigh` is
+    # what tells an operator frames were lost, and the whole shape of
+    # this defect was a box where everything read healthy.
+    c = _emit(WL + "@xdp(lan)\nmasquerade\nredirect to wan\n")
+    body = c[c.index("BPF_FIB_LKUP_RET_NO_NEIGH"):]
+    stat = body.index("fwl_route_stat(FWL_ROUTE_STAT_NO_NEIGH)")
+    want = body.index("fwl_want_neigh(")
+    assert stat < want, "the tally must not depend on the record"
+
+  def test_the_recorded_address_is_the_next_hop_not_the_destination(
+      self):
+    # `bpf_fib_lookup` overwrites ipv4_dst with the resolved next hop —
+    # the gateway for a via route, the destination itself when it is
+    # on-link. Recording the packet's own daddr instead would have `fd`
+    # ARP for a host two hops away, which nothing answers.
+    c = _emit(WL + "@xdp(lan)\nmasquerade\nredirect to wan\n")
+    assert "fwl_want_neigh(fib.ifindex, fib.ipv4_dst)" in c
+
+  def test_only_a_next_hop_out_of_the_named_zone_is_recorded(self):
+    # THE bound. The set of addresses this box can be made to ARP for is
+    # the set its datapath tried to forward to THROUGH THE ZONE THE
+    # POLICY NAMED — the same test `off_zone` makes one branch down. It
+    # is what keeps the management port out of it: nothing redirects to
+    # it, so no XDP program names it, so no row can name it.
+    c = _emit(WL + "@xdp(lan)\nmasquerade\nredirect to wan\n")
+    guarded = re.search(
+      r"if \(fib\.ifindex == zone_ifindex\) \{\s*"
+      r"fwl_want_neigh\(", c)
+    assert guarded, "the record must be gated on the policy's own zone"
+
+  def test_a_policy_that_cannot_redirect_carries_neither(self):
+    # Vacuity: the map is emitted with the routing helpers, and a
+    # program with no redirect has no next hop to fail to resolve.
+    c = _emit("@xdp(eth0)\nallow\n")
+    assert "fwl_neigh_wanted" not in c
+    assert "fwl_want_neigh" not in c
+
+  def test_the_key_is_what_the_daemon_reads(self):
+    # `fd` re-declares this key in C++ (src/neigh_mgr.cc, WantedKey)
+    # because a BPF map key has no header to share. Two declarations of
+    # one shape is the drift that fails silently — the daemon would read
+    # a queue of addresses that are not the addresses in it — so the
+    # shape is pinned here, where it is written.
+    c = _emit(WL + "@xdp(lan)\nredirect to wan\n")
+    decl = re.search(r"struct fwl_nexthop \{(.*?)\};", c, re.S)
+    assert decl, c
+    fields = [f.split()[-1].strip("*")
+              for f in decl.group(1).strip().split(";") if f.strip()]
+    assert fields == ["ifindex", "addr"]
+    assert "__u32 ifindex" in decl.group(1)
+    assert "__be32 addr" in decl.group(1)
+
+  def test_the_queue_is_one_map_across_a_bundle(self):
+    # SHARED, because the neighbour table is the HOST's: two inside
+    # zones behind one uplink want the same gateway resolved, and `fd`
+    # drains ONE queue. A per-zone copy would make what the daemon sees
+    # depend on which zone's object it happened to open.
+    prog = _analyze(WL + "@xdp(wan)\ndrop\n@xdp(lan)\n"
+                    "masquerade\nredirect to wan\n")
+    files = emitter.emit_bundle(prog)
+    assert "fwl_neigh_wanted" in emitter.shared_pinned_map_names(files)
+    for name in ("lan.bpf.c", "wan.bpf.c"):
+      src = files[name]
+      if "fwl_neigh_wanted" not in src:
+        continue
+      block = src[src.index("} fwl_neigh_wanted") - 400:
+                  src.index("} fwl_neigh_wanted")]
+      assert "LIBBPF_PIN_BY_NAME" in block, name
+
+  def test_the_queue_does_not_survive_a_policy_change(self):
+    # POLICY lifetime: an entry is a demand THIS policy's datapath made.
+    # Carried across a reload it would have the daemon ARP for a next
+    # hop nothing routes to any more, which is the one thing a component
+    # that originates traffic must not do.
+    assert "fwl_neigh_wanted" not in emitter.persistent_map_names()
+
+  def test_the_queue_compiles(self):
+    bpf_runner.check_compiles(
+      _emit(WL + "@xdp(lan)\nmasquerade\nredirect to wan\n"))

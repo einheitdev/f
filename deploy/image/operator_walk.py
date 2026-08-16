@@ -676,14 +676,26 @@ def cold_probe(walk, key):
   frames = len([ln for ln in watcher.stdout.read().splitlines()
                 if "IP" in ln])
   walk.fact("reboot", "cold_probe_frames_on_the_far_wire", frames)
-  # Whether the box even TRIED to resolve the next hop. The datapath's
-  # comment beside FWL_ROUTE_STAT_NO_NEIGH says the frame is handed to
-  # the stack "so it can ARP" and that only that packet is lost — if
-  # that were so, the next hop would be in this table, resolved or
-  # failed. An empty table here means no resolution was attempted at
-  # all, and the gap is not one lost flow but every flow.
+  # Whether the box even TRIED to resolve the next hop. This is where
+  # the 2026-08-15 finding was read: an EMPTY table after seven
+  # no_neigh events, so no resolution had been attempted at all and the
+  # gap was not one lost flow but every flow. A translated frame handed
+  # to the stack is a martian to it and never reaches the ARP.
+  #
+  # Since 2026-08-16 the datapath records the address instead and `fd`
+  # asks the kernel for it, so the expected reading here is the next
+  # hop PRESENT with a lladdr and the flow having crossed on the
+  # sender's retransmit. `fd`'s own account of what it asked for is
+  # taken alongside, because the table alone cannot say who filled it —
+  # that is what `cold_neighbour_netns.py` settles with an independent
+  # ARP witness, and what this phase can only record.
   _, neigh, _ = box(walk, key, "reboot", "ip neigh")
   walk.fact("reboot", "neighbours_after_cold_probe", neigh)
+  _, resolving, _ = box(
+    walk, key, "reboot",
+    "fctl status | python3 -c "
+    "'import json,sys; print(json.load(sys.stdin).get(\"neigh\"))'")
+  walk.fact("reboot", "next_hop_resolution_after_cold_probe", resolving)
   after = route_tally(walk, key, "reboot", "after_cold_probe")
   moved = tally_delta(before, after)
   walk.fact("reboot", "cold_probe_route_delta", moved)
@@ -701,9 +713,13 @@ def cold_probe(walk, key):
   if not accepted:
     walk.friction(
       "reboot", "the first flow after a reboot does not cross",
-      f"a box that has just booted forwards nothing until its own "
-      f"stack has resolved the next hop: the datapath counted {moved} "
-      f"and every status field reads healthy. peer={peer or 'none'}")
+      f"a box that has just booted should now resolve its own next hop "
+      f"— the datapath records the address and fd asks the kernel for "
+      f"it — so a flow that still does not cross means either the next "
+      f"hop is not answering ARP or this bundle predates that. Read "
+      f"`next_hop_resolution_after_cold_probe` above. The datapath "
+      f"counted {moved} and every status field reads healthy. "
+      f"peer={peer or 'none'}")
 
 
 # The two ends of a flow that is opened before a reload and read

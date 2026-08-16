@@ -214,8 +214,14 @@ def test_shared_pinned_maps_is_read_off_the_bundle(tmp_path):
   # this bundle carries an egress tracker (v0.4 § 6.9) and the tracker
   # pins its own tally bundle-wide. A bundle whose policy asks no
   # conntrack question carries neither — asserted separately.
+  # `fwl_neigh_wanted` rides with the routing tally, for the same
+  # reason and out of the same declaration block: a program that can
+  # redirect can also fail to resolve a next hop, and the queue of the
+  # ones it could not resolve is bundle-wide because the neighbour
+  # table is the host's.
   assert manifest["shared_pinned_maps"] == [
-    "conntrack", "fwl_egress_stats", "fwl_route_stats"
+    "conntrack", "fwl_egress_stats", "fwl_neigh_wanted",
+    "fwl_route_stats"
   ]
   # The devmap really is in the bundle: the field is describing what is
   # PINNED, not what is declared, so its absence has to be checked

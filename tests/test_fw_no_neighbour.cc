@@ -85,10 +85,11 @@ class NoNeighbourTest : public ::testing::Test {
   }
 
   /// A status reply from an armed, forwarding, two-zone box, with
-  /// whatever routing tally the caller wants on it. Everything outside
-  /// the `route` section is deliberately healthy: that is the whole
-  /// point of the case.
-  static auto Status(const json& route) -> json {
+  /// whatever routing tally and next-hop state the caller wants on it.
+  /// Everything outside those two sections is deliberately healthy:
+  /// that is the whole point of the case.
+  static auto Status(const json& route, const json& neigh = json::object())
+      -> json {
     json rt = {
         {"enabled", true},
         {"ip_forward", true},
@@ -101,7 +102,22 @@ class NoNeighbourTest : public ::testing::Test {
         {"no_neigh", 0},   {"ttl_expired", 0}, {"off_zone", 0},
     };
     rt.update(route);
-    return {{"pid", 344}, {"uptime_s", 30}, {"route", rt}};
+    json ng = {
+        {"enabled", true},   {"solicited", 0},
+        {"resolved", 0},     {"failed", 0},
+        {"off_datapath", 0}, {"forgotten_stale", 0},
+        {"unresolved", json::array()},
+    };
+    ng.update(neigh);
+    return {{"pid", 344},
+            {"uptime_s", 30},
+            {"route", rt},
+            {"neigh", ng}};
+  }
+
+  /// One unresolved next hop, as `NeighMgr::GetState` renders it.
+  static auto Unresolved(const std::string& addr, int ifindex) -> json {
+    return json::array({{{"address", addr}, {"ifindex", ifindex}}});
   }
 
   std::unique_ptr<cli::ProductAdapter> adapter_;
@@ -117,12 +133,73 @@ TEST_F(NoNeighbourTest, ABoxThatHasRoutedNothingIsToldWhatToDo) {
   EXPECT_TRUE(Has(out, "DROPPED")) << out;
   EXPECT_TRUE(Has(out, "nothing is crossing")) << out;
   // The cure, on the screen that shows the fault. Without it the
-  // operator has a number and no next move.
-  EXPECT_TRUE(Has(out, "Ping the next hop FROM this box")) << out;
+  // operator has a number and no next move. On a current bundle the
+  // daemon is doing the resolving, so the next move is to read the
+  // next_hop row — not to ping anything.
+  EXPECT_TRUE(Has(out, "fd has asked the kernel to resolve it")) << out;
   // The control: the row must be the alarming one, not a warning. A
   // [WARN] beside a healthy `forwarding` row is what this box looked
   // like while it carried nothing.
   EXPECT_TRUE(Has(out, "[FAIL]")) << out;
+}
+
+TEST_F(NoNeighbourTest, ABundleWithNoQueueStillSendsTheOperatorToPing) {
+  // The third state, and the reason the sentence is chosen from a fact
+  // about the box rather than written once. A bundle compiled before
+  // `fwl_neigh_wanted` existed records nothing, so `fd` has no address
+  // to ask for and NOTHING will resolve the hop. Telling that operator
+  // "fd has asked the kernel" would be a false claim on exactly the box
+  // that is still black-holed.
+  auto out = Render("show status", Status({{"no_neigh", 7}},
+                                          {{"enabled", false}}));
+  EXPECT_TRUE(Has(out, "[FAIL]")) << out;
+  EXPECT_TRUE(Has(out, "ping the next hop FROM this box")) << out;
+  EXPECT_FALSE(Has(out, "fd has asked the kernel to resolve it")) << out;
+  // ...and the box is told the fix, once, in the row that owns it.
+  EXPECT_TRUE(Has(out, "next_hop")) << out;
+  EXPECT_TRUE(Has(out, "Recompile the policy")) << out;
+}
+
+TEST_F(NoNeighbourTest, AnUnansweredNextHopIsNamedByAddress) {
+  // fd asked and nothing answered. That is a wiring fault, not a
+  // software one, and the operator needs the ADDRESS — this is the
+  // screen that used to carry a count and no way to act on it.
+  auto out = Render(
+      "show status",
+      Status({{"no_neigh", 7}},
+             {{"solicited", 9},
+              {"unresolved", Unresolved("10.10.2.2", 3)}}));
+  EXPECT_TRUE(Has(out, "next_hop")) << out;
+  EXPECT_TRUE(Has(out, "10.10.2.2")) << out;
+  EXPECT_TRUE(Has(out, "ifindex 3")) << out;
+  EXPECT_TRUE(Has(out, "NOT ANSWERING")) << out;
+  EXPECT_TRUE(Has(out, "[FAIL]")) << out;
+}
+
+TEST_F(NoNeighbourTest, ABoxThatResolvedItsOwnNextHopSaysSo) {
+  // The state this whole change exists to produce: forwards were lost
+  // once, fd asked, the segment answered, and traffic is crossing. The
+  // row has to say the daemon did it — an operator who cannot tell
+  // "resolved itself" from "somebody pinged it" cannot tell whether
+  // their appliance will survive the next power cut.
+  auto out = Render(
+      "show status",
+      Status({{"no_neigh", 1}, {"routed", 4000}},
+             {{"solicited", 1}, {"resolved", 1}}));
+  EXPECT_TRUE(Has(out, "next_hop")) << out;
+  EXPECT_TRUE(Has(out, "resolved by fd")) << out;
+  EXPECT_TRUE(Has(out, "[OK]")) << out;
+  EXPECT_FALSE(Has(out, "NOT ANSWERING")) << out;
+}
+
+TEST_F(NoNeighbourTest, TheNextHopRowIsAbsentOnABoxThatNeededNothing) {
+  // The vacuity control for the new row. Every test above would pass
+  // against a renderer that printed a next_hop line unconditionally,
+  // and a screen that always talks about the ARP table is a screen
+  // nobody reads. Most boxes, most of the time, have never had a next
+  // hop to resolve.
+  auto out = Render("show status", Status({{"routed", 4000}}));
+  EXPECT_FALSE(Has(out, "next_hop")) << out;
 }
 
 TEST_F(NoNeighbourTest, ABoxThatIsForwardingKeepsTheMilderLine) {

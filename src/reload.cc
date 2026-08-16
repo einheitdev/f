@@ -288,6 +288,14 @@ auto ApplyBundle(Engine& e, std::string_view bundle_dir)
     // It also resets the watermarks, which a POLICY-lifetime map needs
     // (the new bundle counts from zero).
     AttachRouteMgr(e);
+    // Fourth site, and it is deliberately here rather than folded into
+    // the call above: the queue is a POLICY-lifetime map, so after a
+    // reload it is a NEW kernel map and the old fd names a closed
+    // object. Left stale, this daemon would drain a queue nothing
+    // writes to and the box would go back to healing only by luck —
+    // silently, because a queue that is always empty and a box with
+    // nothing to resolve read identically.
+    AttachNeighMgr(e);
     // The datapath just changed shape, so the forwarding decision is
     // re-taken from the interface count above. A reload that ends up
     // attached to nothing closes the box; there is no reload path that

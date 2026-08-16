@@ -139,6 +139,16 @@ struct ZoneBundleHandles {
   /// it arrived with). A masquerading gateway whose forwards are all
   /// bridged is a black hole, and nothing on the wire says so.
   int route_stats_fd = -1;
+  /// The shared `fwl_neigh_wanted` hash fd, or -1 when no zone program
+  /// can redirect (or when the bundle predates the map). The next hops
+  /// the datapath could not address a forward to, so that `fd` can ask
+  /// the kernel to resolve them: on a masquerading box the stack never
+  /// will by itself, because the frame XDP hands it carries one of this
+  /// box's own addresses as its source and is discarded as a martian
+  /// before anything asks for a neighbour. -1 means this box heals only
+  /// when something it originates happens to go the same way, which is
+  /// the pre-fix behaviour and is reported rather than assumed away.
+  int neigh_wanted_fd = -1;
   /// True when this bundle was compiled before the masquerade source
   /// became per zone, so every object resolves ONE bundle-global
   /// `fwl_nat_cfg` and every `ZoneProgramHandle::nat_cfg_fd` names the

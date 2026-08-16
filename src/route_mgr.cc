@@ -221,23 +221,31 @@ auto RouteMgr::Report() -> void {
   }
   uint64_t no_neigh = Stat(kFwlRouteStatNoNeigh);
   if (no_neigh > reported_no_neigh) {
-    // These packets are LOST, and on a masquerading box nothing
-    // resolves the next hop on their behalf. XDP hands the frame to
-    // the stack so the stack can ARP, but a SOURCE-TRANSLATED frame
-    // carries one of our own addresses as its source and is rejected
-    // as a martian before anything asks for a neighbour — so no ARP
-    // is sent, and the next frame meets the same empty table. A
-    // reboot empties that table, which is how a box comes back with
-    // every field healthy and carries nothing (measured under qemu on
-    // 2026-08-15: no_neigh 0 -> 7 over one client's whole retry
-    // window, routed 0, nothing on the far wire, and the same flow
-    // crossed the moment the box itself pinged the far side).
+    // These packets are LOST. The stack will not resolve the next hop
+    // on their behalf either: XDP hands it the frame so it can ARP, but
+    // a SOURCE-TRANSLATED frame carries one of our own addresses as its
+    // source and is rejected as a martian before anything asks for a
+    // neighbour. A reboot empties the neighbour table, which is how a
+    // box comes back with every field healthy and carries nothing
+    // (measured under qemu on 2026-08-15: no_neigh 0 -> 7 over one
+    // client's whole retry window, routed 0, nothing on the far wire).
+    //
+    // `NeighMgr` is what breaks that now — the datapath records the
+    // address it could not resolve and fd asks the kernel for it — so
+    // this line no longer sends the operator to ping anything. It is
+    // still an ERROR-free WARNING and it still counts every frame,
+    // because the cure costs the FIRST one: the flow crosses on the
+    // client's retransmit, and a count that kept climbing after that
+    // means the next hop is not answering. `fctl status`'s `next_hop`
+    // row is where the address is named.
     spdlog::warn(
-        "route: {} forwarded packet(s) DROPPED — this box has no "
+        "route: {} forwarded packet(s) DROPPED — this box had no "
         "neighbour entry for their next hop, and a translated packet "
         "cannot make one: the stack rejects it as a martian source "
-        "before it would ARP. Nothing crosses until this box's own "
-        "stack talks to the next hop — ping it from here.",
+        "before it would ARP. fd has asked the kernel to resolve it; "
+        "the sender's retransmit should cross. If this keeps climbing, "
+        "the next hop is not answering ARP — see `next_hop` in "
+        "`einheit-f show status`.",
         no_neigh - reported_no_neigh);
     reported_no_neigh = no_neigh;
   }

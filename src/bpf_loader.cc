@@ -826,6 +826,7 @@ auto CloseZoneBundle(ZoneBundleHandles& handles) -> void {
   handles.nat_fd = -1;
   handles.nat_stats_fd = -1;
   handles.route_stats_fd = -1;
+  handles.neigh_wanted_fd = -1;
   handles.legacy_nat_cfg = false;
 }
 
@@ -1120,6 +1121,19 @@ auto LoadZoneBundle(std::string_view bundle_dir,
     if (handles.route_stats_fd < 0) {
       int rs = FindMap(obj, "fwl_route_stats");
       if (rs >= 0) handles.route_stats_fd = rs;
+    }
+
+    // ...and the queue of next hops that tally could not name. The
+    // counter says a forward was lost; only this says WHICH address the
+    // box needed a MAC for, and it is the one thing a masquerading box
+    // cannot work out for itself once the packet is gone. `fd` drains
+    // it and asks the kernel to resolve what is in it (neigh_mgr.cc).
+    // Absent on a bundle compiled before the map existed, which is a
+    // reported state and not a load failure — such a box behaves as it
+    // did before, healing only by luck.
+    if (handles.neigh_wanted_fd < 0) {
+      int nw = FindMap(obj, "fwl_neigh_wanted");
+      if (nw >= 0) handles.neigh_wanted_fd = nw;
     }
 
     // masquerade (v0.4 § NAT): the program translates sources to "the

@@ -384,6 +384,46 @@ auto AttachRouteMgr(Engine& e) -> void {
   e.route.reported_no_neigh = 0;
 }
 
+auto AttachNeighMgr(Engine& e) -> void {
+  e.neigh.datapath_ifindexes.clear();
+  for (uint32_t i = 0; i < e.ifaces.count; i++) {
+    e.neigh.datapath_ifindexes.push_back(e.ifaces.interfaces[i].ifindex);
+  }
+  // POLICY-lifetime map: the pin is discarded on a reload and the new
+  // bundle's queue starts empty, so this daemon's own memory of what it
+  // has already asked for and already reported has to start empty with
+  // it. Carried over, a next hop the previous policy could not resolve
+  // would sit in the throttle table suppressing the first solicitation
+  // the NEW policy needs.
+  e.neigh.last_solicit_ns.clear();
+  e.neigh.reported.clear();
+  e.neigh.outstanding.clear();
+  e.neigh.wanted.reset();
+  int fd = e.zone_bundle.neigh_wanted_fd;
+  if (fd >= 0) {
+    e.neigh.wanted = MakeBpfNeighWanted(fd);
+    if (e.neigh.kernel == nullptr) {
+      e.neigh.kernel = MakeNetlinkNeighKernel();
+    }
+  }
+  e.neigh.enabled =
+      e.neigh.wanted != nullptr && e.neigh.kernel != nullptr;
+  if (!e.neigh.enabled && e.zone_bundle.route_stats_fd >= 0) {
+    // A bundle that CAN redirect and carries no queue: compiled before
+    // the map existed. Not a load failure — the box works exactly as it
+    // did — but it is the box that stays black-holed after a power cut
+    // until something it originates happens to go the same way, and
+    // "recompile the policy" is a thing an operator can act on only if
+    // somebody says it.
+    spdlog::warn(
+        "next hop: this bundle carries no fwl_neigh_wanted map, so it "
+        "was compiled before fd could resolve its own next hops. After "
+        "a reboot a masquerading zone forwards nothing until something "
+        "on this box talks upstream first. Recompile the policy to fix "
+        "it.");
+  }
+}
+
 auto SetForwardingFromDatapath(Engine& e, std::string_view when)
     -> void {
   // One fact, one knob. Not the zone count, not whether any zone
@@ -621,6 +661,9 @@ auto EngineInit(Engine& e,
     spdlog::info("Multi-zone bundle loaded: {} zone program(s), "
                  "attached to {} interface(s).",
                  e.zone_bundle.programs.size(), e.ifaces.count);
+    // After the interface list, never before it: the list is what
+    // bounds the interfaces this daemon may ask the kernel to ARP on.
+    AttachNeighMgr(e);
     // ...and only now does this box get to route. The count above is
     // the same number the readiness notification is gated on, taken
     // from the same place, so "systemd says ready" and "the kernel
@@ -812,6 +855,13 @@ auto EngineRun(Engine& e, std::stop_token stop)
     // counted by the datapath and are invisible everywhere
     // else, so this is where they become a log line.
     e.route.Report();
+    // ...and the half that makes the box stop needing the report. The
+    // two are next to each other and separate on purpose: Report()
+    // counts what was lost, this stops the next one being lost, and
+    // neither is conditional on the other. A cure that suppressed its
+    // own symptom would leave an operator with a box that heals
+    // sometimes and says nothing either way.
+    e.neigh.MaybeResolve(now_ns);
     // The one knob this daemon owns, checked against what the kernel
     // actually holds. Corrects an unarmed box that somebody opened;
     // reports, and does not fight, an armed box that somebody closed.
@@ -897,6 +947,11 @@ auto GetFullState(const Engine& e) -> nlohmann::json {
   // — a frame addressed to the wrong MAC is still on the cable — so
   // this section is the only place the difference is written down.
   j["route"] = e.route.GetState();
+  // And whether this box has resolved the next hops it needs. The
+  // `route` section above can only say that forwards were lost; a box
+  // that has never resolved its next hop looks identical, on every
+  // other field, to one whose cable is out. This names the address.
+  j["neigh"] = e.neigh.GetState();
   // Whether flows the BOX ITSELF starts are tracked. Without the hook
   // this section reports, `conntrack(pkt).state` answers NEW for the
   // reply to the appliance's own DNS query and `default drop` eats it

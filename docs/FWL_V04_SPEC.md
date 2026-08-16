@@ -821,16 +821,17 @@ The failure outcomes follow the kernel's own classification:
 | `SUCCESS`, ifindex matches | routed (MACs rewritten, TTL decremented) |
 | `SUCCESS`, ifindex differs | forwarded L2-adjacent, counted `off_zone` |
 | `BLACKHOLE` / `UNREACHABLE` / `PROHIBIT` | `XDP_DROP`, counted `no_route` |
-| `NO_NEIGH` | `XDP_PASS` so the stack can ARP, counted `no_neigh` |
+| `NO_NEIGH` | `XDP_PASS`, counted `no_neigh`, next hop recorded in `fwl_neigh_wanted` |
 | anything else (incl. `FWD_DISABLED`, no route) | forwarded L2-adjacent |
 | TTL ≤ 1 | `XDP_PASS`; the stack owns the ICMP time-exceeded |
 
-`NO_NEIGH` is the one that does not fully recover: handing the packet to
-the stack is what triggers the ARP, but a **source-translated** packet
-does not survive that trip, because its source is one of this box's own
-addresses and `fib_validate_source` rejects it as a martian. The
-resolution happens; that packet does not. It is counted and logged for
-exactly that reason.
+`NO_NEIGH` is the one the stack cannot recover from on its own, and the consequence is bigger than one lost frame. Handing the packet up is what would normally trigger the ARP — but a **source-translated** packet does not survive that trip: its source is one of this box's own addresses and `fib_validate_source` rejects it as a martian *before* anything asks for a neighbour, so **no ARP is sent at all**. The next frame meets the same empty table. A reboot empties that table, so a masquerading box comes back forwarding nothing, with every other field reading healthy, until something the box itself originates happens to go the same way. Measured under qemu on 2026-08-15, twice: seven forwarded frames across a TCP client's whole retry window all counted here, `routed` 0, nothing on the far wire, and afterwards no neighbour entry of any state for the next hop.
+
+So the datapath records what it could not resolve. `bpf_fib_lookup` has already computed it: `fib.ipv4_dst` holds the **next hop** (the gateway for a via route, the destination itself when it is on-link) and `fib.ifindex` the egress device. The pair goes into `fwl_neigh_wanted` — a bundle-wide hash of at most 64 entries — and `fd` asks the kernel to resolve what turns up there (rtnetlink `RTM_NEWNEIGH` with `NTF_USE`, so the only frames on the wire are the ARP the kernel would have sent for the packet, under the kernel's own retransmit limits).
+
+The record is written **only when the FIB's egress ifindex is the zone's own** — the same test `off_zone` makes one row up. That is what bounds the addresses a firewall daemon can be made to ARP for to the ones a loaded policy routes to, and it is why the management port can never be one of them: nothing redirects to it, so no XDP program names it.
+
+The first frame is still lost and still counted. `no_neigh` is not conditional on any of this — the sender's retransmit is what crosses, and a count that keeps climbing means the next hop is not answering ARP.
 
 `net.ipv4.ip_forward` is therefore load-bearing rather than advisory:
 with it at 0 the lookup returns `FWD_DISABLED`, no next hop is
