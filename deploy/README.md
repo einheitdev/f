@@ -70,6 +70,14 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now fd.service f-confd.service einheit-f-ui.service
 ```
 
+**Reaching the dashboard.** `einheit-f-ui` binds `127.0.0.1:443` and nothing else. It authenticates nobody and cannot serve TLS — there is no `--tls-cert` option in that binary — and what it renders is the whole firewall state: the loaded ruleset, the zone topology, the NAT table and live conntrack. Until there is something to authenticate against, it is reachable over a tunnel and not over the wire:
+
+```sh
+ssh -L 8443:127.0.0.1:443 <box>     # then browse http://127.0.0.1:8443/
+```
+
+It bound `0.0.0.0:443` until 2026-08-16, and firstboot's generated policy admitted 443 on the **uplink** zone, so a stock box published all of the above to the internet. Both halves are fixed; **do not widen the bind back to `0.0.0.0` to "make the dashboard work"**, because the firewall policy is no protection in the state that matters — `fd` down means no XDP program on any interface and nothing filtered at all.
+
 Status:
 
 ```sh

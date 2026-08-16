@@ -437,6 +437,8 @@ class Firstboot:
                       management_ports=policy.get(
                         "management_ports",
                         DEFAULT_MANAGEMENT_PORTS),
+                      uplink_management_ports=policy.get(
+                        "uplink_management_ports", []),
                       when=self.now()),
         encoding="utf-8")
       note = "generated from the zones in system.yaml"
@@ -796,7 +798,8 @@ def _zone_addresses(model, zone):
       out.append(str(address).split("/", 1)[0])
   return out
 def render_policy(model, uplink_zone=None,
-                  management_ports=None, when=None):
+                  management_ports=None, when=None,
+                  uplink_management_ports=None):
   """Generate a starting policy from the zones in the model.
 
   The policy is `default drop` in every zone. What each zone admits
@@ -827,13 +830,24 @@ def render_policy(model, uplink_zone=None,
     model: The parsed system.yaml.
     uplink_zone: The zone facing the world. When named, every other
       zone masquerades out through it and the box becomes a gateway.
-    management_ports: TCP ports reachable on the box itself.
+    management_ports: TCP ports reachable on the box itself, on every
+      zone EXCEPT the one named as the uplink.
     when: Timestamp for the header.
+    uplink_management_ports: TCP ports reachable on the uplink zone.
+      Defaults to NOTHING, and the default is the point. Until
+      2026-08-16 the uplink got `management_ports` like every other
+      zone, so a stock box published its dashboard to the internet:
+      firstboot enables `einheit-f-ui` on every box, its unit bound
+      `0.0.0.0:443`, the binary has no TLS option at all, and nothing
+      in the UI or the framework path it links authenticates anything.
+      Four unconditional links, none of them gated by a flag. Opening
+      a port here is now something an operator has to write down.
 
   Returns:
     The .fw source as a string.
   """
   ports = management_ports or DEFAULT_MANAGEMENT_PORTS
+  uplink_ports = uplink_management_ports or []
   zones = _zone_interfaces(model)
   stamp = (when or datetime.datetime.now()).isoformat(
     timespec="seconds")
@@ -864,9 +878,18 @@ def render_policy(model, uplink_zone=None,
               "# loaded programs would say otherwise.", ""]
       continue
     inside = uplink_zone is not None and zone != uplink_zone
-    out += _zone_block(model, zone, ports, inside, uplink_zone)
+    # The zone the operator NAMED as facing the world is the only one
+    # that gets the uplink's management list. Every other zone — an
+    # inside zone, or any zone at all on a box with no uplink declared
+    # — keeps the ordinary one, because on a non-gateway box this is
+    # the only thing that makes the box reachable at all.
+    is_uplink = uplink_zone is not None and zone == uplink_zone
+    out += _zone_block(model, zone,
+                       uplink_ports if is_uplink else ports,
+                       inside, uplink_zone, is_uplink)
   return "\n".join(out)
-def _zone_block(model, zone, management_ports, inside, uplink_zone):
+def _zone_block(model, zone, management_ports, inside, uplink_zone,
+                is_uplink=False):
   """One @xdp block: what this zone admits and what it does after."""
   out = [f"@xdp({zone})", ""]
   out += [f"count {zone}_total", ""]
@@ -924,10 +947,29 @@ def _zone_block(model, zone, management_ports, inside, uplink_zone):
     "allow if pkt.proto == udp and pkt.src_port == 53",
     "allow if pkt.proto == udp and pkt.src_port == 123",
     "",
-    "# Reaching the box to configure it.",
   ]
-  for port in management_ports:
-    out.append(f"allow if pkt.proto == tcp and pkt.dst_port == {port}")
+  if is_uplink and not management_ports:
+    out += [
+      "# NOTHING is admitted here for management, and that is",
+      "# deliberate. This is the zone facing the world. A box",
+      "# provisioned before 2026-08-16 admitted the management ports",
+      "# on this block too, which put an unauthenticated cleartext",
+      "# dashboard — the whole ruleset, the zone topology, the NAT",
+      "# table and live conntrack — on the internet, because",
+      "# firstboot enables einheit-f-ui on every box and its unit",
+      "# bound 0.0.0.0:443 with no TLS option to set.",
+      "#",
+      "# Reach this box from an inside zone, or over a tunnel. If you",
+      "# genuinely need a port open on the uplink, name it:",
+      "#   policy: { uplink_management_ports: [22] }",
+      "# in the provisioning file, and understand that whatever you",
+      "# name is reachable by everyone.",
+    ]
+  else:
+    out.append("# Reaching the box to configure it.")
+    for port in management_ports:
+      out.append(
+        f"allow if pkt.proto == tcp and pkt.dst_port == {port}")
   out += [
     "",
     "# So that a box that is up can be seen to be up.",

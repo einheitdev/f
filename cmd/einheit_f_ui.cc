@@ -26,7 +26,23 @@
 auto main(int argc, char** argv) -> int {
   CLI::App app{
       "einheit-f-ui — f firewall web dashboard"};
-  std::string bind = "0.0.0.0";
+  // Loopback, deliberately. This process serves the whole firewall
+  // state — the loaded ruleset, the zone topology, the NAT table and
+  // live conntrack — and it authenticates nobody: there is no auth in
+  // this adapter and none in the framework HTTP path it links. It
+  // cannot serve TLS either, because no --tls-cert/--tls-key option
+  // exists here to set.
+  //
+  // The default used to be 0.0.0.0. Combined with a shipped unit that
+  // passed --bind 0.0.0.0 --port 443 and a firstboot policy that
+  // admitted 443 on the UPLINK zone, a stock box published all of the
+  // above to the internet. The policy half is fixed in firstboot.py;
+  // this is the half that still holds when `fd` is not running, which
+  // is exactly when there is no XDP program filtering anything.
+  //
+  // Widening this is a deliberate act and should stay one until there
+  // is something to authenticate against.
+  std::string bind = "127.0.0.1";
   uint16_t port = 7542;
   std::string fd_socket = "ipc:///run/f/control.sock";
   int sample_ms = 1000;

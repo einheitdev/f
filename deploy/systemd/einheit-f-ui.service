@@ -6,8 +6,21 @@ Wants=fd.service
 
 [Service]
 Type=simple
+# Loopback, deliberately — see the comment in cmd/einheit_f_ui.cc.
+# This process authenticates nobody and cannot serve TLS, and what it
+# renders is the entire firewall state. It bound 0.0.0.0 until
+# 2026-08-16, and firstboot's generated policy admitted 443 on the
+# uplink zone, so a stock box served its ruleset, zone topology, NAT
+# table and live conntrack to the internet.
+#
+# Reach it over an SSH tunnel:
+#   ssh -L 8443:127.0.0.1:443 <box>   then http://127.0.0.1:8443/
+#
+# Do NOT widen this back to 0.0.0.0 to "make the dashboard work". The
+# thing that makes it safe to expose is authentication and TLS, and
+# neither exists yet.
 ExecStart=/usr/local/bin/einheit-f-ui \
-    --bind 0.0.0.0 \
+    --bind 127.0.0.1 \
     --port 443 \
     --socket ipc:///run/f/control.sock \
     --templates /usr/share/einheit-ui/templates \

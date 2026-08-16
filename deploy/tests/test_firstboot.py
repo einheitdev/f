@@ -690,3 +690,89 @@ def test_a_binary_that_cannot_load_stops_the_run(tmp_path):
   assert "libzmq5" in boot.steps[0].detail
   assert not (root / "etc/f/.provisioned").exists()
   assert not runner.systemctl_enabled()
+
+
+# --- the uplink is not a management interface -------------------------
+#
+# Until 2026-08-16 the generated policy admitted `management_ports` on
+# the uplink block as well as the inside ones. Combined with firstboot
+# enabling `einheit-f-ui` on every box, a unit that bound 0.0.0.0:443
+# and a binary with no TLS option, a stock box served its whole
+# ruleset, zone topology, NAT table and live conntrack to the internet
+# with no authentication. These tests are what goes red if any part of
+# that comes back.
+
+def _gateway_policy(**kwargs):
+  """A two-zone gateway: `lan` inside, `wan` facing the world."""
+  model = {"zones": {"lan": {}, "wan": {}},
+           "interfaces": {"p0": {"zone": "lan"},
+                          "p1": {"zone": "wan"}}}
+  return firstboot.render_policy(model, uplink_zone="wan", when=WHEN,
+                                 **kwargs)
+
+
+def _block(policy, zone):
+  """Just the one `@xdp(<zone>)` block, up to the next one."""
+  start = policy.index(f"@xdp({zone})")
+  rest = policy[start + 1:]
+  end = rest.find("@xdp(")
+  return rest if end < 0 else rest[:end]
+
+
+def test_the_uplink_admits_no_management_port_by_default():
+  """The dashboard is not published to the world."""
+  policy = _gateway_policy()
+  wan = _block(policy, "wan")
+  assert "dst_port == 443" not in wan
+  assert "dst_port == 22" not in wan
+  # And it says why, so the next person does not add it back.
+  assert "facing the world" in wan
+
+
+def test_the_inside_zone_still_admits_them():
+  """Safe is not the same as unreachable — the box is still managed,
+  from the side of it that is not the internet."""
+  lan = _block(_gateway_policy(), "lan")
+  assert "allow if pkt.proto == tcp and pkt.dst_port == 22" in lan
+  assert "allow if pkt.proto == tcp and pkt.dst_port == 443" in lan
+
+
+def test_a_box_with_no_uplink_keeps_its_management_ports():
+  """The regression this fix could most easily have caused.
+
+  `inside` is false for EVERY zone on a box that names no uplink, so a
+  fix that keyed off that flag would have made a plain filtering box
+  unreachable on every interface it has.
+  """
+  model = {"zones": {"mgmt": {}}, "interfaces": {"p0": {"zone": "mgmt"}}}
+  policy = firstboot.render_policy(model, when=WHEN)
+  assert "allow if pkt.proto == tcp and pkt.dst_port == 22" in policy
+  assert "allow if pkt.proto == tcp and pkt.dst_port == 443" in policy
+
+
+def test_opening_a_port_on_the_uplink_is_possible_and_explicit():
+  """An operator who wants remote SSH says so, and gets only that."""
+  wan = _block(_gateway_policy(uplink_management_ports=[22]), "wan")
+  assert "allow if pkt.proto == tcp and pkt.dst_port == 22" in wan
+  assert "dst_port == 443" not in wan
+
+
+def test_the_generated_uplink_policy_still_compiles():
+  """A block whose management rules were removed must still parse."""
+  policy = _gateway_policy()
+  assert "default drop" in _block(policy, "wan")
+  assert "allow if pkt.proto == icmp" in _block(policy, "wan")
+
+
+def test_the_shipped_unit_does_not_bind_the_dashboard_to_the_world():
+  """The half of the fix that still holds when `fd` is not running.
+
+  With fd down there is no XDP program on any interface, so the
+  firewall policy protects nothing at all — which is exactly the state
+  a refused bundle leaves the box in. The bind address is the only
+  thing standing up in that state.
+  """
+  unit = (Path(__file__).resolve().parents[1]
+          / "systemd" / "einheit-f-ui.service").read_text()
+  assert "--bind 127.0.0.1" in unit
+  assert "--bind 0.0.0.0" not in unit
