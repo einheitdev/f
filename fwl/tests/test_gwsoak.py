@@ -25,6 +25,7 @@ go red. Both are asserted here.
   The report must exit non-zero on drift. That is the property the
     whole soak's evidential value rests on.
 """
+import datetime
 import ipaddress
 import json
 import os
@@ -43,6 +44,7 @@ report = pytest.importorskip("gwsoak_report")
 sniff = pytest.importorskip("sniff")
 
 CHURN_NET = ipaddress.ip_network(gwsoak.CHURN_NET)
+_BASE_TS = datetime.datetime(2026, 8, 16, 12, 0, 0)
 
 
 def test_the_generator_emits_frames_a_real_stack_accepts():
@@ -282,7 +284,8 @@ def test_creep_detection_tells_a_plateau_from_a_climb():
 
 def _sample(index, **over):
   """One structurally complete sample of a healthy run."""
-  minute = f"2026-08-16T12:{index:02d}:00Z"
+  minute = (_BASE_TS + datetime.timedelta(minutes=index)).strftime(
+    "%Y-%m-%dT%H:%M:%SZ")
   sample = {
     "ts": minute,
     "boot_id": "b0",
@@ -379,6 +382,23 @@ def test_a_next_hop_lost_again_after_the_box_is_warm_fails(tmp_path):
   """The reading a long run can take and a short one cannot."""
   samples = [_sample(i) for i in range(40)]
   for sample in samples[30:]:
+    sample["route"]["no_neigh"] = 9
+  path = _write_log(tmp_path, samples)
+  proc = _run_report(path)
+  assert proc.returncode == 1
+  assert "re-lost a next hop" in proc.stdout
+
+
+def test_the_warm_up_window_does_not_grow_with_the_run(tmp_path):
+  """A tenth of a 96 h run is nine hours.
+
+  Scaling the warm-up with the sample count would swallow a next hop
+  re-lost at hour five, which is precisely the event a long run exists
+  to catch. `start` pings every next hop it routes to before the first
+  sample, so the box is warm in minutes and the window is capped.
+  """
+  samples = [_sample(i) for i in range(600)]
+  for sample in samples[40:]:
     sample["route"]["no_neigh"] = 9
   path = _write_log(tmp_path, samples)
   proc = _run_report(path)

@@ -242,7 +242,11 @@ def main() -> int:
   # The question a long run can answer and a short one cannot: does the
   # box RE-LOSE a next hop it has already resolved? Early samples may
   # legitimately count one lost first frame per destination.
-  warm = max(1, len(rows) // 10)
+  # The box is warm within minutes — `start` pings every next hop it
+  # routes to before the first sample. A tenth of a 96 h run is nine
+  # hours, and a next hop re-lost at hour five would be absorbed into
+  # the baseline, so the warm-up window is capped at ten samples.
+  warm = min(10, max(1, len(rows) // 10))
   if no_neigh[-1] > no_neigh[warm]:
     fails.append(f"route.no_neigh climbed after the box was warm: "
                  f"{no_neigh[warm]} at sample {warm} -> "
