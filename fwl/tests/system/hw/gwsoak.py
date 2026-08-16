@@ -981,10 +981,26 @@ def cmd_probe(args) -> int:
 
 
 def cmd_status(args) -> int:
+  """The live glance, then the verdict.
+
+  A unit that died thirty seconds ago is not in the log yet — the
+  report will catch it at the next sample, but `status` is the thing
+  somebody runs when they want to know NOW, so a dead unit makes this
+  non-zero on its own rather than waiting for the log to agree.
+  """
+  dead = []
   for unit in TRAFFIC_UNITS + (SAMPLE_UNIT + ".timer",):
-    print(f"{unit}: {out(['systemctl', 'is-active', unit])}")
+    state = out(["systemctl", "is-active", unit])
+    print(f"{unit}: {state}")
+    if state != "active":
+      dead.append(unit)
   report = os.path.join(HERE, "gwsoak_report.py")
-  return subprocess.run([sys.executable, report, LOG]).returncode
+  verdict = subprocess.run([sys.executable, report, LOG]).returncode
+  if dead:
+    print(f"NOT RUNNING: {', '.join(dead)} — the soak has stopped "
+          f"generating or sampling; the log above ends where it did")
+    return 1
+  return verdict
 
 
 def cmd_stop(args) -> int:
@@ -998,8 +1014,9 @@ def cmd_stop(args) -> int:
   subprocess.run([sys.executable,
                   os.path.join(HERE, "gwsoak_report.py"), LOG])
 
-  restore_smoke()
-  return 0
+  # The restore's own result, not a blanket 0: somebody scripting
+  # `stop` needs a non-zero exit when the rig was NOT put back.
+  return restore_smoke()
 
 
 def restore_smoke() -> int:
