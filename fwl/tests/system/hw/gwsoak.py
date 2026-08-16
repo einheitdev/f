@@ -718,6 +718,34 @@ def deploy(policy: str, bundle: str, tag: str) -> None:
   print(f"deployed {tag}: {bundle}, XDP on {attached} interfaces")
 
 
+def wire_flags() -> dict:
+  """The interface flags this bench borrows, as found.
+
+  `prime_wire` turns promiscuous mode ON and VLAN receive-offload OFF
+  on the inside copper port, because native XDP runs after the NIC's
+  MAC filter and the i350 strips 802.1Q tags in hardware before XDP
+  sees them. Both are borrowed, so both are recorded here and put back
+  by `restore_smoke`. Borrowing a host-wide knob and not recording
+  what it was is how a bench once left the operator's own routing
+  down.
+  """
+  offload = out(["ethtool", "-k", INA_IF], timeout=30)
+  match = re.search(r"^rx-vlan-offload:\s*(\w+)", offload, re.MULTILINE)
+  return {
+    "promisc": "PROMISC" in out(["ip", "link", "show", INA_IF]),
+    "rxvlan": match.group(1) if match else "on",
+  }
+
+
+def restore_wire_flags(saved: dict) -> None:
+  """Put them back. Absent a record, back to the driver's defaults —
+  which is what a walk-up rig has always been described as."""
+  run(["ip", "link", "set", "dev", INA_IF, "promisc",
+       "on" if saved.get("promisc") else "off"])
+  run(["ethtool", "-K", INA_IF, "rxvlan",
+       saved.get("rxvlan", "on")])
+
+
 def prime_wire() -> None:
   """Make the copper usable and the neighbour table warm.
 
@@ -785,6 +813,9 @@ def _start(args) -> int:
   forward = read_int("/proc/sys/net/ipv4/ip_forward")
   print(f"net.ipv4.ip_forward is {forward} (fd's, not ours)")
 
+  found = wire_flags()
+  print(f"{INA_IF} as found: {found}")
+
   print("== building the topology ==")
   topology_up()
   print("== deploying the gateway soak policy ==")
@@ -832,6 +863,7 @@ def _start(args) -> int:
       "policy": POLICY,
       "bundle": BUNDLE,
       "masq_addr": MASQ_ADDR,
+      "wire_flags_as_found": found,
       "note": "does not stop itself; `gwsoak.py stop` ends it",
     }, fh, indent=2)
 
@@ -981,6 +1013,13 @@ def restore_smoke() -> int:
   fd did not do it` after the sweep's own tidy-up on 2026-08-16.
   """
   print("== restoring the walk-up smoke policy ==")
+  saved = {"promisc": False, "rxvlan": "on"}
+  try:
+    with open(STATE) as fh:
+      saved = json.load(fh).get("wire_flags_as_found", saved)
+  except (OSError, json.JSONDecodeError, AttributeError):
+    pass
+  restore_wire_flags(saved)
   topology_down()
   with open(RULES, "w") as fh:
     fh.write(SMOKE_POLICY)

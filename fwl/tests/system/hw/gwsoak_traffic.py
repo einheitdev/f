@@ -126,6 +126,25 @@ def fix_csums(frame: bytearray) -> None:
   struct.pack_into(">H", frame, csum_off, value)
 
 
+def patch_churn(frame: bytearray, zone: dict, churned: int) -> None:
+  """Walk one churn frame to the next distinct flow key.
+
+  Byte 26..29 is the source address and 30..33 the destination, so the
+  third and fourth octets of the destination are 32 and 33. Getting
+  that wrong — as the first writing did — walks the churn out of the
+  black-holed /22 and into addresses the box would try to resolve
+  forever, which is exactly the reading a long run exists to take.
+  Named, so `test_gwsoak.py` can assert the shipped arithmetic against
+  `inet_ntoa` instead of reimplementing it and agreeing with itself.
+  """
+  frame[29] = 100 + (churned // CHURN_SPAN) % 100   # src host
+  frame[32] = 240 + ((churned >> 8) & 0x03)         # dst /22
+  frame[33] = churned & 0xFF
+  struct.pack_into(">H", frame, 34,
+                   zone["churn"] + (churned % CHURN_SPAN))
+  fix_csums(frame)
+
+
 def _sock(iface: str) -> socket.socket:
   s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW)
   s.bind((iface, 0))
@@ -193,17 +212,7 @@ def run_inside(args) -> int:
       except OSError:
         pass
     if cycle % CHURN_EVERY == 0:
-      # Byte 26..29 is the source address, 30..33 the destination, so
-      # the third and fourth octets of the destination are 32 and 33.
-      # Getting that wrong walks the churn out of the black-holed /22
-      # and into addresses the box would try to resolve; it is checked
-      # by test_gwsoak.py against inet_ntoa rather than by reading.
-      churn[29] = 100 + (churned // CHURN_SPAN) % 100  # src host
-      churn[32] = 240 + ((churned >> 8) & 0x03)        # dst /22
-      churn[33] = churned & 0xFF
-      struct.pack_into(">H", churn, 34,
-                       zone["churn"] + (churned % CHURN_SPAN))
-      fix_csums(churn)
+      patch_churn(churn, zone, churned)
       try:
         sock.send(bytes(churn))
         churned += 1

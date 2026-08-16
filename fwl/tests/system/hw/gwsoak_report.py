@@ -352,7 +352,14 @@ def main() -> int:
     fails.append(f"fd was not active in {len(active)} sample(s), "
                  f"first {active[0]}")
   if errs:
-    fails.append(f"{errs} fd journal error line(s) across the run")
+    # Each sample reads a FIVE-minute window and samples land every
+    # minute, so one journal line is counted about five times. The
+    # number is a signal, not a tally, and saying so is cheaper than
+    # letting a reader take it for a count.
+    fails.append(f"fd logged at the error level during the run "
+                 f"({errs} line-sightings across overlapping 5-minute "
+                 f"windows, so roughly {max(1, errs // 5)} distinct "
+                 f"line(s)) — read `journalctl -u fd -p err`")
   if len(boots) > 1:
     fails.append(f"the box rebooted during the run ({len(boots)} boot "
                  f"ids); the soak does not survive a reboot and the "
@@ -369,6 +376,14 @@ def main() -> int:
   soc = [v / 1000 for v in series(rows, "sys", "soc_temp_mC") if v > 0]
   nic = [v / 1000 for v in series(rows, "sys", "i350_die_mC") if v > 0]
   print(f"link flaps : {flaps}")
+  if flaps < 0:
+    # The count comes from the kernel ring buffer, which wraps. Over
+    # four days it can wrap, and a wrapped count reads as a NEGATIVE
+    # delta. Failing on that would be failing on the instrument.
+    notes.append(f"the dmesg ring wrapped during the run "
+                 f"(link-up delta {flaps}); link stability cannot be "
+                 f"judged from it for this window")
+    flaps = 0
   if soc:
     print(f"SoC temp   : {min(soc):.1f} - {max(soc):.1f} C")
   if nic:

@@ -67,28 +67,43 @@ def test_the_generator_emits_frames_a_real_stack_accepts():
 
 
 def _walk_churn(zone_key, churned):
+  """Exercise the SHIPPED arithmetic, never a copy of it."""
   zone = traffic.ZONES[zone_key]
   frame = traffic._frame(
     f'tcp(src_ip="{zone["net"]}.100", dst_ip="10.99.240.1", '
     f'src_port=1024, dst_port=443, syn=true)')
-  frame[29] = 100 + (churned // 60000) % 100
-  frame[32] = 240 + ((churned >> 8) & 0x03)
-  frame[33] = churned & 0xFF
-  struct.pack_into(">H", frame, 34, 1024 + (churned % 60000))
-  traffic.fix_csums(frame)
+  traffic.patch_churn(frame, zone, churned)
   return (ipaddress.ip_address(socket.inet_ntoa(bytes(frame[26:30]))),
           ipaddress.ip_address(socket.inet_ntoa(bytes(frame[30:34]))),
+          struct.unpack_from(">H", frame, 34)[0],
           sniff.checksums_ok(bytes(frame), 14))
 
 
 @pytest.mark.parametrize("zone_key", sorted(traffic.ZONES))
 def test_churn_stays_in_the_black_hole_and_in_its_own_zone(zone_key):
   own = ipaddress.ip_network(traffic.ZONES[zone_key]["net"] + ".0/24")
-  for churned in list(range(0, 2048)) + [59999, 60000, 1 << 20]:
-    src, dst, ok = _walk_churn(zone_key, churned)
+  for churned in list(range(0, 2048)) + [27999, 28000, 1 << 20]:
+    src, dst, _sport, ok = _walk_churn(zone_key, churned)
     assert src in own, f"churn {churned} left {own} with {src}"
     assert dst in CHURN_NET, f"churn {churned} left {CHURN_NET}: {dst}"
     assert ok, f"churn {churned} carries a bad checksum"
+
+
+def test_the_two_zones_churn_on_disjoint_translated_ports():
+  """Both zones masquerade to ONE address, so a shared source-port
+  sequence to a shared destination sequence collides on every churn
+  flow — measured at 462 reallocations in 90 s before the ranges were
+  separated. Half the churn was then spent proving the collision path
+  instead of filling the table at the rate on the label."""
+  seen = {}
+  for zone_key in traffic.ZONES:
+    for churned in range(0, 3000):
+      _src, dst, sport, _ok = _walk_churn(zone_key, churned)
+      key = (str(dst), sport)
+      assert key not in seen or seen[key] == zone_key, (
+        f"{zone_key} churn {churned} collides with {seen.get(key)} "
+        f"on {key}")
+      seen[key] = zone_key
 
 
 def test_the_two_zones_cannot_collide_on_a_translated_port():
@@ -327,7 +342,7 @@ def test_the_report_cannot_reach_a_verdict_without_samples(tmp_path):
   (10, lambda s: s["counters"].pop("w_est"), "ABSENT"),
   (10, lambda s: s["fd"].update(nrestarts=1), "restarted"),
   (10, lambda s: s["fd"].update(active="failed"), "not active"),
-  (10, lambda s: s["fd"].update(err_5min=3), "journal error"),
+  (10, lambda s: s["fd"].update(err_5min=3), "at the error level"),
   (10, lambda s: s.update(boot_id="b1"), "rebooted"),
   (10, lambda s: s["egress"].update(attached=2), "every interface"),
   (10, lambda s: s["egress"].update(refused=5), "refused"),
