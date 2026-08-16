@@ -84,6 +84,16 @@ PACKAGES = [
   "python3-lark", "python3-click",
   "python3-setuptools", "python3-setuptools-scm", "python3-wheel",
   "clang", "llvm", "libbpf1", "libbpf-dev", "libzmq5", "libyaml-cpp0.8",
+  # `einheit-f-ui` links libssl/libcrypto directly since Crow was
+  # built with SSL on (2026-08-16). `curl` and `ca-certificates`
+  # happen to pull the same package today, so leaving it out would
+  # work until the day one of those is dropped — and the symptom
+  # would be a dashboard that cannot start on a sealed image.
+  # `check_binaries_load` below would catch it before an archive is
+  # written, but a direct dependency belongs in the list that names
+  # dependencies. Note the t64 suffix: trixie's time_t transition
+  # renamed libssl3.
+  "libssl3t64",
   "bpftool",
   "dnsmasq", "chrony",
   "sudo", "curl", "ca-certificates", "iproute2", "ethtool",

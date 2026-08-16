@@ -23,6 +23,21 @@
 #include "einheit/ui/stream.h"
 #include "einheit/ui/theme.h"
 
+// The framework's TLS branch is `#ifdef CROW_ENABLE_SSL`
+// (ui/src/server.cc:90). That define comes from the Crow target, and
+// `f/cmake/deps.cmake` set it OFF — and won, because it is included
+// long before the framework declares its own Crow with SSL ON and
+// FetchContent's first declaration wins. So this binary could not
+// serve TLS on any box, whatever it was passed, and nothing said so:
+// the flags simply produced a confusing "both must be provided".
+//
+// Failing the BUILD is the guard, because every other symptom of this
+// is silence.
+// To fix: set CROW_ENABLE_SSL ON in cmake/deps.cmake.
+#ifndef CROW_ENABLE_SSL
+#error "einheit-f-ui cannot serve TLS without CROW_ENABLE_SSL"
+#endif
+
 auto main(int argc, char** argv) -> int {
   CLI::App app{
       "einheit-f-ui — f firewall web dashboard"};
@@ -44,6 +59,12 @@ auto main(int argc, char** argv) -> int {
   // is something to authenticate against.
   std::string bind = "127.0.0.1";
   uint16_t port = 7542;
+  // Empty means plaintext. The framework serves TLS when both are set
+  // (`ui/src/server.cc:90`) and errors when only one is
+  // (`ServerError::TlsConfigFailed`), so a half-configured box fails
+  // loudly rather than quietly serving cleartext on 443.
+  std::string tls_cert;
+  std::string tls_key;
   std::string fd_socket = "ipc:///run/f/control.sock";
   int sample_ms = 1000;
   std::string templates_dir;
@@ -52,6 +73,10 @@ auto main(int argc, char** argv) -> int {
 
   app.add_option("--bind", bind, "Bind address");
   app.add_option("--port", port, "TCP port");
+  app.add_option("--tls-cert", tls_cert,
+                 "PEM certificate chain; enables HTTPS with --tls-key");
+  app.add_option("--tls-key", tls_key,
+                 "PEM private key; enables HTTPS with --tls-cert");
   app.add_option("--socket", fd_socket,
                  "fd control socket endpoint");
   app.add_option("--sample-ms", sample_ms,
@@ -91,6 +116,8 @@ auto main(int argc, char** argv) -> int {
   einheit::ui::ServerConfig scfg;
   scfg.bind_addr = bind;
   scfg.port = port;
+  scfg.tls_cert_path = tls_cert;
+  scfg.tls_key_path = tls_key;
   if (!assets_dir.empty()) {
     scfg.assets_dir = assets_dir;
   }

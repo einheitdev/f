@@ -95,6 +95,11 @@ def test_the_libraries_the_binaries_need_are_in_the_package_list():
     "libbpf.so.1": "libbpf1",
     "libzmq.so.5": "libzmq5",
     "libyaml-cpp.so.0.8": "libyaml-cpp0.8",
+    # einheit-f-ui links these directly since Crow was built with SSL
+    # on (2026-08-16). One package ships both; note the t64 suffix
+    # from trixie's time_t transition.
+    "libssl.so.3": "libssl3t64",
+    "libcrypto.so.3": "libssl3t64",
   }
   manifest = f_install.load_manifest(MANIFEST)
   unaccounted = {}
