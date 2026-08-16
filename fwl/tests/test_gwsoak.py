@@ -724,7 +724,8 @@ def test_an_undeclared_reload_is_not_forgiven(tmp_path):
   (lambda s: s["probe"]["c"].update(completed=0), "wire claim"),
   (lambda s: s["counters"].pop("inc.t2_mcast"), "ABSENT"),
   (lambda s: s["counters"].update(c_offnet=0), "backwards"),
-  (lambda s: s["counters"].update(c_workload=999), "identity"),
+  (lambda s: s["counters"].update(
+    c_total=s["counters"]["c_total"] + 999), "ran AHEAD"),
   (lambda s: s["egress"].update(attached=4), "every interface"),
 ], ids=["fd-restart", "reboot", "journal-error", "link-flap",
         "zone-c-wire", "helper-counter-gone", "counter-backwards",
@@ -776,3 +777,56 @@ def test_the_first_epoch_needs_no_epoch_field(tmp_path):
   blocks = report.segment([{"a": 1}, {"epoch": 1}, {"epoch": 2}])
   assert [e for e, _ in blocks] == [1, 2]
   assert [len(b) for _, b in blocks] == [2, 1]
+
+
+# --- the Tier 2 identity, and the read that cannot see it atomically --
+#
+# `bpftool map dump` walks a map's slots in key order and is not a
+# snapshot, so a frame arriving mid-dump increments a leaf whose zone
+# total has already been read past. Measured on the rig under this
+# soak's own load: 800 live dumps, 794 exact, 6 with the leaves ahead
+# by at most 7, longest run of consecutive non-zero readings ONE. The
+# first spelling of this check demanded exact equality and went red on
+# one sample in 130 — honest, but it named the Tier 2 conjunction when
+# the cause was the reader.
+
+def test_a_transient_skew_is_the_reader_and_is_not_a_failure(tmp_path):
+  """The leaves briefly ahead, back to zero next sample, is a read."""
+  def tear(samples):
+    for i in (24, 31, 38):
+      samples[i]["counters"]["c_workload"] += 5
+  proc = _run_report(_two_epoch_log(tmp_path, tear))
+  assert proc.returncode == 0, proc.stdout
+  assert "closed exactly in" in proc.stdout
+  assert "is not atomic across slots" in proc.stdout
+
+
+def test_a_skew_that_never_comes_back_is_the_datapath(tmp_path):
+  """These counters only ever rise, so a frame counted in two leaves
+  is a PERMANENT offset. A skew still there ten samples later was in
+  the datapath and not in the read."""
+  def double_count(samples):
+    for sample in samples[25:]:
+      sample["counters"]["c_workload"] += 5
+  proc = _run_report(_two_epoch_log(tmp_path, double_count))
+  assert proc.returncode == 1
+  assert "did not close once in 10 consecutive samples" in proc.stdout
+
+
+def test_a_total_ahead_of_its_leaves_fails_on_one_sample(tmp_path):
+  """The direction a non-atomic read CANNOT produce: it can only put
+  the leaves ahead. A total ahead of its leaves is a frame that
+  reached the def and landed in no leaf, and one is enough."""
+  def collapse(samples):
+    samples[30]["counters"]["c_total"] += 40
+  proc = _run_report(_two_epoch_log(tmp_path, collapse))
+  assert proc.returncode == 1
+  assert "ran AHEAD of the sum of its leaves" in proc.stdout
+  flat = " ".join(proc.stdout.split())
+  assert "This is the Tier 2 conjunction, not the instrument" in flat
+
+
+def test_the_identity_window_is_shorter_than_the_epoch_it_judges():
+  """A window longer than the run would silently check nothing."""
+  assert report.IDENTITY_WINDOW >= 2
+  assert report.IDENTITY_WINDOW <= 20

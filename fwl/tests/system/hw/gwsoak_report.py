@@ -69,6 +69,16 @@ SOC_WARN_C = 85
 # plateaus at 40 entries is not failed for wobbling to 47.
 CREEP_RATIO = 1.15
 CREEP_FLOOR = 200
+# How many consecutive samples a Tier 2 identity may fail to close
+# before it stops being the reader and starts being the datapath.
+# `bpftool map dump` is not atomic across slots, so a frame arriving
+# mid-dump can leave the leaves briefly ahead of the zone total.
+# Measured on the rig under this soak's own load: 800 live dumps, 794
+# exact, 6 with the leaves ahead by at most 7, and the longest run of
+# consecutive non-zero readings was ONE. Ten samples is ten minutes of
+# never closing, which a transient read cannot produce and a permanent
+# double-count cannot avoid.
+IDENTITY_WINDOW = 10
 
 
 def load(path: str) -> list:
@@ -285,34 +295,80 @@ def main() -> int:
                      f"across the epoch")
     # The Tier 2 zones' arithmetic. Every frame a Tier 2 `def` sees is
     # counted once in the zone total and once in exactly one leaf, so
-    # the sum IS the total — at every instant, at any rate. A guard
-    # that stopped gating puts a frame in two leaves, a helper whose
-    # `drop` stopped returning the caller's verdict puts a dropped
-    # frame in a leaf as well, and a collapsed branch puts it in none.
+    # the sum IS the total. That is a property of the DATAPATH; it is
+    # not a property the instrument can observe atomically, and the
+    # difference matters.
+    #
+    # `bpftool map dump` walks a map's slots in key order and is not a
+    # snapshot. Slot 0 is the zone total and the leaves come after it,
+    # so a frame arriving mid-dump increments a leaf whose total
+    # increment has already been read past. The skew that produces is
+    # POSITIVE ONLY (leaves ahead), small, and gone by the next read.
+    #
+    # Measured on the rig, 2026-08-16, 800 live dumps of the two
+    # running Tier 2 zones under their own load: 794 closed exactly, 6
+    # had the leaves ahead by at most 7, ZERO had the total ahead, and
+    # the longest run of consecutive non-zero readings was 1. The
+    # first spelling of this check demanded exact equality every
+    # sample and went red on one sample in 130 — honest, but it named
+    # the Tier 2 conjunction when the cause was the reader.
+    #
+    # So the check is split into the two things a torn read CANNOT do,
+    # which makes it strictly stronger than the equality it replaces:
+    #
+    #   (1) The total may never run ahead of the leaves. Tearing can
+    #       only put the leaves ahead. A total ahead of its leaves is
+    #       a frame that reached the def and landed in NO leaf — a
+    #       collapsed branch — and one sample of it is a failure.
+    #   (2) A skew must come back. These counters are monotonic, so a
+    #       frame genuinely counted in two leaves is a PERMANENT +1
+    #       that can never un-happen. A skew still there ten samples
+    #       later was in the counters and not in the read.
     for total_name, leaves in spec.get("identities", ()):
-      broken = []
+      skews = []
       for row in block:
         counters = row.get("counters", {})
         if total_name not in counters or any(x not in counters
                                              for x in leaves):
           continue
-        total = counters[total_name]
-        summed = sum(counters[x] for x in leaves)
-        if total != summed:
-          broken.append((row["ts"], total, summed))
-      if broken:
-        ts, total, summed = broken[0]
+        skews.append((row["ts"],
+                      sum(counters[x] for x in leaves)
+                      - counters[total_name]))
+      if not skews:
+        continue
+      ahead = [(ts, s) for ts, s in skews if s < 0]
+      if ahead:
+        ts, skew = ahead[0]
+        fails.append(
+          f"epoch {epoch}: {total_name} ran AHEAD of the sum of its "
+          f"leaves by {-skew:,} at {ts} ({len(ahead)} sample(s)). A "
+          f"frame reached the zone's def and was counted in no leaf "
+          f"at all, which a non-atomic read cannot produce — it can "
+          f"only put the leaves ahead. This is the Tier 2 "
+          f"conjunction, not the instrument")
+      stuck = [skews[i][0]
+               for i in range(len(skews) - IDENTITY_WINDOW + 1)
+               if min(s for _, s in skews[i:i + IDENTITY_WINDOW]) > 0]
+      if stuck:
         fails.append(
           f"epoch {epoch}: the Tier 2 identity {total_name} == "
-          f"{' + '.join(leaves)} failed in {len(broken)} sample(s), "
-          f"first {ts}: {total_name}={total:,} but the leaves sum to "
-          f"{summed:,} (difference {total - summed:,}). Every frame "
-          f"the zone's def sees lands in exactly one leaf, so this "
-          f"is the Tier 2 conjunction, not the traffic")
-      elif spec.get("identities"):
+          f"{' + '.join(leaves)} did not close once in "
+          f"{IDENTITY_WINDOW} consecutive samples from {stuck[0]}. "
+          f"These counters only ever rise, so a frame counted in two "
+          f"leaves is a permanent offset; a skew that never comes "
+          f"back was in the datapath and not in the read")
+      dirty = [s for _, s in skews if s]
+      if dirty:
+        notes.append(
+          f"epoch {epoch}: {total_name} closed exactly in "
+          f"{len(skews) - len(dirty)} of {len(skews)} sample(s); the "
+          f"other {len(dirty)} had the leaves ahead by at most "
+          f"{max(dirty)} and back to zero next sample — `bpftool map "
+          f"dump` is not atomic across slots")
+      else:
         notes.append(f"epoch {epoch}: {total_name} == the sum of its "
-                     f"{len(leaves)} leaves in all {len(block)} "
-                     f"sample(s)")
+                     f"{len(leaves)} leaves in all {len(skews)} "
+                     f"sample(s), exactly")
 
   # --- the tables ----------------------------------------------------
   # `fwl_nat` and `conntrack` are MapLifetime.FLOW: a reload does not
