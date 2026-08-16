@@ -1,0 +1,127 @@
+# The office-gateway soak policy.
+#
+# The 48 h soak of 2026-08-08 is this project's stability evidence and
+# it covers none of what the office box actually does: counters, rate
+# limiting, sampled logging, conntrack and a drop matrix on ONE zone,
+# with no NAT and no routing. The NAT soak of 2026-08-12 covered
+# masquerade for 1.53 h, on a two-zone bundle, before routing via
+# bpf_fib_lookup, fail-closed forwarding, per-zone NAT config, the
+# devmap unpin, next-hop resolution and the egress tracker existed.
+#
+# This is a gateway. Two inside zones behind ONE uplink — the bundle
+# that could not load until the devmap was unpinned (l2_08) — with the
+# return path gated on conntrack state, which is the composition that
+# did not work behind masquerade until `fwl_snat_egress` began
+# inserting the POST-translation tuple (l11_04). Everything the old
+# soak exercised is still here, on both inside zones.
+#
+# Interface names are literal because the rig's are: enp1s0f1 and
+# enp1s0f2 are copper, `fs3b` is the veth root end that stands in for
+# the third firewall port the i350 does not have (see gwsoak.py's
+# topology note). Keep them in step with gwsoak.py.
+zone ina = [enp1s0f1]
+zone inb = [fs3b]
+zone wanz = [enp1s0f2]
+
+# --- inside zone A — copper, through the EX2300 ----------------------
+#
+# The `drop` matrix runs BEFORE the translation, so the noise never
+# reaches the NAT tables and the rate limiter's budget is spent on the
+# flood rather than on the workload. `count a_masq` is read back by
+# name every sample and paired with a real socket on the far side: on
+# its own it would keep climbing with the rewrite disabled entirely,
+# which is why no counter in this file is evidence by itself.
+@xdp(ina)
+
+count a_total
+count a_masq if pkt.src_ip in 10.99.31.0/24
+count a_flood if pkt.src_ip in 10.99.60.0/24
+count a_mcast if pkt.dst_ip in 224.0.0.0/4
+count a_logged if pkt.proto == udp and pkt.dst_port == 9999
+log(sample=100) if pkt.proto == udp and pkt.dst_port == 9999
+drop if pkt.dst_ip in 224.0.0.0/4
+drop if pkt.proto == udp and (pkt.dst_port == 137 or pkt.dst_port == 138)
+drop if pkt.src_ip in 10.99.60.0/24
+       limited by rate_limit(500, per=src_ip, scope=zone)
+masquerade if pkt.src_ip in 10.99.31.0/24
+redirect to wanz if pkt.src_ip in 10.99.31.0/24
+count a_other
+default drop
+
+# --- inside zone B — the second zone behind the SAME uplink ----------
+#
+# Identical shape on purpose. Two masquerading zones naming one
+# destination is what made the bundle unloadable (two objects declaring
+# one pinned `fwl_devmap_wanz`) and, once it loaded, what made the
+# single bundle-global `fwl_nat_cfg` slot visible. Both zones must
+# resolve the same masquerade address here, and the far side must see
+# that one address from both — which is the assertion, on the wire,
+# every sample.
+@xdp(inb)
+
+count b_total
+count b_masq if pkt.src_ip in 10.99.32.0/24
+count b_flood if pkt.src_ip in 10.99.60.0/24
+count b_mcast if pkt.dst_ip in 224.0.0.0/4
+count b_logged if pkt.proto == udp and pkt.dst_port == 9999
+log(sample=100) if pkt.proto == udp and pkt.dst_port == 9999
+drop if pkt.dst_ip in 224.0.0.0/4
+drop if pkt.proto == udp and (pkt.dst_port == 137 or pkt.dst_port == 138)
+drop if pkt.src_ip in 10.99.60.0/24
+       limited by rate_limit(500, per=src_ip, scope=zone)
+masquerade if pkt.src_ip in 10.99.32.0/24
+redirect to wanz if pkt.src_ip in 10.99.32.0/24
+count b_other
+default drop
+
+# --- the uplink ------------------------------------------------------
+#
+# This is the shape `deploy/firstboot` generates for an uplink, and it
+# is deliberately not the shape this policy started with. `default
+# drop` is what makes the return path a measurement: everything that
+# comes home has to be admitted by `in [established, related]`, so a
+# guest's completed TCP exchange IS the witness that the composition
+# still holds behind masquerade. If it stops composing, nothing comes
+# back and the far side's `completed` goes to zero. The same rule is
+# the box's OWN traffic coming home — flows the appliance originates,
+# whose conntrack entries are made by the TC egress tracker and by
+# nothing else. It is the last rule before `default drop` for that
+# reason: on a box with no tracker this is exactly where DNS died.
+#
+# WHAT IS NOT HERE, AND WHY — finding, 2026-08-16.
+# This zone had `redirect to ina if ... pkt.dst_ip in 10.99.31.0/24`
+# and its `inb` twin. Both are UNREACHABLE and were removed. The
+# emitted program is `{prelude}{nat_denat}{body}`, and the prelude
+# CACHES `dst_ip` out of the header before `fwl_nat_denat(ctx)`
+# rewrites it — the body then tests the cached value. So on any zone
+# that de-NATs, every body rule reading `pkt.dst_ip` sees the address
+# the frame carried ON THE WIRE, never the one de-NAT restored, and a
+# return-path redirect naming an inside host can never match. Behind
+# masquerade there is no pre-de-NAT field that identifies the inside
+# zone either — every reply arrives addressed to the one uplink
+# address — so such a redirect cannot be written at all. Replies get
+# home through `allow` and the Linux stack, which is what
+# `firstboot` already generates and what the office box will run.
+#
+# `l2_08_three_zone_gateway` and `l2_09_two_uplinks` both carry that
+# redirect and both are green: their green comes from `allow` plus the
+# stack, not from the datapath, and their `ip_forward=0` control
+# cannot tell the two apart because it stops both.
+#
+# The three counters below are the finding's continuous witness, and
+# they are a measurement rather than an assertion because one number
+# at zero proves nothing on its own: `w_pre_denat` must stay level
+# with `w_total` while `w_to_a` and `w_to_b` stay at zero, on a wire
+# where EVERY reply is demonstrably de-NAT'd to one of those two
+# subnets. Should that ever invert, the semantics changed under a
+# running soak and somebody should know.
+@xdp(wanz)
+
+count w_total
+count w_est if conntrack(pkt).state in [established, related]
+count w_pre_denat if pkt.dst_ip == 10.99.210.2
+count w_to_a if pkt.dst_ip in 10.99.31.0/24
+count w_to_b if pkt.dst_ip in 10.99.32.0/24
+allow if conntrack(pkt).state in [established, related]
+count w_dropped
+default drop
