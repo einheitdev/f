@@ -1523,6 +1523,36 @@ auto RenderEdit(const Response& resp,
   RenderFormatted(t, renderer);
 }
 
+/// The units the model implies, as systemd reported them AFTER the
+/// apply.
+///
+/// This is a different claim from the `applied` row above it, and the
+/// difference is the point: `applied` says the document was installed,
+/// this says whether the service it binds is running. Before the apply
+/// path owned unit lifecycle, `applied: yes` was the only thing an
+/// operator saw and it was true of a box serving nothing.
+///
+/// Every value here comes from `systemctl show` after the action, so a
+/// row cannot agree with the model by construction.
+auto AddServiceRows(Table* t, const json& j) -> void {
+  if (!j.contains("services") || !j["services"].is_array()) return;
+  for (const auto& s : j["services"]) {
+    const bool ok = s.value("ok", false);
+    // Whether a row has anything to say is `UnitOutcome::Silent()`'s
+    // judgement, carried here rather than re-derived: two renderers
+    // with their own copy of "when to stay quiet" is two ways to lose
+    // a finding.
+    if (s.value("quiet", false)) continue;
+    auto sem = Semantic::Bad;
+    if (ok) {
+      sem = s.value("action", "") == "nothing to do" ? Semantic::Dim
+                                                     : Semantic::Good;
+    }
+    AddRow(*t, {Cell{"service", Semantic::Info},
+                Cell{s.value("summary", ""), sem}});
+  }
+}
+
 auto RenderIfaceConfig(const Response& resp,
                        Renderer& renderer) -> void {
   auto j = ParseData(resp);
@@ -1582,6 +1612,7 @@ auto RenderIfaceConfig(const Response& resp,
     row("warning", j["warning"].get<std::string>(),
         Semantic::Warn);
   }
+  AddServiceRows(&t, j);
   if (j.contains("activation_note")) {
     row("note", j["activation_note"].get<std::string>(),
         Semantic::Warn);
@@ -2188,7 +2219,22 @@ auto RenderApplySystem(const Response& resp, Renderer& renderer)
   if (!note.empty()) out << note << "\n";
   auto dhcp_on = JoinStrings(j.value("dhcp_on", json::array()));
   if (!dhcp_on.empty()) {
+    // NOTE: this list is derived from the model that generated the
+    // config, so it agrees with the config by construction and is
+    // evidence about nothing — it shares a form of words with
+    // `show services`' ANSWERS ON, which is read from the kernel and
+    // is the column entitled to it. Left as it is here because the
+    // same string is pinned in `f-sysconf apply` and in
+    // `tests/system/test_dhcp_zone_containment.py`; renaming it is
+    // its own change, not a side effect of this one.
     out << "dhcp answers on: " << dhcp_on << "\n";
+  }
+  // What the units the model implies are doing NOW, read back out of
+  // systemd after the apply acted on them. `applied` above is a claim
+  // about files; this is the one about service.
+  for (const auto& s : j.value("services", json::array())) {
+    if (s.value("quiet", false)) continue;
+    out << s.value("summary", "") << "\n";
   }
   // Last, and loudest: "applied" is a claim about files. If the ports
   // this configuration names do not exist yet, the box is not running

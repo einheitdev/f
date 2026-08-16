@@ -481,28 +481,48 @@ class Firstboot:
                        f"current -> {bundle.name}")
 
   def plan_units(self):
-    """Decide which units this box needs, from its own model."""
+    """Decide which units this box needs, from its own model.
+
+    The always-on half is this list: the daemons an appliance is, which
+    no model can turn off. The service half comes from `f-sysconf
+    render units` — the same derivation the apply path acts on and
+    `show services` reports against — so this file does not keep a
+    second copy of a table that has to agree with C++ to be worth
+    anything.
+
+    Ordering is why this step still exists rather than being folded
+    into `f-sysconf apply`: a DHCP server must not start before the
+    policy is in the packet path, and `apply` runs several steps
+    earlier.
+    """
     units = ["fd.service", "f-confd.service", "einheit-f-ui.service"]
-    services = (self.model or {}).get("services") or {}
-    if services.get("dhcp") or services.get("dns"):
-      units.append("f-dnsmasq.service")
-    if services.get("ntp"):
-      units.append("f-chrony.service")
+    proc = self._exec([self.f_sysconf, "-c", str(self.system_yaml),
+                       "render", "units"])
+    if proc.returncode != 0:
+      # Guessing the list here is how the two derivations drift apart.
+      # A box whose services cannot be derived is a box that stops.
+      return self.record(
+        "plan services", Outcome.FAILED,
+        f"f-sysconf render units: {self._tail(proc)}",
+        "Which service units this box needs is derived from the "
+        "model by f-sysconf; without it this step would be guessing.")
+    bound = []
+    for line in proc.stdout.splitlines():
+      state, _, unit = line.partition(" ")
+      if state == "wanted" and unit:
+        bound.append(unit)
+    units += bound
     self.units = units
-    bound = [u for u in units if u.startswith("f-dnsmasq")
-             or u.startswith("f-chrony")]
     return self.record(
       "plan services", Outcome.DONE,
       f"{', '.join(units)}",
       "" if bound else
       "No zone binds dhcp, dns or ntp, so neither f-dnsmasq nor "
-      "f-chrony is enabled. Their units are installed. Binding a "
-      "service later — `set dhcp`, `set dns`, or editing "
-      "system.yaml and applying it — writes the config and does NOT "
-      "start the unit: this step is the only thing in the system "
-      "that enables one, and it runs once. After binding a service, "
-      "`systemctl enable --now f-dnsmasq` (or f-chrony), then "
-      "`einheit-f show services` to check ANSWERS ON.")
+      "f-chrony is enabled here. Their units are installed. Binding "
+      "one later — `set dhcp`, `set dns`, or editing system.yaml and "
+      "running `apply system` — enables and starts it as part of the "
+      "apply, and reports what systemd says afterwards. Check it "
+      "with `einheit-f show services`.")
 
   def unit_state(self, unit):
     """What systemd says this unit is actually doing.

@@ -60,20 +60,28 @@ $ einheit-f reload firewall
 
 After that, the everyday changes have verbs — `einheit-f show policy lan` numbers the statements, `set rule` adds one where it can still match, `no rule` takes one out. See [reference/cli.md](../reference/cli.md#the-policy). The whole-file version above is what you write once, because the *ordering* below is the part that has to be deliberate.
 
-## Turn the services on
+## The services are already on
 
-If you bound DHCP or DNS to the zone with `set dhcp` / `set dns`, check that something is actually serving them:
-
-```
-$ einheit-f show services
-```
-
-`STOPPED — the unit was never started` means exactly that. The service verbs edit the model and regenerate the config; the units are enabled once, at provisioning time, and a service bound after that has to be started by hand:
+`set dhcp` and `set dns` enable and start the unit that serves them, as part of the same apply that writes the model — and the line they print afterwards is what `systemctl show` said, not what `systemctl enable --now` returned:
 
 ```
-$ sudo systemctl enable --now f-dnsmasq
-$ einheit-f show services   # ANSWERS ON should now name the zone's port
+$ einheit-f set dhcp lan 10.10.1.100-10.10.1.150 12h
+ zone     │ lan
+ applied  │ yes
+ service  │ f-dnsmasq.service: STARTED — it was not running, and systemd now reports it active
 ```
+
+If the unit will not start, that is an **error**, not a footnote on a success: the configuration is on disk and nothing is serving it, and the command says so with systemd's own reason. `journalctl -u f-dnsmasq` is the next step, and re-running the verb is not — the edit already took.
+
+The other direction is the same apply: `no dhcp` on the last binding stops and disables the unit, so the box is not still answering DHCP after you told it not to.
+
+Either way, the screen that reads the kernel rather than the model is:
+
+```
+$ einheit-f show services   # ANSWERS ON should name the zone's port
+```
+
+`BOUND TO` is what the model asks for; `ANSWERS ON` is what the daemon's sockets actually say. A service that is `running` and answering on nothing is a real state and this is where it shows.
 
 ## Check it worked
 

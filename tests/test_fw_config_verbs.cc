@@ -113,10 +113,34 @@ class ConfigVerbs : public ::testing::Test {
     // Nothing is listening on these; that is the point.
     cfg_.fd_socket = "ipc://" + (dir_ / "no-fd.sock").string();
     cfg_.confd_socket = "ipc://" + (dir_ / "no-confd.sock").string();
+
+    // With no f-confd, this transport IS the apply, and an apply owns
+    // the lifecycle of the units the model implies. The box it acts on
+    // is this table: f-dnsmasq installed, disabled and stopped —
+    // which is the state a factory box is in before anything binds a
+    // service to a zone.
+    units_ = dir_ / "units.json";
+    WriteText(units_, R"({
+  "f-dnsmasq.service": {"active": "inactive", "enabled": "disabled"}
+})");
+    ::setenv("FAKE_SYSTEMCTL_STATE", units_.c_str(), 1);
+    cfg_.systemctl_path = F_FAKE_SYSTEMCTL;
   }
 
   void TearDown() override {
+    ::unsetenv("FAKE_SYSTEMCTL_STATE");
     std::filesystem::remove_all(dir_);
+  }
+
+  /// One field of one unit, as the fake systemctl has it now.
+  auto Unit(const std::string& unit, const std::string& field) const
+      -> std::string {
+    auto table = json::parse(ReadText(units_), nullptr, false);
+    if (table.is_discarded() || !table.contains(unit)) return "";
+    const auto& rec = table[unit];
+    if (!rec.contains(field)) return "";
+    return rec[field].is_string() ? rec[field].get<std::string>()
+                                  : rec[field].dump();
   }
 
   auto SystemPath() const -> std::filesystem::path {
@@ -152,6 +176,7 @@ class ConfigVerbs : public ::testing::Test {
   }
 
   std::filesystem::path dir_;
+  std::filesystem::path units_;
   fw::FLocalConfig cfg_;
 };
 
@@ -333,6 +358,157 @@ TEST_F(ConfigVerbs, SetDhcpRefusesAZoneThatIsNotDeclared) {
   auto r = Send("dhcp_set", {"nope", "10.30.0.1-10.30.0.9"});
   ASSERT_EQ(r.status, proto::ResponseStatus::Error);
   EXPECT_EQ(ReadText(SystemPath()), before);
+}
+
+// -- who starts what the verbs bind -----------------------------------
+//
+// The finding these close: `set dhcp` wrote the model, regenerated
+// `dnsmasq.conf`, answered `applied: yes` — and nothing on the box
+// started the unit that serves it. `systemctl enable --now` occurred
+// in `firstboot.py` and nowhere else, so the unit set was a snapshot
+// of whatever the model bound at provisioning time.
+//
+// The apply path owns it now. These run through the real transport,
+// the real reconcile and a real subprocess to a fake systemctl that
+// keeps a unit table, so the transition is measured rather than
+// asserted about a mock.
+
+TEST_F(ConfigVerbs, SetDhcpStartsTheUnitThatServesIt) {
+  // The state a factory box is in: installed, disabled, stopped.
+  ASSERT_EQ(Unit("f-dnsmasq.service", "active"), "inactive");
+
+  auto r = Send("dhcp_set",
+                {"testnet", "10.10.0.100-10.10.0.200", "12h"});
+  ASSERT_EQ(r.status, proto::ResponseStatus::Ok)
+      << (r.error ? r.error->message : "");
+
+  // The box, not the reply.
+  EXPECT_EQ(Unit("f-dnsmasq.service", "active"), "active");
+  EXPECT_EQ(Unit("f-dnsmasq.service", "enabled"), "enabled");
+
+  // And the reply says so, in a state read back out of systemd.
+  auto j = Body(r);
+  ASSERT_TRUE(j.contains("services")) << j.dump(2);
+  json dm;
+  for (const auto& row : j["services"]) {
+    if (row.value("unit", "") == "f-dnsmasq.service") dm = row;
+  }
+  ASSERT_FALSE(dm.is_null());
+  EXPECT_TRUE(dm.value("wanted", false));
+  EXPECT_EQ(dm.value("before", ""), "STOPPED");
+  EXPECT_EQ(dm.value("after", ""), "running");
+  EXPECT_EQ(dm.value("command", ""),
+            "systemctl enable --now f-dnsmasq.service");
+  EXPECT_TRUE(dm.value("ok", false));
+  EXPECT_TRUE(j.value("services_ok", false));
+}
+
+// The other direction, which nothing did before either: a box that
+// goes on answering DHCP after `no dhcp` is the same defect.
+TEST_F(ConfigVerbs, NoDhcpStopsTheUnitWhenNothingElseNeedsIt) {
+  ASSERT_EQ(Send("dhcp_set", {"testnet", "10.10.0.100-10.10.0.200"})
+                .status,
+            proto::ResponseStatus::Ok);
+  ASSERT_EQ(Unit("f-dnsmasq.service", "active"), "active");
+
+  auto r = Send("dhcp_delete", {"testnet"});
+  ASSERT_EQ(r.status, proto::ResponseStatus::Ok)
+      << (r.error ? r.error->message : "");
+  EXPECT_EQ(Unit("f-dnsmasq.service", "active"), "inactive");
+  EXPECT_EQ(Unit("f-dnsmasq.service", "enabled"), "disabled");
+}
+
+// dnsmasq is one daemon for two services. Removing DHCP while DNS is
+// still bound must leave it running — and restart it, because the
+// configuration it reads has just changed under it.
+TEST_F(ConfigVerbs, NoDhcpLeavesTheUnitUpWhenDnsIsStillBound) {
+  ASSERT_EQ(Send("dhcp_set", {"testnet", "10.10.0.100-10.10.0.200"})
+                .status,
+            proto::ResponseStatus::Ok);
+  ASSERT_EQ(Send("dns_set", {"testnet", "9.9.9.9"}).status,
+            proto::ResponseStatus::Ok);
+  ASSERT_EQ(Unit("f-dnsmasq.service", "active"), "active");
+
+  auto r = Send("dhcp_delete", {"testnet"});
+  ASSERT_EQ(r.status, proto::ResponseStatus::Ok)
+      << (r.error ? r.error->message : "");
+  EXPECT_EQ(Unit("f-dnsmasq.service", "active"), "active");
+  auto j = Body(r);
+  json dm;
+  for (const auto& row : j["services"]) {
+    if (row.value("unit", "") == "f-dnsmasq.service") dm = row;
+  }
+  ASSERT_FALSE(dm.is_null());
+  EXPECT_EQ(dm.value("action", ""), "restarted");
+}
+
+// An apply can now fail in a new way, and it must be visible. The
+// configuration is on disk and the service will not run: that is not
+// a success with a footnote.
+TEST_F(ConfigVerbs, AServiceThatWillNotStartMakesTheReplyAnError) {
+  WriteText(units_, R"({
+  "f-dnsmasq.service": {"active": "inactive", "on_start": "fail"}
+})");
+  auto r = Send("dhcp_set", {"testnet", "10.10.0.100-10.10.0.200"});
+  ASSERT_EQ(r.status, proto::ResponseStatus::Error);
+  ASSERT_TRUE(r.error.has_value());
+  EXPECT_EQ(r.error->code, "service_not_running");
+  EXPECT_NE(r.error->message.find("f-dnsmasq.service"),
+            std::string::npos)
+      << r.error->message;
+  EXPECT_NE(r.error->message.find("FAILED"), std::string::npos)
+      << r.error->message;
+  // The edit is on disk — the error is about the service, and saying
+  // otherwise would send the operator to re-run a command that
+  // already worked.
+  EXPECT_TRUE(Model().ZoneServesDhcp("testnet"));
+}
+
+// `systemctl enable --now` exits 0 for a unit that started, crashed
+// and entered auto-restart. The reply must not be built from that.
+TEST_F(ConfigVerbs, ACrashLoopingServiceIsNotReportedAsStarted) {
+  WriteText(units_, R"({
+  "f-dnsmasq.service": {"active": "inactive",
+                        "on_start": "crashloop"}
+})");
+  auto r = Send("dhcp_set", {"testnet", "10.10.0.100-10.10.0.200"});
+  ASSERT_EQ(r.status, proto::ResponseStatus::Error)
+      << "systemctl exited 0; the unit is in auto-restart";
+  ASSERT_TRUE(r.error.has_value());
+  EXPECT_NE(r.error->message.find("RESTARTING"), std::string::npos)
+      << r.error->message;
+}
+
+// A unit that is not installed is not a unit that failed. The operator
+// is told which, because they are different things to go and fix.
+TEST_F(ConfigVerbs, AnUninstalledUnitSaysSoRatherThanFailed) {
+  WriteText(units_, "{}");
+  auto r = Send("dhcp_set", {"testnet", "10.10.0.100-10.10.0.200"});
+  ASSERT_EQ(r.status, proto::ResponseStatus::Error);
+  ASSERT_TRUE(r.error.has_value());
+  EXPECT_NE(r.error->message.find("NOT INSTALLED"), std::string::npos)
+      << r.error->message;
+  // The three bad endings differ. A screen that renders them alike is
+  // the blank-row defect wearing a third hat.
+  WriteText(units_, R"({
+  "f-dnsmasq.service": {"active": "inactive", "on_start": "fail"}
+})");
+  WriteText(SystemPath(), kSystem);
+  auto failed = Send("dhcp_set",
+                     {"testnet", "10.10.0.100-10.10.0.200"});
+  ASSERT_TRUE(failed.error.has_value());
+  EXPECT_NE(failed.error->message, r.error->message);
+}
+
+// A verb that binds nothing must not disturb a unit, and a box where
+// nothing is bound must stay quiet.
+TEST_F(ConfigVerbs, AVerbThatBindsNoServiceStartsNothing) {
+  auto r = Send("zone_set", {"dmz"});
+  ASSERT_EQ(r.status, proto::ResponseStatus::Ok);
+  EXPECT_EQ(Unit("f-dnsmasq.service", "active"), "inactive");
+  auto j = Body(r);
+  EXPECT_EQ(j.value("services_note", "x"), "");
+  EXPECT_TRUE(j.value("services_ok", false));
 }
 
 // -- policy -----------------------------------------------------------

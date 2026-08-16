@@ -43,6 +43,14 @@ foreach(test_source ${test_sources})
       GTest::gtest_main
     )
   endif()
+  # The apply path owns the lifecycle of the units the model implies,
+  # so anything that drives an apply needs a systemd to drive. This is
+  # a fake systemctl that keeps a real unit table on disk: a test can
+  # start it from `stopped` and prove the transition, which a stub that
+  # answers the same thing before and after cannot.
+  target_compile_definitions(${test_name} PRIVATE
+    F_FAKE_SYSTEMCTL="${CMAKE_CURRENT_SOURCE_DIR}/support/fake_systemctl.py"
+  )
   if(NOT CMAKE_CROSSCOMPILING)
     gtest_discover_tests(${test_name}
       DISCOVERY_TIMEOUT 10

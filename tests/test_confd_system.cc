@@ -31,6 +31,7 @@
 #include "einheit/cli/transport/zmq_local.h"
 #include "f/confd/system_backend.h"
 #include "f/sysconfig/artifact.h"
+#include "f/sysconfig/parse.h"
 
 namespace {
 
@@ -105,6 +106,9 @@ class Box {
   }
   auto lan0_network() const -> std::filesystem::path {
     return networkd() / "10-f-lan0.network";
+  }
+  auto units() const -> std::filesystem::path {
+    return root_ / "units.json";
   }
 
   auto Options() -> f::confd::SystemBackendOptions {
@@ -449,6 +453,134 @@ TEST(ConfdSystemBackend, RevertOutlivesTheClientThatArmedIt) {
       5s);
   EXPECT_TRUE(reverted)
       << "the revert died with the session it was protecting";
+}
+
+// -- who starts the units the model implies ---------------------------
+//
+// The appliance's real activator, not a recording one. It owns the
+// lifecycle of the units the model binds: before this, `apply system`
+// ran `systemctl try-restart`, a documented no-op on a unit that is
+// not already running, so a service bound with `set dhcp` was started
+// by nobody and this report said the configuration had been applied.
+//
+// `networkd_changed` is left empty on purpose — these exercise the
+// service half, and a test that ran `networkctl reload` would be
+// reconfiguring the machine it runs on.
+
+/// A scratch unit table for the fake systemctl, plus the env var that
+/// points at it.
+class UnitTable {
+ public:
+  explicit UnitTable(std::filesystem::path path, const char* json)
+      : path_(std::move(path)) {
+    WriteFile(path_, json);
+    ::setenv("FAKE_SYSTEMCTL_STATE", path_.c_str(), 1);
+  }
+  ~UnitTable() { ::unsetenv("FAKE_SYSTEMCTL_STATE"); }
+
+  auto Field(const std::string& unit, const std::string& key) const
+      -> std::string {
+    // Deliberately a dumb scan rather than a JSON parse: this file has
+    // no other reason to depend on a parser, and the fixture writes
+    // one object per unit.
+    const auto text = ReadFile(path_);
+    auto at = text.find("\"" + unit + "\"");
+    if (at == std::string::npos) return "";
+    auto k = text.find("\"" + key + "\"", at);
+    if (k == std::string::npos) return "";
+    auto colon = text.find(':', k);
+    auto open = text.find('"', colon);
+    auto close = text.find('"', open + 1);
+    if (open == std::string::npos || close == std::string::npos) {
+      return "";
+    }
+    return text.substr(open + 1, close - open - 1);
+  }
+
+ private:
+  std::filesystem::path path_;
+};
+
+auto ServingConfig() -> std::string {
+  return ConfigWithAddress("10.10.0.1/24") +
+         "services:\n"
+         "  dhcp:\n"
+         "    - zone: lan\n"
+         "      range: 10.10.0.100-10.10.0.200\n";
+}
+
+auto ModelOf(const std::string& text) -> f::sysconfig::SystemConfig {
+  auto parsed = f::sysconfig::ParseSystemConfigString(text);
+  EXPECT_TRUE(parsed.has_value());
+  return parsed ? *parsed : f::sysconfig::SystemConfig{};
+}
+
+TEST(DefaultActivator, StartsTheUnitTheModelBinds) {
+  Box box;
+  UnitTable units(box.units(),
+                  R"({"f-dnsmasq.service": {"active": "inactive"}})");
+  ASSERT_EQ(units.Field("f-dnsmasq.service", "active"), "inactive");
+
+  const auto model = ModelOf(ServingConfig());
+  f::confd::Activation act;
+  act.model = &model;
+  act.dnsmasq_changed = true;
+
+  auto report = f::confd::DefaultActivator(F_FAKE_SYSTEMCTL)(act);
+  ASSERT_TRUE(report.has_value()) << report.error();
+  EXPECT_EQ(units.Field("f-dnsmasq.service", "active"), "active");
+  EXPECT_EQ(units.Field("f-dnsmasq.service", "enabled"), "enabled");
+  EXPECT_NE(report->find("STARTED"), std::string::npos) << *report;
+}
+
+// The new way an apply can fail, and it must not be a footnote on a
+// success: `SystemBackend::Apply` turns an activator error into
+// "configuration written but NOT live", which is what has happened.
+TEST(DefaultActivator, AServiceThatWillNotStartIsAnActivationFailure) {
+  Box box;
+  UnitTable units(box.units(),
+                  R"({"f-dnsmasq.service": {"active": "inactive",
+                                            "on_start": "fail"}})");
+  const auto model = ModelOf(ServingConfig());
+  f::confd::Activation act;
+  act.model = &model;
+  act.dnsmasq_changed = true;
+
+  auto report = f::confd::DefaultActivator(F_FAKE_SYSTEMCTL)(act);
+  ASSERT_FALSE(report.has_value());
+  EXPECT_NE(report.error().find("f-dnsmasq.service"),
+            std::string::npos)
+      << report.error();
+  EXPECT_NE(report.error().find("FAILED"), std::string::npos)
+      << report.error();
+}
+
+// The reverse. `no dhcp` removes the last binding and the server has
+// to stop; nothing did this before, in either direction.
+TEST(DefaultActivator, StopsTheUnitTheModelNoLongerBinds) {
+  Box box;
+  UnitTable units(box.units(),
+                  R"({"f-dnsmasq.service": {"active": "active",
+                                            "sub": "running",
+                                            "enabled": "enabled"}})");
+  const auto model = ModelOf(ConfigWithAddress("10.10.0.1/24"));
+  f::confd::Activation act;
+  act.model = &model;
+
+  auto report = f::confd::DefaultActivator(F_FAKE_SYSTEMCTL)(act);
+  ASSERT_TRUE(report.has_value()) << report.error();
+  EXPECT_EQ(units.Field("f-dnsmasq.service", "active"), "inactive");
+  EXPECT_EQ(units.Field("f-dnsmasq.service", "enabled"), "disabled");
+}
+
+// An activator with no model must not report that it found nothing to
+// do. It did not look.
+TEST(DefaultActivator, SaysSoWhenItWasGivenNoModel) {
+  f::confd::Activation act;
+  auto report = f::confd::DefaultActivator(F_FAKE_SYSTEMCTL)(act);
+  ASSERT_TRUE(report.has_value());
+  EXPECT_NE(report->find("NOT reconciled"), std::string::npos)
+      << *report;
 }
 
 }  // namespace

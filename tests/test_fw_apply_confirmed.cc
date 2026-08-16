@@ -72,6 +72,14 @@ class Box {
     std::filesystem::remove_all(root_);
     std::filesystem::create_directories(root_);
     WriteFileText(config(), ConfigWithAddress("10.10.0.1/24"));
+    // The apply path acts on unit state now, so the box it acts on is
+    // pinned here rather than left as whatever this workstation has
+    // running.
+    WriteFileText(units(),
+                  "{\n"
+                  "  \"f-dnsmasq.service\": {\"active\": \"inactive\"}\n"
+                  "}\n");
+    ::setenv("FAKE_SYSTEMCTL_STATE", units().c_str(), 1);
   }
 
   ~Box() {
@@ -89,8 +97,13 @@ class Box {
     return "ipc://" + (root_ / "confd.pub").string();
   }
 
+  auto units() const -> std::filesystem::path {
+    return root_ / "units.json";
+  }
+
   auto TransportConfig() const -> fw::FLocalConfig {
     fw::FLocalConfig cfg;
+    cfg.systemctl_path = F_FAKE_SYSTEMCTL;
     cfg.system_config = config().string();
     cfg.dnsmasq_conf = (root_ / "dnsmasq.conf").string();
     cfg.confd_socket = endpoint();

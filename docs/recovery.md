@@ -297,10 +297,10 @@ f-dnsmasq.service is not installed on this box
 | `running` | Should run, does. | — |
 | `not configured` | Nothing is bound here and nothing runs. Correct. | — |
 | `NOT INSTALLED` | The model binds a service here; the unit file is not on the box. | Install it (`deploy/systemd/f-dnsmasq.service`), then `systemctl daemon-reload`. |
-| `STOPPED` | The unit exists and nobody ever started it. | `systemctl enable --now f-dnsmasq` |
+| `STOPPED` | The unit exists and nobody ever started it. | `einheit-f apply system` — the apply owns unit lifecycle and will enable and start what the model binds. `systemctl enable --now f-dnsmasq` does the same thing by hand. |
 | `FAILED` | It tried and died. The last thing it said is in the detail line. | Read the detail, then `journalctl -u f-dnsmasq`. |
 | `RESTARTING (failing)` | Flapping. systemd calls this `activating` for the whole restart burst, which reads as "starting". | Treat as failing. `journalctl -u f-dnsmasq`. |
-| `running (not in the config)` | Running, and the model says it should not be. | Something else is serving this segment. Find it. |
+| `running (not in the config)` | Running, and the model says it should not be. | `einheit-f apply system` stops and disables it. If it comes back, something other than this model is starting it — find that. |
 | `unknown` | systemd could not be reached. | Not the same as fine. |
 
 The one to be careful with is `RESTARTING`. A unit that flaps forever looks alive in every dashboard while serving nobody; `f-dnsmasq.service` therefore carries a `StartLimitBurst` so it eventually sits in `failed`, where both systemd and this view say so out loud.

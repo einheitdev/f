@@ -67,6 +67,11 @@ struct FLocalConfig {
   /// two enumerations that can disagree is the failure this command
   /// exists to report.
   std::string install_tool = "/usr/local/bin/f-install";
+  /// Path to systemctl. The apply path owns the lifecycle of the
+  /// units the model implies (see `f/sysconfig/service_units.h`), and
+  /// this is the binary it runs and reads state back out of. A test
+  /// bench points it at a stub; nothing else should.
+  std::string systemctl_path = "systemctl";
   /// f-confd's control socket. f-confd owns the commit-confirmed
   /// revert timer, which has to outlive the session that armed it —
   /// so applying the system configuration goes through it whenever it

@@ -87,6 +87,8 @@ A zone name is not created by being referenced: `set interface zone lan0 dmzz` i
 
 **No service verb takes an interface, and none can.** A service binds to a zone and the ports it answers on are derived from zone membership every time the config is generated — so "DHCP answers on the uplink" is not a mistake you can make at this prompt any more than you can make it in the file.
 
+**The apply path owns the unit, in both directions.** `set dhcp` and `set dns` enable and start `f-dnsmasq.service` as part of the same apply that writes the model; `no dhcp` on the last binding stops and disables it. There is no verb that starts a service, because a service that is bound and not running is not a state this surface offers you. What the reply says about the unit is read out of `systemctl show` **after** the action, never from the exit code — `systemctl enable --now` returns 0 for a unit that started, crashed and entered auto-restart. A unit that will not come up makes the verb an **error**, naming systemd's own reason: the edit is on disk and the service is not running, and those are two facts the reply is not allowed to merge.
+
 NTP has no verb yet; see the gaps at the bottom of this page.
 
 ## Devices on the segment

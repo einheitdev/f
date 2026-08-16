@@ -24,7 +24,7 @@ Write down the two MAC addresses and which physical socket each one is. Label th
 
 ## 2. Say what the box is
 
-Everything the box is lives in one file, `/etc/f/system.yaml`, and you can write the whole of it from the CLI. Each command edits that file in place and applies it; nothing is written anywhere else.
+Everything the box is lives in one file, `/etc/f/system.yaml`, and you can write the whole of it from the CLI. Each command edits that file in place and applies it — including starting the service unit a binding implies, and stopping one nothing binds any more. Nothing is written anywhere else, and there is no second step.
 
 ```
 $ einheit-f set zone wan
@@ -93,9 +93,13 @@ wrote /etc/systemd/network/10-f-lan0.network
 wrote /etc/f/generated/dnsmasq.conf
 applied without a confirm window — use `apply system confirmed
 <minutes>` when the change could cut your own access
+dhcp answers on: lan0
+f-dnsmasq.service: STARTED — it was not running, and systemd now reports it active
 ```
 
 This generated the dnsmasq config from the model, had dnsmasq validate it, and installed it. The generated files are derived artifacts: digest-stamped, never hand-edited, and an edit to one is reported as drift rather than quietly overwritten.
+
+The last line is the apply owning the service. The units this model implies are enabled and started by the apply that makes it live, and one the model no longer binds anywhere is stopped by the same apply — you do not reach for `systemctl` after a `set dhcp`. What that line reports is read back out of `systemctl show` **after** the action, never taken from the exit code: `systemctl enable --now` exits 0 for a unit that started, crashed and entered auto-restart. If the service will not run, this command is an **error** rather than a success with a note, because a configuration on disk that nothing is serving is not an applied configuration.
 
 **If the output ends with a `PENDING RENAME` block, stop and read it.** It means the ports named in that configuration do not exist under those names yet, so nothing you just wrote is in effect. The block gives you the three commands that apply the rename, and [recovery.md](recovery.md#a-configuration-was-applied-but-the-ports-it-names-do-not-exist-yet) explains why it happens. A reboot also works.
 

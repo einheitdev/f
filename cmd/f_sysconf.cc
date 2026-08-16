@@ -9,6 +9,8 @@
 ///   f-sysconf show                  the resolved model
 ///   f-sysconf render dnsmasq        print the derived artifact
 ///   f-sysconf render networkd       print the derived units
+///   f-sysconf render units          the systemd units the model
+///                                   implies, `wanted`/`unwanted`
 ///   f-sysconf status                artifacts vs the model (drift)
 ///   f-sysconf apply                 generate -> validate -> install
 
@@ -22,6 +24,7 @@
 
 #include "f/sysconfig/chrony.h"
 #include "f/sysconfig/dnsmasq.h"
+#include "f/sysconfig/service_units.h"
 #include "f/sysconfig/ipv6.h"
 #include "f/sysconfig/model.h"
 #include "f/sysconfig/networkd.h"
@@ -35,6 +38,7 @@ namespace {
 
 using f::sysconfig::AddressModeName;
 using f::sysconfig::ApplyDnsmasq;
+using f::sysconfig::PlanServiceUnits;
 using f::sysconfig::ApplyNetworkd;
 using f::sysconfig::ApplySysctl;
 using f::sysconfig::CheckArtifactDrift;
@@ -329,7 +333,7 @@ auto main(int argc, char** argv) -> int {
   std::string what;
   render->add_option("what", what,
                      "dnsmasq | networkd | sysctl | ipv6 "
-                     "| chrony")
+                     "| chrony | units")
       ->required();
   auto* storage = app.add_subcommand(
       "storage", "Disk, bundles, and what logging has lost");
@@ -375,9 +379,21 @@ auto main(int argc, char** argv) -> int {
       std::cout << PlanIpv6(*cfg).sysctl_content;
     } else if (what == "chrony") {
       std::cout << PlanChrony(*cfg).content;
+    } else if (what == "units") {
+      // The units the model implies, in the one derivation the apply
+      // path acts on and `show services` reports against. Printed so
+      // the first-boot provisioner — which is Python and enables the
+      // same set at its own point in the sequence — does not keep a
+      // second copy of this table. Two enumerations that can disagree
+      // is how the deployable set came to be missing three binaries.
+      for (const auto& u : PlanServiceUnits(*cfg)) {
+        std::cout << std::format("{} {}\n",
+                                 u.wanted ? "wanted" : "unwanted",
+                                 u.unit);
+      }
     } else {
       std::cerr << "render: expected 'dnsmasq', 'networkd', 'sysctl', "
-                   "'ipv6' or 'chrony'\n";
+                   "'ipv6', 'chrony' or 'units'\n";
       return 2;
     }
     return 0;

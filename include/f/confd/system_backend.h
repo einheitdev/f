@@ -34,6 +34,7 @@
 
 #include "einheit/cli/confd/config_backend.h"
 #include "einheit/cli/schema.h"
+#include "f/sysconfig/model.h"
 
 namespace f::confd {
 
@@ -57,14 +58,15 @@ struct Activation {
   std::vector<std::string> networkd_changed;
   /// True when the generated dnsmasq artifact changed.
   bool dnsmasq_changed = false;
-  /// True when the model binds DHCP or DNS to at least one zone.
+  /// The configuration being made live. The activator owns the
+  /// lifecycle of the units this model implies — enabling and starting
+  /// what it binds, stopping what it no longer binds — so it needs the
+  /// model, not a flag derived from it. See
+  /// `f/sysconfig/service_units.h` for why the apply path owns this.
   ///
-  /// Without it, an inactive `f-dnsmasq` cannot be read: on a box that
-  /// serves neither it is correct and expected, and on a box whose
-  /// operator has just bound a DHCP range to a zone it means the
-  /// service they asked for is being served by nobody. Those are
-  /// opposite facts and the report used to give them the same words.
-  bool serves_dhcp_or_dns = false;
+  /// Null only in a test that has nothing to reconcile; the activator
+  /// then says it did not look rather than implying it found nothing.
+  const sysconfig::SystemConfig* model = nullptr;
 };
 
 /// Makes written artifacts take effect. Returns a description of what
@@ -74,9 +76,12 @@ struct Activation {
 using Activator = std::function<
     std::expected<std::string, std::string>(const Activation&)>;
 
-/// The activator used on the appliance: reloads systemd-networkd and
-/// restarts the generated-config services whose inputs changed.
-auto DefaultActivator() -> Activator;
+/// The activator used on the appliance: reloads systemd-networkd, and
+/// brings the units the model implies into the state it implies —
+/// reporting what systemd says afterwards, never what was asked for.
+/// @param systemctl Path to systemctl. A test points it at a stub.
+auto DefaultActivator(std::string systemctl = "systemctl")
+    -> Activator;
 
 /// An activator that does nothing and says so. For hosts where the
 /// operator activates by hand (and for tests).
@@ -103,8 +108,11 @@ struct SystemBackendOptions {
   std::string sysctl_proc_dir = "/proc/sys";
   /// Discard hand edits to generated artifacts instead of refusing.
   bool force = false;
+  /// Path to systemctl, for the default activator. A test bench points
+  /// it at a stub; nothing else should.
+  std::string systemctl_path = "systemctl";
   /// How the written artifacts are made live. Defaults to
-  /// DefaultActivator().
+  /// DefaultActivator(systemctl_path).
   Activator activate;
 };
 

@@ -18,6 +18,7 @@ import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent
                        / "firstboot"))
+from conftest import render_units_stdout  # noqa: E402
 import firstboot  # noqa: E402
 from firstboot import Firstboot, Outcome  # noqa: E402
 
@@ -47,6 +48,18 @@ class FakeRunner:
   def __call__(self, argv, **kwargs):
     """Run one command."""
     self.calls.append(list(argv))
+    if (Path(argv[0]).name == "f-sysconf" and
+        argv[-2:] == ["render", "units"]):
+      # firstboot asks f-sysconf which service units the model
+      # implies rather than keeping its own table. This answers from
+      # the same file the real binary would read; that the two agree
+      # is `test_service_unit_derivation.py`.
+      model = {}
+      if len(argv) > 2 and Path(argv[2]).exists():
+        model = yaml.safe_load(
+          Path(argv[2]).read_text(encoding="utf-8")) or {}
+      return subprocess.CompletedProcess(
+        argv, 0, render_units_stdout(model), "")
     if argv[:2] == ["systemctl", "show"]:
       active, sub, restarts = self.unit_states.get(
         argv[2], ("active", "running", "0"))

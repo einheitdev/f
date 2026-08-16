@@ -18,6 +18,7 @@
 #include "f/sysconfig/model.h"
 #include "f/sysconfig/networkd.h"
 #include "f/sysconfig/parse.h"
+#include "f/sysconfig/service_units.h"
 #include "f/sysconfig/sysctl.h"
 #include "f/sysconfig/validate.h"
 
@@ -105,8 +106,8 @@ auto FormatDiagnostics(const std::vector<sc::Diagnostic>& diags)
 
 }  // namespace
 
-auto DefaultActivator() -> Activator {
-  return [](const Activation& act)
+auto DefaultActivator(std::string systemctl) -> Activator {
+  return [systemctl = std::move(systemctl)](const Activation& act)
              -> std::expected<std::string, std::string> {
     std::string report;
     if (!act.networkd_changed.empty()) {
@@ -128,71 +129,49 @@ auto DefaultActivator() -> Activator {
             " (interface name pinning takes effect on next boot)";
       }
     }
-    if (act.dnsmasq_changed) {
-      auto [rc, out] = RunCommand(
-          {"systemctl", "try-restart", "f-dnsmasq.service"});
-      if (rc != 0) {
-        return std::unexpected(std::format(
-            "restarting f-dnsmasq.service failed ({}): {}", rc,
-            out));
-      }
+
+    // The units the model implies. This apply owns their lifecycle:
+    // a service bound with `set dhcp` is enabled and started here, and
+    // one that is no longer bound anywhere is stopped here. Before
+    // this, `systemctl enable --now` occurred in firstboot.py and
+    // nowhere else, so the unit set was frozen at provisioning time
+    // and a service bound afterwards was served by nobody while this
+    // report said the configuration had been applied.
+    //
+    // What follows is read back out of systemd. `try-restart` used to
+    // stand here and it exits 0 for a unit it did not touch, which is
+    // the whole class of defect: an exit code is a fact about a
+    // command, never about a service.
+    if (act.model == nullptr) {
       if (!report.empty()) report += "; ";
-      // `try-restart` is a no-op that exits 0 when the unit is not
-      // running, so its exit code says the command was issued and
-      // nothing about the unit. Reporting "restarted" from it meant a
-      // dnsmasq that was `failed` when its config was rewritten stayed
-      // failed and the operator was told otherwise. Ask what the unit
-      // is NOW.
-      auto [srv_rc, srv_out] = RunCommand(
-          {"systemctl", "is-active", "f-dnsmasq.service"});
-      std::string state = srv_out;
-      while (!state.empty() &&
-             (state.back() == '\n' || state.back() == '\r')) {
-        state.pop_back();
+      report +=
+          "the service units were NOT reconciled: this activator was "
+          "given no model to derive them from";
+    } else {
+      sc::ReconcileOptions ropts;
+      ropts.ops = sc::RealSystemdOps(systemctl);
+      if (act.dnsmasq_changed) {
+        ropts.config_changed.push_back("f-dnsmasq.service");
       }
-      if (state == "active") {
-        report += "f-dnsmasq restarted (active)";
-      } else if (state == "inactive" && !act.serves_dhcp_or_dns) {
-        // Legitimate on a box that serves neither DHCP nor DNS: the
-        // config was written and nothing is running to read it. Said
-        // plainly, because "restarted" implies something is serving.
-        report += "f-dnsmasq config written, unit not running "
-                  "(inactive)";
-      } else if (state == "inactive") {
-        // NOT legitimate, and until now it read identically to the
-        // case above. This model binds DHCP or DNS to a zone and
-        // nothing is serving it.
-        //
-        // `try-restart` is a no-op on a unit that was never started,
-        // and nothing else enables one: `systemctl enable --now`
-        // occurs in deploy/firstboot/firstboot.py and nowhere else in
-        // this tree, so the units are planned once at provisioning
-        // time from whatever the model bound THEN. A service bound
-        // afterwards — with `set dhcp`, with `set dns`, or by editing
-        // the file — is started by nobody, and firstboot's own
-        // parting message says that binding a service and running
-        // `apply system` is what turns them on. It is not.
-        //
-        // Naming the command is the interim. Closing it properly is a
-        // decision rather than a patch: either these verbs plan units
-        // the way firstboot does, or this apply enables them, or
-        // there is a verb. See the deployment walk of 2026-08-15.
-        report +=
-            "f-dnsmasq config written and the unit is NOT RUNNING, so "
-            "the DHCP/DNS this configuration binds is being served by "
-            "nobody. Nothing here enables it: `sudo systemctl enable "
-            "--now f-dnsmasq`, then `show services` to check ANSWERS "
-            "ON";
-      } else {
-        report += std::format(
-            "f-dnsmasq config written but the unit is '{}' — it is "
-            "NOT serving the configuration that was just applied "
-            "(`systemctl status f-dnsmasq` for why)",
-            state.empty() ? "unknown" : state);
+      auto services = sc::ReconcileServices(*act.model, ropts);
+      auto said = services.Format();
+      if (!services.Ok()) {
+        // A configuration whose service will not run is not an apply
+        // that succeeded with a footnote. `Apply` turns this into
+        // "configuration written but NOT live", which is exactly what
+        // has happened.
+        return std::unexpected(services.FailureDetail());
       }
-      (void)srv_rc;
+      if (!said.empty()) {
+        if (!report.empty()) report += "; ";
+        report += said;
+      }
     }
-    if (report.empty()) report = "nothing needed reloading";
+
+    if (report.empty()) {
+      report = "nothing needed reloading and every service unit was "
+               "already in the state the model asks for";
+    }
     return report;
   };
 }
@@ -206,7 +185,9 @@ auto NullActivator() -> Activator {
 
 SystemBackend::SystemBackend(SystemBackendOptions opts)
     : opts_(std::move(opts)) {
-  if (!opts_.activate) opts_.activate = DefaultActivator();
+  if (!opts_.activate) {
+    opts_.activate = DefaultActivator(opts_.systemctl_path);
+  }
 
   // The baseline is the configuration the box was running when confd
   // first came up. It is what an empty candidate means, so the
@@ -364,8 +345,7 @@ auto SystemBackend::Apply(const cc::Candidate& candidate)
 
   Activation activation;
   activation.networkd_changed = net->changed;
-  activation.serves_dhcp_or_dns =
-      !parsed->dhcp.empty() || !parsed->dns.empty();
+  activation.model = &*parsed;
   if (sysctl->changed) {
     activation.networkd_changed.push_back(sysctl->unit.path);
   }

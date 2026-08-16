@@ -9,14 +9,12 @@
 #include <array>
 #include <cstdio>
 #include <format>
-#include <set>
 #include <string>
 #include <utility>
 #include <vector>
 
-#include "f/sysconfig/chrony.h"
-#include "f/sysconfig/dnsmasq.h"
 #include "f/sysconfig/observe.h"
+#include "f/sysconfig/service_units.h"
 
 namespace f::sysconfig {
 namespace {
@@ -253,77 +251,41 @@ auto ObserveBinding(const ServiceProbe& probe, const PortTable& ports,
   ResolveListenerInterfaces(ports, &out->observed);
 }
 
-/// The time service, which is a service like any other and must not
-/// be allowed to be silently absent — every timestamp on the box is
-/// stated in what it does or fails to do.
-auto ChronyStatus(const SystemConfig& cfg, const ServiceProbe& probe,
-                  const PortTable& ports) -> ServiceStatus {
-  ServiceStatus s;
-  s.unit = "f-chrony.service";
-  auto plan = PlanChrony(cfg);
-  s.expected = plan.needed;
-  s.zones = plan.served_zones;
-  // Interface names, not bind addresses: the column this feeds is
-  // compared against observed sockets resolved to ports, and comparing
-  // two different kinds of string would manufacture a mismatch on
-  // every box. A client-only chrony serves no zone and expects
-  // nothing, which is the containment stated as an empty list.
-  {
-    std::set<std::string> names;
-    for (const auto& z : plan.served_zones) {
-      for (const auto& n : cfg.InterfaceNamesInZone(z)) {
-        names.insert(n);
-      }
-    }
-    s.interfaces.assign(names.begin(), names.end());
-  }
-  s.name = plan.serves ? "ntp client+server (chrony)"
-                       : "ntp client (chrony)";
-  // Probed even when the model does not expect it. A chronyd running
-  // that nothing asked for is `running (not in the config)` — a box
-  // quietly taking its time from a source the model never named — and
-  // skipping the probe would render that as `unknown`, which is a
-  // fault state and would hide a real one behind it.
-  Probe(probe, &s);
-  ObserveBinding(probe, ports, &s);
-  return s;
-}
-
 }  // namespace
 
 auto QueryServices(const SystemConfig& cfg,
                    const ServiceProbe& probe)
     -> std::vector<ServiceStatus> {
-  ServiceStatus dnsmasq;
-  dnsmasq.unit = "f-dnsmasq.service";
-
-  std::set<std::string> zones;
-  for (const auto& d : cfg.dhcp) zones.insert(d.bind.zone);
-  for (const auto& d : cfg.dns) zones.insert(d.bind.zone);
-  dnsmasq.zones.assign(zones.begin(), zones.end());
-
-  auto plan = PlanDnsmasq(cfg);
-  dnsmasq.interfaces = plan.allowed_interfaces;
-  dnsmasq.expected = plan.needed;
-
-  std::string kinds;
-  if (!cfg.dhcp.empty()) kinds = "dhcp";
-  if (!cfg.dns.empty()) {
-    if (!kinds.empty()) kinds += "+";
-    kinds += "dns";
+  // The unit list and the `expected` flag come from
+  // `PlanServiceUnits`, which is also what the apply path acts on.
+  // Two derivations would let the thing that starts a service and the
+  // screen an operator checks afterwards disagree about whether it
+  // should be running at all — and the screen is the only evidence
+  // the operator has.
+  //
+  // Every unit is probed, including one the model does not want: a
+  // chronyd nobody asked for is `running (not in the config)`, a box
+  // quietly taking its time from a source the model never named.
+  // Skipping the probe would render that as `unknown`, which is a
+  // fault state, and would hide a real one behind it.
+  std::vector<ServiceStatus> out;
+  for (const auto& want : PlanServiceUnits(cfg)) {
+    ServiceStatus s;
+    s.unit = want.unit;
+    s.name = want.name;
+    s.expected = want.wanted;
+    s.zones = want.zones;
+    s.interfaces = want.interfaces;
+    Probe(probe, &s);
+    out.push_back(std::move(s));
   }
-  if (kinds.empty()) kinds = "dhcp/dns";
-  dnsmasq.name = std::format("{} (dnsmasq)", kinds);
 
-  Probe(probe, &dnsmasq);
-
-  // The port table is read once and shared: both services resolve
-  // their listening addresses through the same view of the hardware,
-  // so they cannot disagree about which port an address is on.
+  // The port table is read once and shared: every service resolves its
+  // listening addresses through the same view of the hardware, so they
+  // cannot disagree about which port an address is on.
   auto ports = ObservePorts(probe.ports);
-  ObserveBinding(probe, ports, &dnsmasq);
-
-  return {dnsmasq, ChronyStatus(cfg, probe, ports)};
+  for (auto& s : out) ObserveBinding(probe, ports, &s);
+  return out;
 }
 
 }  // namespace f::sysconfig

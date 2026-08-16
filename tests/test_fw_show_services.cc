@@ -365,4 +365,170 @@ TEST_F(GreenWhileBrokenTest, AQuietApplyStaysQuiet) {
   EXPECT_FALSE(Has(out, "LEFT IN PLACE"));
 }
 
+// -- what the apply says about the units it acted on -------------------
+//
+// The reply carries an observation per unit. These pin that the screen
+// keeps the endings apart: "started", "was already running", "failed
+// to start" and "not installed" are four different things for an
+// operator to do next, and a renderer that drew them alike would put
+// the whole reconcile back where `applied: yes` was.
+
+namespace {
+
+/// One service row of an apply reply, as `ReportServiceUnits` builds
+/// it. Only the fields a renderer is entitled to read.
+auto UnitRow(const std::string& before, const std::string& action,
+             const std::string& after, const std::string& command,
+             bool ok, const std::string& summary) -> json {
+  return {
+      {"unit", "f-dnsmasq.service"},
+      {"service", "dhcp+dns (dnsmasq)"},
+      {"wanted", true},
+      {"before", before},
+      {"action", action},
+      {"command", command},
+      {"after", after},
+      {"ok", ok},
+      {"quiet", false},
+      {"detail", ""},
+      {"summary", summary},
+  };
+}
+
+auto ApplyReply(const json& services) -> json {
+  return {
+      {"config", "/etc/f/system.yaml"},
+      {"ok", true},
+      {"applied", true},
+      {"via", "direct"},
+      {"activated", false},
+      {"written", json::array()},
+      {"removed", json::array()},
+      {"leftover", json::array()},
+      {"pending", json::array()},
+      {"pending_note", ""},
+      {"dhcp_on", json::array({"lan0"})},
+      {"note", ""},
+      {"services", services},
+      {"services_ok", true},
+      {"services_note", ""},
+  };
+}
+
+}  // namespace
+
+TEST_F(GreenWhileBrokenTest, TheFourEndingsOfAnApplyDifferOnScreen) {
+  const auto started = Render(
+      "apply system",
+      ApplyReply(json::array({UnitRow(
+          "STOPPED", "enabled and started", "running",
+          "systemctl enable --now f-dnsmasq.service", true,
+          "f-dnsmasq.service: STARTED — it was not running, and "
+          "systemd now reports it active")})));
+  const auto already = Render(
+      "apply system",
+      ApplyReply(json::array({UnitRow(
+          "running", "nothing to do", "running", "", true,
+          "f-dnsmasq.service: already running, nothing to do")})));
+  const auto failed = Render(
+      "apply system",
+      ApplyReply(json::array({UnitRow(
+          "STOPPED", "enabled and started", "FAILED",
+          "systemctl enable --now f-dnsmasq.service", false,
+          "f-dnsmasq.service: the model binds dhcp+dns (dnsmasq) "
+          "here and systemd says FAILED after `systemctl enable "
+          "--now f-dnsmasq.service`")})));
+  const auto absent = Render(
+      "apply system",
+      ApplyReply(json::array({UnitRow(
+          "NOT INSTALLED", "not attempted", "NOT INSTALLED", "",
+          false,
+          "f-dnsmasq.service: NOT INSTALLED on this box, so the "
+          "dhcp+dns (dnsmasq) this configuration binds cannot be "
+          "served at all")})));
+
+  for (const auto* a : {&started, &already, &failed, &absent}) {
+    EXPECT_NE(Flat(*a).find("f-dnsmasq.service"), std::string::npos)
+        << *a;
+  }
+  // Pairwise. A screen that collapses any two of these has lost the
+  // distinction the reconcile exists to make.
+  const std::vector<const std::string*> all = {&started, &already,
+                                               &failed, &absent};
+  for (std::size_t i = 0; i < all.size(); ++i) {
+    for (std::size_t k = i + 1; k < all.size(); ++k) {
+      EXPECT_NE(Flat(*all[i]), Flat(*all[k]))
+          << "screens " << i << " and " << k << " are identical:\n"
+          << *all[i];
+    }
+  }
+  EXPECT_TRUE(Has(started, "STARTED"));
+  EXPECT_TRUE(Has(already, "already running"));
+  EXPECT_FALSE(Has(already, "STARTED"));
+  EXPECT_TRUE(Has(failed, "FAILED"));
+  EXPECT_TRUE(Has(absent, "NOT INSTALLED"));
+}
+
+// The same discipline one verb over: `set dhcp` renders through the
+// config-verb table rather than the apply's plain text, and the four
+// endings have to survive there too.
+TEST_F(GreenWhileBrokenTest, SetDhcpShowsWhatSystemdSaidAfterwards) {
+  auto reply = [](const json& row) {
+    return json{
+        {"zone", "testnet"},
+        {"action", "serve dhcp"},
+        {"value", "10.10.0.100-10.10.0.200"},
+        {"config", "/etc/f/system.yaml"},
+        {"applied", true},
+        {"persisted", true},
+        {"activated", false},
+        {"services", json::array({row})},
+        {"services_ok", true},
+    };
+  };
+  const auto started = Render(
+      "set dhcp",
+      reply(UnitRow("STOPPED", "enabled and started", "running",
+                    "systemctl enable --now f-dnsmasq.service", true,
+                    "f-dnsmasq.service: STARTED — it was not "
+                    "running, and systemd now reports it active")));
+  const auto already = Render(
+      "set dhcp",
+      reply(UnitRow("running", "nothing to do", "running", "", true,
+                    "f-dnsmasq.service: already running, nothing to "
+                    "do")));
+  EXPECT_TRUE(Has(started, "STARTED")) << started;
+  EXPECT_NE(Flat(started), Flat(already));
+  // `applied` and `service` are different claims and both are on the
+  // screen. The whole defect was the first standing in for the second.
+  EXPECT_TRUE(Has(started, "applied"));
+  EXPECT_TRUE(Has(started, "f-dnsmasq.service"));
+}
+
+// A row the reconcile marked silent is dropped, and the judgement is
+// the reply's, not the renderer's. A renderer with its own copy of
+// "when to stay quiet" is a second way to lose a finding — which is
+// how this surface lost one when the same rule was written twice.
+TEST_F(GreenWhileBrokenTest, ASilentServiceRowIsNotDrawn) {
+  auto quiet = UnitRow("not configured", "nothing to do",
+                       "not configured", "", true,
+                       "f-chrony.service: not running, and nothing "
+                       "binds it");
+  quiet["wanted"] = false;
+  quiet["unit"] = "f-chrony.service";
+  quiet["quiet"] = true;
+  const auto hidden = Render("apply system",
+                             ApplyReply(json::array({quiet})));
+  EXPECT_EQ(Flat(hidden).find("f-chrony.service"), std::string::npos)
+      << hidden;
+
+  // The same row NOT marked silent is drawn, so the test above cannot
+  // pass because the renderer draws nothing at all.
+  quiet["quiet"] = false;
+  const auto shown = Render("apply system",
+                            ApplyReply(json::array({quiet})));
+  EXPECT_NE(Flat(shown).find("f-chrony.service"), std::string::npos)
+      << shown;
+}
+
 }  // namespace

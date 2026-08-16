@@ -15,11 +15,13 @@ back quietly.
 """
 
 import re
+import subprocess
 import sys
 from pathlib import Path
 
 DEPLOY = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(DEPLOY / "firstboot"))
+from conftest import render_units_stdout  # noqa: E402
 import firstboot  # noqa: E402
 UNIT = DEPLOY / "systemd/f-firstboot.service"
 def directives(unit_text, name):
@@ -37,17 +39,24 @@ def units_firstboot_starts():
   """Every unit the provisioner can pass to `systemctl enable --now`.
 
   Read off `plan_units` rather than copied, so a new service added to
-  the plan is covered by this test the day it is added.
+  the plan is covered by this test the day it is added. The service
+  half of that plan comes from `f-sysconf render units`, which is
+  answered here by the stand-in `test_service_unit_derivation.py`
+  pins against the real binary.
   """
   boot = firstboot.Firstboot(root="/nonexistent")
   names = set()
-  # Truthy values, because `plan_units` asks whether a service is
-  # bound and an empty mapping is not.
-  bound = {"zone": "lan"}
+  bound = [{"zone": "lan"}]
   for services in ({}, {"dhcp": bound}, {"dns": bound},
                    {"ntp": bound},
                    {"dhcp": bound, "dns": bound, "ntp": bound}):
-    boot.model = {"services": services}
+    model = {
+      "interfaces": {"lan0": {"zone": "lan"}},
+      "services": services,
+    }
+    boot.model = model
+    boot.run = lambda argv, _m=model, **kw: subprocess.CompletedProcess(
+      argv, 0, render_units_stdout(_m), "")
     boot.plan_units()
     names.update(boot.units)
   return names

@@ -414,6 +414,17 @@ def phase_configure(walk, key):
     first = ((out or err).splitlines() or ["no reply"])[0]
     walk.check("configure", command.replace(" ", "-"), rc == 0,
                f"{what}: {first}")
+  # The verbs are supposed to have started the service they bound, so
+  # ask systemd here, at the step that bound it, rather than only in
+  # the traffic phase where a lease would explain it anyway.
+  _, dnsmasq_state, _ = box(walk, key, "configure",
+                            "systemctl is-active f-dnsmasq.service "
+                            "|| true")
+  walk.check("configure", "set-dhcp-started-the-server",
+             dnsmasq_state.strip() == "active",
+             f"f-dnsmasq.service is {dnsmasq_state.strip()} right "
+             f"after `set dhcp`/`set dns`, with nothing having run "
+             f"systemctl")
   cli(walk, key, "configure", "show system")
   cli(walk, key, "configure", "show services")
   _, yaml, _ = box(walk, key, "configure", "cat /etc/f/system.yaml")
@@ -453,41 +464,40 @@ def phase_policy(walk, key):
 
 
 def start_bound_services(walk, key, phase):
-  """Start the units the service verbs bound but nobody enables.
+  """The units the service verbs bound are already running.
 
-  `set dhcp` and `set dns` edit the model, regenerate
-  `/etc/f/generated/dnsmasq.conf` and report success — and the unit
-  that would serve it is not enabled, so nothing on the segment is
-  answered. `show services` says so exactly ("STOPPED ... the unit was
-  never started"), which is the diagnostics working; what is missing
-  is any way to act on it. `systemctl enable --now` appears in
-  `deploy/firstboot/firstboot.py` and nowhere else in the tree, so the
-  units are planned once at provisioning time and a service bound
-  afterwards is never started by anything.
+  This used to be the walk reaching outside the CLI to run `systemctl
+  enable --now` by hand, and recording that it had to as friction: the
+  verbs edited the model, regenerated `/etc/f/generated/dnsmasq.conf`,
+  reported success, and nothing on the box started the unit that
+  serves it. `systemctl enable --now` occurred in
+  `deploy/firstboot/firstboot.py` and nowhere else in the tree.
 
-  So this is the walk reaching outside the CLI, deliberately and on
-  the record, because an operator following the documentation has no
-  other move.
+  The apply path owns it now, so this is a check rather than a
+  workaround — and it is a check the old box fails: it asks systemd,
+  which is the only witness that can tell "the verb worked" from "the
+  segment is served".
   """
-  _, services, _ = cli(walk, key, phase, "show services")
-  if "STOPPED" not in services:
-    return
-  walk.friction(
-    phase, "a service bound through the CLI is never started",
-    "`set dhcp` and `set dns` succeeded, the model and the generated "
-    "dnsmasq.conf carry them, and `show services` reports "
-    "`STOPPED — the unit was never started`. There is no verb that "
-    "starts it: `systemctl enable --now` occurs only in firstboot.py, "
-    "so units are planned once at provisioning time and a service "
-    "bound after that is served by nobody. The operator has to know "
-    "to run systemctl by hand, which is the reach-for-a-file this "
-    "surface exists to remove.")
-  box(walk, key, phase, "systemctl enable --now f-dnsmasq")
-  state = wait_for_unit(walk, key, phase, "f-dnsmasq.service")
-  walk.check(phase, "the-bound-service-can-at-least-be-started",
+  state = wait_for_unit(walk, key, phase, "f-dnsmasq.service",
+                        timeout=30)
+  walk.check(phase, "the-bound-service-is-running",
              state == "active",
-             f"f-dnsmasq.service is {state} after enabling it by hand")
-  cli(walk, key, phase, "show services")
+             f"f-dnsmasq.service is {state}; `set dhcp` and `set dns` "
+             f"are supposed to have started it as part of their own "
+             f"apply, with nobody running systemctl")
+  _, enabled, _ = box(walk, key, phase,
+                      "systemctl is-enabled f-dnsmasq.service || true")
+  walk.check(phase, "the-bound-service-survives-a-reboot",
+             enabled.strip() == "enabled",
+             f"f-dnsmasq.service is {enabled.strip() or 'unknown'}; a "
+             f"service that runs and is not enabled is a segment that "
+             f"goes dark at the next power cut")
+  _, services, _ = cli(walk, key, phase, "show services")
+  walk.check(phase, "show-services-agrees-with-systemd",
+             "STOPPED" not in services,
+             "`show services` reports no STOPPED unit, which is the "
+             "second witness: it reads the kernel's socket table, "
+             "not the model")
 
 
 def phase_traffic(walk, key, out, phase="traffic"):

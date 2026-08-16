@@ -22,6 +22,7 @@
 #include <cstring>
 #include <ctime>
 #include <filesystem>
+#include <map>
 #include <format>
 #include <fstream>
 #include <mutex>
@@ -57,6 +58,7 @@
 #include "f/sysconfig/observe.h"
 #include "f/sysconfig/parse.h"
 #include "f/sysconfig/service_status.h"
+#include "f/sysconfig/service_units.h"
 #include "f/sysconfig/storage.h"
 #include "f/sysconfig/validate.h"
 
@@ -1697,6 +1699,74 @@ class FLocalTransport final
   // writers for one file is how an operator ends up with a running
   // address that no configuration explains.
 
+  using ServiceStates = std::map<std::string, sc::ServiceState>;
+
+  /// What every unit the model implies is doing right now.
+  ///
+  /// Taken before handing an apply to f-confd, so the report
+  /// afterwards names the TRANSITION. Without it the observer reads
+  /// the post-apply state as the pre-apply one and reports "already
+  /// running" for a unit f-confd has just started, which describes
+  /// this process's inaction rather than the operator's change.
+  auto ServiceStatesNow(const sc::SystemConfig& cfg) -> ServiceStates {
+    return sc::ObserveServiceStates(
+        cfg, sc::ReadOnlySystemdOps(cfg_.systemctl_path));
+  }
+
+  /// Bring the units the model implies into the state it implies, and
+  /// put what systemd says AFTERWARDS into the reply.
+  ///
+  /// The apply path owns service lifecycle — see
+  /// `f/sysconfig/service_units.h` for the decision and why the
+  /// alternative was rejected. Two callers, one function:
+  ///
+  ///  - `act = true`  — this process is the apply (f-confd is down),
+  ///    so it enables, starts and stops.
+  ///  - `act = false` — f-confd is the apply and has already acted;
+  ///    this only observes. A unit that still needs a command is
+  ///    reported with that command named, never quietly fixed here,
+  ///    because two writers of unit state is how a box ends up in a
+  ///    state neither of them can explain.
+  ///
+  /// Every state in the reply is read back out of systemd. None of it
+  /// is derived from `cfg`, which is the whole point: a column
+  /// re-derived from the model that generated the config can only ever
+  /// agree with itself.
+  ///
+  /// @returns True when the model and systemd agree afterwards.
+  auto ReportServiceUnits(const sc::SystemConfig& cfg, bool act,
+                          bool dnsmasq_changed, json* out,
+                          const ServiceStates& before = {}) -> bool {
+    sc::ReconcileOptions ropts;
+    ropts.ops = act ? sc::RealSystemdOps(cfg_.systemctl_path)
+                    : sc::ReadOnlySystemdOps(cfg_.systemctl_path);
+    ropts.before = before;
+    if (dnsmasq_changed) {
+      ropts.config_changed.push_back("f-dnsmasq.service");
+    }
+    auto report = sc::ReconcileServices(cfg, ropts);
+    json rows = json::array();
+    for (const auto& u : report.units) {
+      rows.push_back({
+          {"unit", u.unit},
+          {"service", u.name},
+          {"wanted", u.wanted},
+          {"before", sc::ServiceStateName(u.before)},
+          {"action", sc::UnitActionName(u.action)},
+          {"command", u.command},
+          {"after", sc::ServiceStateName(u.after)},
+          {"ok", u.Ok()},
+          {"quiet", u.Silent()},
+          {"detail", u.detail},
+          {"summary", u.Summary()},
+      });
+    }
+    (*out)["services"] = rows;
+    (*out)["services_ok"] = report.Ok();
+    (*out)["services_note"] = report.Format();
+    return report.Ok();
+  }
+
   /// Put `document` in place as the system configuration and make it
   /// live, through f-confd when it is running. Returns the fields to
   /// merge into the reply.
@@ -1728,6 +1798,9 @@ class FLocalTransport final
     }
 
     if (ConfdAvailable()) {
+      // Before f-confd touches anything, so the report below can name
+      // the transition rather than the state it happens to find.
+      const auto before = ServiceStatesNow(*parsed);
       auto sid = StageSystemConfig(req, false);
       if (!sid) return sid.error();
       auto committed = ConfdRequest(req, "commit", {}, *sid,
@@ -1746,6 +1819,26 @@ class FLocalTransport final
       (*out)["commit_id"] = body.value("commit_id", "");
       (*out)["live"] = true;
       (*out)["activated"] = true;
+      // f-confd applied and reconciled the units; this asks systemd
+      // what came of it. A commit that returned Ok while the service
+      // it bound is not running is the case this exists to catch, and
+      // it is the caller's error rather than a note on a success.
+      //
+      // Nothing is reported as changed here even when it was: the
+      // restart is f-confd's to do and it has already done it, and a
+      // row saying this process would have restarted the daemon
+      // describes a command that was neither run nor needed.
+      if (!ReportServiceUnits(*parsed, false, false, out,
+                              before)) {
+        return MakeErr(req.id, "service_not_running",
+            std::format(
+                "the system configuration is live (revision {}), but "
+                "a service it binds is NOT running: {}",
+                (*out)["commit_id"].get<std::string>(),
+                (*out)["services_note"].get<std::string>()),
+            "`show services` reads systemd and the kernel; "
+            "`journalctl -u <unit>` says why");
+      }
       return std::nullopt;
     }
 
@@ -1759,6 +1852,7 @@ class FLocalTransport final
     }
     (*out)["via"] = "direct";
     json written = json::array();
+    bool dnsmasq_changed = false;
     for (const auto& p : net->changed) written.push_back(p);
     // Addresses without forwarding is a box that answers pings and
     // routes nothing. It ships in the same apply as the interfaces
@@ -1811,18 +1905,35 @@ class FLocalTransport final
       }
       if (dm->changed) written.push_back(dm->conf_path);
       (*out)["dhcp_on"] = dm->plan.dhcp_interfaces;
+      dnsmasq_changed = dm->changed;
     }
-    // Written is not running. Nothing here reloads networkd or
-    // restarts dnsmasq; f-confd is what does that, and it is not up.
+    // f-confd is down, so this process is the apply and owns the
+    // lifecycle of the units the model implies. It does NOT reload
+    // networkd — that is a change to the operator's own link and
+    // belongs to the daemon that can put it back — so the note below
+    // says both halves rather than letting the started unit imply the
+    // rest.
     (*out)["activated"] = false;
+    bool services_ok =
+        ReportServiceUnits(*parsed, true, dnsmasq_changed, out);
     // A separate key from `note`: the caller has its own sentence to
     // say about the change it made, and one overwriting the other is
     // how the operator loses whichever half was not the last write.
     (*out)["activation_note"] =
-        "f-confd is not running: the files were written, but nothing "
-        "was reloaded — run `networkctl reload` and restart "
-        "f-dnsmasq, or start f-confd and `apply system`";
+        "f-confd is not running, so no revision was recorded and the "
+        "networkd units were written but NOT reloaded — run "
+        "`networkctl reload`, or start f-confd and `apply system`";
     (*out)["written"] = written;
+    if (!services_ok) {
+      return MakeErr(req.id, "service_not_running",
+          std::format(
+              "the system configuration was written to {} and a "
+              "service it binds is NOT running: {}",
+              SystemConfigPath(),
+              (*out)["services_note"].get<std::string>()),
+          "`show services` reads systemd and the kernel; "
+          "`journalctl -u <unit>` says why");
+    }
     return std::nullopt;
   }
 
@@ -3938,6 +4049,7 @@ class FLocalTransport final
     // Prefer f-confd: one writer, a recorded revision, and a box that
     // can be rolled back to a named configuration afterwards.
     if (ConfdAvailable()) {
+      const auto before = ServiceStatesNow(cfg);
       auto sid = StageSystemConfig(req, force);
       if (!sid) return sid.error();
       auto committed = ConfdRequest(req, "commit", {}, *sid,
@@ -3966,6 +4078,21 @@ class FLocalTransport final
       body["pending"] = pending;
       body["pending_note"] = RenameNote(pending);
       body["diagnostics"] = DiagsToJson(result.diagnostics);
+      // f-confd reconciled the units; this asks systemd what came of
+      // it, and an apply whose service is not running is an error
+      // rather than a success with a quiet column. Nothing is marked
+      // changed: the restart was f-confd's and is already done.
+      if (!ReportServiceUnits(cfg, false, false, &body,
+                              before)) {
+        return MakeErr(req.id, "service_not_running",
+            std::format(
+                "the system configuration is live (revision {}), but "
+                "a service it binds is NOT running: {}",
+                body.value("commit_id", "?"),
+                body["services_note"].get<std::string>()),
+            "`show services` reads systemd and the kernel; "
+            "`journalctl -u <unit>` says why");
+      }
       return MakeOk(req.id, body);
     }
 
@@ -3996,40 +4123,31 @@ class FLocalTransport final
         "`networkctl reload` to adopt the new units";
 
     auto plan = sc::PlanDnsmasq(cfg);
+    bool dnsmasq_changed = false;
+    json dhcp_on = json::array();
+    std::string note = kDirectNote;
     if (!plan.needed) {
-      return MakeOk(req.id, {
-          {"config", SystemConfigPath()},
-          {"ok", true},
-          {"applied", true},
-          {"via", "direct"},
-          {"activated", false},
-          {"written", written},
-          {"removed", removed},
-          {"leftover", conflicts},
-          {"pending", pending},
-          {"pending_note", pending_note},
-          {"dhcp_on", json::array()},
-          {"note", "no service is bound to any zone; dnsmasq is "
-                   "not needed. " + kDirectNote},
-          {"diagnostics", DiagsToJson(result.diagnostics)},
-      });
+      note = "no service is bound to any zone; dnsmasq is not "
+             "needed. " + kDirectNote;
+    } else {
+      sc::DnsmasqOptions dm_opts;
+      dm_opts.conf_path = cfg_.dnsmasq_conf;
+      dm_opts.refuse_on_drift = !force;
+      auto dm = sc::ApplyDnsmasq(cfg, dm_opts);
+      if (!dm) {
+        const char* code =
+            dm.error().code == sc::BackendError::kDrift ? "drift"
+            : dm.error().code == sc::BackendError::kToolMissing
+                ? "tool_missing"
+                : "rejected";
+        return MakeErr(req.id, code, dm.error().message);
+      }
+      if (dm->changed) written.push_back(dm->conf_path);
+      dnsmasq_changed = dm->changed;
+      dhcp_on = dm->plan.dhcp_interfaces;
     }
 
-    sc::DnsmasqOptions dm_opts;
-    dm_opts.conf_path = cfg_.dnsmasq_conf;
-    dm_opts.refuse_on_drift = !force;
-    auto dm = sc::ApplyDnsmasq(cfg, dm_opts);
-    if (!dm) {
-      const char* code =
-          dm.error().code == sc::BackendError::kDrift ? "drift"
-          : dm.error().code == sc::BackendError::kToolMissing
-              ? "tool_missing"
-              : "rejected";
-      return MakeErr(req.id, code, dm.error().message);
-    }
-    if (dm->changed) written.push_back(dm->conf_path);
-
-    return MakeOk(req.id, {
+    json body = {
         {"config", SystemConfigPath()},
         {"ok", true},
         {"applied", true},
@@ -4040,10 +4158,27 @@ class FLocalTransport final
         {"leftover", conflicts},
         {"pending", pending},
         {"pending_note", pending_note},
-        {"dhcp_on", dm->plan.dhcp_interfaces},
-        {"note", kDirectNote},
+        {"dhcp_on", dhcp_on},
+        {"note", note},
         {"diagnostics", DiagsToJson(result.diagnostics)},
-    });
+    };
+    // No f-confd, so this process is the apply: it owns the lifecycle
+    // of the units the model implies, including stopping one the model
+    // no longer binds anywhere. `plan.needed` being false is exactly
+    // that case and is reconciled the same way, not skipped — a box
+    // that goes on serving DHCP after `no dhcp` is the same defect as
+    // one that never starts, pointed the other way.
+    if (!ReportServiceUnits(cfg, true, dnsmasq_changed, &body)) {
+      return MakeErr(req.id, "service_not_running",
+          std::format(
+              "the system configuration was written to {} and a "
+              "service it binds is NOT running: {}",
+              SystemConfigPath(),
+              body["services_note"].get<std::string>()),
+          "`show services` reads systemd and the kernel; "
+          "`journalctl -u <unit>` says why");
+    }
+    return MakeOk(req.id, body);
   }
 };
 
