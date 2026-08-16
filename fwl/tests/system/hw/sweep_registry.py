@@ -850,8 +850,17 @@ SCENARIOS = {s.name: s for s in [
            'never runs its clean shutdown and the program is left '
            'attached with no daemon',
            [UnitDropIn(unit='fd', body='[Service]\nKillSignal=SIGKILL\n')],
-           verify='[ "$(systemctl show fd -p KillSignal --value)" '
-                  '= SIGKILL ]')],
+           # systemd renders KillSignal as the NUMBER, not the name:
+           # 257 answers `9`, and this compared against `SIGKILL`. So
+           # the drop-in installed perfectly, the defect was genuinely
+           # present, and the plant's own verification said it was not
+           # — which the sweep correctly reports as `unrunnable`, and
+           # is why this scenario has gone unswept since the verify was
+           # added. The check that checks the check was itself never
+           # checked. Both spellings are accepted because the
+           # rendering is a systemd-version detail, not our contract.
+           verify='case "$(systemctl show fd -p KillSignal --value)" '
+                  'in 9|SIGKILL) exit 0;; *) exit 1;; esac')],
        witness_note='the subject is unit behaviour and netdev state',
        timeout_s=360),
 

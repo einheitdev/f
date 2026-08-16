@@ -192,12 +192,25 @@ hw::restore_smoke
 DATA_IFACES = ['enp1s0f0', 'enp1s0f1', 'enp1s0f2']
 
 def restore_rig(ip_forward=None):
-  """Put the rig back on the smoke policy and say whether it worked."""
+  """Put the rig back on the smoke policy and say whether it worked.
+
+  `ip_forward` is now CHECKED, not written, and the reason is a state
+  this used to create. It wrote the knob after `hw::restore_smoke` had
+  already restarted fd, so on an armed box the sequence was: fd raises
+  ip_forward to 1 and records why, then this wrote 0 behind it. Since
+  the fail-closed change that is not a tidy resting state, it is a
+  disagreement — and `show status` reports it exactly as designed,
+  `[FAIL] OFF, and fd did not do it`. The rig was found in that state
+  on 2026-08-16, left by the previous run's restore, and it renders as
+  a failure to whoever walks up next.
+
+  On a box whose datapath is armed the knob belongs to fd. So restore
+  leaves it alone and reports what the kernel actually holds together
+  with fd's own interface count, which is what an operator needs to
+  tell "closed on purpose" from "closed by accident".
+  """
   script = RESTORE_SH % {'here': HERE, 'ifaces': ' '.join(DATA_IFACES)}
   proc = _run(['bash', '-c', script], timeout=300)
-  if ip_forward is not None:
-    with open('/proc/sys/net/ipv4/ip_forward', 'w') as fh:
-      fh.write(str(ip_forward))
   ok = False
   for _ in range(20):
     status = _run(['fctl', 'status'])
@@ -205,7 +218,18 @@ def restore_rig(ip_forward=None):
       ok = True
       break
     time.sleep(0.5)
-  return {'ok': ok, 'stderr': proc.stderr[-400:]}
+  with open('/proc/sys/net/ipv4/ip_forward') as fh:
+    knob = fh.read().strip()
+  out = {'ok': ok, 'stderr': proc.stderr[-400:], 'ip_forward': knob}
+  if ip_forward is not None and knob != str(ip_forward):
+    # Not an error: fd owns this on an armed box. Recorded so a run
+    # that expected otherwise says so instead of being surprised.
+    out['ip_forward_expected'] = str(ip_forward)
+  if ok and knob == '0':
+    out['disagreement'] = (
+        'the datapath is armed but net.ipv4.ip_forward is 0 — '
+        '`einheit-f show status` will report this as a FAIL')
+  return out
 
 # --- one scenario -----------------------------------------------------
 
@@ -687,7 +711,7 @@ def main(argv=None):
     return 0
 
   if args.cmd == 'restore':
-    result = restore_rig(ip_forward=0)
+    result = restore_rig()
     print(json.dumps(result))
     return 0 if result['ok'] else 1
 
@@ -706,7 +730,7 @@ def main(argv=None):
       restore_rig()
     with open(RESULTS, 'a') as fh:
       fh.write(json.dumps(row) + '\n')
-  final = restore_rig(ip_forward=0)
+  final = restore_rig()
   _log('rig restored: %s' % json.dumps(final))
   print(report(load_results(), history))
   return 0
