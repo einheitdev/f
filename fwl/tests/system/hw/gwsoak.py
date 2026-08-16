@@ -1499,6 +1499,11 @@ def cmd_status(args) -> int:
     if state != "active":
       dead.append(unit)
   report = os.path.join(HERE, "gwsoak_report.py")
+  # The report is a subprocess writing straight to fd 1 while these
+  # prints sit in Python's own buffer, so without this the live glance
+  # lands AFTER the verdict it is supposed to introduce — and the
+  # epoch line is the first thing a reader of a two-epoch run needs.
+  sys.stdout.flush()
   verdict = subprocess.run([sys.executable, report, LOG]).returncode
   if dead:
     print(f"NOT RUNNING: {', '.join(dead)} — the soak has stopped "
