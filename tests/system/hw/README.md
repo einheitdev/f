@@ -12,6 +12,7 @@ It lived on the rig alone until 2026-08-19, at `/opt/fwl/tests/system/hw`, on on
 | `l2_*` | Zones, redirect, SNAT/DNAT/masquerade, pipeline split, storm shield, two uplinks |
 | `l7_*` | Tier 2: semantics, multi-def zones, the two rate-limit forms compared |
 | `l10_*` | Capacity: conntrack table limits, rate-limit evasion |
+| `l13_*` | Load: the policy cost ladder — what the SoC gives out at, and what each construct costs per packet |
 | `l11_*` | NAT under load: port collision, table ceiling, GC under churn, PMTU |
 | `l12_*` | Box-originated flows, DNS forwarding, egress cold boot |
 | `gwsoak*` | The long gateway soak: driver, traffic generators, policies, report |
