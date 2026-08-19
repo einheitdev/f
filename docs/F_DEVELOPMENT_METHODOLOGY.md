@@ -132,39 +132,13 @@ That level of detail is what's needed. Write one of these for every v0.1 constru
 
 ## The Verification Loop
 
-Once you have a spec entry, the verification loop runs:
+Once you have a spec entry, a construct becomes verified through one loop:
 
-```
-┌──────────────────────────────────────────────────────────────┐
-│                                                              │
-│  Spec entry (FWL_SPEC.md)                                    │
-│         │                                                    │
-│         ▼                                                    │
-│  Agent generates test corpus  ◀──────┐                       │
-│   (Claude API, structured prompt)    │                       │
-│         │                            │                       │
-│         ▼                            │ refine spec /         │
-│  Human review of generated tests     │ correct agent         │
-│         │                            │ misunderstanding      │
-│         ▼                            │                       │
-│  Compiler runs corpus                │                       │
-│         │                            │                       │
-│         ▼                            │                       │
-│  AST interpreter runs corpus  ──────▶│                       │
-│         │                            │                       │
-│         ▼                            │                       │
-│  BPF_PROG_RUN runs corpus  ─────────▶│                       │
-│         │                            │                       │
-│         ▼                            │                       │
-│  Discrepancy?  ────── yes ───────────┤                       │
-│         │                                                    │
-│         no                                                   │
-│         │                                                    │
-│         ▼                                                    │
-│  Construct verified, corpus added to regression suite        │
-│                                                              │
-└──────────────────────────────────────────────────────────────┘
-```
+1. An agent generates a test corpus from the spec entry.
+2. A human reviews the generated tests — this is where a misunderstood spec gets caught, and where the spec itself often turns out to be the thing that is wrong.
+3. The compiler, the AST interpreter and `BPF_PROG_RUN` each run the corpus.
+4. Any discrepancy sends you back to step 1: refine the spec, or correct the agent.
+5. No discrepancy, and the construct is verified and its corpus joins the regression suite.
 
 Three oracles independently verify each test case:
 

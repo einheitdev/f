@@ -10,34 +10,7 @@ Policy does not live in a rule table that userspace edits. A `.fw` source file i
 
 Maps are classified by whether their contents outlive the policy that created them. Flow-keyed state (conntrack, NAT) is inherited across the swap, because an established connection is a fact about the wire rather than about the policy that admitted it. Anything sized or indexed by one compilation's analysis (counters, rate-limit buckets, log sampling) is replaced with it.
 
-```
-                    ┌──────────────┐
-                    │   Browser    │
-                    │  (HTMX UI)   │
-                    └──────┬───────┘
-                           │ HTTP
-                           ▼
-┌─────────┐      ┌────────────────────────┐
-│  fctl   │──────│  fd (daemon)           │
-│  (CLI)  │ unix │  ┌──────────────────┐  │
-└─────────┘ sock │  │ Crow (REST API)  │  │
-                 │  └────────┬─────────┘  │
-                 │  ┌────────┴─────────┐  │
-                 │  │ Engine (BPF ops) │  │
-                 │  └────────┬─────────┘  │
-                 └───────────┼────────────┘
-                             │ bpf() syscalls
-                             ▼
-                 ┌───────────────────────┐
-                 │  Kernel (XDP)         │
-                 │  ┌─────────────────┐  │
-                 │  │ Packet filter   │  │
-                 │  │ Conntrack       │  │
-                 │  │ Rate limiter    │  │
-                 │  │ Counters        │  │
-                 │  └─────────────────┘  │
-                 └───────────────────────┘
-```
+The path a packet takes is short and fixed: parse, de-NAT, the zone's rules, NAT, verdict. Everything else — the operator CLI, the dashboard, the file watcher that recompiles on change — talks to the daemon over its control socket and never touches a BPF map.
 
 ## Features
 
