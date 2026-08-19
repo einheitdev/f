@@ -29,12 +29,15 @@ Two topologies, and only one of them measures the firewall.
 ./l13_01_policy_cost_ladder.py --seconds 20
 ```
 
-**Generator off-box** — the workstation on the EX2300's SFP ports, feeding the i350. The rig then does nothing but receive, and the readings are the datapath's own.
+**Generator on the workstation, DUT driven over ssh** — the real measurement. Run it **from the workstation**, because ssh works ksys -> f-rig and not the other way:
 
 ```sh
-./l13_01_policy_cost_ladder.py --gen-host ksys --gen-iface enp3s0f0 \
-    --seconds 20
+sudo ./l13_01_policy_cost_ladder.py --dut-host f-rig \
+    --send-iface <workstation NIC on the test path> \
+    --iface enp1s0f1 --seconds 20
 ```
+
+Needs root locally (pktgen), ssh to the DUT as root (already the case), and a **test path that is not the management link**. On this bench `enp4s0` is the r8169 carrying 192.168.0.130 -> the rig: flooding it would saturate the link the script itself is using and cost you control of the box mid-run, besides contaminating the reading with its own control traffic. The mlx5 ports (`enp3s0f0np0`, `enp3s0f1np1`) are the ones to cable into the EX2300 alongside an i350 port.
 
 **Start with one 1 GbE link, not with 10 GbE.** Think in packets rather than bits: 1 GbE at 64-byte frames is **1.488 Mpps**, and an RK3588 running a simple XDP program lands somewhere around 1-3 Mpps. There is a real chance the SoC saturates below a single gigabit of small packets, in which case the measurement is done with an ordinary copper port and no SFP involved.
 

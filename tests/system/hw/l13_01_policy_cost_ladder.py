@@ -57,6 +57,7 @@ import json
 import os
 import pathlib
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -139,6 +140,63 @@ def die(msg):
   print(f'FAIL: {msg}', file=sys.stderr)
   sys.exit(1)
 
+class Host:
+  """The box under test, local or reached over ssh.
+
+  The generator and the DUT are different machines, and which one runs
+  this script is decided by which direction ssh actually works. On this
+  bench that is workstation -> rig, so the script runs on the generator
+  and drives the DUT remotely. Everything the DUT side does goes
+  through here rather than calling subprocess directly, so the two
+  cases cannot drift.
+  """
+
+  def __init__(self, ssh_target=None):
+    self.ssh_target = ssh_target
+
+  @property
+  def name(self):
+    return self.ssh_target or 'localhost'
+
+  def run(self, argv, input=None):
+    """Run a command on the host."""
+    if self.ssh_target is None:
+      return run(argv, input=input)
+    quoted = ' '.join(shlex.quote(a) for a in argv)
+    return run(['ssh', '-o', 'BatchMode=yes', self.ssh_target, quoted],
+               input=input)
+
+  def read_text(self, path):
+    """Read a file on the host, or '' if unreadable."""
+    if self.ssh_target is None:
+      try:
+        return pathlib.Path(path).read_text()
+      except OSError:
+        return ''
+    r = self.run(['cat', path])
+    return r.stdout if r.returncode == 0 else ''
+
+  def read_int(self, path):
+    try:
+      return int(self.read_text(path).strip())
+    except ValueError:
+      return -1
+
+  def write_text(self, path, content):
+    """Write a file on the host."""
+    if self.ssh_target is None:
+      pathlib.Path(path).parent.mkdir(parents=True, exist_ok=True)
+      pathlib.Path(path).write_text(content)
+      return True
+    r = self.run(['sh', '-c', f'mkdir -p $(dirname {shlex.quote(path)}) '
+                              f'&& cat > {shlex.quote(path)}'],
+                 input=content)
+    return r.returncode == 0
+
+  def reachable(self):
+    return self.run(['true']).returncode == 0
+
+
 def read_int(path):
   """Read an integer from a sysfs file, or -1."""
   try:
@@ -146,30 +204,26 @@ def read_int(path):
   except (OSError, ValueError):
     return -1
 
-def hwmon_by_name(want):
+def hwmon_by_name(host, want):
   """Find /sys/class/hwmon/*/temp1_input for a named sensor.
 
   Same lookup gwsoak.py uses, so the two report the same numbers from
   the same places rather than two guesses about where a sensor lives.
   """
   base = '/sys/class/hwmon'
-  try:
-    entries = os.listdir(base)
-  except OSError:
+  listing = host.run(['ls', base])
+  if listing.returncode != 0:
     return None
-  for entry in entries:
+  for entry in listing.stdout.split():
     name_path = os.path.join(base, entry, 'name')
-    try:
-      if pathlib.Path(name_path).read_text().strip() == want:
-        return os.path.join(base, entry, 'temp1_input')
-    except OSError:
-      continue
+    if host.read_text(name_path).strip() == want:
+      return os.path.join(base, entry, 'temp1_input')
   return None
 
-def cpu_times():
+def cpu_times(host):
   """Per-CPU jiffy counters from /proc/stat, keyed by cpu name."""
   out = {}
-  for line in pathlib.Path('/proc/stat').read_text().splitlines():
+  for line in host.read_text('/proc/stat').splitlines():
     if not line.startswith('cpu') or line.startswith('cpu '):
       continue
     parts = line.split()
@@ -373,11 +427,13 @@ class RemotePktgen:
     self._remote('echo reset > /proc/net/pktgen/pgctrl')
 
 
-def iface_rx(iface):
+def iface_rx(host, iface):
   """Frames the NIC says it received, from its own counters."""
-  return read_int(f'/sys/class/net/{iface}/statistics/rx_packets')
+  return host.read_int(
+    f'/sys/class/net/{iface}/statistics/rx_packets')
 
-def deploy(source, fwl_bin, workdir, bundle_root, recv_if, tag):
+def deploy(host, source, fwl_bin, workdir, bundle_root,
+           recv_if, tag):
   """Compile a policy and make fd run it.
 
   Deliberately the same sequence `hw::deploy` uses in hwlib.sh: compile
@@ -390,59 +446,59 @@ def deploy(source, fwl_bin, workdir, bundle_root, recv_if, tag):
   Returns True, or False with the reason printed.
   """
   fw = workdir / f'{tag}.fw'
-  fw.write_text(source)
-  r = run([fwl_bin, 'check', str(fw)])
+  if not host.write_text(str(fw), source):
+    print('  could not write the policy to the DUT')
+    return False
+  r = host.run([fwl_bin, 'check', str(fw)])
   if r.returncode != 0:
     print(f'  policy rejected: {r.stderr.strip()[:300]}')
     return False
   version = pathlib.Path(bundle_root) / f'v-l13-{tag}-{os.getpid()}'
-  shutil.rmtree(version, ignore_errors=True)
-  r = run([fwl_bin, 'compile', '--bundle', str(version), str(fw)])
+  host.run(['rm', '-rf', str(version)])
+  r = host.run([fwl_bin, 'compile', '--bundle', str(version), str(fw)])
   if r.returncode != 0:
     print(f'  bundle compile failed: {r.stderr.strip()[:300]}')
     return False
   manifest = version / 'manifest.json'
-  if '"object": null' in manifest.read_text():
+  if '"object": null' in host.read_text(str(manifest)):
     print('  bundle has uncompiled zone objects')
     return False
 
-  run(['systemctl', 'stop', 'fd'])
+  host.run(['systemctl', 'stop', 'fd'])
   current = pathlib.Path(bundle_root) / 'current'
-  run(['ln', '-sfT', str(version), str(current)])
-  run(['systemctl', 'start', 'fd'])
+  host.run(['ln', '-sfT', str(version), str(current)])
+  host.run(['systemctl', 'start', 'fd'])
 
   for _ in range(20):
-    status = run(['fctl', 'status'])
+    status = host.run(['fctl', 'status'])
     if '"xdp_attached":true' in status.stdout:
       break
     time.sleep(0.5)
   else:
     print('  fd did not attach XDP')
-    print(run(['journalctl', '-u', 'fd', '-n', '12',
-               '--no-pager']).stdout[-600:])
+    print(host.run(['journalctl', '-u', 'fd', '-n', '12',
+                    '--no-pager']).stdout[-600:])
     return False
 
-  run(['ip', 'link', 'set', 'dev', recv_if, 'promisc', 'on'])
-  # XDP attach resets the igb links; wait for the wire before load.
-  probe = run([sys.executable, str(HERE / 'sendmany.py'), '--probe',
-               os.environ.get('SEND_IF', 'enp1s0f0'), recv_if, '45'])
-  if probe.returncode != 0:
-    print('  wire never came back after attach')
-    return False
+  host.run(['ip', 'link', 'set', 'dev', recv_if, 'promisc', 'on'])
+  # XDP attach resets the igb links. Give them a beat before load; the
+  # on-box tests probe the wire with sendmany.py, which is not
+  # available from here when the generator is a different machine.
+  time.sleep(3)
   return True
 
 
-def measure(rung, gen, seconds, iface, soc_sensor, nic_sensor):
+def measure(host, rung, gen, seconds, iface, soc_sensor, nic_sensor):
   """Run one rung and return its reading."""
-  before_rx = iface_rx(iface)
-  before_cpu = cpu_times()
+  before_rx = iface_rx(host, iface)
+  before_cpu = cpu_times(host)
   before_sent = gen.sent()
   proc = gen.start_background()
   time.sleep(seconds)
   gen.stop()
   proc.wait(timeout=10)
-  after_rx = iface_rx(iface)
-  after_cpu = cpu_times()
+  after_rx = iface_rx(host, iface)
+  after_cpu = cpu_times(host)
   after_sent = gen.sent()
 
   busy = cpu_busy_delta(before_cpu, after_cpu)
@@ -455,8 +511,8 @@ def measure(rung, gen, seconds, iface, soc_sensor, nic_sensor):
     'loss_pct': round(100.0 * (1 - received / offered), 2) if offered else 0,
     'softirq_max': round(max((s for s, _ in busy.values()), default=0), 3),
     'busy_max': round(max((b for _, b in busy.values()), default=0), 3),
-    'soc_mC': read_int(soc_sensor),
-    'nic_mC': read_int(nic_sensor) if nic_sensor else -1,
+    'soc_mC': host.read_int(soc_sensor),
+    'nic_mC': host.read_int(nic_sensor) if nic_sensor else -1,
   }
 
 def report(readings, seconds, remote_host=None):
@@ -514,6 +570,11 @@ def main():
                                                          'enp1s0f0'))
   ap.add_argument('--gen-cpus', default='0,1',
                   help='CPUs pktgen threads run on')
+  ap.add_argument('--dut-host', default=None,
+                  help='drive the box under test over ssh (e.g. f-rig) '
+                       'and generate locally. Use this when ssh works '
+                       'generator -> DUT but not the other way, which '
+                       'is the case on this bench.')
   ap.add_argument('--gen-host', default=None,
                   help='run pktgen on this host over ssh instead of '
                        'locally. THIS is the configuration that makes '
@@ -541,17 +602,20 @@ def main():
       print(src.format(recv=args.iface, send=args.send_iface))
     return 0
 
+  dut = Host(args.dut_host)
+  if not dut.reachable():
+    die(f'cannot reach the DUT at {dut.name}')
   if os.geteuid() != 0:
-    die('needs root: pktgen, BPF and IRQ affinity all do')
+    die('needs root: pktgen and IRQ affinity both do')
   if not Pktgen.available():
     die('pktgen unavailable — modprobe pktgen failed. '
         'CONFIG_NET_PKTGEN is not built on this kernel.')
   if not shutil.which(args.fwl) and not pathlib.Path(args.fwl).exists():
     die(f'no fwl at {args.fwl}')
 
-  soc = (hwmon_by_name('package_thermal')
+  soc = (hwmon_by_name(dut, 'package_thermal')
          or '/sys/class/thermal/thermal_zone0/temp')
-  nic = hwmon_by_name('i350bb')
+  nic = hwmon_by_name(dut, 'i350bb')
 
   gen_cpus = [int(c) for c in args.gen_cpus.split(',')]
   if args.gen_host:
@@ -572,19 +636,19 @@ def main():
     die('pktgen configured no devices')
 
   workdir = pathlib.Path('/tmp/l13_ladder')
-  workdir.mkdir(exist_ok=True)
+  dut.run(['mkdir', '-p', str(workdir)])
   readings = []
   try:
     for name, why, template in LADDER:
       src = template.format(recv=args.iface, send=args.send_iface)
       print(f'--- {name}: {why}')
-      if not deploy(src, args.fwl, workdir, args.bundle_root,
+      if not deploy(dut, src, args.fwl, workdir, args.bundle_root,
                     args.iface, name):
         print('  skipped: could not deploy this rung')
         continue
       time.sleep(2)
-      readings.append(measure(name, gen, args.seconds, args.iface,
-                              soc, nic))
+      readings.append(measure(dut, name, gen, args.seconds,
+                              args.iface, soc, nic))
       print(f'  {readings[-1]["received_pps"]:,} pps through, '
             f'SoC {readings[-1]["soc_mC"] / 1000:.1f}C')
   finally:
@@ -593,7 +657,8 @@ def main():
   if not readings:
     die('no rung produced a reading')
   report(readings, args.seconds, args.gen_host)
-  out = workdir / 'ladder.json'
+  out = pathlib.Path('/tmp/l13_ladder.json')
+  out.parent.mkdir(parents=True, exist_ok=True)
   out.write_text(json.dumps(readings, indent=2))
   print(f'\nreadings: {out}')
   return 0
