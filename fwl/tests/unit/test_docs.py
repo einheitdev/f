@@ -18,16 +18,27 @@ import pytest
 
 from fwl import analyzer, parser
 
-DOCS = pathlib.Path(__file__).resolve().parents[3] / "docs"
+ROOT = pathlib.Path(__file__).resolve().parents[3]
+DOCS = ROOT / "docs"
+
+# The two READMEs carry the policy a reader meets first and is most
+# likely to paste, so they are held to the same bar as the guide. They
+# are named rather than globbed: a glob would sweep in vendored and
+# generated markdown and make the check somebody else's problem.
+EXTRA = ("README.md", "fwl/README.md")
 
 
 def _blocks():
   out = []
-  for md in sorted(DOCS.rglob("*.md")):
+  paths = list(sorted(DOCS.rglob("*.md")))
+  paths += [ROOT / name for name in EXTRA]
+  for md in paths:
+    if not md.exists():
+      continue
     text = md.read_text()
     for i, block in enumerate(
         re.findall(r"```fwl\n(.*?)```", text, re.S)):
-      out.append((md.relative_to(DOCS).as_posix(), i + 1, block))
+      out.append((md.relative_to(ROOT).as_posix(), i + 1, block))
   return out
 
 

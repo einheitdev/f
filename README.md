@@ -1,12 +1,14 @@
 # f
 
-An eBPF/XDP firewall with zero-downtime rule updates, a REST API, a web dashboard, and a domain-specific language compiler.
+An eBPF/XDP firewall built around a small declarative language. Policy is written in FWL, compiled to verifier-accepted BPF, and loaded into the kernel without dropping a packet or an established connection. A daemon owns the datapath, a Junos-style CLI owns the configuration, and a web dashboard reads both.
 
 ## How It Works
 
 `f` runs as a userspace daemon (`fd`) that loads an XDP program onto network interfaces. Packets are filtered at the earliest point in the kernel networking stack — before socket allocation, before iptables, before the kernel builds an `sk_buff`.
 
-Rules live in BPF maps. Updates go to a standby table while the active table continues serving traffic. A single-byte atomic flip switches to the new table. Zero packets are dropped during updates.
+Policy does not live in a rule table that userspace edits. A `.fw` source file is compiled to a bundle — one BPF object per zone plus a manifest — and reloading means loading the new objects and replacing the running ones interface by interface with `XDP_FLAGS_REPLACE`. A policy change is therefore a compile step with real diagnostics, not a sequence of map writes that can half-apply.
+
+Maps are classified by whether their contents outlive the policy that created them. Flow-keyed state (conntrack, NAT) is inherited across the swap, because an established connection is a fact about the wire rather than about the policy that admitted it. Anything sized or indexed by one compilation's analysis (counters, rate-limit buckets, log sampling) is replaced with it.
 
 ```
                     ┌──────────────┐
@@ -71,10 +73,10 @@ cmake --build --preset debug
 
 ## Running
 
-Start the daemon and attach to an interface:
+Start the daemon. It attaches to the interfaces the bundle's zones name — there is no interface flag, because a list that disagreed with the policy was a box enforcing something nobody wrote:
 
 ```bash
-sudo ./build/fd --iface eth0
+sudo ./build/fd run --bundle-dir /usr/share/f/compiled
 ```
 
 Start the web dashboard:
@@ -104,39 +106,53 @@ Run a single test:
 
 ## FWL — Firewall Language
 
-FWL is a small declarative language that compiles to XDP/eBPF. The v0.1 surface is one hook + a sequence of rules + an optional default:
+FWL is a small declarative language that compiles to XDP/eBPF. A policy declares zones and gives each an `@xdp` block — either a sequence of rules or a single `def` body:
 
-```
-@xdp(eth0)
+```fwl
+zone lan = [lan0, lan1]
+zone wan = [wan0]
 
-# Drop new SSH connections beyond 3 per second per source IP.
-drop if pkt.proto == tcp
-       and pkt.dst_port == 22
-       and pkt.tcp.syn and not pkt.tcp.ack
-       limited by rate_limit(3, per=src_ip)
+@xdp(wan)
 
-# Track allowed SSH attempts so userspace can chart them.
-count ssh_allowed if pkt.proto == tcp and pkt.dst_port == 22
+count wan_total
+count wan_noise if pkt.dst_ip in 224.0.0.0/4
 
-allow if pkt.proto == tcp and pkt.dst_port in [22, 80, 443]
-allow if pkt.proto == udp and pkt.dst_port == 53
+# The plant-floor broadcast firehose dies at the driver.
+drop if pkt.dst_ip in 224.0.0.0/4
+drop if pkt.dst_ip == 255.255.255.255
+
+# Keep the DHCP lease alive, then admit only replies to flows we started.
+allow if pkt.proto == udp and pkt.src_port == 67 and pkt.dst_port == 68
+allow if conntrack(pkt).state == established
+drop limited by rate_limit(2000, per=src_ip)
 
 default drop
+
+@xdp(lan)
+
+count lan_out
+masquerade
+redirect to wan
 ```
 
-What v0.1 covers: `allow|drop|log|count <name>` actions, `default allow|drop`, the seven `pkt.*` fields above plus `pkt.{src,dst}_ip`, all the usual comparison operators including `in` (lists, port ranges, CIDR, CIDR lists), `and`/`or`/`not`/parens with correct precedence and short-circuit, and the `rate_limit(N, per=<field>)` modifier as the one stateful primitive. Tier 2 functions, Tier 3 inline C, IPv6, geoip, and conntrack are explicitly deferred — see the spec for the full list.
+That is a working NAT gateway: the testnet on `lan0`/`lan1` reaches the internet through `wan0`, hidden behind its address, and nothing unsolicited comes back.
+
+**What v0.4 covers.** Actions `allow`, `drop`, `log`, `count <name>`, `redirect to <zone>`, `masquerade`, `snat to <ip>`, `dnat to <ip>:<port>`. All eight TCP flags, ICMP and ICMPv6 type/code, IPv4 and IPv6 addresses, ports, protocol, VLAN, and `pkt.zone`. `conntrack(pkt).state` and `rate_limit(N, per=<field>)` — the latter as a Tier 1 modifier or a Tier 2 condition, with `scope=zone|global`. `geoip(...)` against a compiled country trie. Tier 2 `def` bodies with locals and control flow, plus helper defs callable from several zones. Programs that would exceed the verifier's budget are split into a tail-call pipeline automatically, invisibly to the author.
+
+Tier 3 raw-C `inline_c` is excluded by design, not merely unbuilt. The spec's "What Is Not in v0.4" section is the authoritative list of everything else.
 
 Install and use:
 
 ```bash
 cd fwl
 pip install -e ".[dev]"
-fwl compile rules.fw -o rules.bpf.c
+fwl check rules.fw                    # parse + semantic check
+fwl compile --bundle out/ rules.fw    # per-zone objects + manifest
 fwl test tests/corpus/                # interpreter + clang-compile
 sudo .venv/bin/fwl test tests/corpus/ # add live BPF_PROG_TEST_RUN
 ```
 
-See [`fwl/README.md`](fwl/README.md) for the compiler architecture and the `.pkt` test format; the language reference is in [`docs/FWL_V01_SPEC.md`](docs/FWL_V01_SPEC.md); the methodology that gates each construct on three-oracle agreement is in [`docs/F_DEVELOPMENT_METHODOLOGY.md`](docs/F_DEVELOPMENT_METHODOLOGY.md).
+See [`fwl/README.md`](fwl/README.md) for the compiler architecture and the `.pkt` test format; the language reference is in [`docs/FWL_V04_SPEC.md`](docs/FWL_V04_SPEC.md); the methodology that gates each construct on three-oracle agreement is in [`docs/F_DEVELOPMENT_METHODOLOGY.md`](docs/F_DEVELOPMENT_METHODOLOGY.md).
 
 ## Control surface
 
@@ -152,6 +168,6 @@ The daemon speaks one protocol: ZMQ REQ/REP at `ipc:///run/f/control.sock`, a re
 - [FWL guide](docs/fwl/README.md) — a learning path from `allow`/`drop` to NAT and helpers
 - [Recovery](docs/recovery.md) — the ways this has actually gone wrong
 - [CLI reference](docs/reference/cli.md) · [`system.yaml` reference](docs/reference/system-yaml.md) · [Error codes](docs/reference/error-codes.md)
-- [FWL v0.1 language reference](docs/FWL_V01_SPEC.md)
+- [FWL v0.4 language reference](docs/FWL_V04_SPEC.md) — current; [v0.2](docs/FWL_V02_SPEC.md) and [v0.1](docs/FWL_V01_SPEC.md) are superseded, kept for their reasoning
 - [FWL development methodology](docs/F_DEVELOPMENT_METHODOLOGY.md)
 - [FWL compiler README](fwl/README.md)

@@ -49,6 +49,33 @@ drop limited by rate_limit(2000, per=src_ip)
 default allow
 ```
 
+## Inside a Tier 2 body
+
+The same limiter is available as a condition rather than a modifier, which is how it is written in a `def` body:
+
+```fwl
+@xdp(eth0)
+
+def firewall(pkt):
+  if pkt.proto == tcp and pkt.src_ip in 0.0.0.0/0:
+    if rate_limit(10, per=src_ip):
+      drop
+  allow
+```
+
+It reads the same way and answers the same question — true once the bucket already holds `N` in the current second — so the two-step idiom above is expressed here by nesting: the guarded `drop` catches the excess, and the trailing `allow` catches everything else.
+
+Two differences worth knowing. There is no `scope=` on the call form, so a Tier 2 limiter is always per zone; if you need one budget across zones, that is the Tier 1 modifier. And the `per=` field must be readable on every path that reaches the call, which the compiler enforces — hence the `pkt.src_ip in 0.0.0.0/0` guard above. Without it you get:
+
+```
+error: rate_limit(per=src_ip) call site does not dominate the
+       implicit read of pkt.src_ip
+```
+
+That is the same dominance rule every `pkt.*` read obeys in Tier 2; the limiter is subject to it because computing a bucket key *is* a field read.
+
+> **Until 2026-08-19 this construct compiled and did nothing.** It emitted a constant false, so the guarded action never fired and a policy asking for a limit silently got none — while `fwl check` reported success. If you have a Tier 2 policy written against an older build, its limiter was not running. Nothing else about the policy changes; the limit simply starts working.
+
 ## `scope=`
 
 One program per zone raises a question a single-program world could not ask: when a rule appears in three zones, is `N` a budget per zone or a budget for the box?

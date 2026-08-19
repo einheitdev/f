@@ -1,3 +1,11 @@
+> **SUPERSEDED — April 2026 design sketch, kept for its reasoning.**
+>
+> This is the document that argued FWL into existence, and the motivation section still reads true. The surface it describes does not.
+>
+> Most importantly, **Tier 3 (`inline_c`, the raw-C escape hatch) does not exist and is not coming.** It appears throughout below as though it were part of the design; it was cut deliberately, and `f.planning/DATA_SOURCES.md` records why. Nothing in the compiler has ever implemented it.
+>
+> For the language as shipped, read [`docs/FWL_V04_SPEC.md`](../docs/FWL_V04_SPEC.md). For using it, [`docs/fwl/`](../docs/fwl/). For the compiler's internals, [`fwl/README.md`](../fwl/README.md).
+
 # FWL — Firewall Language
 
 A Python-syntax domain-specific language that compiles to eBPF/XDP
