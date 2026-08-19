@@ -12,9 +12,9 @@ It lived on the rig alone until 2026-08-19, at `/opt/fwl/tests/system/hw`, on on
 | `l2_*` | Zones, redirect, SNAT/DNAT/masquerade, pipeline split, storm shield, two uplinks |
 | `l7_*` | Tier 2: semantics, multi-def zones, the two rate-limit forms compared |
 | `l10_*` | Capacity: conntrack table limits, rate-limit evasion |
-| `l13_*` | Load: the policy cost ladder — what the SoC gives out at, and what each construct costs per packet |
 | `l11_*` | NAT under load: port collision, table ceiling, GC under churn, PMTU |
 | `l12_*` | Box-originated flows, DNS forwarding, egress cold boot |
+| `l13_*` | Load: the policy cost ladder — what the SoC gives out at, and what each construct costs per packet |
 | `gwsoak*` | The long gateway soak: driver, traffic generators, policies, report |
 | `sweep_registry.py` | The vacuity sweep — plants each test's defect and requires it to go red |
 | `hwlib.sh` | Shared bench primitives: deploy, send, sniff, counter reads, assertions |
