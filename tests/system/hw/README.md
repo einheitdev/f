@@ -19,6 +19,29 @@ It lived on the rig alone until 2026-08-19, at `/opt/fwl/tests/system/hw`, on on
 | `sweep_registry.py` | The vacuity sweep — plants each test's defect and requires it to go red |
 | `hwlib.sh` | Shared bench primitives: deploy, send, sniff, counter reads, assertions |
 
+## Running the load ladder (`l13_01`)
+
+Two topologies, and only one of them measures the firewall.
+
+**Generator on the rig** (default) — self-contained, needs nothing plugged in, and every number is a **lower bound**: pktgen competes with the datapath for the same CPUs. Useful for a quick look, not for a figure anyone quotes.
+
+```sh
+./l13_01_policy_cost_ladder.py --seconds 20
+```
+
+**Generator off-box** — the workstation on the EX2300's SFP ports, feeding the i350. The rig then does nothing but receive, and the readings are the datapath's own.
+
+```sh
+./l13_01_policy_cost_ladder.py --gen-host ksys --gen-iface enp3s0f0 \
+    --seconds 20
+```
+
+Think in **packets**, not bits. The i350 is four 1 GbE ports, so 64-byte line rate is 4 x 1.488 = **5.95 Mpps**, and that is what should outrun the SoC. A 1500-byte flood at the same bandwidth is 24 times fewer packets and will tell you almost nothing about XDP cost.
+
+A 10 GbE source into 1 GbE ports means the **switch** drops the excess, at which point the ladder measures the EX2300's egress queue instead of the firewall. Pace the generator near per-port line rate rather than blasting.
+
+Requires on the generator: `pktgen` (mainline, `modprobe pktgen`), passwordless `sudo`, and ssh from the rig. Requires on the switch: the SFP port and the i350 ports in one VLAN, and frames addressed to MACs the FDB knows — `hw::teach_fdb` does that for on-box tests and the two-box case needs the same treatment.
+
 ## The vacuity sweep
 
 A test that passes proves nothing until you know it can fail. `sweep_registry.py` names, for each scenario, the defect it claims to guard and how to plant it — then requires the scenario to go red. A scenario that stays green with its bug planted is reported **vacuous**, and several here have been.

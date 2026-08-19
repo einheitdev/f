@@ -287,6 +287,92 @@ class Pktgen:
     self.stop()
     self._write(str(PKTGEN / 'pgctrl'), 'reset')
 
+class RemotePktgen:
+  """pktgen on another machine, driven over ssh.
+
+  This is the configuration that makes the measurement mean something.
+  With the generator on the box under test, the two compete for CPU and
+  every reading is a lower bound. With the generator on a workstation
+  feeding the switch, the DUT does nothing but receive, and the number
+  is the datapath's own.
+
+  Sizing: the i350 is four 1 GbE ports, so line rate at 64-byte frames
+  is 4 x 1.488 = 5.95 Mpps. That is the figure to think in, not 4 Gbit
+  -- XDP costs are per packet, and a 64-byte flood is 24 times the
+  packet rate of a 1500-byte one at the same bandwidth. An x86 box with
+  pktgen clears 5.95 Mpps across a few threads without difficulty, so
+  the generator should outrun the DUT, which is the point.
+
+  A 10 GbE source into 1 GbE ports means the SWITCH drops the excess,
+  and then the ladder measures the EX2300's egress queue rather than
+  the firewall. Pace the generator at or just above per-port line rate
+  instead of blasting, and read `offered` from the far side rather than
+  assuming it.
+  """
+
+  def __init__(self, host, iface, cpus, dst_mac, dst_ip, pkt_size,
+               ssh='ssh'):
+    self.host = host
+    self.ssh = ssh
+    self.iface = iface
+    self.cpus = cpus
+    self.dst_mac = dst_mac
+    self.dst_ip = dst_ip
+    self.pkt_size = pkt_size
+    self.devices = []
+
+  def _remote(self, script):
+    return run([self.ssh, '-o', 'BatchMode=yes', self.host,
+                'sudo sh -s'], input=script)
+
+  def available(self):
+    r = self._remote('modprobe pktgen 2>/dev/null; '
+                     'test -d /proc/net/pktgen && echo yes')
+    return 'yes' in r.stdout
+
+  def configure(self, count=0):
+    lines = ['set -e', 'echo reset > /proc/net/pktgen/pgctrl']
+    self.devices = []
+    for cpu in self.cpus:
+      dev = f'{self.iface}@{cpu}'
+      d = f'/proc/net/pktgen/{dev}'
+      lines.append(f'echo "add_device {dev}" > '
+                   f'/proc/net/pktgen/kpktgend_{cpu}')
+      for setting in (
+        f'count {count}', 'clone_skb 0', f'pkt_size {self.pkt_size}',
+        'delay 0', f'dst_mac {self.dst_mac}', f'dst {self.dst_ip}',
+        'udp_src_min 1024', 'udp_src_max 65000',
+        'udp_dst_min 9000', 'udp_dst_max 9000',
+        'flag IPSRC_RND', 'src_min 10.60.0.1', 'src_max 10.60.255.254',
+      ):
+        lines.append(f'echo "{setting}" > {d}')
+      self.devices.append(d)
+    r = self._remote('\n'.join(lines))
+    if r.returncode != 0:
+      print(f'  remote pktgen config failed: {r.stderr.strip()[:300]}')
+      return False
+    return True
+
+  def start_background(self):
+    return subprocess.Popen(
+      [self.ssh, '-o', 'BatchMode=yes', self.host,
+       'sudo sh -c "echo start > /proc/net/pktgen/pgctrl"'],
+      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+  def stop(self):
+    self._remote('echo stop > /proc/net/pktgen/pgctrl')
+
+  def sent(self):
+    reads = ' '.join(f'cat {d} 2>/dev/null;' for d in self.devices)
+    r = self._remote(reads)
+    return sum(int(m) for m in
+               re.findall(r'^\s*pkts-sofar:\s*(\d+)', r.stdout, re.M))
+
+  def cleanup(self):
+    self.stop()
+    self._remote('echo reset > /proc/net/pktgen/pgctrl')
+
+
 def iface_rx(iface):
   """Frames the NIC says it received, from its own counters."""
   return read_int(f'/sys/class/net/{iface}/statistics/rx_packets')
@@ -373,7 +459,7 @@ def measure(rung, gen, seconds, iface, soc_sensor, nic_sensor):
     'nic_mC': read_int(nic_sensor) if nic_sensor else -1,
   }
 
-def report(readings, seconds):
+def report(readings, seconds, remote_host=None):
   """Print the ladder, the deltas, and the caveats that bound it."""
   print()
   print('=' * 66)
@@ -408,10 +494,17 @@ def report(readings, seconds):
     print('That is the signature of a GENERATOR-bound run, not a')
     print('datapath-bound one — the policies are not what limited it.')
     print('This measurement needs a second machine to offer load from.')
-  print('These are LOWER BOUNDS. The generator ran on the box under')
-  print('test, so it competed for CPU with the datapath it measured.')
-  print(f'Each rung ran {seconds}s. Quote these as "at least", never as')
-  print('a ceiling.')
+  if remote_host:
+    print(f'Generator was {remote_host}, off-box, so these are the')
+    print('datapath\'s own rates rather than lower bounds. They still')
+    print('depend on frame size: at 64 bytes the i350\'s four ports')
+    print('carry 5.95 Mpps, and a 1500-byte flood is 24x cheaper per')
+    print('bit. Say which size a number came from.')
+  else:
+    print('These are LOWER BOUNDS. The generator ran on the box under')
+    print('test, so it competed for CPU with the datapath it measured.')
+    print('Re-run with --gen-host for a real measurement.')
+  print(f'Each rung ran {seconds}s.')
 
 def main():
   ap = argparse.ArgumentParser(description=__doc__)
@@ -421,6 +514,14 @@ def main():
                                                          'enp1s0f0'))
   ap.add_argument('--gen-cpus', default='0,1',
                   help='CPUs pktgen threads run on')
+  ap.add_argument('--gen-host', default=None,
+                  help='run pktgen on this host over ssh instead of '
+                       'locally. THIS is the configuration that makes '
+                       'the numbers a measurement rather than a lower '
+                       'bound — see RemotePktgen.')
+  ap.add_argument('--gen-iface', default=None,
+                  help='the generating interface on --gen-host '
+                       '(defaults to --send-iface)')
   ap.add_argument('--seconds', type=int, default=20)
   ap.add_argument('--pkt-size', type=int, default=64)
   ap.add_argument('--dst-mac', default='02:00:00:00:00:02')
@@ -453,8 +554,20 @@ def main():
   nic = hwmon_by_name('i350bb')
 
   gen_cpus = [int(c) for c in args.gen_cpus.split(',')]
-  gen = Pktgen(args.send_iface, gen_cpus, args.dst_mac, args.dst_ip,
-               args.pkt_size)
+  if args.gen_host:
+    gen = RemotePktgen(args.gen_host, args.gen_iface or args.send_iface,
+                       gen_cpus, args.dst_mac, args.dst_ip,
+                       args.pkt_size)
+    if not gen.available():
+      die(f'no pktgen on {args.gen_host} (modprobe pktgen failed '
+          f'there, or ssh/sudo is not set up)')
+    print(f'generator: pktgen on {args.gen_host} — readings are the '
+          f'datapath\'s own')
+  else:
+    gen = Pktgen(args.send_iface, gen_cpus, args.dst_mac, args.dst_ip,
+                 args.pkt_size)
+    print('generator: pktgen on THIS box — readings are lower bounds. '
+          'Use --gen-host for a real measurement.')
   if not gen.configure():
     die('pktgen configured no devices')
 
@@ -479,7 +592,7 @@ def main():
 
   if not readings:
     die('no rung produced a reading')
-  report(readings, args.seconds)
+  report(readings, args.seconds, args.gen_host)
   out = workdir / 'ladder.json'
   out.write_text(json.dumps(readings, indent=2))
   print(f'\nreadings: {out}')
