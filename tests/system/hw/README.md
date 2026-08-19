@@ -36,9 +36,16 @@ Two topologies, and only one of them measures the firewall.
     --seconds 20
 ```
 
-Think in **packets**, not bits. The i350 is four 1 GbE ports, so 64-byte line rate is 4 x 1.488 = **5.95 Mpps**, and that is what should outrun the SoC. A 1500-byte flood at the same bandwidth is 24 times fewer packets and will tell you almost nothing about XDP cost.
+**Start with one 1 GbE link, not with 10 GbE.** Think in packets rather than bits: 1 GbE at 64-byte frames is **1.488 Mpps**, and an RK3588 running a simple XDP program lands somewhere around 1-3 Mpps. There is a real chance the SoC saturates below a single gigabit of small packets, in which case the measurement is done with an ordinary copper port and no SFP involved.
 
-A 10 GbE source into 1 GbE ports means the **switch** drops the excess, at which point the ladder measures the EX2300's egress queue instead of the firewall. Pace the generator near per-port line rate rather than blasting.
+Escalate only if the rig does *not* saturate. The i350 is four 1 GbE ports, so its own ceiling is 4 x 1.488 = 5.95 Mpps and nothing upstream of that helps — a 10 GbE uplink buys no receive capacity at all, only the ability to feed several ports at once.
+
+Two ways to get this wrong:
+
+- **Using large frames.** A 1500-byte flood at the same bandwidth is 24 times fewer packets. XDP costs are per packet, so it would say almost nothing. Always state the frame size beside a number.
+- **Overrunning the switch.** A 10 GbE source aimed at a 1 GbE port has the **switch** dropping the excess, and the ladder then measures the EX2300's egress queue instead of the firewall. Pace near per-port line rate rather than blasting.
+
+(If you do want the uplinks: Juniper names interfaces by speed, so `show interfaces terse | match "xe-"` lists 10 GbE ports and `ge-` lists 1 GbE ones.)
 
 Requires on the generator: `pktgen` (mainline, `modprobe pktgen`), passwordless `sudo`, and ssh from the rig. Requires on the switch: the SFP port and the i350 ports in one VLAN, and frames addressed to MACs the FDB knows — `hw::teach_fdb` does that for on-box tests and the two-box case needs the same treatment.
 
