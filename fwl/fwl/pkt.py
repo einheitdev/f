@@ -1412,17 +1412,26 @@ def _strip_truncated_fields(
 
 
 def _rate_limit_rule_indices(source_fw: str) -> frozenset[int]:
-  """Indices of rules in `source_fw` that carry a rate_limit modifier.
+  """Indices `state.rate_limit` may legally reference in `source_fw`.
+
+  Two numbering schemes share one block: a Tier 1 key is a rule index,
+  a Tier 2 key is a rate_limit() call index. They never overlap in one
+  program, because a program is a rule sequence xor a Tier 2 body.
 
   Imported lazily to avoid an import cycle if the parser module ever
   grows a dependency on this one.
   """
   from . import analyzer, ast, parser
   program = analyzer.analyze(parser.parse(source_fw))
-  return frozenset(
+  tier1 = {
     idx for idx, rule in enumerate(program.rules)
     if isinstance(rule.modifier, ast.RateLimit)
-  )
+  }
+  tier2 = {
+    call.call_index
+    for call in analyzer.rate_limit_calls_tier2(program)
+  }
+  return frozenset(tier1 | tier2)
 
 
 def _declared_counter_names(source_fw: str) -> frozenset[str]:

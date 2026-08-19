@@ -350,6 +350,18 @@ _MAP_KINDS: tuple[_MapKind, ...] = (
     private_name=r"fwl_rl_{zone}_\1",
   ),
   _MapKind(
+    r"fwl_rl_t2_(\d+)", MapScope.PRIVATE,
+    "addressed by this zone's own rate_limit() call index (v0.4 § 6.7; "
+    "the Tier 2 condition form, whose call sites are numbered per zone "
+    "exactly as Tier 1's are numbered per rule)",
+    lifetime=MapLifetime.POLICY,
+    lifetime_why=(
+      "named for a call index this compilation assigned; the same "
+      "name in the next policy is a different call site"
+    ),
+    private_name=r"fwl_rl_t2_{zone}_\1",
+  ),
+  _MapKind(
     r"fwl_geoip_(\d+)", MapScope.PRIVATE,
     "one LPM trie per geoip() call site, numbered within the zone",
     lifetime=MapLifetime.POLICY,
@@ -559,6 +571,16 @@ class MapNames:
   def rate_limit(self, mod: ast.RateLimit, rule_idx: int) -> str:
     """The bucket map for a rate_limit rule (v0.4 § 6.7)."""
     return self.qualified(_rl_base_name(mod, rule_idx))
+
+  def rate_limit_call(self, call_index: int) -> str:
+    """The bucket map for a Tier 2 `rate_limit(...)` call site.
+
+    Always zone-scoped. The Tier 1 modifier can be declared GLOBAL and
+    share one budget across zones; the Tier 2 call form has no such
+    spelling, so there is nothing to widen and the private name is the
+    only correct one.
+    """
+    return self.qualified(f"fwl_rl_t2_{call_index}")
 
 
 _PROTO_TO_IPPROTO = {
@@ -3210,6 +3232,65 @@ struct {{
   return "\n".join(blocks)
 
 
+def _rate_limit_calls_tier2(program: ast.Program) -> list:
+  """Tier 2 rate_limit call sites, from the analyzer's own walk.
+
+  Deliberately not a second traversal: the map and helper names below
+  are derived from call_index, so walking independently would let the
+  emitter and the analyzer disagree about which call is which the
+  moment either walk gains a statement form.
+  """
+  from . import analyzer
+  return analyzer.rate_limit_calls_tier2(program)
+
+
+def _emit_rl_t2_maps_and_helpers(
+  program: ast.Program, names: MapNames, overflow_slot: int | None
+) -> str:
+  """Emit a bucket map and its lookup helper per Tier 2 rate_limit call.
+
+  The helper does the same window arithmetic and the same `cur >= N`
+  comparison as `_emit_rate_limit_gate`. Keeping the two identical is
+  the point: a Tier 2 limiter with its own idea of what "rate
+  exceeded" means would be worse than the gap this replaces, because
+  it would be invisible rather than absent — a policy author cannot
+  see which tier their rule compiled through.
+
+  Always zone-scoped, so never pinned: the Tier 2 form has no `scope=`
+  spelling to widen it to a bundle-global budget.
+  """
+  blocks: list[str] = []
+  for call in _rate_limit_calls_tier2(program):
+    idx = call.call_index
+    rl_map = names.rate_limit_call(idx)
+    ovf = _emit_rate_limit_overflow(names, overflow_slot)
+    blocks.append(f"""\
+struct {{
+  __uint(type, BPF_MAP_TYPE_PERCPU_HASH);
+  __type(key, __u32);
+  __type(value, struct fwl_rl_state);
+  __uint(max_entries, {_RL_MAX_ENTRIES});
+}} {rl_map} SEC(".maps");
+
+static __always_inline int fwl_rl_t2_hit_{idx}(__u32 rl_key) {{
+  __u64 now = bpf_ktime_get_ns();
+  struct fwl_rl_state *st =
+    bpf_map_lookup_elem(&{rl_map}, &rl_key);
+  __u32 cur = 0;
+  __u64 cur_ts = now;
+  if (st && now - st->ts < 1000000000ULL) {{
+    cur = st->count;
+    cur_ts = st->ts;
+  }}
+  struct fwl_rl_state new_st = {{ .ts = cur_ts, .count = cur + 1 }};
+  int upd_rc = bpf_map_update_elem(
+    &{rl_map}, &rl_key, &new_st, BPF_ANY);{ovf}
+  return cur >= {call.threshold};
+}}
+""")
+  return "\n".join(blocks)
+
+
 def _collect_geoip_calls(program: ast.Program) -> list[ast.GeoIp]:
   """Walk every rule (Tier 1) and statement (Tier 2) collecting geoip
   call sites in source order. Mirrors the analyzer's call-index
@@ -3823,9 +3904,14 @@ def _emit_zone_source(
     for h in reachable
   )
 
+  # Tier 2 bucket helpers come after the counter array they may tick
+  # the overflow slot in, and before any body that calls them.
+  rl_t2_block = _emit_rl_t2_maps_and_helpers(
+    zp, names, counter_slots.get(RATE_LIMIT_OVERFLOW_COUNTER))
+
   maps_block = (
     f"{log_decl}{log_sample_decl}{counter_decl}{rl_maps}{geoip_block}"
-    f"{conntrack_decl}{nat_decl}{devmaps}"
+    f"{conntrack_decl}{nat_decl}{devmaps}{rl_t2_block}"
   )
 
   if plan.split:
@@ -4977,9 +5063,13 @@ def _emit_scalar(expr, ctx: _Tier2EmitCtx) -> str:
   if isinstance(expr, ast.NotOp):
     return f"(!({_emit_scalar(expr.inner, ctx)}))"
   if isinstance(expr, ast.RateLimitCall):
-    # v0.2 minimum-viable: emit a stub that always returns false.
-    # Real rate_limit_call implementation is deferred to v0.3.
-    return "(0)"
+    # The bucket update is several statements and a scalar has to be an
+    # expression, so the work lives in a helper emitted alongside the
+    # map. The per= field is already a C local here: the analyzer's
+    # dominance rule exists precisely to guarantee the implicit read
+    # has happened on every path that reaches this call.
+    key = _RL_FIELD_TO_C[expr.per_field]
+    return f"fwl_rl_t2_hit_{expr.call_index}((__u32){key})"
   raise AssertionError(f"unsupported scalar {type(expr).__name__}")
 
 

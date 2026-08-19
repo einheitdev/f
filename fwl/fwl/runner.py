@@ -132,7 +132,7 @@ def _interpreter_oracle(
 
   program = _zone_program(program, case.ingress_zone)
   result = interpreter.evaluate_full(
-    program, case.packet.fields, _private_rl_state(case),
+    program, case.packet.fields, _private_rl_state(case, program),
     geoip_data=(case.geoip_data or None),
     conntrack=interpreter.ConntrackTable(case.conntrack_seed),
     nat=_build_nat_state(case),
@@ -448,7 +448,7 @@ def _seq_interpreter_oracle(case: pkt.PktCase) -> OracleResult:
   nat = _build_nat_state(case) or interpreter.NatState()
   # One private copy carried across the steps: the buckets must
   # accumulate between packets, but must not reach the BPF oracle.
-  rl_state = _private_rl_state(case)
+  rl_state = _private_rl_state(case, program)
   for i, step in enumerate(case.sequence):
     want = _EXPECTED_TO_XDP[step.expected.get("bpf_action", "allow")]
     res = interpreter.evaluate_full(
@@ -689,16 +689,27 @@ def _build_map_init(
     nr_cpus = bpf_runner.num_possible_cpus()
   except OSError:
     nr_cpus = 1
-  for rule_idx, buckets in state.items():
-    if not isinstance(rule_idx, int) or rule_idx >= len(program.rules):
+  # Tier 2 call sites first: a program is a rule list xor a Tier 2
+  # body, so at most one of these lookups can match a given key.
+  t2 = {c.call_index: c for c in _tier2_rate_limit_calls(program)}
+
+  for idx, buckets in state.items():
+    if not isinstance(idx, int):
       continue
-    rule = program.rules[rule_idx]
-    if rule.modifier is None:
+    if idx in t2:
+      per_field = t2[idx].per_field
+      map_name = emitter.MapNames().rate_limit_call(idx)
+    elif idx < len(program.rules):
+      rule = program.rules[idx]
+      if rule.modifier is None:
+        continue
+      per_field = rule.modifier.per_field
+      map_name = emitter.rl_map_name(rule.modifier, idx)
+    else:
       continue
-    map_name = emitter.rl_map_name(rule.modifier, rule_idx)
     entries: dict[bytes, bytes] = {}
     for raw_key, count in buckets.items():
-      key_bytes = _encode_rl_key(rule.modifier.per_field, raw_key)
+      key_bytes = _encode_rl_key(per_field, raw_key)
       value_bytes = _encode_rl_value_per_cpu(count, nr_cpus)
       entries[key_bytes] = value_bytes
     if entries:
@@ -737,7 +748,7 @@ def _build_conntrack_map_init(
 _NAT_TYPE_NUM = {"snat": 1, "dnat": 2}
 
 
-def _private_rl_state(case: pkt.PktCase) -> dict:
+def _private_rl_state(case: pkt.PktCase, program=None) -> dict:
   """A private copy of the case's rate_limit buckets.
 
   The interpreter now *writes* these buckets (it models the emitted
@@ -750,7 +761,26 @@ def _private_rl_state(case: pkt.PktCase) -> dict:
   independence is the whole basis for comparing them
   (F_DEVELOPMENT_METHODOLOGY.md:307-311).
   """
-  return {idx: dict(buckets) for idx, buckets in (case.state or {}).items()}
+  raw = {idx: dict(buckets) for idx, buckets in (case.state or {}).items()}
+  if program is None:
+    return raw
+  # A .pkt spells a Tier 2 bucket with the bare call index, because
+  # that is what the author wrote in the source. The interpreter keys
+  # those buckets under ("t2", idx) so the two numbering schemes can
+  # never be confused for one another; translate here, at the one
+  # boundary where the .pkt's spelling meets the interpreter's.
+  t2 = {c.call_index for c in _tier2_rate_limit_calls(program)}
+  if not t2:
+    return raw
+  return {
+    (("t2", idx) if isinstance(idx, int) and idx in t2 else idx): buckets
+    for idx, buckets in raw.items()
+  }
+
+
+def _tier2_rate_limit_calls(program: ast.Program) -> list:
+  """Tier 2 rate_limit call sites, from the analyzer's own walk."""
+  return analyzer.rate_limit_calls_tier2(program)
 
 
 def _build_nat_state(case: pkt.PktCase):

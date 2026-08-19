@@ -525,6 +525,12 @@ def evaluate_full(
   _apply_ingress_denat(packet, ctx)
   counters: dict[str, int] = {}
   log_events: list[LogEvent] = []
+  # A Tier 2 rate_limit() can sit anywhere inside a nested condition,
+  # far from the statement walker that holds the evaluation's state, so
+  # both ride on the ctx rather than being threaded through every
+  # scalar-eval signature.
+  ctx.rate_limit_state = state
+  ctx.rate_limit_counters = counters
   if program.function is not None:
     result = _exec_tier2(program.function, packet, ctx, state)
     action = result if result is not None else XdpAction.PASS
@@ -728,8 +734,17 @@ def _eval_scalar(
         return True
     return False
   if isinstance(expr, ast.RateLimitCall):
-    # Test harness doesn't simulate rate-limit dynamics for Tier 2.
-    return False
+    # Tier 2 buckets share the `state.rate_limit` mapping with Tier 1's
+    # but are keyed by ("t2", call_index) so the two numbering schemes
+    # cannot collide in a program that somehow held both.
+    return _rate_limit_bucket_hit(
+      threshold=expr.threshold,
+      per_field=expr.per_field,
+      state_key=rl_call_state_key(expr.call_index),
+      packet=packet,
+      state=ctx.rate_limit_state,
+      counters=ctx.rate_limit_counters,
+    )
   raise AssertionError(f"unexpected scalar expr {type(expr).__name__}")
 
 
@@ -1182,6 +1197,19 @@ RATE_LIMIT_MAP_MAX_ENTRIES = 4096
 RATE_LIMIT_OVERFLOW_COUNTER = "__rate_limit_overflow"
 
 
+def rl_call_state_key(call_index: int):
+  """Which entry of the bucket state a Tier 2 rate_limit() addresses.
+
+  Tagged rather than bare: Tier 1 keys are rule indices and Tier 2 keys
+  are call indices, and although a program is a rule list xor a Tier 2
+  body — so they cannot co-occur today — an untagged integer would make
+  a future overlap silently route one tier's seeded state into the
+  other's bucket. The `.pkt` loader accepts the bare integer and this
+  is where it is disambiguated.
+  """
+  return ("t2", call_index)
+
+
 def rl_state_key(mod: ast.RateLimit, rule_idx: int):
   """Which entry of the bucket state a rate_limit rule addresses.
 
@@ -1277,17 +1305,42 @@ def _rate_limit_allows(
   bucket "1.2.3.4" and 16909060 refer to — surfaced by the
   explore-mode bug hunter (Finding 2).
   """
-  bucket_key = packet.get(mod.per_field)
+  return _rate_limit_bucket_hit(
+    threshold=mod.threshold,
+    per_field=mod.per_field,
+    state_key=rl_state_key(mod, rule_idx),
+    packet=packet,
+    state=state,
+    counters=counters,
+  )
+
+
+def _rate_limit_bucket_hit(
+  *,
+  threshold: int,
+  per_field: str,
+  state_key,
+  packet: dict[str, Any],
+  state: dict[Any, dict[Any, int]],
+  counters: dict[str, int] | None = None,
+) -> bool:
+  """The bucket rule itself, shared by both tiers.
+
+  One implementation on purpose. Tier 1's `limited by` modifier and
+  Tier 2's `rate_limit(...)` condition are the same mechanism with
+  different spellings, and two implementations is exactly how they
+  came to disagree: Tier 2 answered a constant false in the emitter
+  AND here, so every differential test agreed with itself and passed.
+  """
+  bucket_key = packet.get(per_field)
   if bucket_key is None:
     # The per= field isn't available on this packet (e.g. src_port
     # for an ICMP packet). Treat as bucket count = 0.
     bucket_key = 0
-  # `rl_state_key`, not `rule_idx`: a scope=global rule keeps its
-  # buckets in the bundle-wide slot, which is the entry the emitter's
-  # one pinned map corresponds to. `setdefault`, not `get`: the count
-  # written below has to land in the caller's state, not in a
-  # throwaway that the next packet of the sequence never sees.
-  buckets = state.setdefault(rl_state_key(mod, rule_idx), {})
+  # `setdefault`, not `get`: the count written below has to land in the
+  # caller's state, not in a throwaway that the next packet of the
+  # sequence never sees.
+  buckets = state.setdefault(state_key, {})
 
   # Resolve which key this packet's bucket is stored under. IP buckets
   # may be seeded as dotted-quad (the .pkt spec's form) or as the
@@ -1295,7 +1348,7 @@ def _rate_limit_allows(
   # oracles silently disagree about what "1.2.3.4" means (Finding 2).
   key = bucket_key
   if key not in buckets and (
-    mod.per_field in ("src_ip", "dst_ip") and isinstance(key, str)
+    per_field in ("src_ip", "dst_ip") and isinstance(key, str)
   ):
     int_key = _ipv4_str_to_int(key)
     if int_key in buckets:
@@ -1328,9 +1381,9 @@ def _rate_limit_allows(
       counters[RATE_LIMIT_OVERFLOW_COUNTER] = (
         counters.get(RATE_LIMIT_OVERFLOW_COUNTER, 0) + 1
       )
-    return current >= mod.threshold
+    return current >= threshold
   buckets[key] = current + 1
-  return current >= mod.threshold
+  return current >= threshold
 
 
 def _ipv4_str_to_int(addr: str) -> int:
@@ -1359,6 +1412,11 @@ class _Ctx:
     helpers: dict[str, ast.FunctionDef] | None = None,
   ):
     self.geoip_data = geoip_data
+    # Tier 2 rate_limit() bucket state and the counter dict its
+    # overflow slot ticks. Set by evaluate_full before any statement
+    # runs; empty defaults keep a directly-constructed _Ctx usable.
+    self.rate_limit_state: dict[Any, dict[Any, int]] = {}
+    self.rate_limit_counters: dict[str, int] = {}
     # v0.4 § 6.5 multi-def: name -> helper FunctionDef, so a CallStmt in
     # a Tier 2 body executes the helper inline (the interpreter models
     # the split-invisible single unit).

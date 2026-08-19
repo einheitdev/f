@@ -139,3 +139,69 @@ class TestSequenceOraclesHonourIngressZone:
     import pytest
     with pytest.raises(ValueError, match="matches no @xdp block"):
       runner._zone_program(self._program(), "dmz")
+
+
+class TestTier2RateLimitStateRouting:
+  """Seeded Tier 2 buckets must reach the map the program reads.
+
+  A .pkt spells the key as the bare rate_limit() call index. The BPF
+  oracle needs it as a map name, the interpreter needs it tagged. Get
+  either wrong and the state lands nowhere: the oracle sees an empty
+  bucket, the case passes, and it has tested nothing.
+  """
+
+  SOURCE = (
+    "@xdp(eth0)\n"
+    "\n"
+    "def firewall(pkt):\n"
+    "  if pkt.proto == tcp and pkt.src_ip in 0.0.0.0/0:\n"
+    "    if rate_limit(3, per=src_ip):\n"
+    "      drop\n"
+    "  allow\n"
+  )
+
+  TIER1 = (
+    "@xdp(eth0)\n"
+    "drop limited by rate_limit(3, per=src_ip)\n"
+  )
+
+  def _program(self, source):
+    from fwl import analyzer, parser
+    return analyzer.analyze(parser.parse(source))
+
+  def test_bpf_seed_names_the_tier2_map(self):
+    from fwl import runner
+    init = runner._build_map_init(
+      self._program(self.SOURCE), {0: {"1.2.3.4": 3}})
+    assert "fwl_rl_t2_0" in init
+    assert "fwl_rl_map_0" not in init
+
+  def test_bpf_seed_still_names_the_tier1_map(self):
+    from fwl import runner
+    init = runner._build_map_init(
+      self._program(self.TIER1), {0: {"1.2.3.4": 3}})
+    assert "fwl_rl_map_0" in init
+    assert "fwl_rl_t2_0" not in init
+
+  def test_interpreter_state_is_tagged_for_tier2(self):
+    from fwl import interpreter, pkt, runner
+    case = pkt.PktCase.__new__(pkt.PktCase)
+    object.__setattr__(case, "state", {0: {"1.2.3.4": 3}})
+    out = runner._private_rl_state(case, self._program(self.SOURCE))
+    assert interpreter.rl_call_state_key(0) in out
+    assert 0 not in out
+
+  def test_interpreter_state_is_untouched_for_tier1(self):
+    from fwl import pkt, runner
+    case = pkt.PktCase.__new__(pkt.PktCase)
+    object.__setattr__(case, "state", {0: {"1.2.3.4": 3}})
+    out = runner._private_rl_state(case, self._program(self.TIER1))
+    assert 0 in out
+
+  def test_pkt_accepts_a_tier2_call_index(self):
+    from fwl import pkt
+    assert 0 in pkt._rate_limit_rule_indices(self.SOURCE)
+
+  def test_pkt_rejects_an_index_with_no_limiter(self):
+    from fwl import pkt
+    assert 1 not in pkt._rate_limit_rule_indices(self.SOURCE)

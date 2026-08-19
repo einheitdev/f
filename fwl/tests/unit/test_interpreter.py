@@ -241,3 +241,67 @@ class TestV04Fields:
       "default allow\n"
     )
     assert evaluate(src, {"proto": "icmp"}) == PASS
+
+
+TIER2_RL = (
+  "@xdp(eth0)\n"
+  "\n"
+  "def firewall(pkt):\n"
+  "  if pkt.proto == tcp and pkt.src_ip in 0.0.0.0/0:\n"
+  "    if rate_limit(3, per=src_ip):\n"
+  "      drop\n"
+  "  allow\n"
+)
+
+T2 = interpreter.rl_call_state_key
+
+
+class TestTier2RateLimit:
+  """The oracle half of the Tier 2 limiter.
+
+  Returned a constant False until 2026-08-17, matching an emitter that
+  returned a constant `(0)`. Two oracles wrong in the same direction
+  agree, so the differential corpus passed while the limiter did not
+  exist.
+  """
+
+  PACKET = {"proto": "tcp", "src_ip": "1.2.3.4", "dst_port": 22}
+
+  def test_at_threshold_fires(self):
+    assert evaluate(TIER2_RL, dict(self.PACKET),
+                    {T2(0): {"1.2.3.4": 3}}) == DROP
+
+  def test_below_threshold_does_not_fire(self):
+    assert evaluate(TIER2_RL, dict(self.PACKET),
+                    {T2(0): {"1.2.3.4": 2}}) == PASS
+
+  def test_no_state_does_not_fire(self):
+    assert evaluate(TIER2_RL, dict(self.PACKET)) == PASS
+
+  def test_buckets_are_per_key(self):
+    packet = {"proto": "tcp", "src_ip": "5.6.7.8", "dst_port": 22}
+    assert evaluate(TIER2_RL, packet, {T2(0): {"1.2.3.4": 99}}) == PASS
+
+  def test_integer_bucket_key_matches_dotted_quad(self):
+    # The BPF runner writes the key as a host-order u32. A .pkt may
+    # seed either form and both must reach one bucket, or the
+    # interpreter and the kernel disagree about whose count they read.
+    assert evaluate(TIER2_RL, dict(self.PACKET),
+                    {T2(0): {16909060: 3}}) == DROP
+
+  def test_the_bucket_climbs_across_packets(self):
+    # The property a single-packet case cannot express, and the one
+    # that makes this oracle able to disagree with BPF at all: the
+    # interpreter must record each packet, not merely read the seed.
+    program = analyzer.analyze(parser.parse(TIER2_RL))
+    state = {}
+    seen = [
+      interpreter.evaluate(program, dict(self.PACKET), state)
+      for _ in range(4)
+    ]
+    assert seen == [PASS, PASS, PASS, DROP]
+
+  def test_tier2_key_is_tagged_apart_from_a_rule_index(self):
+    # A bare 0 would be rule 0 under Tier 1's numbering. Tagging keeps
+    # seeded state for one tier out of the other tier's bucket.
+    assert T2(0) != 0

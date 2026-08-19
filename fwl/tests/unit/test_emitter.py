@@ -283,3 +283,80 @@ class TestComposition:
     # v0.2: bool-field reads are gated on l4_ok to keep non-TCP
     # frames out of the rule body.
     assert "!((l4_ok && tcp_syn))" in src
+
+
+TIER2_RL = (
+  "@xdp(eth0)\n"
+  "\n"
+  "def firewall(pkt):\n"
+  "  if pkt.proto == tcp and pkt.src_ip in 0.0.0.0/0:\n"
+  "    if rate_limit(7, per=src_ip):\n"
+  "      drop\n"
+  "  allow\n"
+)
+
+
+class TestTier2RateLimit:
+  """A Tier 2 rate_limit() must be a limiter, not a constant.
+
+  It emitted `(0)` up to 2026-08-17, and the interpreter modelled it
+  the same way — both wrong in the same direction, so every
+  differential test agreed with itself and passed. No corpus case
+  combined `def` with `rate_limit` at all. A 96 h gateway soak on
+  hardware found it, by flooding the Tier 1 and Tier 2 forms side by
+  side. These tests exist so the constant cannot come back quietly.
+  """
+
+  def test_no_longer_emits_a_constant(self):
+    assert "if ((0))" not in emit(TIER2_RL)
+
+  def test_emits_a_bucket_map(self):
+    src = emit(TIER2_RL)
+    assert "fwl_rl_t2_0" in src
+    assert "BPF_MAP_TYPE_PERCPU_HASH" in src
+
+  def test_call_site_reaches_the_helper_with_the_per_field(self):
+    assert "fwl_rl_t2_hit_0((__u32)src_ip)" in emit(TIER2_RL)
+
+  def test_helper_and_map_are_distinct_c_identifiers(self):
+    # They cannot share a name: one is a function, the other an object.
+    src = emit(TIER2_RL)
+    assert "} fwl_rl_t2_0 SEC(\".maps\");" in src
+    assert "int fwl_rl_t2_hit_0(__u32 rl_key)" in src
+
+  def test_threshold_matches_tier1_semantics(self):
+    # The same `cur >= N` the Tier 1 gate uses. The two tiers
+    # disagreeing about what "rate exceeded" means would be worse than
+    # the gap this replaces — invisible rather than absent, since a
+    # policy author cannot see which tier their rule compiled through.
+    assert "cur >= 7" in emit(TIER2_RL)
+
+  def test_two_calls_get_separate_buckets(self):
+    src = emit(
+      "@xdp(eth0)\n"
+      "\n"
+      "def firewall(pkt):\n"
+      "  if pkt.proto == tcp and pkt.src_ip in 0.0.0.0/0:\n"
+      "    if rate_limit(3, per=src_ip):\n"
+      "      drop\n"
+      "    if rate_limit(9, per=dst_ip):\n"
+      "      drop\n"
+      "  allow\n"
+    )
+    assert "fwl_rl_t2_0" in src and "fwl_rl_t2_1" in src
+    assert "fwl_rl_t2_hit_1((__u32)dst_ip)" in src
+
+  def test_helper_precedes_its_call_site(self):
+    src = emit(TIER2_RL)
+    assert (src.index("int fwl_rl_t2_hit_0")
+            < src.index("fwl_rl_t2_hit_0((__u32)src_ip)"))
+
+  def test_bucket_is_zone_private_in_a_bundle(self):
+    # PRIVATE in the registry: two zones must never address one kernel
+    # map by their own call indices. Tier 2 has no `scope=global`
+    # spelling, so there is nothing that could widen it.
+    kind = emitter._map_kind("fwl_rl_t2_0")
+    assert kind is not None
+    assert kind.scope is emitter.MapScope.PRIVATE
+    assert kind.lifetime is emitter.MapLifetime.POLICY
+    assert emitter.MapNames("wan").rate_limit_call(0) == "fwl_rl_t2_wan_0"

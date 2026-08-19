@@ -153,6 +153,19 @@ class TestOmission:
         )
         + "default allow\n"
       ), split=True),
+      # A Tier 2 body is a program shape the Tier 1 source above
+      # cannot also be (rule sequence xor def), so the Tier 2
+      # rate_limit bucket needs its own emission or its row reads as
+      # dead.
+      emitter.emit(_analyze(
+        "@xdp(e0)\n"
+        "\n"
+        "def firewall(pkt):\n"
+        "  if pkt.proto == tcp and pkt.src_ip in 0.0.0.0/0:\n"
+        "    if rate_limit(3, per=src_ip):\n"
+        "      drop\n"
+        "  allow\n"
+      )),
       # The egress tracker is a bundle object rather than a zone one,
       # so single-object emission never reaches its maps. Left out, the
       # `fwl_egress_stats` row would read as dead — and a rule that

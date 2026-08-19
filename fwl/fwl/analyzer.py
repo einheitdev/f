@@ -1419,15 +1419,30 @@ def _walk_geoip_in_expr(expr):
       yield from _walk_geoip_in_expr(c)
 
 
+def rate_limit_calls_tier2(program: ast.Program) -> list:
+  """Tier 2 rate_limit primaries, in the order indices were assigned.
+
+  Public because four modules must agree on which bucket a given call
+  owns: the analyzer stamps the index, the emitter names a map and a
+  helper after it, the .pkt loader validates seeded state against it,
+  and the runner writes that state into the kernel. Any two of them
+  walking the tree separately is a silent mismatch — state seeded for
+  one call lands in another call's bucket, and the corpus agrees with
+  itself while testing nothing.
+
+  Helper defs cannot contain rate_limit (rejected in
+  `_check_helper_restrictions`), so the zone body is the whole search.
+  """
+  func = getattr(program, "function", None)
+  if func is None:
+    return []
+  return list(_walk_rate_limit_in_stmts(func.body))
+
+
 def _assign_rate_limit_call_indices_tier2(program: ast.Program) -> None:
   """Source-order index assignment for Tier 2 rate_limit_call instances."""
-  func = program.function
-  if func is None:
-    return
-  next_index = 0
-  for call in _walk_rate_limit_in_stmts(func.body):
+  for next_index, call in enumerate(rate_limit_calls_tier2(program)):
     object.__setattr__(call, "call_index", next_index)
-    next_index += 1
 
 
 def _walk_rate_limit_in_stmts(stmts):

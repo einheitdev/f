@@ -1,0 +1,22 @@
+name: "Tier 2 rate_limit(): one source's climb does not spend another's budget"
+source_fw: |
+  @xdp(eth0)
+
+  def firewall(pkt):
+    if pkt.proto == tcp and pkt.src_ip in 0.0.0.0/0:
+      if rate_limit(2, per=src_ip):
+        drop
+    allow
+sequence:
+  - name: .7 packet 1
+    builder: tcp(src_ip="10.0.0.7", dst_ip="93.184.216.34", dst_port=8080, syn=true)
+    expected: { bpf_action: allow }
+  - name: .7 packet 2
+    builder: tcp(src_ip="10.0.0.7", dst_ip="93.184.216.34", dst_port=8080, syn=true)
+    expected: { bpf_action: allow }
+  - name: .7 packet 3 — .7 is now at its limit
+    builder: tcp(src_ip="10.0.0.7", dst_ip="93.184.216.34", dst_port=8080, syn=true)
+    expected: { bpf_action: drop }
+  - name: .8 packet 1 — its own bucket is untouched
+    builder: tcp(src_ip="10.0.0.8", dst_ip="93.184.216.34", dst_port=8080, syn=true)
+    expected: { bpf_action: allow }

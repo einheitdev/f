@@ -1,0 +1,17 @@
+name: "Tier 2 rate_limit(): an empty bucket does not fire"
+source_fw: |
+  @xdp(eth0)
+
+  def firewall(pkt):
+    if pkt.proto == tcp and pkt.src_ip in 0.0.0.0/0:
+      if rate_limit(3, per=src_ip):
+        drop
+    allow
+
+test_packet:
+  builder: tcp(src_ip="1.2.3.4", dst_port=22)
+
+expected:
+  compiles: true
+  # The first packet of a window is never the one over the limit.
+  bpf_action: allow

@@ -1,0 +1,24 @@
+name: "Tier 2 rate_limit(): bucket under threshold does not fire"
+source_fw: |
+  @xdp(eth0)
+
+  def firewall(pkt):
+    if pkt.proto == tcp and pkt.src_ip in 0.0.0.0/0:
+      if rate_limit(3, per=src_ip):
+        drop
+    allow
+
+# Keyed by rate_limit CALL index. This program has no rules at all, so
+# there is no rule index this could be confused with.
+state:
+  rate_limit:
+    0:
+      "1.2.3.4": 2
+
+test_packet:
+  builder: tcp(src_ip="1.2.3.4", dst_port=22)
+
+expected:
+  compiles: true
+  # 2 < 3, so the packet falls through to allow.
+  bpf_action: allow
