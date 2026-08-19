@@ -1,0 +1,22 @@
+# 48h soak policy — exercises every stateful construct at once:
+# counters, rate limit, log sampling, conntrack, and a drop matrix,
+# on the wan-side data port. Deployed by soak_start.sh.
+zone wan = [enp1s0f1]
+
+@xdp(wan)
+
+count soak_total
+count soak_mcast if pkt.dst_ip in 224.0.0.0/4
+count soak_tcp if pkt.proto == tcp
+count soak_udp if pkt.proto == udp
+log(sample=100) if pkt.proto == udp and pkt.dst_port == 9999
+drop if pkt.dst_ip in 224.0.0.0/4
+drop if pkt.proto == udp and (pkt.dst_port == 137 or pkt.dst_port == 138)
+drop if pkt.src_ip in 10.99.60.0/24
+       limited by rate_limit(500, per=src_ip)
+allow if conntrack(pkt).state == established
+count soak_initiated if pkt.src_ip == 10.99.61.1 and pkt.proto == tcp
+       and pkt.tcp.syn
+allow if pkt.src_ip == 10.99.61.1 and pkt.proto == tcp and pkt.tcp.syn
+count soak_dropped
+default drop

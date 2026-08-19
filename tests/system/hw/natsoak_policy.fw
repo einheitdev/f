@@ -1,0 +1,34 @@
+# NAT/masquerade soak policy — the gap the 48 h soak of 2026-08-08 did
+# not cover. That policy exercised counters, rate limiting, sampled
+# logging, conntrack and a drop matrix; it contained no NAT at all,
+# while masquerade is the entire function of the office deployment.
+#
+# The return-path rule is `allow if pkt.proto == tcp`, NOT
+# `allow if conntrack(pkt).state == established`, because the stateful
+# form does not work behind masquerade: the conntrack lookup lives in
+# the program prelude and the de-NAT pass runs after it, so a reply is
+# looked up under the address it carries on the wire while the entry
+# was created under the guest's pre-translation address. Measured on
+# the rig: l11_04_masq_established_reply.sh. This policy therefore
+# soaks the configuration that actually forwards today.
+zone lan = [enp1s0f1]
+zone wanz = [enp1s0f2]
+
+@xdp(lan)
+
+count nat_total
+count nat_egress if pkt.src_ip in 10.99.61.0/24
+count nat_reply if pkt.src_ip == 10.99.71.9
+count nat_est if conntrack(pkt).state == established
+count nat_mcast if pkt.dst_ip in 224.0.0.0/4
+log(sample=100) if pkt.proto == udp and pkt.dst_port == 9999
+drop if pkt.dst_ip in 224.0.0.0/4
+masquerade if pkt.src_ip in 10.99.61.0/24
+dnat to 10.99.61.50:8080 if pkt.proto == tcp and pkt.dst_port == 8080
+redirect to wanz if pkt.proto == udp and pkt.dst_port == 1
+drop if pkt.src_ip in 10.99.60.0/24
+       limited by rate_limit(500, per=src_ip)
+allow if pkt.proto == tcp
+allow if pkt.proto == udp and pkt.dst_port == 9999
+count nat_dropped
+default drop
