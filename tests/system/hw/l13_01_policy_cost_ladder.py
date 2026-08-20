@@ -427,6 +427,45 @@ class RemotePktgen:
     self._remote('echo reset > /proc/net/pktgen/pgctrl')
 
 
+def cpu_freqs(host):
+  """Per-policy (current, max) CPU frequency in kHz on the DUT.
+
+  RK3588 has several cpufreq policies -- the A55 cluster and the two
+  A76 pairs -- so this globs policy* rather than assuming cpu0 speaks
+  for the machine.
+
+  UNVERIFIED against the rig: it was already powered down for heatsink
+  work when this was written. If the paths are wrong the reading is
+  empty and `throttled` reports None, which is honest; it does not
+  invent a number.
+  """
+  listing = host.run(['sh', '-c',
+                      'for p in /sys/devices/system/cpu/cpufreq/policy*; '
+                      'do echo "$(basename $p) '
+                      '$(cat $p/scaling_cur_freq 2>/dev/null) '
+                      '$(cat $p/cpuinfo_max_freq 2>/dev/null)"; done'])
+  out = {}
+  for line in listing.stdout.splitlines():
+    parts = line.split()
+    if len(parts) == 3 and parts[1].isdigit() and parts[2].isdigit():
+      out[parts[0]] = (int(parts[1]), int(parts[2]))
+  return out
+
+
+def throttle_verdict(freqs):
+  """Fraction of max clock the slowest policy is running at, or None.
+
+  This is the difference between "the datapath tops out here" and "the
+  cooling tops out here". A rung measured on a throttled SoC is not a
+  ceiling, and without this the two are indistinguishable in the
+  numbers -- a throttled run just looks like an expensive policy.
+  """
+  if not freqs:
+    return None
+  ratios = [cur / mx for cur, mx in freqs.values() if mx > 0]
+  return min(ratios) if ratios else None
+
+
 def iface_rx(host, iface):
   """Frames the NIC says it received, from its own counters."""
   return host.read_int(
@@ -501,6 +540,7 @@ def measure(host, rung, gen, seconds, iface, soc_sensor, nic_sensor):
   after_cpu = cpu_times(host)
   after_sent = gen.sent()
 
+  freqs = cpu_freqs(host)
   busy = cpu_busy_delta(before_cpu, after_cpu)
   offered = (after_sent - before_sent) / seconds
   received = (after_rx - before_rx) / seconds
@@ -511,6 +551,7 @@ def measure(host, rung, gen, seconds, iface, soc_sensor, nic_sensor):
     'loss_pct': round(100.0 * (1 - received / offered), 2) if offered else 0,
     'softirq_max': round(max((s for s, _ in busy.values()), default=0), 3),
     'busy_max': round(max((b for _, b in busy.values()), default=0), 3),
+    'clock_frac': throttle_verdict(freqs),
     'soc_mC': host.read_int(soc_sensor),
     'nic_mC': host.read_int(nic_sensor) if nic_sensor else -1,
   }
@@ -522,11 +563,13 @@ def report(readings, seconds, remote_host=None):
   print('POLICY COST LADDER')
   print('=' * 66)
   print(f'{"rung":<12} {"offered":>10} {"through":>10} {"loss":>7} '
-        f'{"si":>5} {"SoC":>6} {"NIC":>6}')
+        f'{"si":>5} {"clk":>5} {"SoC":>6} {"NIC":>6}')
   for r in readings:
+    clk = r.get('clock_frac')
+    clk_s = f'{clk:>5.2f}' if clk is not None else '    ?'
     print(f'{r["rung"]:<12} {r["offered_pps"]:>10,} '
           f'{r["received_pps"]:>10,} {r["loss_pct"]:>6}% '
-          f'{r["softirq_max"]:>5.2f} '
+          f'{r["softirq_max"]:>5.2f} {clk_s} '
           f'{r["soc_mC"] / 1000:>5.1f}C {r["nic_mC"] / 1000:>5.1f}C')
 
   print()
@@ -543,8 +586,23 @@ def report(readings, seconds, remote_host=None):
     print(f'  {cur["rung"]:<12} {added_ns:>8.1f} ns/pkt   '
           f'{pct:>5.1f}% fewer pps than `{prev["rung"]}`')
 
+  throttled = [r for r in readings
+               if r.get('clock_frac') is not None
+               and r['clock_frac'] < 0.95]
   rates = [r['received_pps'] for r in readings if r['received_pps'] > 0]
   print()
+  if throttled:
+    names = ', '.join(r['rung'] for r in throttled)
+    print(f'WARNING: the SoC was CLOCKED DOWN during: {names}.')
+    print('Those rungs measured the cooling, not the datapath. A')
+    print('throttled run is indistinguishable from an expensive policy')
+    print('in the pps column alone, which is why the clock is here.')
+    print('Fix the airflow and re-run before quoting any of it.')
+    print()
+  elif all(r.get('clock_frac') is None for r in readings):
+    print('NOTE: no clock reading — the cpufreq paths did not resolve')
+    print('on this box, so nothing here rules out thermal throttling.')
+    print()
   if rates and (max(rates) - min(rates)) / max(rates) < 0.05:
     print('WARNING: every rung landed within 5% of every other one.')
     print('That is the signature of a GENERATOR-bound run, not a')
