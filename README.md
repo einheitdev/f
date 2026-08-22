@@ -2,7 +2,7 @@
 
 An eBPF/XDP firewall built around a small declarative language. Policy is written in FWL, compiled to verifier-accepted BPF, and loaded into the kernel without dropping a packet or an established connection. A daemon owns the datapath, a Junos-style CLI owns the configuration, and a web dashboard reads both.
 
-It forwards at 97-99% of line rate at realistic frame sizes and absorbs a full-rate small-packet flood on three ports at once without losing a packet or slowing the management plane — measured, not estimated. See [Performance](#performance).
+On a 200 EUR SoC board it forwards a 10 GbE link at 98% of line rate, absorbs a full-rate IMIX flood at 98.9% of line, and keeps the management plane responsive throughout — measured against RFC 2544, not estimated. See [Performance](#performance).
 
 ## How It Works
 
@@ -25,25 +25,37 @@ The path a packet takes is short and fixed: parse, de-NAT, the zone's rules, NAT
 
 ## Performance
 
-Measured on the bench, not estimated: Orange Pi 5 Plus (RK3588, 4x A76 + 4x A55), Intel i350, 64-byte frames unless stated. Throughput here means **RFC 2544 throughput — the highest offered rate with zero loss**, not the packets that survived an overload.
+Measured on the bench against **RFC 2544 — the highest offered rate at which nothing is lost**, not the packets that survived an overload. Rig is an Orange Pi 5 Plus (RK3588: 4x A76 @ 2.4 GHz + 4x A55 @ 1.8 GHz), ConnectX 10 GbE, DACs straight into the generator. The policy under test is a bare `redirect to <zone>` — no rules, no conntrack, no NAT — so these are the datapath floor and an upper bound on what a real policy does.
 
-| workload | 64 B | 512 B | 1518 B |
+IMIX below is the mix appliance datasheets quote: 7 x 64, 4 x 594 and 1 x 1518 byte frames, average 361.8 bytes. Figures are at 0.01% loss; the strict zero-loss column is in the evidence file, and differs by under 3% once the box is tuned.
+
+| workload | 64 B | IMIX | 1518 B |
 |---|---|---|---|
-| **forward** (in one zone, out another) | 808,545 pps (54% line) | 231,708 pps (**98.6%**) | 79,767 pps (**98.1%**) |
-| **drop** (storm shield, blocklists) | line rate, zero loss | — | — |
+| **drop** — storm shield, blocklists | 3,387,811 pps | 3,237,542 pps (**9.37 Gb/s, 98.9% of line**) | 799,803 pps (line-limited) |
+| **forward** — one direction | 1,378,641 pps | 1,392,633 pps | 799,919 pps (**9.71 Gb/s, 98.4% of line**) |
+| **bidirectional** — both directions, aggregate | 1,419,420 pps | 1,366,340 pps | 1,168,694 pps (**14.19 Gb/s**) |
 
-**Three ports flooded at once: 3,032,962 pps aggregate, zero loss**, with the A76 cores at 26% and the package at 37 C against a 55 C trip. The SoC is not the limit at three gigabit ports.
+**The datapath is packet-limited, not byte-limited.** Forwarding tops out at 1.38-1.39 Mpps at every frame size where the link is not the binding constraint, and running both directions at once reaches the same aggregate — one direction or two, the box moves the same number of packets. Bytes are close to free; packets are what cost.
 
-**The management plane is unaffected by a full-rate flood.** Under 3 Mpps, ssh round-trip measured 165 ms median against 214 ms idle — *faster*, because the governor parks the big cores at 600 MHz when idle and a flood pins them at 2.4 GHz. XDP runs in softirq on cores that still have 70% idle, so the datapath and the CLI never compete. An operator can log in and fix the box while every port is being hammered, which is exactly when they need to.
+**Dropping costs 2.4x less than forwarding.** At IMIX the box absorbs a full 10 GbE line-rate flood, while a policy that has to put the packets back on the wire manages 42% of line. For a blocklist or a plant-floor broadcast storm there is room to spare; for a gateway the transmit path is the constraint.
 
-Two things worth knowing before quoting any of this:
+**The firewall itself is about an eighth of the cost.** Under `bpf_stats`, the compiled FWL program measures 411 ns per packet — 6.6% of eight cores while the system is 56% busy. The rest is driver, page pool and redirect plumbing. Rules are cheap relative to the fixed cost of moving a packet.
 
-- **Always state the frame size.** 1 GbE is 1,488,095 pps at 64 bytes and 81,274 pps at 1518. The same box does 54% of line at one and 98% at the other, and a number without its frame size is not a measurement.
-- **Forwarding costs about twice what receiving does.** Dropping runs at line rate; forwarding does not. The transmit path, not the match, is the constraint — and it costs much the same whether a packet leaves via `bpf_redirect_map` or via the kernel stack.
+**The management plane is unaffected by a full-rate flood.** Under a 3 Mpps flood, ssh round-trip measured 165 ms median against 214 ms idle — *faster*, because the governor parks the big cores when idle and a flood pins them at maximum. An operator can log in and fix the box while every port is being hammered, which is exactly when they need to.
 
-One tuning change matters on big.LITTLE hardware and is not a default: RSS feeds every core equally, so the 1.8 GHz A55s saturate while the 2.4 GHz A76s idle. Weighting the hash buckets toward the fast cores is worth **25%** (`ethtool -X <iface> weight 3 3 1 1 1 1 3 3`, matched to the queue-to-CPU map). Pinning everything to the big cores instead *halves* throughput — the little cores carry real work.
+### Three tuning changes worth 40%, none of them a default
 
-Harness and full results: `tests/system/hw/l13_02_rfc2544_throughput.py`, and `f.planning/rig-evidence/`.
+- **Disable deep cpuidle and pin the governor to `performance`.** `cpu-sleep` on this SoC has a 220 us exit latency; at 1.4 Mpps that is 300 packets against a 1024-entry ring. Worth **31-43%**, and it turns a noisy loss threshold into a sharp one. The box had been losing packets with 45% of its CPU idle.
+- **Weight the RSS indirection table toward the fast cores.** big.LITTLE plus a flat table feeds 1.8 GHz cores exactly as hard as 2.4 GHz ones. `ethtool -X <iface> weight 1 1 1 1 3 3 3 3`, matched to the queue-to-CPU map, is worth **25-32%** — confirmed independently on igb and mlx5. Pinning everything to the big cores instead *halves* throughput; the little cores carry real work.
+- **Ring size does nothing.** Tested 256 to 4096 on igb and 1024 to 8192 on mlx5. No effect either time. It is the obvious knob and it is the wrong one.
+
+### Before quoting any of this
+
+- **Always state the frame size.** 10 GbE is 14,880,952 pps at 64 bytes and 812,743 at 1518. The same box does 9% of line at one and 98% at the other, and a number without its frame size is not a measurement.
+- **The 1518-byte bidirectional figure is PCIe-limited, not SoC-limited.** 14.19 Gb/s forwarded is 28.4 Gb/s across the bus, because every forwarded byte crosses it twice, and the card is an x8 in an x4 slot. That number is a property of the rig.
+- **No rule set has been measured yet.** Netgate publishes a 10,000-ACL figure; `f` does not have one, and the numbers above are for an empty policy.
+
+Harness and full results, including the side-by-side against Netgate's published figures: `tests/system/hw/l13_02_rfc2544_throughput.py` and `f.planning/rig-evidence/RFC2544_10G_2026-08-23.md`.
 
 ## Requirements
 
