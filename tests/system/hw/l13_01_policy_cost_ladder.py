@@ -325,11 +325,29 @@ class Pktgen:
         # which measures a cache-friendly best case rather than a
         # policy under real load.
         'flag IPSRC_RND',
+        # One flag per write. pktgen keeps the first token of a
+        # space-separated pair and silently drops the rest, which cost
+        # a whole tuning run: UDPSRC_RND never applied, the source port
+        # stayed fixed at 65000, and enabling 4-tuple RSS hashing
+        # therefore changed nothing because the ports carried no
+        # entropy to hash.
+        'flag UDPSRC_RND',
         'src_min 10.60.0.1',
         'src_max 10.60.255.254',
       ) + ((f'ratep {self.pps}',) if self.pps else ()):
         self._write(d, line)
       self.devices.append(d)
+    if self.devices:
+      state = root_sh(f'cat {shlex.quote(self.devices[0])}').stdout
+      for line in state.splitlines():
+        if 'Flags:' in line:
+          print(f'  generator {line.strip()}')
+          for want in ('IPSRC_RND', 'UDPSRC_RND'):
+            if want not in line:
+              print(f'  WARNING: {want} was not accepted -- traffic '
+                    f'will not vary that field, so RSS cannot spread '
+                    f'on it')
+          break
     return bool(self.devices)
 
   def start_background(self):
@@ -414,7 +432,8 @@ class RemotePktgen:
         'delay 0', f'dst_mac {self.dst_mac}', f'dst {self.dst_ip}',
         'udp_src_min 1024', 'udp_src_max 65000',
         'udp_dst_min 9000', 'udp_dst_max 9000',
-        'flag IPSRC_RND', 'src_min 10.60.0.1', 'src_max 10.60.255.254',
+        'flag IPSRC_RND', 'flag UDPSRC_RND',
+        'src_min 10.60.0.1', 'src_max 10.60.255.254',
       ) + ((f'ratep {self.pps}',) if self.pps else ()):
         lines.append(f'echo "{setting}" > {d}')
       self.devices.append(d)
