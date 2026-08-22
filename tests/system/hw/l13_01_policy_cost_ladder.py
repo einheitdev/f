@@ -109,6 +109,8 @@ default allow
 masquerade
 default allow
 '''),
+  # Needs --geoip data at compile time; the rung is skipped rather
+  # than silently dropped when none is supplied. See --geoip-data.
   ('geoip', 'an LPM trie probe', '''
 zone wan = [{recv}]
 
@@ -135,6 +137,19 @@ def run(cmd, **kw):
   """Run a command, returning CompletedProcess. Never raises on rc."""
   return subprocess.run(cmd, shell=isinstance(cmd, str),
                         capture_output=True, text=True, **kw)
+
+
+def root_sh(script):
+  """Run a shell snippet as root, elevating only if we are not already.
+
+  The script itself must NOT be run under sudo: local pktgen needs
+  root, but reaching the DUT needs the invoking user's ssh config and
+  agent, and root has neither. So privilege is taken here, for the
+  pktgen writes alone, and everything else stays as the user.
+  """
+  if os.geteuid() == 0:
+    return run(['sh', '-c', script])
+  return run(['sudo', '-n', 'sh', '-c', script])
 
 def die(msg):
   print(f'FAIL: {msg}', file=sys.stderr)
@@ -254,7 +269,9 @@ def cpu_busy_delta(before, after):
 class Pktgen:
   """Drive kernel pktgen threads bound to specific CPUs."""
 
-  def __init__(self, iface, cpus, dst_mac, dst_ip, pkt_size, clone=0):
+  def __init__(self, iface, cpus, dst_mac, dst_ip, pkt_size, clone=0,
+               pps=0):
+    self.pps = pps
     self.iface = iface
     self.cpus = cpus
     self.dst_mac = dst_mac
@@ -267,16 +284,16 @@ class Pktgen:
   def available():
     if PKTGEN.exists():
       return True
-    run(['modprobe', 'pktgen'])
+    root_sh('modprobe pktgen')
     return PKTGEN.exists()
 
   def _write(self, path, value):
-    try:
-      pathlib.Path(path).write_text(value + '\n')
-      return True
-    except OSError as exc:
-      print(f'  pktgen write failed {path}: {exc}', file=sys.stderr)
+    r = root_sh(f'echo {shlex.quote(value)} > {shlex.quote(path)}')
+    if r.returncode != 0:
+      print(f'  pktgen write failed {path}: {r.stderr.strip()[:160]}',
+            file=sys.stderr)
       return False
+    return True
 
   def configure(self, count=0):
     """Bind one pktgen device per CPU. count=0 means run until stopped."""
@@ -310,16 +327,18 @@ class Pktgen:
         'flag IPSRC_RND',
         'src_min 10.60.0.1',
         'src_max 10.60.255.254',
-      ):
+      ) + ((f'ratep {self.pps}',) if self.pps else ()):
         self._write(d, line)
       self.devices.append(d)
     return bool(self.devices)
 
   def start_background(self):
     """Start transmitting. Returns the Popen; pgctrl blocks while running."""
-    return subprocess.Popen(
-      ['sh', '-c', f'echo start > {PKTGEN / "pgctrl"}'],
-      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    cmd = f'echo start > {PKTGEN / "pgctrl"}'
+    argv = (['sh', '-c', cmd] if os.geteuid() == 0
+            else ['sudo', '-n', 'sh', '-c', cmd])
+    return subprocess.Popen(argv, stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL)
 
   def stop(self):
     self._write(str(PKTGEN / 'pgctrl'), 'stop')
@@ -328,10 +347,7 @@ class Pktgen:
     """Total packets pktgen reports having transmitted."""
     total = 0
     for d in self.devices:
-      try:
-        text = pathlib.Path(d).read_text()
-      except OSError:
-        continue
+      text = root_sh(f'cat {shlex.quote(d)}').stdout
       m = re.search(r'^\s*pkts-sofar:\s*(\d+)', text, re.M)
       if m:
         total += int(m.group(1))
@@ -365,7 +381,8 @@ class RemotePktgen:
   """
 
   def __init__(self, host, iface, cpus, dst_mac, dst_ip, pkt_size,
-               ssh='ssh'):
+               ssh='ssh', pps=0):
+    self.pps = pps
     self.host = host
     self.ssh = ssh
     self.iface = iface
@@ -398,7 +415,7 @@ class RemotePktgen:
         'udp_src_min 1024', 'udp_src_max 65000',
         'udp_dst_min 9000', 'udp_dst_max 9000',
         'flag IPSRC_RND', 'src_min 10.60.0.1', 'src_max 10.60.255.254',
-      ):
+      ) + ((f'ratep {self.pps}',) if self.pps else ()):
         lines.append(f'echo "{setting}" > {d}')
       self.devices.append(d)
     r = self._remote('\n'.join(lines))
@@ -472,7 +489,7 @@ def iface_rx(host, iface):
     f'/sys/class/net/{iface}/statistics/rx_packets')
 
 def deploy(host, source, fwl_bin, workdir, bundle_root,
-           recv_if, tag):
+           recv_if, tag, geoip_data=None):
   """Compile a policy and make fd run it.
 
   Deliberately the same sequence `hw::deploy` uses in hwlib.sh: compile
@@ -527,98 +544,234 @@ def deploy(host, source, fwl_bin, workdir, bundle_root,
   return True
 
 
-def measure(host, rung, gen, seconds, iface, soc_sensor, nic_sensor):
-  """Run one rung and return its reading."""
-  before_rx = iface_rx(host, iface)
-  before_cpu = cpu_times(host)
-  before_sent = gen.sent()
-  proc = gen.start_background()
-  time.sleep(seconds)
-  gen.stop()
-  proc.wait(timeout=10)
-  after_rx = iface_rx(host, iface)
-  after_cpu = cpu_times(host)
-  after_sent = gen.sent()
+def _live_line(rung, first, prev, cur):
+  """One watchable line per sample: instantaneous rates and heat."""
+  dt = cur['t'] - prev['t']
+  if dt <= 0:
+    return
+  rx = (cur['nic']['rx_packets'] - prev['nic']['rx_packets']) / dt
+  miss = ((cur['nic'].get('rx_missed_errors', 0)
+           - prev['nic'].get('rx_missed_errors', 0)) / dt)
+  mbps = ((cur['nic']['rx_bytes'] - prev['nic']['rx_bytes'])
+          * 8 / dt / 1e6)
+  soc = cur['temps_mC'].get('package_thermal', 0) / 1000
+  nic_t = cur['temps_mC'].get('i350bb', 0) / 1000
+  clk = 1.0
+  for pol, c in cur['freq_khz'].items():
+    m = cur['freq_max_khz'].get(pol, 0)
+    if m > 0 and c > 0:
+      clk = min(clk, c / m)
+  busy = 0
+  for cpu, after in cur['cpu'].items():
+    before = prev['cpu'].get(cpu)
+    if before:
+      d = [a - b for a, b in zip(after, before)]
+      tot = sum(d)
+      if tot > 0 and len(d) > 6 and d[6] / tot > 0.2:
+        busy += 1
+  print(f'  {rung:<10} t+{cur["t"] - first["t"]:5.1f}s  '
+        f'rx {rx / 1000:7.0f}k/s  miss {miss / 1000:6.0f}k/s  '
+        f'{mbps:6.0f}Mb/s  {busy} core  clk {clk:.2f}  '
+        f'SoC {soc:5.1f}C  NIC {nic_t:5.1f}C', flush=True)
 
-  freqs = cpu_freqs(host)
-  busy = cpu_busy_delta(before_cpu, after_cpu)
-  offered = (after_sent - before_sent) / seconds
-  received = (after_rx - before_rx) / seconds
+
+def measure(host, rung, gen, seconds, iface, sampler_path,
+            live=False, raw_path=None):
+  """Run one rung, sampling the DUT from the DUT.
+
+  Everything is timed against the sampler's own monotonic clock rather
+  than the nominal duration. The first real run divided by `seconds`
+  while each counter came over its own ssh round trip, and reported
+  2.16 Mpps arriving on a 1 GbE port -- above the 1.488 Mpps a 64-byte
+  frame allows, so plainly the instrument and not the datapath.
+  """
+  argv = ['python3', sampler_path, str(seconds), iface, '0.5']
+  if host.ssh_target:
+    argv = ['ssh', '-o', 'BatchMode=yes', host.ssh_target,
+            ' '.join(argv)]
+  sampler = subprocess.Popen(argv, stdout=subprocess.PIPE,
+                             stderr=subprocess.DEVNULL, text=True,
+                             bufsize=1)
+  proc = gen.start_background()
+
+  # Read as it arrives rather than at the end, so a run can be watched
+  # instead of waited out, and so a run that goes wrong is visible
+  # while there is still time to stop it.
+  samples = []
+  raw = open(raw_path, 'w') if raw_path else None
+  prev = None
+  for line in sampler.stdout:
+    try:
+      cur = json.loads(line)
+    except ValueError:
+      continue
+    samples.append(cur)
+    if raw:
+      raw.write(line)
+      raw.flush()
+    if live and prev is not None:
+      _live_line(rung, samples[0], prev, cur)
+    prev = cur
+  sampler.wait(timeout=30)
+  gen.stop()
+  proc.wait(timeout=15)
+  if raw:
+    raw.close()
+
+  if len(samples) < 2:
+    return {'rung': rung, 'error': 'sampler returned nothing usable'}
+
+  first, last = samples[0], samples[-1]
+  elapsed = last['t'] - first['t']
+  if elapsed <= 0:
+    return {'rung': rung, 'error': 'zero elapsed'}
+
+  def nic_delta(key):
+    return last['nic'].get(key, 0) - first['nic'].get(key, 0)
+
+  received = nic_delta('rx_packets')
+  missed = nic_delta('rx_missed_errors')
+  dropped = nic_delta('rx_dropped')
+
+  # Temperatures across the whole rung, not one reading at its end.
+  temps = {}
+  for name in first['temps_mC']:
+    vals = [s['temps_mC'][name] for s in samples
+            if s['temps_mC'].get(name, -1) > 0]
+    if vals:
+      temps[name] = {'min': min(vals) / 1000, 'max': max(vals) / 1000,
+                     'end': vals[-1] / 1000}
+
+  # Thermal throttling is a package-wide event on this SoC, so the
+  # question is whether ANY cluster still reached its ceiling, not
+  # whether every one did. Taking the minimum across policies reported
+  # 0.34 at 38 C with a 55 C trip -- that was the A55 cluster idling
+  # at 600 MHz while the A76s ran flat out, which is a governor doing
+  # its job, not heat. Per-cluster detail is kept for reading.
+  per_policy = {}
+  for s in samples:
+    for pol, cur in s['freq_khz'].items():
+      mx = s['freq_max_khz'].get(pol, 0)
+      if mx > 0 and cur > 0:
+        frac = cur / mx
+        lo, hi = per_policy.get(pol, (frac, frac))
+        per_policy[pol] = (min(lo, frac), max(hi, frac))
+  clock_frac = max((hi for _, hi in per_policy.values()), default=1.0)
+
+  # Per-core softirq share: XDP runs there, so this says how many
+  # cores actually carried the datapath rather than averaging it away.
+  softirq = {}
+  for cpu, after in last['cpu'].items():
+    before = first['cpu'].get(cpu)
+    if not before:
+      continue
+    delta = [a - b for a, b in zip(after, before)]
+    total = sum(delta)
+    if total > 0 and len(delta) > 6:
+      softirq[cpu] = delta[6] / total
+
   return {
     'rung': rung,
-    'offered_pps': round(offered),
-    'received_pps': round(received),
-    'loss_pct': round(100.0 * (1 - received / offered), 2) if offered else 0,
-    'softirq_max': round(max((s for s, _ in busy.values()), default=0), 3),
-    'busy_max': round(max((b for _, b in busy.values()), default=0), 3),
-    'clock_frac': throttle_verdict(freqs),
-    'soc_mC': host.read_int(soc_sensor),
-    'nic_mC': host.read_int(nic_sensor) if nic_sensor else -1,
+    'elapsed_s': round(elapsed, 2),
+    'samples': len(samples),
+    'offered_pps': round(gen.sent() / elapsed),
+    'received_pps': round(received / elapsed),
+    'nic_missed_pps': round(missed / elapsed),
+    'nic_dropped_pps': round(dropped / elapsed),
+    'rx_bytes_per_s': round(nic_delta('rx_bytes') / elapsed),
+    'softirq_by_cpu': {c: round(v, 3) for c, v in softirq.items()},
+    'softirq_max': round(max(softirq.values(), default=0), 3),
+    'softirq_cores_busy': sum(1 for v in softirq.values() if v > 0.2),
+    'clock_frac': round(clock_frac, 3),
+    'clock_by_policy': {k: (round(lo, 3), round(hi, 3))
+                        for k, (lo, hi) in per_policy.items()},
+    'temps_C': temps,
+    'fd_rss_kb': last.get('fd_rss_kb', -1),
+    'fd_rss_delta_kb': (last.get('fd_rss_kb', 0)
+                        - first.get('fd_rss_kb', 0)),
+    'net_rx_softirq_per_s': round(
+      (last.get('net_rx_softirq', 0)
+       - first.get('net_rx_softirq', 0)) / elapsed),
   }
 
-def report(readings, seconds, remote_host=None):
-  """Print the ladder, the deltas, and the caveats that bound it."""
+
+def report(readings, remote_host=None):
+  """Print the ladder, the per-construct costs, and the caveats."""
+  ok = [r for r in readings if 'error' not in r]
   print()
-  print('=' * 66)
+  print('=' * 78)
   print('POLICY COST LADDER')
-  print('=' * 66)
-  print(f'{"rung":<12} {"offered":>10} {"through":>10} {"loss":>7} '
-        f'{"si":>5} {"clk":>5} {"SoC":>6} {"NIC":>6}')
+  print('=' * 78)
+  print(f'{"rung":<11}{"offered":>10}{"through":>10}{"nic miss":>10}'
+        f'{"Mb/s":>8}{"si":>6}{"cores":>6}{"clk":>6}{"SoC":>7}{"NIC":>7}')
+  for r in ok:
+    soc = r['temps_C'].get('package_thermal', {})
+    nic = r['temps_C'].get('i350bb', {})
+    print(f'{r["rung"]:<11}{r["offered_pps"]:>10,}'
+          f'{r["received_pps"]:>10,}{r["nic_missed_pps"]:>10,}'
+          f'{r["rx_bytes_per_s"] * 8 // 1_000_000:>8}'
+          f'{r["softirq_max"]:>6.2f}{r["softirq_cores_busy"]:>6}'
+          f'{r["clock_frac"]:>6.2f}'
+          f'{soc.get("max", 0):>6.1f}C{nic.get("max", 0):>6.1f}C')
+
   for r in readings:
-    clk = r.get('clock_frac')
-    clk_s = f'{clk:>5.2f}' if clk is not None else '    ?'
-    print(f'{r["rung"]:<12} {r["offered_pps"]:>10,} '
-          f'{r["received_pps"]:>10,} {r["loss_pct"]:>6}% '
-          f'{r["softirq_max"]:>5.2f} {clk_s} '
-          f'{r["soc_mC"] / 1000:>5.1f}C {r["nic_mC"] / 1000:>5.1f}C')
+    if 'error' in r:
+      print(f'  {r["rung"]}: {r["error"]}')
 
   print()
   print('cost of each construct, against the rung above it:')
-  for prev, cur in zip(readings, readings[1:]):
+  for prev, cur in zip(ok, ok[1:]):
     a, b = prev['received_pps'], cur['received_pps']
     if a <= 0 or b <= 0:
       continue
-    # ns/packet at one core-equivalent; the difference of reciprocals
-    # is the added per-packet cost, independent of how many cores were
-    # actually busy.
     added_ns = (1e9 / b) - (1e9 / a)
     pct = 100.0 * (a - b) / a
-    print(f'  {cur["rung"]:<12} {added_ns:>8.1f} ns/pkt   '
-          f'{pct:>5.1f}% fewer pps than `{prev["rung"]}`')
+    verb = 'fewer' if pct >= 0 else 'MORE'
+    print(f'  {cur["rung"]:<11} {added_ns:>9.1f} ns/pkt   '
+          f'{abs(pct):>5.1f}% {verb} pps than `{prev["rung"]}`')
 
-  throttled = [r for r in readings
-               if r.get('clock_frac') is not None
-               and r['clock_frac'] < 0.95]
-  rates = [r['received_pps'] for r in readings if r['received_pps'] > 0]
-  print()
+  # The NIC dropping before the datapath sees a packet is a different
+  # finding from the datapath being slow, and the two are easy to
+  # confuse: both show up as fewer packets through.
+  starved = [r for r in ok
+             if r['nic_missed_pps'] > r['received_pps'] * 0.05]
+  if starved:
+    print()
+    print('NIC-LIMITED: rx_missed_errors is significant on: '
+          + ', '.join(r['rung'] for r in starved))
+    print('Those frames never reached XDP -- the NIC ring overflowed')
+    print('before the datapath was involved. The cost figures above')
+    print('are then bounded by the driver, not by the policy.')
+
+  throttled = [r for r in ok if r['clock_frac'] < 0.95]
   if throttled:
-    names = ', '.join(r['rung'] for r in throttled)
-    print(f'WARNING: the SoC was CLOCKED DOWN during: {names}.')
-    print('Those rungs measured the cooling, not the datapath. A')
-    print('throttled run is indistinguishable from an expensive policy')
-    print('in the pps column alone, which is why the clock is here.')
-    print('Fix the airflow and re-run before quoting any of it.')
     print()
-  elif all(r.get('clock_frac') is None for r in readings):
-    print('NOTE: no clock reading — the cpufreq paths did not resolve')
-    print('on this box, so nothing here rules out thermal throttling.')
+    print('THROTTLED: no cluster reached its maximum clock during: '
+          + ', '.join(r['rung'] for r in throttled))
+    print('Those rungs measured the cooling, not the datapath.')
+
+  leaked = [r for r in ok if r.get('fd_rss_delta_kb', 0) > 512]
+  if leaked:
     print()
+    print('fd RSS GREW during: '
+          + ', '.join(f'{r["rung"]} (+{r["fd_rss_delta_kb"]}kB)'
+                      for r in leaked))
+
+  rates = [r['received_pps'] for r in ok if r['received_pps'] > 0]
+  print()
   if rates and (max(rates) - min(rates)) / max(rates) < 0.05:
-    print('WARNING: every rung landed within 5% of every other one.')
-    print('That is the signature of a GENERATOR-bound run, not a')
-    print('datapath-bound one — the policies are not what limited it.')
-    print('This measurement needs a second machine to offer load from.')
+    print('WARNING: every rung landed within 5% of every other one --')
+    print('the signature of a generator- or NIC-bound run, not a')
+    print('datapath-bound one. The policies were not what limited it.')
   if remote_host:
-    print(f'Generator was {remote_host}, off-box, so these are the')
-    print('datapath\'s own rates rather than lower bounds. They still')
-    print('depend on frame size: at 64 bytes the i350\'s four ports')
-    print('carry 5.95 Mpps, and a 1500-byte flood is 24x cheaper per')
-    print('bit. Say which size a number came from.')
+    print(f'Generator: {remote_host}, off-box. Frame size matters: at')
+    print('64 bytes 1 GbE carries 1,488,095 pps, and a 1500-byte flood')
+    print('at the same bandwidth is 24x fewer packets. Say which size')
+    print('a number came from.')
   else:
-    print('These are LOWER BOUNDS. The generator ran on the box under')
-    print('test, so it competed for CPU with the datapath it measured.')
-    print('Re-run with --gen-host for a real measurement.')
-  print(f'Each rung ran {seconds}s.')
+    print('Generator ran ON the box under test, so these are LOWER')
+    print('BOUNDS -- it competed for CPU with what it measured.')
+
 
 def main():
   ap = argparse.ArgumentParser(description=__doc__)
@@ -643,9 +796,29 @@ def main():
                        '(defaults to --send-iface)')
   ap.add_argument('--seconds', type=int, default=20)
   ap.add_argument('--pkt-size', type=int, default=64)
+  ap.add_argument('--pps', type=int, default=1600000,
+                  help='pace the generator, packets per second. The '
+                       'default sits just above 1 GbE line rate at 64 '
+                       'bytes (1,488,095 pps) so the DUT port is '
+                       'saturated without the switch discarding the '
+                       'excess -- an unpaced 10 GbE source into a 1 '
+                       'GbE port measures the switch egress queue, not '
+                       'the firewall. 0 disables pacing.')
   ap.add_argument('--dst-mac', default='02:00:00:00:00:02')
   ap.add_argument('--dst-ip', default='10.99.9.9')
   ap.add_argument('--fwl', default='/opt/fwl/.venv/bin/fwl')
+  ap.add_argument('--quiet', action='store_true',
+                  help='suppress the per-sample live lines')
+  ap.add_argument('--out', default='/tmp/l13',
+                  help='local directory for raw per-sample JSONL and '
+                       'the summary; every sample is kept so a run can '
+                       'be re-read without repeating it')
+  ap.add_argument('--sampler',
+                  default='/opt/fwl/tests/system/hw/l13_sampler.py',
+                  help='path to the sampler ON THE DUT')
+  ap.add_argument('--geoip-data', default=None,
+                  help='geoip json for the geoip rung; without it that '
+                       'rung is skipped rather than silently dropped')
   ap.add_argument('--bundle-root',
                   default=os.environ.get('BUNDLE_ROOT',
                                          '/usr/share/f/compiled'),
@@ -663,23 +836,23 @@ def main():
   dut = Host(args.dut_host)
   if not dut.reachable():
     die(f'cannot reach the DUT at {dut.name}')
-  if os.geteuid() != 0:
-    die('needs root: pktgen and IRQ affinity both do')
+  if os.geteuid() == 0 and args.dut_host:
+    die('do not run this under sudo when driving a remote DUT: root '
+        'has neither your ssh config nor your agent, so it cannot '
+        'reach the DUT. Run it as yourself; pktgen is elevated '
+        'internally via sudo.')
   if not Pktgen.available():
     die('pktgen unavailable — modprobe pktgen failed. '
         'CONFIG_NET_PKTGEN is not built on this kernel.')
-  if not shutil.which(args.fwl) and not pathlib.Path(args.fwl).exists():
-    die(f'no fwl at {args.fwl}')
-
-  soc = (hwmon_by_name(dut, 'package_thermal')
-         or '/sys/class/thermal/thermal_zone0/temp')
-  nic = hwmon_by_name(dut, 'i350bb')
+  # fwl runs on the DUT, which may not be this machine.
+  if dut.run(['test', '-x', args.fwl]).returncode != 0:
+    die(f'no executable fwl at {args.fwl} on {dut.name}')
 
   gen_cpus = [int(c) for c in args.gen_cpus.split(',')]
   if args.gen_host:
     gen = RemotePktgen(args.gen_host, args.gen_iface or args.send_iface,
                        gen_cpus, args.dst_mac, args.dst_ip,
-                       args.pkt_size)
+                       args.pkt_size, pps=args.pps)
     if not gen.available():
       die(f'no pktgen on {args.gen_host} (modprobe pktgen failed '
           f'there, or ssh/sudo is not set up)')
@@ -687,7 +860,7 @@ def main():
           f'datapath\'s own')
   else:
     gen = Pktgen(args.send_iface, gen_cpus, args.dst_mac, args.dst_ip,
-                 args.pkt_size)
+                 args.pkt_size, pps=args.pps)
     print('generator: pktgen on THIS box — readings are lower bounds. '
           'Use --gen-host for a real measurement.')
   if not gen.configure():
@@ -695,30 +868,63 @@ def main():
 
   workdir = pathlib.Path('/tmp/l13_ladder')
   dut.run(['mkdir', '-p', str(workdir)])
+  workdir_local = pathlib.Path(args.out)
+  workdir_local.mkdir(parents=True, exist_ok=True)
+
+  # Prove the wire before believing any rung. The first trial run on
+  # the rig reported 1 pps through on every rung and dutifully computed
+  # "0.0 ns/pkt" costs from it -- numbers that looked like data and
+  # meant nothing. The i350 ports were in different switch VLANs, so
+  # nothing generated on one could ever reach the other. A ladder that
+  # cannot see its own traffic must say so instead of reporting zeros.
+  probe_before = iface_rx(dut, args.iface)
+  probe = gen.start_background()
+  time.sleep(3)
+  gen.stop()
+  probe.wait(timeout=10)
+  probe_rx = iface_rx(dut, args.iface) - probe_before
+  if probe_rx < 100:
+    die(f'only {probe_rx} frames reached {args.iface} in 3s. The '
+        f'generator and the receiving port have no layer-2 path '
+        f'between them -- check they share a VLAN, or patch them '
+        f'directly. Refusing to report a ladder measured on no '
+        f'traffic.')
+  print(f'wire ok: {probe_rx} frames reached {args.iface} in 3s\n')
   readings = []
   try:
     for name, why, template in LADDER:
       src = template.format(recv=args.iface, send=args.send_iface)
       print(f'--- {name}: {why}')
+      if 'geoip(' in src and not args.geoip_data:
+        print('  skipped: needs --geoip-data')
+        continue
       if not deploy(dut, src, args.fwl, workdir, args.bundle_root,
-                    args.iface, name):
+                    args.iface, name, args.geoip_data):
         print('  skipped: could not deploy this rung')
         continue
       time.sleep(2)
+      raw = workdir_local / f'samples-{name}.jsonl'
       readings.append(measure(dut, name, gen, args.seconds,
-                              args.iface, soc, nic))
-      print(f'  {readings[-1]["received_pps"]:,} pps through, '
-            f'SoC {readings[-1]["soc_mC"] / 1000:.1f}C')
+                              args.iface, args.sampler,
+                              live=not args.quiet, raw_path=str(raw)))
+      r = readings[-1]
+      if 'error' in r:
+        print(f'  no reading: {r["error"]}')
+      else:
+        soc = r['temps_C'].get('package_thermal', {}).get('max', 0)
+        print(f'  {r["received_pps"]:,} pps through, '
+              f'{r["nic_missed_pps"]:,} missed at the NIC, '
+              f'SoC {soc:.1f}C, clk {r["clock_frac"]:.2f}')
   finally:
     gen.cleanup()
 
   if not readings:
     die('no rung produced a reading')
-  report(readings, args.seconds, args.gen_host)
-  out = pathlib.Path('/tmp/l13_ladder.json')
-  out.parent.mkdir(parents=True, exist_ok=True)
+  report(readings, args.gen_host)
+  out = workdir_local / 'ladder.json'
   out.write_text(json.dumps(readings, indent=2))
-  print(f'\nreadings: {out}')
+  print(f'\nsummary:      {out}')
+  print(f'raw samples:  {workdir_local}/samples-*.jsonl')
   return 0
 
 if __name__ == '__main__':
