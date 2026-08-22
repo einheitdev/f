@@ -2,6 +2,8 @@
 
 An eBPF/XDP firewall built around a small declarative language. Policy is written in FWL, compiled to verifier-accepted BPF, and loaded into the kernel without dropping a packet or an established connection. A daemon owns the datapath, a Junos-style CLI owns the configuration, and a web dashboard reads both.
 
+It forwards at 97-99% of line rate at realistic frame sizes and absorbs a full-rate small-packet flood on three ports at once without losing a packet or slowing the management plane — measured, not estimated. See [Performance](#performance).
+
 ## How It Works
 
 `f` runs as a userspace daemon (`fd`) that loads an XDP program onto network interfaces. Packets are filtered at the earliest point in the kernel networking stack — before socket allocation, before iptables, before the kernel builds an `sk_buff`.
@@ -20,6 +22,28 @@ The path a packet takes is short and fixed: parse, de-NAT, the zone's rules, NAT
 - **ZMQ control protocol** — `[1B Cmd][payload]`, JSON reply, at `ipc:///run/f/control.sock`
 - **Operator CLI and web dashboard** — `einheit-f` and `einheit-f-ui`, both reading the daemon
 - **FWL compiler** — small declarative language that compiles to verifier-accepted BPF C, verified construct-by-construct against three independent oracles
+
+## Performance
+
+Measured on the bench, not estimated: Orange Pi 5 Plus (RK3588, 4x A76 + 4x A55), Intel i350, 64-byte frames unless stated. Throughput here means **RFC 2544 throughput — the highest offered rate with zero loss**, not the packets that survived an overload.
+
+| workload | 64 B | 512 B | 1518 B |
+|---|---|---|---|
+| **forward** (in one zone, out another) | 808,545 pps (54% line) | 231,708 pps (**98.6%**) | 79,767 pps (**98.1%**) |
+| **drop** (storm shield, blocklists) | line rate, zero loss | — | — |
+
+**Three ports flooded at once: 3,032,962 pps aggregate, zero loss**, with the A76 cores at 26% and the package at 37 C against a 55 C trip. The SoC is not the limit at three gigabit ports.
+
+**The management plane is unaffected by a full-rate flood.** Under 3 Mpps, ssh round-trip measured 165 ms median against 214 ms idle — *faster*, because the governor parks the big cores at 600 MHz when idle and a flood pins them at 2.4 GHz. XDP runs in softirq on cores that still have 70% idle, so the datapath and the CLI never compete. An operator can log in and fix the box while every port is being hammered, which is exactly when they need to.
+
+Two things worth knowing before quoting any of this:
+
+- **Always state the frame size.** 1 GbE is 1,488,095 pps at 64 bytes and 81,274 pps at 1518. The same box does 54% of line at one and 98% at the other, and a number without its frame size is not a measurement.
+- **Forwarding costs about twice what receiving does.** Dropping runs at line rate; forwarding does not. The transmit path, not the match, is the constraint — and it costs much the same whether a packet leaves via `bpf_redirect_map` or via the kernel stack.
+
+One tuning change matters on big.LITTLE hardware and is not a default: RSS feeds every core equally, so the 1.8 GHz A55s saturate while the 2.4 GHz A76s idle. Weighting the hash buckets toward the fast cores is worth **25%** (`ethtool -X <iface> weight 3 3 1 1 1 1 3 3`, matched to the queue-to-CPU map). Pinning everything to the big cores instead *halves* throughput — the little cores carry real work.
+
+Harness and full results: `tests/system/hw/l13_02_rfc2544_throughput.py`, and `f.planning/rig-evidence/`.
 
 ## Requirements
 
@@ -76,6 +100,15 @@ Run a single test:
 ```bash
 ./build/tests/test_types --gtest_filter='TypesTest.RuleKey*'
 ```
+
+**Load and throughput** live in `tests/system/hw/` and need a rig, a traffic generator and root, so they do not run in CI:
+
+```bash
+./l13_02_rfc2544_throughput.py --dut-host f-rig --rx-iface eth1 \
+    --tx-iface eth2 --gen-iface <generator NIC> --dst-mac <rx MAC>
+```
+
+It binary-searches for the highest lossless rate per frame size and refuses to report a trial the generator could not actually deliver. `l13_01_policy_cost_ladder.py` measures per-construct cost with a sampler that records every thermal sensor, per-cluster clocks, per-core softirq and NIC drop counters twice a second.
 
 ## FWL — Firewall Language
 
