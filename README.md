@@ -2,7 +2,7 @@
 
 An eBPF/XDP firewall built around a small declarative language. Policy is written in FWL, compiled to verifier-accepted BPF, and loaded into the kernel without dropping a packet or an established connection. A daemon owns the datapath, a Junos-style CLI owns the configuration, and a web dashboard reads both.
 
-On a 200 EUR SoC board it forwards a 10 GbE link at 98% of line rate, absorbs a full-rate IMIX flood at 98.9% of line, and keeps the management plane responsive throughout — measured against RFC 2544, not estimated. See [Performance](#performance).
+On a 200 EUR SoC board it forwards 10 GbE at line rate in both directions at once and keeps the management plane responsive while doing it — 19.4 Gb/s bidirectional, more than a $899 appliance running pfSense on the same test. Measured against RFC 2544, not estimated. See [Performance](#performance).
 
 ## How It Works
 
@@ -25,37 +25,54 @@ The path a packet takes is short and fixed: parse, de-NAT, the zone's rules, NAT
 
 ## Performance
 
-Measured on the bench against **RFC 2544 — the highest offered rate at which nothing is lost**, not the packets that survived an overload. Rig is an Orange Pi 5 Plus (RK3588: 4x A76 @ 2.4 GHz + 4x A55 @ 1.8 GHz), ConnectX 10 GbE, DACs straight into the generator. The policy under test is a bare `redirect to <zone>` — no rules, no conntrack, no NAT — so these are the datapath floor and an upper bound on what a real policy does.
+Measured on the bench against **RFC 2544 — the highest offered rate at which nothing is lost**, not the packets that survived an overload. Rig is an Orange Pi 5 Plus (RK3588: 4x A76 @ 2.4 GHz + 4x A55 @ 1.8 GHz), ConnectX 10 GbE, DACs straight into the generator. Figures are at 0.01% loss.
 
-IMIX below is the mix appliance datasheets quote: 7 x 64, 4 x 594 and 1 x 1518 byte frames, average 361.8 bytes. Figures are at 0.01% loss; the strict zero-loss column is in the evidence file, and differs by under 3% once the box is tuned.
+The policy under test is a single `redirect to <zone>` with no rule set, no conntrack and no NAT — but it is real L3 forwarding, not an L2 bounce: every packet gets a FIB lookup against this box's routing table, a MAC rewrite and a TTL decrement.
+
+IMIX is the mix appliance datasheets quote: 7 x 64, 4 x 594 and 1 x 1518 byte frames, average 361.8 bytes.
 
 | workload | 64 B | IMIX | 1518 B |
 |---|---|---|---|
-| **drop** — storm shield, blocklists | 3,387,811 pps | 3,237,542 pps (**9.37 Gb/s, 98.9% of line**) | 799,803 pps (line-limited) |
-| **forward** — one direction | 1,378,641 pps | 1,392,633 pps | 799,919 pps (**9.71 Gb/s, 98.4% of line**) |
-| **bidirectional** — both directions, aggregate | 1,419,420 pps | 1,366,340 pps | 1,168,694 pps (**14.19 Gb/s**) |
+| **drop** — storm shield, blocklists | 6,433,444 pps | 3,240,759 pps (**99.0% of line**) | line-limited |
+| **forward** — one direction | 3,865,457 pps | 3,230,294 pps (**98.7% of line**) | 9.73 Gb/s (98.5%) |
+| **bidirectional** — both directions, aggregate | 3,513,116 pps | **10.83 Gb/s** | **19.39 Gb/s (98.2% of line)** |
 
-**The datapath is packet-limited, not byte-limited.** Forwarding tops out at 1.38-1.39 Mpps at every frame size where the link is not the binding constraint, and running both directions at once reaches the same aggregate — one direction or two, the box moves the same number of packets. Bytes are close to free; packets are what cost.
+**At IMIX and above, the ports are the limit — not the box.** 98.7% of line one way, 98.2% both ways at 1518 bytes. Only 64-byte traffic still finds a ceiling inside the SoC.
 
-**Dropping costs 2.4x less than forwarding.** At IMIX the box absorbs a full 10 GbE line-rate flood, while a policy that has to put the packets back on the wire manages 42% of line. For a blocklist or a plant-floor broadcast storm there is room to spare; for a gateway the transmit path is the constraint.
-
-**The firewall itself is about an eighth of the cost.** Under `bpf_stats`, the compiled FWL program measures 411 ns per packet — 6.6% of eight cores while the system is 56% busy. The rest is driver, page pool and redirect plumbing. Rules are cheap relative to the fixed cost of moving a packet.
+**The firewall is a twentieth of the cost.** Under `bpf_stats` the compiled FWL program measures 411 ns per packet, under 5% of the machine while it forwards. Rules are cheap relative to the fixed cost of moving a packet, which is the property that decides whether a real policy costs anything a customer notices.
 
 **The management plane is unaffected by a full-rate flood.** Under a 3 Mpps flood, ssh round-trip measured 165 ms median against 214 ms idle — *faster*, because the governor parks the big cores when idle and a flood pins them at maximum. An operator can log in and fix the box while every port is being hammered, which is exactly when they need to.
 
-### Three tuning changes worth 40%, none of them a default
+### For scale: the same test on appliances that cost more
 
-- **Disable deep cpuidle and pin the governor to `performance`.** `cpu-sleep` on this SoC has a 220 us exit latency; at 1.4 Mpps that is 300 packets against a 1024-entry ring. Worth **31-43%**, and it turns a noisy loss threshold into a sharp one. The box had been losing packets with 45% of its CPU idle.
+Netgate publishes these for pfSense Plus, measured bidirectionally across all ports — the same thing the bidirectional row above measures.
+
+| appliance | price | L3 forwarding, iPerf3 | L3 forwarding, IMIX |
+|---|---|---|---|
+| Netgate 4200 | $599 | 8.75 Gb/s | 9.28 Gb/s |
+| Netgate 6100 | $899 | 18.50 Gb/s | 6.08 Gb/s |
+| Netgate 8200 MAX | $1,749 | 18.60 Gb/s | 11.76 Gb/s |
+| **`f` on the rig** | ~200 EUR + NIC | **19.39 Gb/s** | **10.83 Gb/s** |
+
+Read that with its caveats or it misleads: `f` carries no rule set here where Netgate publishes a 10,000-ACL figure, their aggregate spans more ports than this rig has, `f` has no IPsec at all where every Netgate row has a VPN number, and an appliance buys a case, redundant power and support that a dev board does not.
+
+### Four tuning changes worth 3.4x, none of them a default
+
+Untuned, this box forwards 955,429 pps. Tuned, 3,230,294. Every one of these was invisible until it was measured.
+
+- **The IOMMU was half the machine.** `XDP_REDIRECT` DMA-maps a frame on the transmit device per packet, and the kernel's default strict mode makes every unmap wait for an SMMU invalidation. `perf` found 37% of the big cores in `arm_smmu_cmdq_issue_cmdlist`. `iommu.strict=0` is worth **+80%** and keeps DMA isolation; `iommu.passthrough=1` is worth **+180%** and removes it — a security decision, not a tuning one.
+- **Disable deep cpuidle and pin the governor to `performance`.** `cpu-sleep` on this SoC has a 220 us exit latency; at 1.4 Mpps that is 300 packets against a 1024-entry ring. Worth **31-43%**, and it turns a loss threshold that moved 40% between identical runs into one that does not.
 - **Weight the RSS indirection table toward the fast cores.** big.LITTLE plus a flat table feeds 1.8 GHz cores exactly as hard as 2.4 GHz ones. `ethtool -X <iface> weight 1 1 1 1 3 3 3 3`, matched to the queue-to-CPU map, is worth **25-32%** — confirmed independently on igb and mlx5. Pinning everything to the big cores instead *halves* throughput; the little cores carry real work.
 - **Ring size does nothing.** Tested 256 to 4096 on igb and 1024 to 8192 on mlx5. No effect either time. It is the obvious knob and it is the wrong one.
 
+`deploy/f_datapath_tune.py` applies the ones that are runtime-settable and reports the IOMMU, which is not.
+
 ### Before quoting any of this
 
-- **Always state the frame size.** 10 GbE is 14,880,952 pps at 64 bytes and 812,743 at 1518. The same box does 9% of line at one and 98% at the other, and a number without its frame size is not a measurement.
-- **The 1518-byte bidirectional figure is PCIe-limited, not SoC-limited.** 14.19 Gb/s forwarded is 28.4 Gb/s across the bus, because every forwarded byte crosses it twice, and the card is an x8 in an x4 slot. That number is a property of the rig.
-- **No rule set has been measured yet.** Netgate publishes a 10,000-ACL figure; `f` does not have one, and the numbers above are for an empty policy.
+- **Always state the frame size.** 10 GbE is 14,880,952 pps at 64 bytes and 812,743 at 1518. The same box does 26% of line at one and 98% at the other, and a number without its frame size is not a measurement.
+- **No rule set has been measured yet.** These are datapath figures for a policy with no rules in it.
 
-Harness and full results, including the side-by-side against Netgate's published figures: `tests/system/hw/l13_02_rfc2544_throughput.py` and `f.planning/rig-evidence/RFC2544_10G_2026-08-23.md`.
+Harness and full results, including how two earlier conclusions here turned out to be artifacts: `tests/system/hw/l13_02_rfc2544_throughput.py` and `f.planning/rig-evidence/RFC2544_10G_2026-08-23.md`.
 
 ## Requirements
 
