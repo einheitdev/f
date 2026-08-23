@@ -271,15 +271,64 @@ def indirection_table(iface):
   return out
 
 def candidate_ifaces():
-  """Physical interfaces that are up and have more than one RX ring."""
-  out = []
-  for entry in sorted(NET_ROOT.iterdir()):
-    if not (entry / "device").exists():
-      continue
-    if read(entry / "operstate") != "up":
-      continue
-    out.append(entry.name)
-  return out
+  """Every physical interface, up or not.
+
+  Deliberately does NOT require the link to be up. This unit runs
+  before fd, which runs before network.target, so on a cold boot the
+  interfaces it has to weight are still administratively down -- and
+  an earlier version that filtered on `operstate == up` silently
+  weighted nothing on every reboot while reporting success. mlx5
+  accepts `ethtool -X` on a closed interface and keeps the table
+  across the open, which is what makes the ordering work at all.
+  """
+  return sorted(entry.name for entry in NET_ROOT.iterdir()
+                if (entry / "device").exists())
+
+def iommu_mode(iface):
+  """How the SMMU is translating DMA for this interface, or None.
+
+  "DMA" is strict mode, the kernel default: every DMA unmap issues an
+  SMMU TLB invalidation and waits for it. XDP_REDIRECT maps and
+  unmaps a buffer on the transmit device for **every forwarded
+  packet**, so strict mode puts a synchronous IOMMU command round
+  trip in the datapath's inner loop. On the rig it was 37% of the big
+  cores in `arm_smmu_cmdq_issue_cmdlist` alone, and turning it off
+  doubled forwarding throughput.
+
+  It also explains a difference that looked like a hardware property:
+  dropping was 2.4x cheaper than forwarding, because dropping never
+  maps anything for transmit. After this was fixed the two came out
+  within 5% of each other.
+  """
+  group = NET_ROOT / iface / "device" / "iommu_group"
+  if not group.exists():
+    return None
+  return read(group.resolve() / "type")
+
+def check_iommu(report, ifaces):
+  """Report the SMMU mode. Advisory: it is set on the kernel cmdline.
+
+  This tool cannot fix it -- `iommu.passthrough` and `iommu.strict`
+  are boot parameters -- but a box in strict mode runs at half speed
+  for a reason nothing else reports, so it is named here rather than
+  left for whoever next wonders why the numbers do not match.
+  """
+  strict = sorted(i for i in ifaces if iommu_mode(i) == "DMA")
+  if strict:
+    report.failed.append(
+      f"SMMU in strict mode for {', '.join(strict)}: every forwarded "
+      "packet pays a synchronous TLB invalidation, measured at ~2x "
+      "throughput on RK3588. Fix on the kernel cmdline: "
+      "iommu.strict=0 keeps DMA isolation and recovers most of it, "
+      "iommu.passthrough=1 removes translation entirely and recovers "
+      "all of it.")
+    return
+  for iface in ifaces:
+    mode = iommu_mode(iface)
+    if mode in ("DMA-FQ", "identity"):
+      report.already.append(
+        f"{iface} SMMU {mode} "
+        f'({"lazy invalidation" if mode == "DMA-FQ" else "passthrough"})')
 
 def tune_rss(report, iface, big_weight, little_weight):
   """Weight the RSS table toward the cores that are actually faster.
@@ -391,8 +440,18 @@ def main():
     tune_cpuidle(report, args.max_idle_latency_us)
   if not args.no_governor:
     tune_governor(report, args.governor)
+  ifaces = args.interfaces or candidate_ifaces()
+  check_iommu(report, ifaces)
   if not args.no_rss:
-    for iface in (args.interfaces or candidate_ifaces()):
+    # A run that examined no interface at all is not a clean run. The
+    # first version filtered them out and still printed "tuning
+    # applied", so every reboot came up with a flat indirection table
+    # and nothing said so.
+    if not ifaces:
+      report.failed.append(
+        "RSS: no physical interface found to examine. Either this "
+        "box has none, or this ran before the drivers were bound.")
+    for iface in ifaces:
       tune_rss(report, iface, args.big_weight, args.little_weight)
   return report.emit()
 

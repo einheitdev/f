@@ -252,3 +252,82 @@ def test_a_queue_pinned_to_several_cpus_is_not_mapped(tmp_path,
   (msi / "41").write_text("")
   monkeypatch.setattr(tune, "NET_ROOT", tmp_path)
   assert tune.queue_cpu_map("mlx") == {}
+
+def _fake_net(tmp_path, monkeypatch, ifaces):
+  """A fake /sys/class/net.
+
+  Args:
+    tmp_path: pytest temporary directory.
+    monkeypatch: pytest monkeypatch fixture.
+    ifaces: {name: (has_device, operstate, iommu_type or None)}.
+
+  Returns:
+    The fake NET_ROOT path.
+  """
+  root = tmp_path / "net"
+  groups = tmp_path / "iommu_groups"
+  for index, (name, (device, state, iommu)) in enumerate(
+      sorted(ifaces.items())):
+    entry = root / name
+    entry.mkdir(parents=True)
+    (entry / "operstate").write_text(state + "\n")
+    if device:
+      (entry / "device").mkdir()
+    if iommu:
+      group = groups / str(index)
+      group.mkdir(parents=True)
+      (group / "type").write_text(iommu + "\n")
+      (entry / "device" / "iommu_group").symlink_to(group)
+  monkeypatch.setattr(tune, "NET_ROOT", root)
+  return root
+
+def test_a_down_interface_is_still_a_candidate(tmp_path, monkeypatch):
+  """The regression that made every reboot come up untuned.
+
+  This unit runs before fd, which runs before network.target, so on a
+  cold boot the interfaces it must weight are administratively down.
+  Filtering on operstate meant it weighted nothing, every time, and
+  said "tuning applied" while doing it.
+  """
+  _fake_net(tmp_path, monkeypatch,
+            {"enp1s0f0np0": (True, "down", None),
+             "enp1s0f1np1": (True, "down", None),
+             "lo": (False, "unknown", None)})
+  assert tune.candidate_ifaces() == ["enp1s0f0np0", "enp1s0f1np1"]
+
+def test_finding_no_interface_at_all_is_a_failure(tmp_path,
+                                                  monkeypatch, capsys):
+  """Silence is the failure mode; it has to be loud instead."""
+  _fake_net(tmp_path, monkeypatch, {"lo": (False, "unknown", None)})
+  monkeypatch.setattr(tune, "cpu_ids", lambda: [])
+  monkeypatch.setattr(tune, "CPU_ROOT", tmp_path / "nothing")
+  monkeypatch.setattr(tune.sys, "argv", ["f-datapath-tune"])
+  assert tune.main() == 1
+  assert "no physical interface found" in capsys.readouterr().out
+
+def test_strict_smmu_is_reported_with_the_fix(tmp_path, monkeypatch):
+  """Strict mode halves forwarding and nothing else reports it."""
+  _fake_net(tmp_path, monkeypatch,
+            {"enp1s0f0np0": (True, "up", "DMA")})
+  report = tune.Report()
+  tune.check_iommu(report, ["enp1s0f0np0"])
+  assert report.failed
+  assert "iommu.strict=0" in report.failed[0]
+  assert "iommu.passthrough=1" in report.failed[0]
+
+@pytest.mark.parametrize("mode", ["DMA-FQ", "identity"])
+def test_a_relaxed_smmu_passes(tmp_path, monkeypatch, mode):
+  _fake_net(tmp_path, monkeypatch,
+            {"enp1s0f0np0": (True, "up", mode)})
+  report = tune.Report()
+  tune.check_iommu(report, ["enp1s0f0np0"])
+  assert not report.failed
+  assert any(mode in line for line in report.already)
+
+def test_no_iommu_in_the_path_is_not_a_failure(tmp_path, monkeypatch):
+  """An x86 box with the IOMMU off has nothing to report."""
+  _fake_net(tmp_path, monkeypatch,
+            {"enp1s0f0np0": (True, "up", None)})
+  report = tune.Report()
+  tune.check_iommu(report, ["enp1s0f0np0"])
+  assert not report.failed and not report.already
