@@ -4,7 +4,7 @@
 
 The language reference is [`docs/FWL_V04_SPEC.md`](../docs/FWL_V04_SPEC.md); the build methodology is [`docs/F_DEVELOPMENT_METHODOLOGY.md`](../docs/F_DEVELOPMENT_METHODOLOGY.md). For using the language rather than working on it, start at [`docs/fwl/`](../docs/fwl/).
 
-**Status: v0.4 surface complete.** 2120 unit tests and 1244 corpus cases pass. On a host with `CAP_BPF` (or root) every behavioral corpus case runs through `BPF_PROG_TEST_RUN`; unprivileged, the BPF oracle skips cleanly while spec, interpreter and clang-compile still gate regressions. That skip matters — see "Verification model".
+**Status: v0.4 surface complete.** 2238 unit tests and 1291 corpus cases pass. On a host with `CAP_BPF` (or root) every behavioral corpus case runs through `BPF_PROG_TEST_RUN`; unprivileged, the BPF oracle skips cleanly while spec, interpreter and clang-compile still gate regressions. That skip matters — see "Verification model".
 
 ## Install
 
@@ -159,6 +159,6 @@ fwl/examples/         ssh_brute_force, web_server_ddos, internal_network,
                       storm_shield, dogfood_v02, dogfood_v03
   feeds/              Sample table source files the examples read
 fwl/tests/
-  corpus/             1244 .pkt cases
-  unit/               2120 pytest tests
+  corpus/             1291 .pkt cases
+  unit/               2238 pytest tests
 ```
