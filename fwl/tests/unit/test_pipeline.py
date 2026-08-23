@@ -161,3 +161,79 @@ def test_pipeline_equivalence_pass_or_skip():
   # On a CAP_BPF kernel this asserts single==split; otherwise it must at
   # least confirm both forms compile (skip, not fail).
   assert res.status in ("pass", "skip"), res.detail
+
+
+class TestTailCallDepthLimit:
+  """A pipeline deeper than the kernel will follow is not a program.
+
+  The kernel stops following a tail-call chain at MAX_TAIL_CALL_CNT.
+  Past that the call does not happen, execution falls through, and for
+  a Tier 1 policy the stages holding the terminal verdict never run.
+
+  Measured on the rig before this was caught: a 2,500-rule policy
+  compiled to 41 stages, loaded without complaint, reported
+  `xdp_attached: true` on both interfaces, and then dropped nothing,
+  redirected nothing and forwarded nothing. Every XDP counter stayed
+  flat while traffic arrived. A firewall that silently stops enforcing
+  is worse than one that refuses to start, so this refuses to compile.
+  """
+
+  @staticmethod
+  def _policy(count):
+    lines = ["zone wan = [eth0]", "zone lan = [eth1]", "", "@xdp(wan)", ""]
+    for i in range(count):
+      a, b = (i // 254) % 250 + 1, i % 254 + 1
+      lines.append(f"drop if pkt.src_ip in 10.{a}.{b}.0/24 "
+                   f"and pkt.proto == tcp and pkt.dst_port == {1024 + i}")
+    lines += ["redirect to lan", "", "@xdp(lan)", "", "default drop", ""]
+    return "\n".join(lines)
+
+  def _plan(self, count):
+    program = analyzer.analyze(parser.parse(self._policy(count)))
+    return splitter.plan(program.programs[0])
+
+  def test_the_ceiling_is_stated_in_terms_of_rules(self):
+    """The constant an operator needs is a rule count, not a stage count."""
+    assert splitter.MAX_TIER1_RULES == (
+      (splitter.MAX_STAGES - 1) * splitter.MAX_RULES_PER_STAGE)
+
+  def test_a_policy_within_the_limit_still_compiles(self):
+    plan = self._plan(1500)
+    assert plan.split
+    assert plan.n_stages <= splitter.MAX_STAGES
+    emitter.emit_bundle(
+      analyzer.analyze(parser.parse(self._policy(1500))))
+
+  def test_a_policy_past_the_limit_is_refused(self):
+    count = splitter.MAX_TIER1_RULES + splitter.MAX_RULES_PER_STAGE * 2
+    program = analyzer.analyze(parser.parse(self._policy(count)))
+    stages = splitter.plan(program.programs[0]).n_stages
+    assert stages > splitter.MAX_STAGES
+    with pytest.raises(FwlException) as caught:
+      emitter.emit_bundle(program)
+    message = caught.value.error.message
+    assert "pipeline stages" in message
+    assert str(splitter.MAX_STAGES) in message
+    # The message has to carry the numbers, not just the verdict: the
+    # operator's next action is deciding how much policy to move, and
+    # that needs the count it has and the count it may have. The rule
+    # total includes the terminal verdict, so it is read from the
+    # program rather than assumed to equal the generated count.
+    assert str(len(program.programs[0].rules)) in message
+    assert str(splitter.MAX_TIER1_RULES) in message
+
+  def test_the_refusal_names_the_zone(self):
+    count = splitter.MAX_TIER1_RULES * 3
+    with pytest.raises(FwlException) as caught:
+      emitter.emit_bundle(
+        analyzer.analyze(parser.parse(self._policy(count))))
+    assert "'wan'" in caught.value.error.message
+
+  def test_it_is_a_codegen_error_not_a_crash(self):
+    """It must arrive as a reportable error, not a traceback."""
+    count = splitter.MAX_TIER1_RULES * 2
+    with pytest.raises(FwlException) as caught:
+      emitter.emit_bundle(
+        analyzer.analyze(parser.parse(self._policy(count))))
+    assert caught.value.error.category == "codegen"
+    assert caught.value.error.format().startswith("error: ")

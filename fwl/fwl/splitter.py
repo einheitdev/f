@@ -52,6 +52,32 @@ HARD_STACK = 512
 # where a single stage stops compiling on clang 19 / kernel 6.12.
 MAX_RULES_PER_STAGE = 64
 
+# The kernel will not follow a tail-call chain deeper than
+# MAX_TAIL_CALL_CNT, which has been 33 since 5.10. Past that the tail
+# call simply does not happen: `bpf_tail_call` returns, and the calling
+# stage falls through to whatever follows it.
+#
+# For a firewall that is the worst possible failure. Measured on the
+# rig with a 2,500-rule policy, which the compiler split into 41
+# stages: the program loaded, `fctl status` reported `xdp_attached:
+# true` on both interfaces, and not one packet was dropped, redirected
+# or forwarded -- because the terminal `redirect to lan` lives in the
+# last stage, and stages 34 through 40 never ran. A policy that
+# silently stops enforcing while reporting healthy is precisely what
+# this compiler exists to refuse.
+#
+# A chain of N stages performs N-1 tail calls, so 34 stages would fit
+# exactly. One is kept in hand rather than sitting on the boundary of
+# a kernel constant we do not control.
+MAX_TAIL_CALL_CNT = 33
+MAX_STAGES = MAX_TAIL_CALL_CNT
+
+# With MAX_RULES_PER_STAGE rules in each policy stage and one parse
+# stage ahead of them, this is the largest Tier 1 rule set that can be
+# expressed at all. Reported in the error rather than left for the
+# reader to multiply.
+MAX_TIER1_RULES = (MAX_STAGES - 1) * MAX_RULES_PER_STAGE
+
 # Rough stack costs (bytes), 8-byte aligned working set.
 _STACK_BASE = 24
 _STACK_PER_FIELD = 8

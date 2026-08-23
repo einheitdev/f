@@ -3801,6 +3801,24 @@ def _emit_zone_source(
     )
   else:
     plan = splitter.plan(zp, force_split=(split is True))
+  # A chain the kernel will not follow is not a program. See
+  # splitter.MAX_STAGES: past the tail-call limit the last stages never
+  # run, which for a Tier 1 policy means the terminal verdict never
+  # runs, which means the box forwards nothing and reports healthy.
+  if plan.split and plan.n_stages > splitter.MAX_STAGES:
+    raise _codegen_error(
+      f"zone {zone_name!r} needs {plan.n_stages} pipeline stages and "
+      f"the kernel will only follow {splitter.MAX_STAGES}. Past that "
+      f"limit `bpf_tail_call` stops happening and the stages holding "
+      f"the final verdict never run -- the policy would load, report "
+      f"attached, and enforce nothing. This zone has "
+      f"{len(zp.rules)} rules against a ceiling of "
+      f"{splitter.MAX_TIER1_RULES} "
+      f"({splitter.MAX_STAGES - 1} stages x "
+      f"{splitter.MAX_RULES_PER_STAGE} rules). Split the policy across "
+      f"zones, or express the bulk of it as a data structure rather "
+      f"than as rules."
+    )
   reachable = _reachable_helpers(zp, helpers or [])
   # The zone body plus every helper it reaches, each wrapped as a unit
   # so the per-unit collectors (conntrack/NAT/log/rate-limit/counters)

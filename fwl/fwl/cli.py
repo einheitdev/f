@@ -179,8 +179,16 @@ def compile(source: Path, output: Path | None, bundle_dir: Path | None,
     geoip_data = json.loads(geoip_file.read_text(encoding="utf-8"))
 
   if bundle_dir is not None:
-    _emit_bundle_dir(program, bundle_dir, geoip_data,
-                     source=source, source_text=text)
+    # Codegen errors were escaping as tracebacks: only `analyze` was
+    # wrapped, so anything the emitter refuses -- an unclassified map,
+    # a pipeline deeper than the kernel will follow -- reached the
+    # operator as a Python stack instead of a sentence.
+    try:
+      _emit_bundle_dir(program, bundle_dir, geoip_data,
+                       source=source, source_text=text)
+    except FwlException as exc:
+      click.echo(exc.error.format(), err=True)
+      sys.exit(1)
     return
 
   # A multi-zone unit has more than one program; a single C file cannot
@@ -193,7 +201,11 @@ def compile(source: Path, output: Path | None, bundle_dir: Path | None,
     )
     sys.exit(1)
 
-  c_source = emitter.emit(program)
+  try:
+    c_source = emitter.emit(program)
+  except FwlException as exc:
+    click.echo(exc.error.format(), err=True)
+    sys.exit(1)
   if output is None:
     click.echo(c_source, nl=False)
   else:
