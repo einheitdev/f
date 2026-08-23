@@ -75,7 +75,7 @@ def _load_rfc2544():
   spec.loader.exec_module(module)
   return module
 
-def probe_throughput(dut, rx, tx, samples):
+def probe_throughput(dut, directions, samples):
   """Rate of frames the datapath actually forwarded, between probes.
 
   NOT `rx_packets`. mlx5 does not count XDP-handled frames there, so a
@@ -91,9 +91,11 @@ def probe_throughput(dut, rx, tx, samples):
   perturbs nothing.
   """
   now = time.monotonic()
-  counters = dut.counters(rx, tx)
-  moved = counters.get("tx_xdp", 0) or counters.get("tx", 0)
-  samples.append({"t": now, "moved": moved})
+  total = 0
+  for d in directions:
+    counters = dut.counters(d.rx, d.tx)
+    total += counters.get("tx_xdp", 0) or counters.get("tx", 0)
+  samples.append({"t": now, "moved": total})
 
 def probe_management(target, samples):
   """Time a control-plane round trip, the way an operator would feel it.
@@ -140,6 +142,16 @@ def main():
   ap.add_argument("--gen-iface", required=True)
   ap.add_argument("--dst-mac", required=True)
   ap.add_argument("--gen-cpus", default="0,1,2,3,4,5")
+  ap.add_argument("--gen-iface-b", default=None,
+                  help="second generator port, cabled to --tx-iface. "
+                       "Bidirectional load is what a gateway actually "
+                       "sees, and it costs more per packet than one "
+                       "direction does -- two ingress ports spraying "
+                       "across the same cores.")
+  ap.add_argument("--dst-mac-b", default=None)
+  ap.add_argument("--gen-cpus-b", default=None,
+                  help="must not overlap --gen-cpus: a pktgen thread "
+                       "belongs to exactly one cpu")
   ap.add_argument("--minutes", type=float, default=30)
   ap.add_argument("--pps", type=int, required=True,
                   help="offered rate. Pick it from a measured RFC 2544 "
@@ -176,13 +188,25 @@ def main():
   out.mkdir(parents=True, exist_ok=True)
   seconds = args.minutes * 60
   rate = int(args.pps * args.headroom)
-  direction = rfc.Direction(args.gen_iface,
-                            [int(c) for c in args.gen_cpus.split(",")],
-                            args.dst_mac, args.rx_iface, args.tx_iface)
-  gen = rfc.Generator([direction], mix)
+  cpus = [int(c) for c in args.gen_cpus.split(",")]
+  directions = [rfc.Direction(args.gen_iface, cpus, args.dst_mac,
+                              args.rx_iface, args.tx_iface)]
+  if args.gen_iface_b:
+    if not (args.dst_mac_b and args.gen_cpus_b):
+      sys.exit("--gen-iface-b needs --dst-mac-b and --gen-cpus-b")
+    cpus_b = [int(c) for c in args.gen_cpus_b.split(",")]
+    if set(cpus) & set(cpus_b):
+      sys.exit("--gen-cpus and --gen-cpus-b overlap; the second "
+               "stream would silently replace the first")
+    directions.append(rfc.Direction(args.gen_iface_b, cpus_b,
+                                    args.dst_mac_b, args.tx_iface,
+                                    args.rx_iface))
+  gen = rfc.Generator(directions, mix)
 
-  print(f"offering {rate:,} pps ({args.headroom:.0%} of {args.pps:,}) "
-        f"for {args.minutes:g} min, {mix.label} frames")
+  print(f"offering {rate:,} pps per direction "
+        f"({args.headroom:.0%} of {args.pps:,}) x "
+        f"{len(directions)} direction(s) for {args.minutes:g} min, "
+        f"{mix.label} frames")
   print(f"warm-up {args.warmup:g}s discarded before judging trends\n")
 
   samples, mgmt, moved = [], [], []
@@ -202,7 +226,7 @@ def main():
   def sample_mgmt():
     while not stop.is_set():
       probe_management(args.dut_host, mgmt)
-      probe_throughput(dut, args.rx_iface, args.tx_iface, moved)
+      probe_throughput(dut, directions, moved)
       stop.wait(15)
 
   stop = threading.Event()
@@ -212,17 +236,21 @@ def main():
     t.start()
 
   gen.configure(rate)
-  before = dut.counters(args.rx_iface, args.tx_iface)
+  before = {d.rx: dut.counters(d.rx, d.tx) for d in directions}
   sent, elapsed = gen.run_for(seconds)
-  after = dut.counters(args.rx_iface, args.tx_iface)
+  after = {d.rx: dut.counters(d.rx, d.tx) for d in directions}
   stop.set()
   gen.cleanup()
   time.sleep(3)
 
   sent_total = sum(sent.values())
-  delivered = after.get("tx_xdp", 0) - before.get("tx_xdp", 0)
-  missed = after["missed"] - before["missed"]
-  offered = sent_total / elapsed
+  delivered = sum(
+    (after[d.rx].get("tx_xdp", 0) or after[d.rx].get("tx", 0))
+    - (before[d.rx].get("tx_xdp", 0) or before[d.rx].get("tx", 0))
+    for d in directions)
+  missed = sum(after[d.rx]["missed"] - before[d.rx]["missed"]
+               for d in directions)
+  offered = sent_total / elapsed / len(directions)
   achieved = offered / rate if rate else 0
 
   raw = out / "endurance.jsonl"
