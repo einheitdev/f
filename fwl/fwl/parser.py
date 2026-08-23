@@ -109,6 +109,12 @@ def _span(token_or_tree) -> Span:
   return Span(line=line, column=column)
 
 
+# The attribute set a `table` declaration must carry, exactly.
+# Required rather than defaulted: a table whose capacity or key width
+# was guessed would be wrong silently, and `source` has no sensible
+# default at all.
+_TABLE_ATTRS = frozenset({"kind", "max", "source"})
+
 _PROTO_FROM_KEYWORD = {
   "tcp": ast.Proto.TCP,
   "udp": ast.Proto.UDP,
@@ -441,6 +447,116 @@ class _ToAst(Transformer):
       span=_span(zone_tok),
     )
 
+  def STRING(self, tok):
+    """Strip the surrounding quotes off a STRING terminal."""
+    return tok.update(value=str(tok)[1:-1])
+
+  def table_attr(self, children) -> tuple[str, object, Span]:
+    """One `<name> = <value>` line inside a table declaration."""
+    key_tok, value_tok = children
+    return (str(key_tok), value_tok, _span(key_tok))
+
+  def table_decl(self, children) -> ast.TableDecl:
+    """`table <name> { kind = ... max = ... source = "..." }`.
+
+    Validates the attribute set here rather than in the analyzer
+    because these are shape errors, not semantic ones: an unknown key
+    or a missing one cannot be given a meaning further down.
+    """
+    table_tok, name_tok = children[0], children[1]
+    span = _span(table_tok)
+    name = str(name_tok)
+    attrs: dict[str, object] = {}
+    for key, value_tok, key_span in children[2:]:
+      if key in attrs:
+        raise FwlException(FwlError(
+          category="syntax",
+          message=f"table '{name}' repeats attribute '{key}'",
+          span=key_span,
+        ))
+      if key not in _TABLE_ATTRS:
+        raise FwlException(FwlError(
+          category="syntax",
+          message=(
+            f"table '{name}' has unknown attribute '{key}'; "
+            f"expected one of {', '.join(sorted(_TABLE_ATTRS))}"
+          ),
+          span=key_span,
+        ))
+      attrs[key] = value_tok
+    for want in sorted(_TABLE_ATTRS):
+      if want not in attrs:
+        raise FwlException(FwlError(
+          category="syntax",
+          message=(
+            f"table '{name}' is missing required attribute '{want}'"
+          ),
+          span=span,
+        ))
+    kind = str(attrs["kind"])
+    if kind not in ast.TABLE_KINDS:
+      raise FwlException(FwlError(
+        category="syntax",
+        message=(
+          f"table '{name}' has kind '{kind}'; supported kinds are "
+          f"{', '.join(ast.TABLE_KINDS)}"
+        ),
+        span=_span(attrs["kind"]),
+      ))
+    max_tok = attrs["max"]
+    if max_tok.type != "INTEGER":
+      raise FwlException(FwlError(
+        category="syntax",
+        message=(
+          f"table '{name}' needs an integer 'max' (capacity), "
+          f"got '{max_tok}'"
+        ),
+        span=_span(max_tok),
+      ))
+    max_entries = _parse_int(str(max_tok))
+    if max_entries < 1:
+      raise FwlException(FwlError(
+        category="syntax",
+        message=(
+          f"table '{name}' declares max = {max_entries}; a table with "
+          f"no capacity can hold nothing and would never match"
+        ),
+        span=_span(max_tok),
+      ))
+    source_tok = attrs["source"]
+    if source_tok.type != "STRING":
+      raise FwlException(FwlError(
+        category="syntax",
+        message=(
+          f"table '{name}' needs a quoted path for 'source', "
+          f"got '{source_tok}'"
+        ),
+        span=_span(source_tok),
+      ))
+    source = str(source_tok)
+    if not source:
+      raise FwlException(FwlError(
+        category="syntax",
+        message=f"table '{name}' declares an empty source path",
+        span=_span(source_tok),
+      ))
+    return ast.TableDecl(
+      name=name, kind=kind, max_entries=max_entries, source=source,
+      span=span,
+    )
+
+  def table_alias(self, children) -> ast.TableAlias:
+    """`table <alias> = <target>` (TABLES.md)."""
+    table_tok, name_tok, target_tok = children
+    return ast.TableAlias(
+      name=str(name_tok), target=str(target_tok), span=_span(table_tok),
+    )
+
+  def table_ref(self, children) -> ast.TableRef:
+    """A bare table name as the RHS of `in`."""
+    (name_tok,) = children
+    return ast.TableRef(name=str(name_tok), span=_span(name_tok))
+
   def chain_decl(self, children) -> ast.ChainMarker:
     """`chain <name>` — a v0.4 § 6.6 manual stage boundary."""
     chain_tok, name_tok = children
@@ -491,14 +607,23 @@ class _ToAst(Transformer):
     # any @xdp block) are shared helper defs; those inside an xdp_block
     # arrive folded into their ZoneProgram.function by `xdp_block`.
     helpers: list[ast.FunctionDef] = []
+    tables: list[ast.TableDecl] = []
+    table_aliases: list[ast.TableAlias] = []
     for child in children:
       if isinstance(child, ast.ZoneDecl):
         zones.append(child)
+      elif isinstance(child, ast.TableDecl):
+        tables.append(child)
+      elif isinstance(child, ast.TableAlias):
+        table_aliases.append(child)
       elif isinstance(child, ast.ZoneProgram):
         programs.append(child)
       elif isinstance(child, ast.FunctionDef):
         helpers.append(child)
-    return ast.Program(programs=programs, zones=zones, helpers=helpers)
+    return ast.Program(
+      programs=programs, zones=zones, helpers=helpers, tables=tables,
+      table_aliases=table_aliases,
+    )
 
   # --- conditions ---
 
