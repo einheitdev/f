@@ -30,6 +30,8 @@ The systemd unit shipped under `deploy/systemd/fd.service` declares `After=sys-f
 ```
 /usr/share/f/compiled/
 ├── current -> v-2026-05-01T12:00:00Z/
+├── last-known-good -> v-2026-04-30T18:42:11Z/
+├── .load-attempt.json      # present only while a start is unfinished
 ├── v-2026-05-01T12:00:00Z/
 │   ├── manifest.json
 │   ├── rules.json
@@ -40,6 +42,29 @@ The systemd unit shipped under `deploy/systemd/fd.service` declares `After=sys-f
 └── v-2026-04-30T18:42:11Z/
     └── ...
 ```
+
+`last-known-good` is written by `fd` itself, and only after the datapath is attached — not after a successful compile and not after a successful load. It is the bundle this box has been *observed* to run, which is the only evidence worth having after a board that stopped answering. Retention never prunes it.
+
+`.load-attempt.json` is the anti-lockout breadcrumb. `fd` writes it before it opens a bundle and removes it once XDP is on an interface, so a start that never returned still leaves a record that it happened. A version that has been started twice without the datapath ever coming up is quarantined and not opened again: `fd` loads `last-known-good` instead, repoints `current` at it, and says so at `critical` in the journal and in `einheit-f show status` for as long as it holds. Configure the trade in `/etc/f/fd.yaml`:
+
+```yaml
+bundle:
+  # `fallback`    keep filtering, on a policy that is not the one last
+  #               asked for, loudly.
+  # `fail-closed` do not start. The box stays reachable and stops
+  #               routing; nothing is enforced because nothing is
+  #               forwarded.
+  on_load_failure: fallback
+  max_load_attempts: 2
+```
+
+**Before making a bundle `current`, ask the kernel.** The order that costs a box is compile, point `current` at it, restart, find out — every step after the first is irreversible from a board that has stopped answering.
+
+```sh
+sudo fd verify-bundle /usr/share/f/compiled/v-2026-05-01T12:00:00Z
+```
+
+It loads every program in the bundle, requires each to leave a program behind with a non-zero translated size, and closes them again. Nothing is attached and `current` is not moved.
 
 Bootstrap — but do not do it by hand. `f-install` creates every directory the deployable set names, and `f-install verify` tells you which ones are missing:
 
@@ -167,6 +192,25 @@ ls -l /usr/share/f/compiled/current/
 ```
 
 A broken symlink, a directory with no `manifest.json`, and a manifest naming no `@xdp` programs are all the same answer: the unit does not start and says which directory it looked in. The usual cause is that nothing has compiled a bundle yet — `einheit-f reload firewall`, or `fwl compile` as above, produces one.
+
+If the unit instead says `bundle '<version>' has been started 2 times and the datapath never came up`, the guard has quarantined it. That is not a fault to clear by deleting the record: the bundle really did fail twice. `einheit-f show status` reports which one is quarantined and which one is running under `bundle`; fix or recompile the policy, check it with `fd verify-bundle`, and point `current` at the result. Staging a different version clears the history by itself, because the count is kept per version.
+
+If the message names a kernel — `compiled for BPF ISA v4 and needs kernel 6.6 or newer` — a zone in the policy was too large to assemble with the default instruction set and the bundle was built with a wider jump. Recompile on a box with a matching kernel, split the policy across zones, or move the bulk of it into a table.
+
+## Recovery when the box stops answering
+
+`systemctl --force --force reboot` is **not** a recovery tool here. Measured on 2026-08-23: two udev workers deadlocked in `finit_module`, every `systemctl` verb hung because it talks to PID 1, and the double-force reboot — documented as bypassing PID 1 — did not get far enough to matter. sysrq reset the board immediately.
+
+`kernel.sysrq` is enabled on every box by the generated sysctl drop-in, at `184`: dumps, sync, remount read-only and reboot, but not process signalling and not keyboard control. So, over a shell that still works even when nothing that needs PID 1 does:
+
+```sh
+echo w > /proc/sysrq-trigger   # what is blocked, and where
+echo l > /proc/sysrq-trigger   # a backtrace from every CPU
+echo s > /proc/sysrq-trigger   # sync first
+echo b > /proc/sysrq-trigger   # then reset
+```
+
+Read `/proc/interrupts` and `dmesg` directly and use `ps` rather than `systemctl`: everything that failed in that session failed because it needed PID 1, and everything that did not need PID 1 kept working.
 
 ## Logs and metrics
 

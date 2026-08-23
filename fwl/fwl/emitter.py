@@ -3801,10 +3801,64 @@ def _emit_zone_source(
     )
   else:
     plan = splitter.plan(zp, force_split=(split is True))
-  # A chain the kernel will not follow is not a program. See
-  # splitter.MAX_STAGES: past the tail-call limit the last stages never
-  # run, which for a Tier 1 policy means the terminal verdict never
-  # runs, which means the box forwards nothing and reports healthy.
+  # Three refusals, in the order an operator meets them.
+  #
+  # First: one rule that is too big for any stage. A rule is the unit
+  # the splitter cuts in, so there is no smaller piece to make. The way
+  # to get here is a long inline list -- `pkt.src_ip in [a/24, b/24,
+  # ...]` becomes one `||` chain -- and without this check it arrives
+  # as `error in backend: Branch target out of insn range` from clang,
+  # which names neither the rule nor the list nor anything an operator
+  # can act on. Measured: 9,000 inline /24s assemble and 10,000 do not.
+  oversized = splitter.oversized_rule(zp)
+  if oversized is not None:
+    index, cost = oversized
+    rule = zp.rules[index]
+    entries = splitter.rule_list_entries(rule)
+    line = getattr(getattr(rule, "span", None), "line", None)
+    where = f" (line {line})" if line else ""
+    detail = (
+      f"It expands an inline list of {entries} entries into a single "
+      f"`||` chain, and a chain inside one rule cannot be split across "
+      f"stages. "
+      if entries else
+      "")
+    raise _codegen_error(
+      f"zone {zone_name!r}: rule {index + 1}{where} is too large for "
+      f"one pipeline stage -- about {cost} instructions against a "
+      f"budget of {splitter.STAGE_INSTR_BUDGET}. {detail}"
+      f"The limit underneath is LLVM's signed 16-bit branch offset, "
+      f"which stops at {splitter.LLVM_BRANCH_RANGE_INSTR} instructions "
+      f"and would otherwise report this as an internal backend crash. "
+      f"Split the list across several rules, or hold it in a table: a "
+      f"prefix table of 50,000 entries costs 227 instructions and does "
+      f"not grow with what is in it."
+    )
+
+  # Second: more rules than any arrangement of them is known to load.
+  # Not a stage-count arithmetic -- the verifier's jump-sequence limit,
+  # measured on the rig at 10,000 rules ("the sequence of 8193 jumps is
+  # too complex") with the million-instruction limit still four fifths
+  # unused.
+  if len(zp.rules) > splitter.MAX_TIER1_RULES:
+    raise _codegen_error(
+      f"zone {zone_name!r} has {len(zp.rules)} rules and the ceiling "
+      f"is {splitter.MAX_TIER1_RULES}. Past it the kernel's verifier "
+      f"refuses the program -- `BPF_COMPLEXITY_LIMIT_JMP_SEQ` is "
+      f"{splitter.JMP_SEQ_LIMIT} explored jumps, and a rule of a few "
+      f"terms costs about one -- so there is no way to arrange this "
+      f"policy that loads. Split it across zones, or express the bulk "
+      f"of it as a data structure rather than as rules: a table of "
+      f"50,000 prefixes is one lookup, 227 instructions, and 99% of "
+      f"line rate, where 2,000 rules is 12%."
+    )
+
+  # Third: a chain the kernel will not follow is not a program. Past
+  # `MAX_TAIL_CALL_CNT` the last stages never run, which for a Tier 1
+  # policy means the terminal verdict never runs, which means the box
+  # forwards nothing and reports healthy. The rule ceiling above now
+  # keeps an automatic split to about nine stages, so this is reachable
+  # only through manual `chain` markers -- which is exactly why it stays.
   if plan.split and plan.n_stages > splitter.MAX_STAGES:
     raise _codegen_error(
       f"zone {zone_name!r} needs {plan.n_stages} pipeline stages and "
@@ -3812,12 +3866,10 @@ def _emit_zone_source(
       f"limit `bpf_tail_call` stops happening and the stages holding "
       f"the final verdict never run -- the policy would load, report "
       f"attached, and enforce nothing. This zone has "
-      f"{len(zp.rules)} rules against a ceiling of "
-      f"{splitter.MAX_TIER1_RULES} "
-      f"({splitter.MAX_STAGES - 1} stages x "
-      f"{splitter.MAX_RULES_PER_STAGE} rules). Split the policy across "
-      f"zones, or express the bulk of it as a data structure rather "
-      f"than as rules."
+      f"{len(zp.rules)} rules and "
+      f"{len(getattr(zp, 'chain_boundaries', ()))} manual `chain` "
+      f"boundaries; each `chain` is a stage the splitter may not merge "
+      f"away. Remove some of them, or split the policy across zones."
     )
   reachable = _reachable_helpers(zp, helpers or [])
   # The zone body plus every helper it reaches, each wrapped as a unit
