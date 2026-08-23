@@ -422,6 +422,96 @@ class TestTablesAndGeoipShareOnePayload:
     assert maps == {"fwl_geoip_eth0_0", "fwl_tbl_0"}
 
 
+# The headline number from the rig: 50,000 prefixes at 99% of line
+# rate, in a program that stayed 227 instructions. The kernel tests
+# below use the same count so that "the map really held them all" is
+# asserted at the size the claim is made at.
+_BIG_TABLE_COUNT = 50000
+
+
+@pytest.fixture(scope="module")
+def big_table(tmp_path_factory):
+  """A compiled 50,000-prefix policy plus the map seed for its trie."""
+  if not bpf_runner._can_load_bpf():
+    pytest.skip("kernel BPF load unavailable (needs root)")
+  d = tmp_path_factory.mktemp("bigtable")
+  _feed(d / "feed.txt", _BIG_TABLE_COUNT)
+  result, bundle = _compile_bundle(d, _policy(_BIG_TABLE_COUNT))
+  assert result.exit_code == 0, result.output
+  payload = json.loads((bundle / "geoip.json").read_text())
+  prefixes = payload["tries"][0]["prefixes"]
+  assert len(prefixes) == _BIG_TABLE_COUNT
+  program = _analyze(_policy(_BIG_TABLE_COUNT))
+  map_init = fwl_runner._build_table_map_init(
+    program, {"badhosts": prefixes}
+  )
+  assert len(map_init["fwl_tbl_0"]) == _BIG_TABLE_COUNT
+  return emitter.emit(program), map_init, sorted(prefixes)
+
+
+# --------------------------------------------------------------------
+class TestTheKernelHoldsTheWholeTable:
+  """A real LPM trie, a real 50,000 prefixes, real lookups.
+
+  The rig would answer this with `bpftool map dump | wc -l`. This
+  answers it without hardware and asks a harder question: the entries
+  go into a kernel map through bpf_map_update_elem, and then
+  BPF_PROG_TEST_RUN is asked about addresses drawn from the start, the
+  middle and the end of the file. A trie that took the first few
+  thousand and stopped would load without complaint and answer wrong,
+  which is exactly the failure this is looking for.
+
+  Skips without CAP_BPF, like the corpus's own BPF oracle. A green run
+  unprivileged does not include this.
+  """
+
+  @staticmethod
+  def _first_address(cidr: str) -> str:
+    return cidr.split("/")[0]
+
+  @pytest.mark.parametrize("position", ["first", "middle", "last"])
+  def test_an_address_from_anywhere_in_the_file_is_dropped(
+    self, big_table, position
+  ):
+    c_source, map_init, prefixes = big_table
+    index = {
+      "first": 0, "middle": len(prefixes) // 2, "last": -1,
+    }[position]
+    addr = self._first_address(prefixes[index])
+    packet = pkt._build_from_spec(
+      f'tcp(src_ip="{addr}", dst_port=80)', None
+    )
+    action = bpf_runner.run(c_source, packet.raw, map_init)
+    assert action.name == "DROP", (
+      f"{addr} is prefix {index} of {len(prefixes)} in the loaded "
+      f"trie and the program did not drop it"
+    )
+
+  def test_an_address_in_no_prefix_is_allowed(self, big_table):
+    # The near-miss half: 50,000 entries must not make the lookup
+    # answer yes to everything.
+    c_source, map_init, _ = big_table
+    packet = pkt._build_from_spec(
+      'tcp(src_ip="203.0.113.7", dst_port=80)', None
+    )
+    action = bpf_runner.run(c_source, packet.raw, map_init)
+    assert action.name == "PASS"
+
+  def test_a_map_too_small_for_the_entries_fails_the_load(
+    self, big_table
+  ):
+    # Plant the defect the tests above exist to catch. Same 50,000
+    # entries, a map declared with room for 1,000: the kernel returns
+    # E2BIG and the seeding raises. Without this, "the lookups
+    # answered right" would be consistent with a map that quietly
+    # took a fraction of the file -- and the passing runs above would
+    # be proving much less than they appear to.
+    _, map_init, _ = big_table
+    small = emitter.emit(_analyze(_policy(1000)))
+    with pytest.raises(OSError, match="bpf_map_update_elem"):
+      bpf_runner.run(small, b"\x00" * 64, map_init)
+
+
 # --------------------------------------------------------------------
 class TestTheDaemonReadsWhatTheCompilerWrites:
   """The "phase 1 needs no daemon change" claim, held from both ends.
