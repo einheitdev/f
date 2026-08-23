@@ -227,13 +227,19 @@ class Direction:
   """
 
   def __init__(self, gen_iface, cpus, dst_mac, rx, tx=None,
-               dst_ip='10.99.9.9'):
+               dst_ip='10.99.9.9', extra=None):
     self.gen_iface = gen_iface
     self.cpus = cpus
     self.dst_mac = dst_mac
     self.rx = rx
     self.tx = tx
     self.dst_ip = dst_ip
+    # Extra pktgen settings, applied AFTER the defaults so a shape can
+    # override them -- `flows`/`flowlen` for a flow-size distribution,
+    # `vlan_id` to tag, a broadcast `dst_mac`. Shape is the axis every
+    # measurement so far held constant, which is why every number so
+    # far describes exactly one traffic pattern.
+    self.extra = list(extra or [])
     self.devices = []
 
   def __str__(self):
@@ -565,6 +571,16 @@ def selftest():
       share = by_size.get(size, 0) / total * IMIX.total_weight
       check(f'{n} threads, {size}B share', round(share, 1),
             float(weight))
+
+  # Every Direction must carry `extra`, and configure() must be able
+  # to read it. Half of the patch that added the field once shipped
+  # without the other half, and nothing here noticed because no test
+  # built a Direction and asked for its settings.
+  d = Direction('gen0', [0], 'aa:bb:cc:dd:ee:ff', 'rx', 'tx')
+  check('default extra', d.extra, [])
+  d = Direction('gen0', [0], 'aa:bb:cc:dd:ee:ff', 'rx', 'tx',
+                extra=['flows 64', 'flowlen 100'])
+  check('extra kept in order', d.extra, ['flows 64', 'flowlen 100'])
 
   # A single size must still work, and must not be paced as a mix.
   d = Direction('gen0', [0, 1], 'aa:bb:cc:dd:ee:ff', 'rx')
