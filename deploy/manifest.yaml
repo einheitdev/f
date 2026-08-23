@@ -234,6 +234,19 @@ components:
       generated config exists, so it is safe to install unconditionally
       and enable only when the model binds a service.
 
+  - id: unit-f-datapath-tune
+    group: units
+    kind: file
+    source: deploy/systemd/f-datapath-tune.service
+    dest: /lib/systemd/system/f-datapath-tune.service
+    mode: "0644"
+    requirement: required
+    needed_by: f-datapath-tune.service
+    why: >-
+      Applies the tuning the published throughput figures were
+      measured with, before fd starts. Without it the box runs about
+      40% slower than its datasheet and nothing says so.
+
   - id: unit-f-chrony
     group: units
     kind: file
@@ -272,6 +285,20 @@ components:
       Reads the manifest and answers `verify`. firstboot runs it before
       it provisions anything, and `einheit-f show install` runs it for
       the operator.
+
+  - id: f-datapath-tune
+    group: data
+    kind: file
+    source: deploy/f_datapath_tune.py
+    dest: "{prefix}/bin/f-datapath-tune"
+    mode: "0755"
+    requirement: required
+    needed_by: f-datapath-tune.service
+    why: >-
+      Disables idle states too slow to exit for line-rate polling,
+      pins the governor, and weights RSS toward the fast cores on
+      big.LITTLE. All three are lost on reboot and none is a kernel
+      default; together they are worth 40% of forwarding throughput.
 
   - id: firstboot
     group: data

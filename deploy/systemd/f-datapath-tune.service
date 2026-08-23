@@ -1,0 +1,30 @@
+[Unit]
+Description=f — datapath tuning (idle states, governor, RSS weighting)
+Documentation=https://github.com/einheitdev/f
+# Interfaces have to exist before their indirection tables can be
+# weighted, and the datapath should not start on a box that is still
+# in its untuned state — the measured difference is 40%, which is
+# large enough that a box would look broken rather than untuned.
+After=systemd-networkd.service
+Before=fd.service network.target
+Wants=systemd-networkd.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/f-datapath-tune
+
+# Advisory, not required. Every setting here is a performance
+# property: a box that cannot apply them still filters and still
+# forwards, just slower, and refusing to boot over a governor would
+# trade a real outage for a benchmark. The failure is journalled
+# under this unit's own name and `systemctl status` shows which
+# setting did not take.
+SuccessExitStatus=0 1
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=f-datapath-tune
+
+[Install]
+WantedBy=multi-user.target
