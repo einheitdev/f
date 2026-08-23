@@ -324,7 +324,7 @@ class Generator:
           # was briefly mistaken for the DUT's ceiling.
           f'queue_map_min {cpu}', f'queue_map_max {cpu}',
           f'ratep {ratep}',
-        ):
+        ) + tuple(direction.extra):
           lines.append(f'echo "{setting}" > {d}')
         direction.devices.append(d)
     r = root_sh('; '.join(lines))
