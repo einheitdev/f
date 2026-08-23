@@ -556,7 +556,8 @@ def _emit_bundle_dir(program: ast.Program, bundle_dir: Path,
     missing = [p["zone"] for p in programs_meta if p["object"] is None]
     click.echo(
       f"warning: no compiled object for zone(s) "
-      f"{', '.join(missing)} — clang/bpftool unavailable. This "
+      f"{', '.join(missing)} — clang is unavailable, or refused the "
+      f"generated C even with the widest instruction set. This "
       f"bundle cannot be loaded; `fd` will refuse it.",
       err=True,
     )
