@@ -1,0 +1,10 @@
+# A threat feed as `table blocklist_table.fw` reads one: one prefix
+# per line, `#` starts a comment, blank lines ignored. This is a
+# sample, not a real feed -- the addresses are RFC 5737 / RFC 3849
+# documentation ranges.
+192.0.2.0/24
+198.51.100.0/24
+203.0.113.0/24
+
+# A single host is a /32.
+198.51.100.77/32

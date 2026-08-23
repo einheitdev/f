@@ -28,18 +28,30 @@ class BpfLoaderResolverTest : public ::testing::Test {
  protected:
   void SetUp() override {
     // Per-test scratch dir; cleared on TearDown.
-    auto base = fs::temp_directory_path()
-        / std::format("fwl-bpf-loader-{}", ::getpid());
+    //
+    // The prefix is `fwl-loader-`, NOT `fwl-bpf-loader-`. The Python
+    // harness asserts that `bpf_runner.compile_c` leaves nothing
+    // behind by globbing `fwl-bpf-*` in the temp directory, and this
+    // fixture used to land inside that glob -- so a stale dir from an
+    // old gtest run, swept by whatever tidies /tmp, made
+    // test_bpf_runner fail intermittently in a suite that never ran
+    // this binary. 620 of them had accumulated since August.
+    base_ = fs::temp_directory_path()
+        / std::format("fwl-loader-{}", ::getpid());
     auto suffix = ::testing::UnitTest::GetInstance()
                       ->current_test_info()
                       ->name();
-    scratch_ = base / suffix;
+    scratch_ = base_ / suffix;
     fs::create_directories(scratch_);
   }
 
   void TearDown() override {
     std::error_code ec;
     fs::remove_all(scratch_, ec);
+    // The per-pid parent too, once its last test is done with it.
+    // Removing only `scratch_` left one empty directory per test
+    // process in /tmp forever.
+    fs::remove(base_, ec);
   }
 
   // Drop a placeholder file at `path`, creating intermediate dirs.
@@ -48,6 +60,7 @@ class BpfLoaderResolverTest : public ::testing::Test {
     std::ofstream(path) << "placeholder";
   }
 
+  fs::path base_;
   fs::path scratch_;
 };
 

@@ -25,6 +25,19 @@ def _temp_dirs() -> set[Path]:
   return set(Path(tempfile.gettempdir()).glob("fwl-bpf-*"))
 
 
+def _leaked(before: set[Path]) -> set[Path]:
+  """Scratch directories that appeared and were not cleaned up.
+
+  Only NEW directories, which is what "leaves nothing behind" means.
+  Comparing the two snapshots for equality also asserted that nothing
+  ELSE in /tmp changed, and that is not this test's business: a stale
+  fwl-bpf-* directory from an old run, swept by whatever tidies /tmp
+  while the suite happens to be running, made these tests fail
+  intermittently with nothing wrong in the code they cover.
+  """
+  return _temp_dirs() - before
+
+
 def _requires_clang() -> None:
   try:
     bpf_runner.check_compiles(_emit())
@@ -37,7 +50,7 @@ def test_check_compiles_leaves_nothing_behind():
   before = _temp_dirs()
   for _ in range(5):
     bpf_runner.check_compiles(_emit())
-  assert _temp_dirs() == before
+  assert not _leaked(before)
 
 
 def test_compile_c_cleans_up_on_context_exit():
@@ -46,9 +59,9 @@ def test_compile_c_cleans_up_on_context_exit():
   with bpf_runner.compile_c(_emit()) as result:
     # The object really is there while the caller is using it.
     assert result.obj_path.exists()
-    assert _temp_dirs() != before
+    assert _leaked(before)
   assert not result.obj_path.exists()
-  assert _temp_dirs() == before
+  assert not _leaked(before)
 
 
 def test_failed_compile_leaves_nothing_behind():
@@ -58,7 +71,7 @@ def test_failed_compile_leaves_nothing_behind():
   before = _temp_dirs()
   with pytest.raises(subprocess.CalledProcessError):
     bpf_runner.compile_c("this is not C\n")
-  assert _temp_dirs() == before
+  assert not _leaked(before)
 
 
 def test_caller_supplied_work_dir_is_not_removed(tmp_path):
@@ -78,4 +91,4 @@ def test_run_full_leaves_nothing_behind():
     bpf_runner.run_full(_emit(), b"\x00" * 64)
   except bpf_runner.BpfUnavailable as exc:
     pytest.skip(str(exc))
-  assert _temp_dirs() == before
+  assert not _leaked(before)

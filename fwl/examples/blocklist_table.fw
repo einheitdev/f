@@ -1,0 +1,35 @@
+# Blocklist policy built on a table rather than on rules.
+#
+# The same intent written as one rule per prefix is a linear chain the
+# box walks for every packet: measured on the rig, 2,000 rules run at
+# 12% of 10 GbE line rate, and 2,048 is the hard ceiling. As a table
+# it is one lookup against an LPM trie, and 50,000 prefixes cost what
+# 1,000 cost -- 99% of line rate, 227 instructions, flat.
+#
+# The alias exists so that the two `drop` rules below could have been
+# pasted from another box's policy, referring to `badhosts`
+# throughout, without editing a name through every rule that uses it.
+
+table corporate_blocklist {
+  kind = cidr4
+  max = 100000
+  source = "feeds/blocklist.txt"
+}
+
+table badhosts = corporate_blocklist
+
+table corporate_blocklist6 {
+  kind = cidr6
+  max = 100000
+  source = "feeds/blocklist6.txt"
+}
+
+@xdp(eth0)
+
+# One lookup each, whatever the feeds grow to.
+drop if pkt.src_ip  in badhosts
+drop if pkt.src_ip6 in corporate_blocklist6
+
+# Everything not on the list is ordinary traffic.
+allow if pkt.proto == tcp and pkt.dst_port in [80, 443]
+default drop

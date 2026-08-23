@@ -118,11 +118,14 @@ class TestTheProgramDoesNotGrowWithTheTable:
 
   @staticmethod
   def _instruction_count(c_source: str) -> int:
-    result = bpf_runner.compile_c(c_source)
-    dump = subprocess.run(
-      ["llvm-objdump", "-d", str(result.obj_path)],
-      capture_output=True, text=True, check=True,
-    )
+    # The context manager, not a bare call: compile_c owns the scratch
+    # directory it creates, and leaking one moves the ground under
+    # test_bpf_runner's cleanup assertions.
+    with bpf_runner.compile_c(c_source) as result:
+      dump = subprocess.run(
+        ["llvm-objdump", "-d", str(result.obj_path)],
+        capture_output=True, text=True, check=True,
+      )
     return sum(
       1 for line in dump.stdout.splitlines()
       if "\t" in line and line.strip()[:1].isdigit()
@@ -539,6 +542,110 @@ class TestTheSplitterChargesTheLookup:
       splitter.estimate(table_zone).instructions
       > splitter.estimate(plain_zone).instructions
     )
+
+
+# --------------------------------------------------------------------
+class TestTheShippedExample:
+  """`fwl/examples/blocklist_table.fw` is policy we ship.
+
+  An example is what an operator copies, so it is held to the bar
+  test_examples.py sets: not "it compiles" but "this packet gets this
+  verdict". The table contents come from the same feed files the
+  compiler reads, so the assertion is against the artifact rather than
+  against a restatement of it.
+  """
+
+  EXAMPLES = Path(__file__).resolve().parents[2] / "examples"
+
+  @staticmethod
+  def _feed(path: Path) -> list[str]:
+    out = []
+    for raw in path.read_text().splitlines():
+      line = raw.split("#", 1)[0].strip()
+      if line:
+        out.append(line)
+    return out
+
+  @pytest.fixture
+  def program(self):
+    return _analyze((self.EXAMPLES / "blocklist_table.fw").read_text())
+
+  @pytest.fixture
+  def table_data(self):
+    return {
+      "corporate_blocklist": self._feed(
+        self.EXAMPLES / "feeds" / "blocklist.txt"),
+      "corporate_blocklist6": self._feed(
+        self.EXAMPLES / "feeds" / "blocklist6.txt"),
+    }
+
+  def _run(self, program, table_data, builder: str):
+    packet = pkt._build_from_spec(builder, None)
+    from fwl import interpreter
+    return interpreter.evaluate(
+      program, packet.fields, table_data=table_data
+    )
+
+  def test_it_compiles_to_a_bundle_with_the_feeds_loaded(
+    self, tmp_path
+  ):
+    bundle = tmp_path / "out"
+    result = CliRunner().invoke(cli.main, [
+      "compile", str(self.EXAMPLES / "blocklist_table.fw"),
+      "--bundle", str(bundle),
+    ])
+    assert result.exit_code == 0, result.output
+    payload = json.loads((bundle / "geoip.json").read_text())
+    by_map = {t["map"]: t["prefixes"] for t in payload["tries"]}
+    assert "198.51.100.77/32" in by_map["fwl_tbl_0"]
+    assert by_map["fwl_tbl_1"] == ["2001:db8::/32"]
+
+  def test_a_listed_v4_source_is_dropped(self, program, table_data):
+    from fwl.interpreter import XdpAction
+    assert self._run(
+      program, table_data,
+      'tcp(src_ip="203.0.113.9", dst_port=443)',
+    ) == XdpAction.DROP
+
+  def test_the_single_host_entry_is_dropped(self, program, table_data):
+    # The /32 in the feed, which the surrounding /24 does NOT cover.
+    from fwl.interpreter import XdpAction
+    assert self._run(
+      program, table_data,
+      'tcp(src_ip="198.51.100.77", dst_port=443)',
+    ) == XdpAction.DROP
+
+  def test_an_unlisted_source_on_an_allowed_port_passes(
+    self, program, table_data
+  ):
+    from fwl.interpreter import XdpAction
+    assert self._run(
+      program, table_data,
+      'tcp(src_ip="10.0.0.5", dst_port=443)',
+    ) == XdpAction.PASS
+
+  def test_an_unlisted_source_on_a_closed_port_is_dropped(
+    self, program, table_data
+  ):
+    from fwl.interpreter import XdpAction
+    assert self._run(
+      program, table_data,
+      'tcp(src_ip="10.0.0.5", dst_port=23)',
+    ) == XdpAction.DROP
+
+  def test_a_listed_v6_source_is_dropped(self, program, table_data):
+    from fwl.interpreter import XdpAction
+    assert self._run(
+      program, table_data,
+      'tcp6(src_ip="2001:db8::1", dst_port=443)',
+    ) == XdpAction.DROP
+
+  def test_the_alias_and_its_target_are_one_table(self, program):
+    # `badhosts` in the rule, `corporate_blocklist` in the feed key:
+    # the assertions above only hold because the two are one table.
+    ref = program.programs[0].rules[0].condition.operand
+    assert ref.name == "badhosts"
+    assert ref.resolved == "corporate_blocklist"
 
 
 # --------------------------------------------------------------------
