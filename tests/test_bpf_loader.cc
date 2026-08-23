@@ -11,9 +11,12 @@
 
 #include <arpa/inet.h>
 #include <bpf/bpf.h>
+#include <bpf/libbpf.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -875,6 +878,308 @@ TEST(DecidePinFateTest, UndeclaredPersistentPinIsDroppedNotHoarded) {
   auto have = SomeShape();
   EXPECT_EQ(DecidePinFate("conntrack", kPersistent, nullptr, have,
                           PinPolicy::kColdBoot),
+            PinVerdict::kDiscard);
+}
+
+// --- The reload itself, on real bpffs with real entries ------------
+//
+// DecidePinFate above is the decision; this is the decision applied.
+// It runs the loop `fd` runs before every load, against a real pinned
+// LPM trie holding real prefixes, and asks the question the acceptance
+// criterion asks: after a policy edit that did not touch the table,
+// are the entries still there?
+
+class TablePinReloadTest : public ::testing::Test {
+ protected:
+  void SetUp() override {
+    // A per-test subdirectory of bpffs. Pinning needs a real bpffs;
+    // a tmpfs path makes bpf_obj_pin return -EINVAL.
+    root_ = std::filesystem::path("/sys/fs/bpf") /
+            std::format("fwl-tbl-{}", ::getpid());
+    std::error_code ec;
+    std::filesystem::create_directories(root_, ec);
+    if (ec) {
+      GTEST_SKIP() << "cannot create " << root_.string()
+                   << " (needs root and a mounted bpffs)";
+    }
+    LIBBPF_OPTS(bpf_map_create_opts, opts,
+                .map_flags = BPF_F_NO_PREALLOC);
+    trie_fd_ = bpf_map_create(BPF_MAP_TYPE_LPM_TRIE, "fwl_tbl_0", 8, 1,
+                              1000, &opts);
+    counters_fd_ = bpf_map_create(BPF_MAP_TYPE_PERCPU_ARRAY,
+                                  "fwl_counters_wan", 4, 8, 4, nullptr);
+    if (trie_fd_ < 0 || counters_fd_ < 0) {
+      GTEST_SKIP() << "bpf_map_create failed (needs CAP_BPF)";
+    }
+    if (bpf_obj_pin(trie_fd_, (root_ / "fwl_tbl_0").c_str()) != 0 ||
+        bpf_obj_pin(counters_fd_,
+                    (root_ / "fwl_counters_wan").c_str()) != 0) {
+      GTEST_SKIP() << "bpf_obj_pin failed";
+    }
+  }
+
+  void TearDown() override {
+    if (trie_fd_ >= 0) ::close(trie_fd_);
+    if (counters_fd_ >= 0) ::close(counters_fd_);
+    std::error_code ec;
+    std::filesystem::remove_all(root_, ec);
+  }
+
+  // A bundle whose zone object declares the trie and the counter map
+  // with the shapes created above. `persistent` is the manifest list
+  // the compiler wrote.
+  void WriteBundle(const std::string& persistent) {
+    std::ofstream(scratch_dir() / "manifest.json") << std::format(R"({{
+  "version": "0.4",
+  "zones": [{{"name": "wan", "interfaces": ["eth0"]}}],
+  "programs": [{{"zone": "wan", "source": "wan.bpf.c",
+                "object": "wan.bpf.o"}}],
+  "persistent_maps": [{}]
+}})", persistent);
+  }
+
+  /// Build `wan.bpf.o`, because BundlePinnedDeclarations learns a
+  /// bundle's declared shapes by opening the OBJECT with libbpf. A
+  /// hand-written .bpf.c would not be read, and a hand-written shape
+  /// struct would be this test agreeing with itself instead of with
+  /// what the emitter produces.
+  auto BuildObject() -> bool {
+    auto src = scratch_dir() / "wan.bpf.c";
+    std::ofstream(src) << R"(
+#include <linux/bpf.h>
+#include <bpf/bpf_helpers.h>
+
+struct fwl_tbl_0_key {
+  __u32 prefixlen;
+  __u32 ip;
+};
+
+struct {
+  __uint(type, BPF_MAP_TYPE_LPM_TRIE);
+  __type(key, struct fwl_tbl_0_key);
+  __type(value, __u8);
+  __uint(max_entries, 1000);
+  __uint(map_flags, BPF_F_NO_PREALLOC);
+  __uint(pinning, LIBBPF_PIN_BY_NAME);
+} fwl_tbl_0 SEC(".maps");
+
+struct {
+  __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+  __type(key, __u32);
+  __type(value, __u64);
+  __uint(max_entries, 4);
+  __uint(pinning, LIBBPF_PIN_BY_NAME);
+} fwl_counters_wan SEC(".maps");
+
+char _license[] SEC("license") = "GPL";
+)";
+    auto cmd = std::format(
+        "clang -O2 -g -target bpf "
+        "-I/usr/include/x86_64-linux-gnu -I/usr/include/aarch64-linux-gnu "
+        "-c {} -o {} 2>/dev/null",
+        src.string(), (scratch_dir() / "wan.bpf.o").string());
+    return std::system(cmd.c_str()) == 0;
+  }
+
+  auto scratch_dir() -> std::filesystem::path {
+    if (scratch_.empty()) {
+      scratch_ = std::filesystem::temp_directory_path() /
+                 std::format("fwl-tblbundle-{}", ::getpid());
+      std::filesystem::create_directories(scratch_);
+    }
+    return scratch_;
+  }
+
+  void Insert(const char* cidr) {
+    std::string text(cidr);
+    auto slash = text.find('/');
+    uint8_t key[8] = {};
+    uint32_t len = static_cast<uint32_t>(
+        std::stoul(text.substr(slash + 1)));
+    std::memcpy(key, &len, sizeof(len));
+    inet_pton(AF_INET, text.substr(0, slash).c_str(), key + 4);
+    uint8_t one = 1;
+    ASSERT_EQ(bpf_map_update_elem(trie_fd_, key, &one, BPF_ANY), 0);
+  }
+
+  auto CountVia(const std::filesystem::path& pin) -> int {
+    int fd = bpf_obj_get(pin.c_str());
+    if (fd < 0) return -1;
+    uint8_t key[8] = {};
+    uint8_t next[8] = {};
+    int n = 0;
+    bool have = false;
+    while (bpf_map_get_next_key(fd, have ? key : nullptr, next) == 0) {
+      n++;
+      std::memcpy(key, next, sizeof(key));
+      have = true;
+    }
+    ::close(fd);
+    return n;
+  }
+
+  std::filesystem::path root_;
+  std::filesystem::path scratch_;
+  int trie_fd_ = -1;
+  int counters_fd_ = -1;
+};
+
+TEST_F(TablePinReloadTest, APolicyEditLeavesTheTableIntact) {
+  if (!BuildObject()) GTEST_SKIP() << "clang unavailable";
+  // Write entries, "edit the policy", reload, read them back. The
+  // counter map is the control: it is MapLifetime.POLICY, its pin is
+  // NOT in persistent_maps, and it must be swept by the same pass
+  // that keeps the table -- otherwise the test would pass on a
+  // reconcile that simply kept everything.
+  Insert("10.0.0.0/8");
+  Insert("192.168.0.0/16");
+  Insert("203.0.113.0/24");
+  ASSERT_EQ(CountVia(root_ / "fwl_tbl_0"), 3);
+
+  WriteBundle(R"("conntrack", "fwl_nat", "fwl_tbl_0")");
+  auto report = ReconcilePinnedMaps(scratch_dir().string(),
+                                    root_.string(), PinPolicy::kReload,
+                                    /*conntrack_timeout_s=*/0);
+
+  EXPECT_NE(std::find(report.adopted.begin(), report.adopted.end(),
+                      "fwl_tbl_0"),
+            report.adopted.end())
+      << "the table was not adopted across the reload";
+  EXPECT_NE(std::find(report.discarded.begin(), report.discarded.end(),
+                      "fwl_counters_wan"),
+            report.discarded.end())
+      << "the control map survived, so this proves nothing";
+
+  // The pin is still there and still holds every prefix.
+  EXPECT_TRUE(std::filesystem::exists(root_ / "fwl_tbl_0"));
+  EXPECT_EQ(CountVia(root_ / "fwl_tbl_0"), 3);
+  EXPECT_FALSE(std::filesystem::exists(root_ / "fwl_counters_wan"));
+}
+
+TEST_F(TablePinReloadTest, ABundleThatDropsTheTableSweepsItsPin) {
+  if (!BuildObject()) GTEST_SKIP() << "clang unavailable";
+  // The policy stopped declaring the table. Its pin must not linger
+  // in bpffs holding a dead policy's blocklist.
+  Insert("10.0.0.0/8");
+  WriteBundle(R"("conntrack", "fwl_nat")");
+  auto report = ReconcilePinnedMaps(scratch_dir().string(),
+                                    root_.string(), PinPolicy::kReload,
+                                    0);
+  EXPECT_NE(std::find(report.discarded.begin(), report.discarded.end(),
+                      "fwl_tbl_0"),
+            report.discarded.end());
+  EXPECT_FALSE(std::filesystem::exists(root_ / "fwl_tbl_0"));
+}
+
+TEST_F(TablePinReloadTest, AnAdoptedTableIsStillReconciledToItsFile) {
+  if (!BuildObject()) GTEST_SKIP() << "clang unavailable";
+  // Adoption and disk authority together, which is the pair that
+  // makes the id allocation safe without a registry: the trie keeps
+  // its map object across the edit, and the sync then makes its
+  // contents exactly the feed's. An entry that was in the old
+  // contents and is not in the file does not survive.
+  Insert("198.51.100.0/24");
+  Insert("10.0.0.0/8");
+  WriteBundle(R"("conntrack", "fwl_nat", "fwl_tbl_0")");
+  ReconcilePinnedMaps(scratch_dir().string(), root_.string(),
+                      PinPolicy::kReload, 0);
+  ASSERT_TRUE(std::filesystem::exists(root_ / "fwl_tbl_0"));
+
+  GeoipTrieEntry keep;
+  keep.v6 = false;
+  keep.prefixlen = 8;
+  inet_pton(AF_INET, "10.0.0.0", keep.addr);
+  auto synced = SyncTableTrie(trie_fd_, false, {keep});
+  ASSERT_TRUE(synced.has_value()) << synced.error().message;
+  EXPECT_EQ(synced->unchanged, 1u) << "10.0.0.0/8 was already there";
+  EXPECT_EQ(synced->removed, 1u);
+  EXPECT_EQ(CountVia(root_ / "fwl_tbl_0"), 1);
+}
+
+// --- A table survives a policy edit (MapLifetime.EXTERNAL) ---------
+
+TEST(DecidePinFateTest, ATableTrieIsAdoptedAcrossAPolicyEdit) {
+  // The phase-2 property, at the decision that makes it true. A
+  // policy edit says nothing about whether an address is still
+  // hostile, so the trie is not this compilation's to discard -- and
+  // a table erased by every policy edit is not a table.
+  //
+  // The name is in `persistent` because the compiler put it there:
+  // persistent_map_names() resolves the EXTERNAL registry row into
+  // the literal fwl_tbl_<id> names the unit declares. fd compares
+  // strings and re-derives nothing.
+  const std::vector<std::string> persistent = {
+      "conntrack", "fwl_nat", "fwl_tbl_0", "fwl_tbl_1"};
+  PinnedMapShape trie;
+  trie.type = BPF_MAP_TYPE_LPM_TRIE;
+  trie.key_size = 8;
+  trie.value_size = 1;
+  trie.max_entries = 100000;
+  trie.map_flags = BPF_F_NO_PREALLOC;
+  for (auto policy : {PinPolicy::kColdBoot, PinPolicy::kReload}) {
+    EXPECT_EQ(DecidePinFate("fwl_tbl_0", persistent, &trie, trie,
+                            policy),
+              PinVerdict::kAdopt);
+  }
+}
+
+TEST(DecidePinFateTest, ATableTrieIsStillDroppedWhenCapacityMoves) {
+  // Adoption is not unconditional. `max` is part of the declaration
+  // an operator reviews, so raising it is a shape change libbpf will
+  // refuse to reuse -- the state is unreachable either way and all
+  // that is left to decide is who finds out. The contents are not
+  // lost by this: they are on disk, and the next load reads them.
+  const std::vector<std::string> persistent = {"fwl_tbl_0"};
+  PinnedMapShape have;
+  have.type = BPF_MAP_TYPE_LPM_TRIE;
+  have.key_size = 8;
+  have.value_size = 1;
+  have.max_entries = 1000;
+  have.map_flags = BPF_F_NO_PREALLOC;
+  PinnedMapShape want = have;
+  want.max_entries = 100000;
+  EXPECT_NE(DecidePinFate("fwl_tbl_0", persistent, &want, have,
+                          PinPolicy::kColdBoot),
+            PinVerdict::kAdopt);
+  EXPECT_NE(DecidePinFate("fwl_tbl_0", persistent, &want, have,
+                          PinPolicy::kReload),
+            PinVerdict::kAdopt);
+}
+
+TEST(DecidePinFateTest, ATablePinNoPolicyDeclaresIsSweptAway) {
+  // The table was deleted from the policy. Nothing will read it,
+  // nothing will reconcile it against a file, and it would sit in
+  // bpffs holding a dead policy's blocklist until something with the
+  // same id and shape adopted it. Dropping it is what makes an id
+  // that shifted between compilations safe.
+  const std::vector<std::string> persistent = {"fwl_tbl_0"};
+  PinnedMapShape have;
+  have.type = BPF_MAP_TYPE_LPM_TRIE;
+  have.key_size = 8;
+  have.value_size = 1;
+  have.max_entries = 1000;
+  have.map_flags = BPF_F_NO_PREALLOC;
+  for (auto policy : {PinPolicy::kColdBoot, PinPolicy::kReload}) {
+    EXPECT_EQ(DecidePinFate("fwl_tbl_0", persistent, nullptr, have,
+                            policy),
+              PinVerdict::kDiscard);
+  }
+}
+
+TEST(DecidePinFateTest, ATableIsSweptWhenTheManifestDoesNotNameIt) {
+  // A bundle compiled before tables existed, or one whose policy
+  // declares none, carries a persistent list without any fwl_tbl_
+  // name. The pin must go: `persistent` is the whole gate, and a
+  // prefix-shaped exception in the daemon would be the second copy of
+  // a decision this list exists to keep in one place.
+  PinnedMapShape have;
+  have.type = BPF_MAP_TYPE_LPM_TRIE;
+  have.key_size = 8;
+  have.value_size = 1;
+  have.max_entries = 1000;
+  have.map_flags = BPF_F_NO_PREALLOC;
+  EXPECT_EQ(DecidePinFate("fwl_tbl_0", kPersistent, &have, have,
+                          PinPolicy::kReload),
             PinVerdict::kDiscard);
 }
 
