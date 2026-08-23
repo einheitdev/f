@@ -95,14 +95,52 @@ def test_weights_follow_the_measured_queue_to_cpu_map(monkeypatch):
   assert calls["argv"][4:] == ["1", "1", "1", "1", "3", "3", "3", "3"]
 
 def test_refuses_when_a_queue_cannot_be_traced_to_a_cpu(monkeypatch):
-  """A guessed map is the failure mode this tool exists to avoid."""
+  """A guessed map is the failure mode this tool exists to avoid.
+
+  And it is a FAILURE, not a skip. A multi-queue NIC is one the
+  weighting was meant for; leaving it flat costs 25-32% on
+  big.LITTLE. The rig ran a day at three quarters of its capability
+  because this was a skip line in a report that ended "datapath
+  tuning applied".
+  """
   partial = {q: q for q in range(6)}
   _rss_fixture(monkeypatch, queues=partial)
   report = tune.Report()
   tune.tune_rss(report, "eth0", 3, 1)
   assert not report.changed
   assert any("cannot tell which CPU serves queue" in line
-             for line in report.skipped)
+             for line in report.failed)
+  assert not report.skipped
+
+def test_an_unweighted_multiqueue_nic_makes_the_run_exit_nonzero(
+    monkeypatch, capsys):
+  """The property that matters: the operator is told, and told loudly."""
+  _rss_fixture(monkeypatch, queues={q: q for q in range(4)})
+  report = tune.Report()
+  tune.tune_rss(report, "eth0", 3, 1)
+  assert report.emit() == 1
+  assert "NOT in the state" in capsys.readouterr().out
+
+def test_it_waits_for_a_queue_map_that_arrives_late(monkeypatch):
+  """The boot race: udev has not renamed the NIC and the driver's
+  completion-queue interrupts do not exist yet. Waiting is what makes
+  running before network.target survivable."""
+  calls = {"n": 0}
+
+  def late(iface):
+    calls["n"] += 1
+    return RK3588_QUEUES if calls["n"] > 2 else {}
+
+  monkeypatch.setattr(tune, "queue_cpu_map", late)
+  monkeypatch.setattr(tune.time, "sleep", lambda _s: None)
+  got = tune.wait_for_queue_map("eth0", 8, seconds=5)
+  assert got == RK3588_QUEUES
+  assert calls["n"] > 2
+
+def test_waiting_gives_up_rather_than_hanging(monkeypatch):
+  monkeypatch.setattr(tune, "queue_cpu_map", lambda iface: {})
+  monkeypatch.setattr(tune.time, "sleep", lambda _s: None)
+  assert tune.wait_for_queue_map("eth0", 8, seconds=0) == {}
 
 def test_skips_a_machine_whose_cores_are_all_the_same_speed(monkeypatch):
   """There is nothing to weight toward on a uniform CPU."""

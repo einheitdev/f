@@ -57,6 +57,7 @@ import argparse
 import pathlib
 import re
 import shutil
+import time
 import subprocess
 import sys
 import yaml
@@ -478,7 +479,34 @@ def apply_boot(want, dry_run=False):
         f"({IOMMU_MODES[want]['why']})")
   return 0
 
-def tune_rss(report, iface, big_weight, little_weight):
+def wait_for_queue_map(iface, rings, seconds):
+  """Wait for the driver to publish a queue-to-CPU map, or give up.
+
+  This unit runs early -- before fd, which runs before network.target
+  -- and on a cold boot that is early enough to lose a race twice
+  over. Measured on the rig: when it ran, the mlx5 ports were still
+  named `eth0` because udev had not renamed them yet, and their
+  completion-queue interrupts did not exist, so the map could not be
+  resolved and the weighting was skipped. The box then ran at about
+  three quarters of its measured capability until somebody noticed,
+  which took a day.
+
+  Ordering directives do not fix this: the interfaces are not a unit
+  to be ordered after, and udev-settle is deprecated and would not
+  wait for interrupts anyway. Waiting for the thing actually needed is
+  the honest version, and it costs nothing where the map already
+  exists.
+  """
+  deadline = time.monotonic() + seconds
+  while True:
+    qmap = queue_cpu_map(iface)
+    if all(q in qmap for q in range(rings)):
+      return qmap
+    if time.monotonic() >= deadline:
+      return qmap
+    time.sleep(0.5)
+
+def tune_rss(report, iface, big_weight, little_weight, wait_s=0):
   """Weight the RSS table toward the cores that are actually faster.
 
   Skips rather than guesses in every case where the premise does not
@@ -500,13 +528,20 @@ def tune_rss(report, iface, big_weight, little_weight):
     return
   fastest = max(maxima.values())
 
-  qmap = queue_cpu_map(iface)
+  qmap = wait_for_queue_map(iface, rings, wait_s)
   missing = [q for q in range(rings) if q not in qmap]
   if missing:
-    report.skipped.append(
-      f"{iface} RSS: cannot tell which CPU serves queue(s) "
-      f'{",".join(str(q) for q in missing)} -- refusing to weight a '
-      "map it had to guess")
+    # A FAILURE, not a skip. A NIC with several receive queues is one
+    # the weighting was meant for, and leaving it flat costs 25-32% on
+    # big.LITTLE. A skip line inside a report that ends "datapath
+    # tuning applied" is how this box spent a day at three quarters of
+    # its capability with nothing saying so.
+    report.failed.append(
+      f"{iface} RSS: {rings} RX rings but cannot tell which CPU "
+      f"serves queue(s) "
+      f'{",".join(str(q) for q in missing)} after waiting {wait_s}s '
+      "-- refusing to weight a map it had to guess. This interface is "
+      "running an unweighted table.")
     return
 
   weights, description = [], []
@@ -639,6 +674,13 @@ def main():
                   help="leave idle states alone")
   ap.add_argument("--no-governor", action="store_true",
                   help="leave the governor alone")
+  ap.add_argument("--queue-map-wait", type=int, default=30,
+                  help="seconds to wait for a NIC to publish its "
+                       "queue-to-CPU map. This unit runs before "
+                       "network.target, which on a cold boot is "
+                       "before udev has renamed the interfaces and "
+                       "before the driver's completion-queue "
+                       "interrupts exist.")
   ap.add_argument("--no-rss", action="store_true",
                   help="leave the indirection tables alone")
   args = ap.parse_args()
@@ -679,7 +721,7 @@ def main():
         "box has none, or this ran before the drivers were bound.")
     for iface in ifaces:
       tune_rss(report, iface, settings["rss_big_weight"],
-               settings["rss_little_weight"])
+               settings["rss_little_weight"], args.queue_map_wait)
   return report.emit()
 
 if __name__ == "__main__":
