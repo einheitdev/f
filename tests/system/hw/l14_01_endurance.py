@@ -105,6 +105,24 @@ def probe_throughput(dut, directions, samples):
     total += counters.get("tx_xdp", 0) or counters.get("tx", 0)
   samples.append({"t": now, "moved": total})
 
+def probe_offered(gen, samples):
+  """Cumulative packets the generator has sent, sampled as we go.
+
+  `run_for` reads this at the start and the end and returns the
+  difference, which is fine for a ten-second trial and lost the entire
+  offered figure on a two-hour one: by the time the final read
+  happened the pktgen devices were gone, so `sent` came back zero and
+  the run could not say what it had offered. A periodic sample keeps
+  the last good reading, so a lost read at the end costs one interval
+  rather than the measurement.
+  """
+  try:
+    total = sum(gen.sent().values())
+  except (OSError, ValueError):
+    return
+  if total > 0:
+    samples.append({"t": time.monotonic(), "sent": total})
+
 def probe_management(target, samples):
   """Time a control-plane round trip, the way an operator would feel it.
 
@@ -225,7 +243,7 @@ def main():
         f"{mix.label} frames")
   print(f"warm-up {args.warmup:g}s discarded before judging trends\n")
 
-  samples, mgmt, moved = [], [], []
+  samples, mgmt, moved, offered_s = [], [], [], []
 
   def sample_dut():
     proc = subprocess.Popen(
@@ -243,6 +261,7 @@ def main():
     while not stop.is_set():
       probe_management(args.dut_host, mgmt)
       probe_throughput(dut, directions, moved)
+      probe_offered(gen, offered_s)
       stop.wait(15)
 
   stop = threading.Event()
@@ -269,6 +288,7 @@ def main():
   gen.configure(rate)
   before = {d.rx: dut.counters(d.rx, d.tx) for d in directions}
   sent, elapsed = gen.run_for(seconds)
+  traffic_end = time.monotonic()
   after = {d.rx: dut.counters(d.rx, d.tx) for d in directions}
   stop.set()
   gen.cleanup()
@@ -277,6 +297,16 @@ def main():
   time.sleep(3)
 
   sent_total = sum(sent.values())
+  if sent_total == 0 and len(offered_s) >= 2:
+    # The end-of-run read came back empty. Fall back to the periodic
+    # samples rather than reporting an offered rate of zero for a run
+    # that plainly offered something -- and say so, because a figure
+    # reconstructed from samples is not the same evidence as a direct
+    # read.
+    sent_total = offered_s[-1]["sent"] - offered_s[0]["sent"]
+    elapsed = offered_s[-1]["t"] - offered_s[0]["t"]
+    print("  note: the generator's final counter read failed; offered "
+          "figures below come from periodic samples")
   delivered = sum(
     (after[d.rx].get("tx_xdp", 0) or after[d.rx].get("tx", 0))
     - (before[d.rx].get("tx_xdp", 0) or before[d.rx].get("tx", 0))
@@ -345,9 +375,14 @@ def main():
   hot = []
   if moved:
     hot = [m for m in moved if m["t"] - moved[0]["t"] >= args.warmup]
+  # Only pairs that closed BEFORE the traffic stopped. The sampler
+  # outlives the generator by design, so the final window is mostly
+  # idle and reads as a 100% collapse -- which the first two-hour run
+  # duly reported as a failure.
   rates = [(b["moved"] - a["moved"]) / (b["t"] - a["t"])
            for a, b in zip(hot, hot[1:])
-           if b["t"] > a["t"] and b["moved"] >= a["moved"]]
+           if b["t"] > a["t"] and b["moved"] >= a["moved"]
+           and b["t"] <= traffic_end]
   if rates:
     check(*trend(rates, "forwarding rate", args.decay_tolerance,
                  " pps", rising_is_bad=False))
