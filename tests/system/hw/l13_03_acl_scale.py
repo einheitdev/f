@@ -107,6 +107,46 @@ def policy(count, rx, tx):
   lines += ["redirect to lan", "", "@xdp(lan)", "", "default drop", ""]
   return "\n".join(lines)
 
+def table_policy(count, rx, tx):
+  """The same intent as `policy()`, expressed as one lookup.
+
+  This is the comparison that matters. `policy()` writes N rules and
+  gets N comparisons in a tail-call chain; this writes ONE rule
+  against a trie holding N prefixes, and gets one LPM descent no
+  matter how large N is. Same packets, same non-matching outcome, same
+  traversal-to-the-bottom worst case -- the only difference is whether
+  the policy is code or data.
+
+  `geoip()` is used as the vehicle because it is the only construct in
+  the language today that compiles to a BPF_MAP_TYPE_LPM_TRIE. The
+  named tables in `f.planning/TABLES.md` are the same mechanism with
+  an operator-facing name, so what this measures is what those would
+  cost.
+  """
+  return "\n".join([
+    f"zone wan = [{rx}]", f"zone lan = [{tx}]", "", "@xdp(wan)", "",
+    "drop if pkt.src_ip in geoip(DE)",
+    "redirect to lan", "", "@xdp(lan)", "", "default drop", ""])
+
+def table_data(count):
+  """`count` distinct /24s that never contain the generator's sources.
+
+  The generator sends from 10.60.0.0/16, so 10.60 is skipped: a hit
+  would short-circuit the lookup and measure the easy case. Everything
+  else stays inside 10/8 so the trie walk descends as far as it can
+  before failing, which is the honest worst case for a miss.
+  """
+  prefixes, a, b = [], 0, 0
+  while len(prefixes) < count:
+    if a != 60:
+      prefixes.append(f"10.{a}.{b}.0/24")
+    b += 1
+    if b > 255:
+      b, a = 0, a + 1
+    if a > 255:
+      break
+  return {"DE": prefixes[:count]}
+
 def xdp_insns(obj):
   """BPF instructions in the object's xdp section, or -1."""
   out = run(["readelf", "-S", str(obj)]).stdout.splitlines()
@@ -122,13 +162,20 @@ def xdp_insns(obj):
         return -1
   return -1
 
-def compile_local(count, rx, tx, fwl, workdir):
+def compile_local(count, rx, tx, fwl, workdir, as_table=False):
   """Build the bundle here, where there is memory to build it in."""
   src = workdir / f"acl{count}.fw"
-  src.write_text(policy(count, rx, tx))
+  extra = []
+  if as_table:
+    src.write_text(table_policy(count, rx, tx))
+    data = workdir / f"geoip{count}.json"
+    data.write_text(json.dumps(table_data(count)))
+    extra = ["--geoip", str(data)]
+  else:
+    src.write_text(policy(count, rx, tx))
   bundle = workdir / f"bundle{count}"
   start = time.monotonic()
-  proc = run([fwl, "compile", "--bundle", str(bundle), str(src)])
+  proc = run([fwl, "compile", "--bundle", str(bundle), str(src)] + extra)
   seconds = time.monotonic() - start
   if proc.returncode != 0:
     return None, {"error": (proc.stderr or proc.stdout).strip()[:400],
@@ -328,6 +375,11 @@ def main():
   ap.add_argument("--fwl-local", default="fwl")
   ap.add_argument("--fwl-remote", default="/usr/local/bin/fwl")
   ap.add_argument("--bundle-root", default="/usr/share/f/compiled")
+  ap.add_argument("--as-table", action="store_true",
+                  help="express the same policy as ONE rule against a "
+                       "trie of N prefixes instead of N rules. The "
+                       "comparison that decides whether rules should "
+                       "be code or data.")
   ap.add_argument("--measure", action="store_true",
                   help="also measure throughput at every count that "
                        "verifies. Without this it only reports what "
@@ -361,17 +413,18 @@ def main():
                             args.rx_iface, args.tx_iface)
   results = []
 
+  unit = "prefixes" if args.as_table else "rules"
   for count in [int(c) for c in args.counts.split(",")]:
-    row = {"rules": count}
+    row = {"rules": count, "form": unit}
     bundle, built = compile_local(count, args.rx_iface, args.tx_iface,
-                                  args.fwl_local, workdir)
+                                  args.fwl_local, workdir, args.as_table)
     row.update(built)
     if bundle is None:
-      print(f"{count:>6} rules: COMPILE FAILED after "
+      print(f"{count:>6} {unit}: COMPILE FAILED after "
             f"{built['compile_s']}s -- {built['error']}")
       results.append(row)
       break
-    print(f"{count:>6} rules: compiled in {built['compile_s']}s, "
+    print(f"{count:>6} {unit}: compiled in {built['compile_s']}s, "
           f"{built['insns']:,} insns, {built['obj_bytes'] // 1024} KB "
           f"object, {built['manifest_bytes'] // 1024} KB manifest",
           flush=True)
@@ -416,12 +469,12 @@ def main():
   print("\n" + "=" * 74)
   print("RULE SET SCALING")
   print("=" * 74)
-  header = f'{"rules":>7}{"insns":>10}{"obj KB":>9}{"verify s":>10}'
+  header = f'{unit:>9}{"insns":>10}{"obj KB":>9}{"verify s":>10}'
   if args.measure:
     header += f'{"pps":>12}{"% line":>9}'
   print(header)
   for row in results:
-    line = (f'{row["rules"]:>7}{row.get("insns", -1):>10,}'
+    line = (f'{row["rules"]:>9}{row.get("insns", -1):>10,}'
             f'{row.get("obj_bytes", 0) // 1024:>9}'
             f'{row.get("verify_s", -1):>10}')
     if args.measure:

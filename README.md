@@ -54,7 +54,19 @@ Netgate publishes these for pfSense Plus, measured bidirectionally across all po
 | Netgate 8200 MAX | $1,749 | 18.60 Gb/s | 11.76 Gb/s |
 | **`f` on the rig** | ~200 EUR + NIC | **19.39 Gb/s** | **10.83 Gb/s** |
 
-Read that with its caveats or it misleads. This is the **routing** column, and it is the one `f` wins. The rule-set column is the one it loses: Netgate's 6100 does 2.73 Gb/s through 10,000 ACLs, while `f` tops out at 2,048 rules and does 1.12 Gb/s at that ceiling. Their aggregate also spans more ports than this rig has, `f` has no IPsec at all where every Netgate row has a VPN number, and an appliance buys a case, redundant power and support that a dev board does not.
+### Through a 10,000-entry blocklist
+
+Netgate publishes a second figure for the same traffic through 10,000 ACLs. Measured the same way, bidirectionally, with 10,000 prefixes loaded on both zones:
+
+| | price | iPerf3 frames | IMIX |
+|---|---|---|---|
+| Netgate 6100, 10k ACLs | $899 | 9.93 Gb/s | 2.73 Gb/s |
+| Netgate 8200 MAX, 10k ACLs | $1,749 | 18.55 Gb/s | 5.10 Gb/s |
+| **`f`, 10k prefixes** | ~200 EUR | **19.60 Gb/s** | **10.70 Gb/s** |
+
+The blocklist costs 1.2% against the same test with no policy at all, and the program stays 227 instructions whether it holds 1,000 prefixes or 50,000 — the size is in a map, not in the code.
+
+Read all of it with its caveats or it misleads. The forms are not identical: Netgate's 10,000 ACLs are 10,000 independent rules that may each test different fields, while this is one rule against a 10,000-entry prefix table. For blocklists, customer prefixes and threat feeds they express the same intent; for 10,000 genuinely heterogeneous rules `f` falls back to a linear chain and cannot express them at all. Their aggregate also spans more ports than this rig has, `f` has no IPsec where every Netgate row has a VPN number, and an appliance buys a case, redundant power and support that a dev board does not.
 
 ### Four tuning changes worth 3.4x, none of them a default
 
@@ -70,7 +82,7 @@ Untuned, this box forwards 955,429 pps. Tuned, 3,230,294. Every one of these was
 ### Before quoting any of this
 
 - **Always state the frame size.** 10 GbE is 14,880,952 pps at 64 bytes and 812,743 at 1518. The same box does 26% of line at one and 98% at the other, and a number without its frame size is not a measurement.
-- **These are datapath figures for a policy with no rules in it.** With a rule set they fall hard: 250 rules costs 8%, 1,000 rules costs 69%, and the ceiling is 2,048 rules. Rules are a code chain today, not a data structure, so the cost is one `bpf_tail_call` per 64 rules per packet rather than the rules themselves. Netgate publishes a 10,000-ACL figure; `f` cannot express one yet. See `f.planning/rig-evidence/ACL_SCALING_2026-08-23.md`.
+- **Written as rules, a policy costs dearly; written as data, it costs nothing.** 1,000 rules drops forwarding to 994,638 pps and the ceiling is 2,048 rules, because rules compile to a code chain cut into 64-rule stages with a tail call between each. The same policy as one lookup against a **50,000-entry** trie runs at 99% of line in 227 instructions. Both measured: `f.planning/rig-evidence/ACL_SCALING_2026-08-23.md`.
 
 Harness and full results, including how two earlier conclusions here turned out to be artifacts: `tests/system/hw/l13_02_rfc2544_throughput.py` and `f.planning/rig-evidence/RFC2544_10G_2026-08-23.md`.
 
