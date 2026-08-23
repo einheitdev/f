@@ -508,3 +508,30 @@ def test_an_unrecognised_bootloader_refuses_and_says_what_to_add(
                       (("/nonexistent/boot.conf", "x", "armbian"),))
   assert tune.apply_boot("lazy") == 1
   assert "iommu.strict=0" in capsys.readouterr().out
+
+def test_swap_enabled_is_a_failure():
+  """Swap made an over-large compile unrecoverable rather than fatal.
+
+  With 1.8 GB of zram the box pinned every core compressing, scheduled
+  nothing, never OOM-killed anything, and needed a power cycle.
+  Without swap the same compile is an ordinary OOM kill and the
+  datapath keeps running -- fwl returns an error and fd refuses the
+  bundle.
+  """
+  report = tune.Report()
+  tune.check_swap(report, total=1_923_072)
+  assert report.failed
+  assert "swap is enabled" in report.failed[0]
+  assert "1878 MB" in report.failed[0]
+
+def test_no_swap_passes_and_says_why():
+  report = tune.Report()
+  tune.check_swap(report, total=0)
+  assert not report.failed
+  assert any("fails fast" in line for line in report.already)
+
+def test_unreadable_swap_is_silent_rather_than_wrong():
+  """A box that cannot be asked should not be accused."""
+  report = tune.Report()
+  tune.check_swap(report, total=-1)
+  assert not report.failed and not report.already

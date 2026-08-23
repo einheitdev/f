@@ -351,6 +351,47 @@ def mode_of_group_type(group_type):
       return name
   return None
 
+def swap_total_kb():
+  """Swap configured on this box, in kB. 0 if none, -1 if unreadable."""
+  try:
+    for line in pathlib.Path("/proc/meminfo").read_text().splitlines():
+      if line.startswith("SwapTotal:"):
+        return int(line.split()[1])
+  except (OSError, ValueError, IndexError):
+    return -1
+  return 0
+
+def check_swap(report, total=None):
+  """Report swap, because here it turns a clean failure into a wedge.
+
+  Measured: `fwl compile` on an over-large policy drove a 4 GB board
+  into 1.8 GB of zram and pinned every core compressing, with nothing
+  scheduled and no OOM kill. The box answered ping and nothing else
+  until it was power-cycled. Without swap the same compile is an
+  ordinary OOM -- clang is killed, `fwl` returns an error, `fd`
+  refuses the bundle, and the datapath keeps running.
+
+  An appliance whose daemon has an 8 MB resident set has nothing worth
+  swapping. What swap buys here is the ability to fail slowly rather
+  than quickly, and on a remote box slow failure is the worse one.
+
+  Advisory rather than applied: `swapoff` on a running box is
+  disruptive, and the right place to not have swap is the image.
+  """
+  if total is None:
+    total = swap_total_kb()
+  if total < 0:
+    return
+  if total == 0:
+    report.already.append("swap: none, so memory pressure fails fast")
+    return
+  report.failed.append(
+    f"swap is enabled ({total // 1024} MB). Here that converts an "
+    "over-large compile from an OOM kill into an unrecoverable "
+    "thrash -- every core compressing, nothing scheduled, no OOM "
+    "kill, and only a power cycle or the watchdog gets it back. "
+    "Disable it in the image.")
+
 def check_iommu(report, ifaces, want):
   """Compare the running SMMU posture against the one asked for.
 
@@ -709,6 +750,7 @@ def main():
   if not args.no_governor:
     tune_governor(report, settings["governor"])
   ifaces = settings["interfaces"] or candidate_ifaces()
+  check_swap(report)
   check_iommu(report, ifaces, settings["iommu"])
   if not args.no_rss:
     # A run that examined no interface at all is not a clean run. The
