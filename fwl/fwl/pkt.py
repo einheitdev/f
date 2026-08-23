@@ -63,6 +63,17 @@ class PktCase:
 
   Empty dict when the file omits a `geoip_data:` block — geoip
   lookups against an empty dict always miss.
+
+  `table_data` carries a table-name → CIDR-list mapping for
+  TABLES.md named tables, mirroring the same bundle payload. Format:
+
+    table_data:
+      badhosts: ["1.2.3.0/24"]
+
+  Keyed by the table's declared name, not by an alias and not by the
+  `fwl_tbl_<id>` the kernel sees: a .pkt names tables the way the
+  policy does. Empty dict when the block is absent, which makes every
+  lookup against that table miss — the shape a vacuity check needs.
   """
   name: str
   source_fw: str
@@ -71,6 +82,7 @@ class PktCase:
   state: dict[int, dict[Any, int]]
   path: Path
   geoip_data: dict[str, list[str]] = None  # type: ignore[assignment]
+  table_data: dict[str, list[str]] = None  # type: ignore[assignment]
   # v0.4 conntrack. `conntrack_seed` holds pre-existing forward
   # 5-tuple keys (proto str, src u32, dst u32, sport, dport) from the
   # `state.conntrack` block — both oracles start with these entries
@@ -974,6 +986,9 @@ def _apply_ihl_to_decoded(
 
 _TOP_LEVEL_KEYS = frozenset({
   "name", "source_fw", "test_packet", "expected", "state", "geoip_data",
+  # TABLES.md: seeds a named table's contents, mirroring what the
+  # bundle payload holds for its LPM trie.
+  "table_data",
   # v0.4: a multi-packet conntrack test. Mutually exclusive with the
   # single test_packet/expected pair.
   "sequence",
@@ -1210,6 +1225,23 @@ def _parse_geoip_data(doc: dict) -> dict[str, list[str]]:
   return geoip_data
 
 
+def _parse_table_data(doc: dict) -> dict[str, list[str]]:
+  """Parse + validate the `table_data` block (TABLES.md)."""
+  raw = doc.get("table_data") or {}
+  table_data: dict[str, list[str]] = {}
+  for name, prefixes in raw.items():
+    if not isinstance(name, str) or not name:
+      raise ValueError(
+        f"table_data key {name!r} must be a table name"
+      )
+    if not isinstance(prefixes, list):
+      raise ValueError(
+        f"table_data[{name}] must be a list of CIDR strings"
+      )
+    table_data[name] = [str(x) for x in prefixes]
+  return table_data
+
+
 def _check_counter_changes_declared(doc: dict, expected: dict) -> None:
   """Reject counter_changes naming a counter the source doesn't declare."""
   counter_changes = expected.get("counter_changes", {})
@@ -1260,6 +1292,7 @@ def _load_sequence(doc: dict, path: Path) -> PktCase:
     state=_parse_rate_limit_state(doc),
     path=path,
     geoip_data=_parse_geoip_data(doc),
+    table_data=_parse_table_data(doc),
     conntrack_seed=_parse_conntrack_seed(
       (doc.get("state") or {}).get("conntrack")
     ),
@@ -1305,6 +1338,7 @@ def load(path: Path) -> PktCase:
   state = _parse_rate_limit_state(doc)
   _check_counter_changes_declared(doc, doc["expected"])
   geoip_data = _parse_geoip_data(doc)
+  table_data = _parse_table_data(doc)
   conntrack_seed = _parse_conntrack_seed(
     (doc.get("state") or {}).get("conntrack")
   )
@@ -1325,6 +1359,7 @@ def load(path: Path) -> PktCase:
     state=state,
     path=path,
     geoip_data=geoip_data,
+    table_data=table_data,
     conntrack_seed=conntrack_seed,
     ingress_zone=doc.get("ingress_zone"),
     nat_masq_ip=nat_masq_ip,

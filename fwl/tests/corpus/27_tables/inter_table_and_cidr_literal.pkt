@@ -1,0 +1,21 @@
+name: "a table lookup ands with an ordinary CIDR test"
+source_fw: |
+  table badhosts {
+    kind = cidr4
+    max = 1000
+    source = "badhosts.txt"
+  }
+
+  @xdp(eth0)
+  drop if pkt.src_ip in badhosts and pkt.dst_ip in 10.0.0.0/8
+  default allow
+
+table_data:
+  badhosts: ["5.8.0.0/16"]
+
+test_packet:
+  builder: tcp(src_ip="5.8.0.9", dst_ip="192.168.1.1", dst_port=80)
+
+expected:
+  compiles: true
+  bpf_action: allow

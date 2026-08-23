@@ -1,0 +1,26 @@
+name: "a hit stands when a shorter prefix also covers the address"
+# An LPM trie answers "is there a covering prefix", so /32 and /8 both
+# covering 10.1.2.3 must still be one membership answer. The case
+# exists because a lookup that returned the SHORTEST match, or that
+# stopped at the first non-exact node, would differ here and nowhere
+# else.
+source_fw: |
+  table badhosts {
+    kind = cidr4
+    max = 1000
+    source = "badhosts.txt"
+  }
+
+  @xdp(eth0)
+  drop if pkt.src_ip in badhosts
+  default allow
+
+table_data:
+  badhosts: ["10.0.0.0/8", "10.1.2.3/32"]
+
+test_packet:
+  builder: tcp(src_ip="10.1.2.3", dst_port=80)
+
+expected:
+  compiles: true
+  bpf_action: drop

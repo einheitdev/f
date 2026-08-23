@@ -1,0 +1,17 @@
+name: "a cidr4 table cannot be matched against pkt.src_ip6"
+source_fw: |
+  table badhosts {
+    kind = cidr4
+    max = 10
+    source = "b.txt"
+  }
+
+  @xdp(eth0)
+  drop if pkt.src_ip6 in badhosts
+  default allow
+
+test_packet:
+  builder: tcp6(src_ip="2001:db8::1")
+
+expected:
+  compiles: false

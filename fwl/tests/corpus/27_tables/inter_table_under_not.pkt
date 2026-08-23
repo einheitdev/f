@@ -1,0 +1,21 @@
+name: "not (src_ip in table) fires for an address the table lacks"
+source_fw: |
+  table badhosts {
+    kind = cidr4
+    max = 1000
+    source = "badhosts.txt"
+  }
+
+  @xdp(eth0)
+  drop if not (pkt.src_ip in badhosts)
+  default allow
+
+table_data:
+  badhosts: ["5.8.0.0/16"]
+
+test_packet:
+  builder: tcp(src_ip="9.9.9.9", dst_port=80)
+
+expected:
+  compiles: true
+  bpf_action: drop

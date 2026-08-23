@@ -1,0 +1,21 @@
+name: "a /32 matches its one address and not its neighbour"
+source_fw: |
+  table badhosts {
+    kind = cidr4
+    max = 1000
+    source = "badhosts.txt"
+  }
+
+  @xdp(eth0)
+  drop if pkt.src_ip in badhosts
+  default allow
+
+table_data:
+  badhosts: ["198.51.100.7/32"]
+
+test_packet:
+  builder: tcp(src_ip="198.51.100.8", dst_port=80)
+
+expected:
+  compiles: true
+  bpf_action: allow

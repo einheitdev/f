@@ -1,0 +1,21 @@
+name: "src_ip6 inside a cidr6 table's prefix drops"
+source_fw: |
+  table badhosts6 {
+    kind = cidr6
+    max = 1000
+    source = "badhosts6.txt"
+  }
+
+  @xdp(eth0)
+  drop if pkt.src_ip6 in badhosts6
+  default allow
+
+table_data:
+  badhosts6: ["2a00:1370::/32"]
+
+test_packet:
+  builder: tcp6(src_ip="2a00:1370::1", dst_port=22)
+
+expected:
+  compiles: true
+  bpf_action: drop

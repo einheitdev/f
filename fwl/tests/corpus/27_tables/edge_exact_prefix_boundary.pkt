@@ -1,0 +1,21 @@
+name: "the last address a /24 covers matches"
+source_fw: |
+  table badhosts {
+    kind = cidr4
+    max = 1000
+    source = "badhosts.txt"
+  }
+
+  @xdp(eth0)
+  drop if pkt.src_ip in badhosts
+  default allow
+
+table_data:
+  badhosts: ["192.0.2.0/24"]
+
+test_packet:
+  builder: tcp(src_ip="192.0.2.255", dst_port=80)
+
+expected:
+  compiles: true
+  bpf_action: drop

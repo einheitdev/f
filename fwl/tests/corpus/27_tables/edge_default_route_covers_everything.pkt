@@ -1,0 +1,23 @@
+name: "0.0.0.0/0 in a table covers every address"
+# prefixlen 0 is the case an LPM implementation most often gets wrong,
+# because a zero-width mask is a shift by the full key width.
+source_fw: |
+  table badhosts {
+    kind = cidr4
+    max = 1000
+    source = "badhosts.txt"
+  }
+
+  @xdp(eth0)
+  drop if pkt.src_ip in badhosts
+  default allow
+
+table_data:
+  badhosts: ["0.0.0.0/0"]
+
+test_packet:
+  builder: tcp(src_ip="198.51.100.7", dst_port=80)
+
+expected:
+  compiles: true
+  bpf_action: drop

@@ -1,0 +1,28 @@
+name: "a Tier 2 v6 local matches against a cidr6 table"
+# The 128-bit half of the local dispatch: the lookup takes a hi/lo
+# pair rather than a u32, and the family comes from the table's
+# declaration because a local has no field name to dispatch on.
+source_fw: |
+  table badhosts6 {
+    kind = cidr6
+    max = 1000
+    source = "badhosts6.txt"
+  }
+
+  @xdp(eth0)
+  def firewall(pkt):
+    if pkt.src_ip6 in ::/0:
+      who = pkt.src_ip6
+      if who in badhosts6:
+        drop
+    allow
+
+table_data:
+  badhosts6: ["2a00:1370::/32"]
+
+test_packet:
+  builder: tcp6(src_ip="2a00:1370::1", dst_port=80)
+
+expected:
+  compiles: true
+  bpf_action: drop

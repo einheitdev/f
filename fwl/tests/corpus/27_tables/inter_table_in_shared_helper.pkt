@@ -1,0 +1,31 @@
+name: "a shared helper def matches against a table"
+# geoip() is refused inside a helper because its call sites are
+# numbered within a zone, so a body duplicated across zones has no
+# single index. A table is named once for the whole unit and its map
+# is bundle-global, so it composes -- and this is the case that says
+# so.
+source_fw: |
+  table badhosts {
+    kind = cidr4
+    max = 1000
+    source = "badhosts.txt"
+  }
+
+  def screen(pkt):
+    if pkt.src_ip in badhosts:
+      drop
+
+  @xdp(eth0)
+  def firewall(pkt):
+    screen(pkt)
+    allow
+
+table_data:
+  badhosts: ["5.8.0.0/16"]
+
+test_packet:
+  builder: tcp(src_ip="5.8.1.1", dst_port=80)
+
+expected:
+  compiles: true
+  bpf_action: drop

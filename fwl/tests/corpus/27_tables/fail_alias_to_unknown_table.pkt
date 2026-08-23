@@ -1,0 +1,13 @@
+name: "an alias onto a table that does not exist is refused"
+source_fw: |
+  table pasted = nothing_here
+
+  @xdp(eth0)
+  drop if pkt.src_ip in pasted
+  default allow
+
+test_packet:
+  builder: tcp(src_ip="1.2.3.4")
+
+expected:
+  compiles: false

@@ -1,0 +1,21 @@
+name: "the table matches dst_ip as readily as src_ip"
+source_fw: |
+  table badhosts {
+    kind = cidr4
+    max = 1000
+    source = "badhosts.txt"
+  }
+
+  @xdp(eth0)
+  drop if pkt.dst_ip in badhosts
+  default allow
+
+table_data:
+  badhosts: ["203.0.113.0/24"]
+
+test_packet:
+  builder: tcp(src_ip="10.0.0.5", dst_ip="203.0.113.9", dst_port=443)
+
+expected:
+  compiles: true
+  bpf_action: drop

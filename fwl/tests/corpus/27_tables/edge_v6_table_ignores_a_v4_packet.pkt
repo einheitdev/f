@@ -1,0 +1,23 @@
+name: "a v4 frame never reaches a cidr6 table's rule"
+# The v6 field read is gated on the EtherType parse, so a v4 frame
+# falls through without the lookup happening at all.
+source_fw: |
+  table badhosts6 {
+    kind = cidr6
+    max = 1000
+    source = "badhosts6.txt"
+  }
+
+  @xdp(eth0)
+  drop if pkt.src_ip6 in badhosts6
+  default allow
+
+table_data:
+  badhosts6: ["2a00:1370::/32"]
+
+test_packet:
+  builder: tcp(src_ip="5.8.1.1", dst_port=80)
+
+expected:
+  compiles: true
+  bpf_action: allow
