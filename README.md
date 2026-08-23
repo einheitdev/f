@@ -54,7 +54,7 @@ Netgate publishes these for pfSense Plus, measured bidirectionally across all po
 | Netgate 8200 MAX | $1,749 | 18.60 Gb/s | 11.76 Gb/s |
 | **`f` on the rig** | ~200 EUR + NIC | **19.39 Gb/s** | **10.83 Gb/s** |
 
-Read that with its caveats or it misleads: `f` carries no rule set here where Netgate publishes a 10,000-ACL figure, their aggregate spans more ports than this rig has, `f` has no IPsec at all where every Netgate row has a VPN number, and an appliance buys a case, redundant power and support that a dev board does not.
+Read that with its caveats or it misleads. This is the **routing** column, and it is the one `f` wins. The rule-set column is the one it loses: Netgate's 6100 does 2.73 Gb/s through 10,000 ACLs, while `f` tops out at 2,048 rules and does 1.12 Gb/s at that ceiling. Their aggregate also spans more ports than this rig has, `f` has no IPsec at all where every Netgate row has a VPN number, and an appliance buys a case, redundant power and support that a dev board does not.
 
 ### Four tuning changes worth 3.4x, none of them a default
 
@@ -70,7 +70,7 @@ Untuned, this box forwards 955,429 pps. Tuned, 3,230,294. Every one of these was
 ### Before quoting any of this
 
 - **Always state the frame size.** 10 GbE is 14,880,952 pps at 64 bytes and 812,743 at 1518. The same box does 26% of line at one and 98% at the other, and a number without its frame size is not a measurement.
-- **No rule set has been measured yet.** These are datapath figures for a policy with no rules in it.
+- **These are datapath figures for a policy with no rules in it.** With a rule set they fall hard: 250 rules costs 8%, 1,000 rules costs 69%, and the ceiling is 2,048 rules. Rules are a code chain today, not a data structure, so the cost is one `bpf_tail_call` per 64 rules per packet rather than the rules themselves. Netgate publishes a 10,000-ACL figure; `f` cannot express one yet. See `f.planning/rig-evidence/ACL_SCALING_2026-08-23.md`.
 
 Harness and full results, including how two earlier conclusions here turned out to be artifacts: `tests/system/hw/l13_02_rfc2544_throughput.py` and `f.planning/rig-evidence/RFC2544_10G_2026-08-23.md`.
 
