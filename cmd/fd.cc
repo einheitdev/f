@@ -19,6 +19,8 @@
 #include <spdlog/spdlog.h>
 #include <yaml-cpp/yaml.h>
 
+#include "f/bundle_guard.h"
+#include "f/bundle_verify.h"
 #include "f/engine.h"
 #include "f/route_mgr.h"
 
@@ -29,6 +31,12 @@ std::atomic<bool> g_interrupted{false};
 void SignalHandler(int) {
   g_interrupted.store(true, std::memory_order_release);
 }
+
+/// Anti-lockout settings from the `bundle:` config block.
+struct BundleConfig {
+  int max_attempts = 2;
+  f::GuardPolicy policy = f::GuardPolicy::kFallback;
+};
 
 /// File-watcher settings from the `watch:` config block.
 struct WatchConfig {
@@ -42,8 +50,13 @@ struct WatchConfig {
 auto RunEngine(const std::string& sock_addr,
                const std::string& pin_path,
                const std::string& bundle_dir,
-               const WatchConfig& watch) -> int {
+               const WatchConfig& watch,
+               const BundleConfig& bundle) -> int {
   f::Engine engine;
+  // Set before EngineInit, because EngineInit is where the guard runs
+  // and the guard runs before anything opens the bundle.
+  engine.guard.max_attempts = bundle.max_attempts;
+  engine.guard.policy = bundle.policy;
   auto res = f::EngineInit(
       engine, sock_addr, pin_path, bundle_dir);
   if (!res) {
@@ -114,7 +127,8 @@ auto LoadConfig(const std::string& path,
                 std::string& socket_addr,
                 std::string& pin_path,
                 std::string& log_level,
-                WatchConfig& watch) -> bool {
+                WatchConfig& watch,
+                BundleConfig& bundle) -> bool {
   try {
     auto cfg = YAML::LoadFile(path);
     // `interfaces:` was the v0.1 attach list, and it is refused rather
@@ -138,6 +152,27 @@ auto LoadConfig(const std::string& path,
     }
     if (cfg["log_level"]) {
       log_level = cfg["log_level"].as<std::string>();
+    }
+    if (cfg["bundle"]) {
+      auto b = cfg["bundle"];
+      if (b["on_load_failure"]) {
+        auto parsed = f::ParseGuardPolicy(
+            b["on_load_failure"].as<std::string>());
+        if (parsed) {
+          bundle.policy = *parsed;
+        } else {
+          // Refusing to start over a typo in an anti-lockout setting
+          // would be its own lockout. Say so and keep the default,
+          // which is the one that keeps the box filtering.
+          spdlog::error("{}: {}. Keeping the default '{}'.", path,
+                        parsed.error(),
+                        f::GuardPolicyName(bundle.policy));
+        }
+      }
+      if (b["max_load_attempts"]) {
+        bundle.max_attempts =
+            std::max(1, b["max_load_attempts"].as<int>());
+      }
     }
     if (cfg["watch"]) {
       auto w = cfg["watch"];
@@ -199,6 +234,17 @@ int main(int argc, char** argv) {
                                              "error"}));
   (void)opt_config;
 
+  std::string verify_dir;
+  auto* verify = app.add_subcommand(
+      "verify-bundle",
+      "Ask the kernel whether it will take a bundle, without "
+      "attaching it or moving `current`. This is the safe order of "
+      "operations: a bundle that is refused here costs a log line "
+      "instead of a box that cannot boot.");
+  verify->add_option("dir", verify_dir,
+                     "Bundle directory (default <bundle-dir>/current)")
+      ->required(false);
+
   app.add_subcommand("run", "Run in foreground");
   app.add_subcommand("start", "Daemonize and run");
   app.add_subcommand(
@@ -216,6 +262,7 @@ int main(int argc, char** argv) {
   // silently bound the config file's socket instead; found by the
   // netns system tests running against a rig with /etc/f/fd.yaml.)
   WatchConfig watch;
+  BundleConfig bundle;
   {
     std::string cfg_socket = socket_addr;
     std::string cfg_pin = pin_path;
@@ -223,10 +270,10 @@ int main(int argc, char** argv) {
     bool loaded = false;
     if (!config_file.empty()) {
       loaded = LoadConfig(config_file, cfg_socket,
-                          cfg_pin, cfg_log, watch);
+                          cfg_pin, cfg_log, watch, bundle);
     } else if (std::ifstream("/etc/f/fd.yaml").good()) {
       loaded = LoadConfig("/etc/f/fd.yaml", cfg_socket,
-                          cfg_pin, cfg_log, watch);
+                          cfg_pin, cfg_log, watch, bundle);
     }
     if (loaded) {
       if (opt_socket->count() == 0) socket_addr = cfg_socket;
@@ -269,6 +316,32 @@ int main(int argc, char** argv) {
     return 0;
   }
 
+  // Also before the already-running check: verifying a bundle is a
+  // read-only question about the kernel, and the daemon being up is
+  // the normal case in which an operator wants to ask it.
+  if (sub->get_name() == "verify-bundle") {
+    std::string dir = verify_dir.empty()
+        ? bundle_dir + "/current"
+        : verify_dir;
+    auto scratch =
+        std::format("/sys/fs/bpf/f-verify-{}", static_cast<int>(getpid()));
+    auto report = f::VerifyBundle(dir, scratch);
+    if (!report) {
+      std::println(stderr, "error: {}", report.error());
+      return 1;
+    }
+    for (const auto& p : report->programs) {
+      if (p.loaded) {
+        std::println("  zone {:<12} ok   {} xlated bytes, {} jited",
+                     p.zone, p.xlated_bytes, p.jited_bytes);
+      } else {
+        std::println("  zone {:<12} FAIL {}", p.zone, p.why);
+      }
+    }
+    std::println("{}", report->summary);
+    return report->ok ? 0 : 1;
+  }
+
   int existing = f::ReadPidFile(f::kEnginePidPath);
   if (f::IsProcessRunning(existing)) {
     spdlog::error("Engine already running (pid {}).",
@@ -283,14 +356,15 @@ int main(int argc, char** argv) {
     }
     f::WritePidFile(f::kEnginePidPath);
     chmod(f::kEnginePidPath, 0644);
-    int rc = RunEngine(socket_addr, pin_path, bundle_dir, watch);
+    int rc = RunEngine(socket_addr, pin_path, bundle_dir, watch,
+                       bundle);
     f::RemovePidFile(f::kEnginePidPath);
     return rc;
   }
 
   // "run" — foreground.
   f::WritePidFile(f::kEnginePidPath);
-  int rc = RunEngine(socket_addr, pin_path, bundle_dir, watch);
+  int rc = RunEngine(socket_addr, pin_path, bundle_dir, watch, bundle);
   f::RemovePidFile(f::kEnginePidPath);
   return rc;
 }

@@ -17,6 +17,7 @@
 #include <zmq.hpp>
 
 #include "f/bpf_loader.h"
+#include "f/bundle_guard.h"
 #include "f/conntrack_mgr.h"
 #include "f/egress_mgr.h"
 #include "f/error.h"
@@ -84,6 +85,15 @@ struct Engine {
   // Source file-watcher / hot-reload state (ReloadFromSource reads
   // source_path, compiled_dir, fwl_path from here).
   Watcher watcher;
+
+  // The anti-lockout guard on the cold-boot load path. `guard.policy`
+  // and `guard.max_attempts` come from fd.yaml; `guard.bundle_dir` is
+  // set by EngineInit from the bundle root it was given.
+  GuardConfig guard;
+  // What the guard decided this start, kept so `fctl status` can say
+  // that the box is running a bundle the operator did not ask for. A
+  // fallback nobody can see is the same defect as no fallback at all.
+  GuardStatus guard_status;
 
   // Uptime tracking.
   uint64_t start_time_s = 0;

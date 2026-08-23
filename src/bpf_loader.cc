@@ -11,6 +11,7 @@
 #include <ifaddrs.h>
 #include <netinet/in.h>
 
+#include <sys/utsname.h>
 #include <unistd.h>
 
 #include <array>
@@ -830,6 +831,45 @@ auto CloseZoneBundle(ZoneBundleHandles& handles) -> void {
   handles.legacy_nat_cfg = false;
 }
 
+// See bpf_loader.h for what these two are for.
+auto RunningKernelRelease() -> std::string {
+  struct utsname u = {};
+  if (::uname(&u) != 0) return {};
+  return u.release;
+}
+
+auto KernelAtLeast(const std::string& release, const std::string& floor)
+    -> bool {
+  auto parts = [](const std::string& text) {
+    std::vector<int> out;
+    int value = 0;
+    bool seen = false;
+    for (char c : text) {
+      if (c >= '0' && c <= '9') {
+        value = value * 10 + (c - '0');
+        seen = true;
+        continue;
+      }
+      if (seen) out.push_back(value);
+      value = 0;
+      seen = false;
+      // Only the leading dotted numbers are a version; `6.18.43-rk` is
+      // three components, not four.
+      if (c != '.') break;
+    }
+    if (seen) out.push_back(value);
+    return out;
+  };
+  auto have = parts(release);
+  auto want = parts(floor);
+  if (have.empty() || want.empty()) return true;
+  for (std::size_t i = 0; i < want.size(); ++i) {
+    int h = i < have.size() ? have[i] : 0;
+    if (h != want[i]) return h > want[i];
+  }
+  return true;
+}
+
 auto LoadZoneBundle(std::string_view bundle_dir,
                     std::string_view pin_root,
                     const ZoneBundleHandles* replace)
@@ -856,6 +896,46 @@ auto LoadZoneBundle(std::string_view bundle_dir,
   } catch (const std::exception& e) {
     return MakeError(BpfError::kLoadFailed,
         std::format("parse manifest.json: {}", e.what()));
+  }
+
+  // Before anything is opened: does this kernel have the instructions
+  // these objects were assembled with?
+  //
+  // `fwl compile` builds for clang's default BPF ISA, which loads on
+  // every kernel this project supports. A zone too large to assemble
+  // inside LLVM's signed 16-bit branch offset is built with
+  // `-mcpu=v4` instead, whose `gotol` the kernel gained in 6.6, and
+  // the manifest records the floor. Without this check the failure is
+  // a verifier rejection naming an opcode -- true, useless, and
+  // indistinguishable from a policy the verifier disliked on its
+  // merits.
+  // `is_string()` rather than `value(...)`: every bundle built for the
+  // default instruction set writes `"min_kernel": null`, and
+  // nlohmann's `value()` THROWS on a present-but-null key rather than
+  // returning the default. That threw out of the middle of a load, so
+  // fd died by std::terminate with the bundle half-open -- no error
+  // return, no journal line, and to the guard indistinguishable from a
+  // board that stopped being scheduled.
+  if (manifest.contains("min_kernel") &&
+      manifest["min_kernel"].is_string()) {
+    const auto floor = manifest["min_kernel"].get<std::string>();
+    auto running = RunningKernelRelease();
+    if (!KernelAtLeast(running, floor)) {
+      return MakeError(BpfError::kLoadFailed,
+          std::format(
+              "bundle {} was compiled for BPF ISA {} and needs kernel "
+              "{} or newer; this box runs {}. A zone in this policy is "
+              "too large to assemble with the default instruction set. "
+              "Recompile it on a box with a matching kernel, split the "
+              "policy across zones, or express the bulk of it as a "
+              "table rather than as rules.",
+              bundle_dir,
+              manifest["bpf_isa"].is_string()
+                  ? manifest["bpf_isa"].get<std::string>()
+                  : std::string{"a newer one"},
+              floor,
+              running.empty() ? "an unreadable version" : running));
+    }
   }
 
   // zone name -> resolved ifindexes (egress targets for redirect, and

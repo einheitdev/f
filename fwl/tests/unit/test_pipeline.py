@@ -45,8 +45,10 @@ def test_over_instruction_budget_splits():
   many = "@xdp(eth0)\n" + "".join(
     f"drop if pkt.src_ip == 10.0.0.{i}\n" for i in range(1, 12)
   ) + "default allow\n"
-  # Force the budget low so the estimate exceeds it.
-  plan = splitter.plan(_zp(many), instr_budget=1500, max_stage_instr=1500)
+  # Force the budget low so the estimate exceeds it. It has to be low
+  # in the new units: a rule is about 24 instructions, not 500, so the
+  # old 1,500 is now a budget sixty rules fit inside.
+  plan = splitter.plan(_zp(many), instr_budget=64, max_stage_instr=64)
   assert plan.split is True
   rule_stages = [s for s in plan.stages if s.kind == "rules"]
   assert len(rule_stages) >= 2
@@ -192,10 +194,79 @@ class TestTailCallDepthLimit:
     program = analyzer.analyze(parser.parse(self._policy(count)))
     return splitter.plan(program.programs[0])
 
-  def test_the_ceiling_is_stated_in_terms_of_rules(self):
-    """The constant an operator needs is a rule count, not a stage count."""
-    assert splitter.MAX_TIER1_RULES == (
-      (splitter.MAX_STAGES - 1) * splitter.MAX_RULES_PER_STAGE)
+  def test_the_ceiling_is_a_verifier_limit_not_stage_arithmetic(self):
+    """Where the number comes from decides whether it can be raised.
+
+    It used to be (MAX_STAGES - 1) x MAX_RULES_PER_STAGE = 2,048, which
+    is not a property of the kernel at all — it is two compiler
+    constants that happened to multiply to LLVM's branch range, one of
+    them 48x too large. The real ceiling is the verifier's
+    jump-sequence limit, measured on the rig: a 10,000-rule program is
+    refused with "the sequence of 8193 jumps is too complex" while the
+    million-instruction limit is four fifths unused.
+    """
+    assert splitter.MAX_TIER1_RULES == splitter.JMP_SEQ_LIMIT
+    # ...and the stage arithmetic now has room to spare rather than
+    # being the thing that binds. A policy at the ceiling must fit in
+    # far fewer stages than the kernel will follow.
+    stages_needed = 1 + -(-splitter.MAX_TIER1_RULES //
+                          splitter.MAX_RULES_PER_STAGE)
+    assert stages_needed < splitter.MAX_STAGES
+
+  def test_the_estimate_matches_what_clang_actually_emits(self):
+    """The guard against the defect that produced 41 stages.
+
+    `RULE_INSTR` was 500 against a measured 10.35. This fails if
+    anybody sets it back to a number nobody measured — in either
+    direction, because an estimate that is far too LOW walks into the
+    verifier and one that is far too HIGH splits a policy into stages
+    the kernel will not follow.
+    """
+    assert (splitter.MEASURED_RULE_INSTR_STAGE <= splitter.RULE_INSTR
+            <= 2 * splitter.MEASURED_RULE_INSTR_STAGE)
+    assert (splitter.MEASURED_RULE_INSTR_SINGLE <= splitter.RULE_INSTR_SINGLE
+            <= 2 * splitter.MEASURED_RULE_INSTR_SINGLE)
+    assert (splitter.MEASURED_BASE_INSTR <= splitter.PARSE_INSTR
+            <= 2 * splitter.MEASURED_BASE_INSTR)
+    assert (splitter.MEASURED_GEOIP_INSTR <= splitter.GEOIP_INSTR
+            <= 4 * splitter.MEASURED_GEOIP_INSTR)
+    assert (splitter.MEASURED_CIDR_ENTRY_INSTR <= splitter.CIDR_ENTRY_INSTR
+            <= 2 * splitter.MEASURED_CIDR_ENTRY_INSTR)
+    # And the estimate for a real policy has to land near the real
+    # object. 1,000 of these rules measured 22,266 instructions.
+    est = splitter.estimate(
+      analyzer.analyze(parser.parse(self._policy(1000))).programs[0])
+    assert 22_266 <= est.instructions <= 2 * 22_266
+
+  def test_a_stage_budget_stays_under_the_llvm_branch_range(self):
+    """The budget has to leave room for the estimate to be wrong.
+
+    Measured: 3,200 rules in one stage assembles at 32,305 instructions
+    and 4,000 does not. A stage filled exactly to its budget must be
+    comfortably inside that.
+    """
+    assert splitter.STAGE_INSTR_BUDGET < splitter.LLVM_BRANCH_RANGE_INSTR
+    assert splitter.INSTR_BUDGET < splitter.LLVM_BRANCH_RANGE_INSTR
+    filled = splitter.MAX_RULES_PER_STAGE * splitter.RULE_INSTR
+    assert filled < splitter.LLVM_BRANCH_RANGE_INSTR
+
+  def test_a_realistic_policy_is_a_handful_of_stages_not_dozens(self):
+    """The 41-stage bug, stated as the number it should have been.
+
+    2,500 rules produced 41 stages against a kernel limit of 33. With a
+    per-rule cost that is measured rather than guessed the same policy
+    is a few stages, and the count is bounded by the rule cap rather
+    than by an estimate that was 48x high.
+    """
+    plan = self._plan(2500)
+    assert plan.split
+    assert plan.n_stages <= 5, plan.reason
+    # ...and every rule is still covered exactly once, in order.
+    covered = []
+    for stage in plan.stages:
+      if stage.rule_range:
+        covered.extend(range(*stage.rule_range))
+    assert covered == list(range(2501))
 
   def test_a_policy_within_the_limit_still_compiles(self):
     plan = self._plan(1500)
@@ -205,15 +276,11 @@ class TestTailCallDepthLimit:
       analyzer.analyze(parser.parse(self._policy(1500))))
 
   def test_a_policy_past_the_limit_is_refused(self):
-    count = splitter.MAX_TIER1_RULES + splitter.MAX_RULES_PER_STAGE * 2
+    count = splitter.MAX_TIER1_RULES + 1
     program = analyzer.analyze(parser.parse(self._policy(count)))
-    stages = splitter.plan(program.programs[0]).n_stages
-    assert stages > splitter.MAX_STAGES
     with pytest.raises(FwlException) as caught:
       emitter.emit_bundle(program)
     message = caught.value.error.message
-    assert "pipeline stages" in message
-    assert str(splitter.MAX_STAGES) in message
     # The message has to carry the numbers, not just the verdict: the
     # operator's next action is deciding how much policy to move, and
     # that needs the count it has and the count it may have. The rule
@@ -221,9 +288,36 @@ class TestTailCallDepthLimit:
     # program rather than assumed to equal the generated count.
     assert str(len(program.programs[0].rules)) in message
     assert str(splitter.MAX_TIER1_RULES) in message
+    # ...and it says which limit, because "too many rules" with no
+    # reason reads like a number somebody chose.
+    assert "verifier" in message
+
+  def test_the_tail_call_depth_refusal_survives_for_manual_chains(self):
+    """The rule ceiling no longer produces 34 stages. `chain` still can.
+
+    Each `chain` marker is a cut the splitter may not merge away, so a
+    policy with more of them than the kernel will follow is still the
+    fail-open this class exists to refuse — and now it is the ONLY way
+    to reach it, which is why the message talks about `chain` markers
+    rather than about rule counts.
+    """
+    lines = ["zone wan = [eth0]", "zone lan = [eth1]", "", "@xdp(wan)", ""]
+    for i in range(splitter.MAX_STAGES + 4):
+      lines.append(f"drop if pkt.src_ip == 10.0.0.{i % 254 + 1}")
+      lines.append(f"chain c{i}")
+    lines += ["redirect to lan", "", "@xdp(lan)", "", "default drop", ""]
+    program = analyzer.analyze(parser.parse("\n".join(lines)))
+    plan = splitter.plan(program.programs[0])
+    assert plan.n_stages > splitter.MAX_STAGES
+    with pytest.raises(FwlException) as caught:
+      emitter.emit_bundle(program)
+    message = caught.value.error.message
+    assert "pipeline stages" in message
+    assert str(splitter.MAX_STAGES) in message
+    assert "chain" in message
 
   def test_the_refusal_names_the_zone(self):
-    count = splitter.MAX_TIER1_RULES * 3
+    count = splitter.MAX_TIER1_RULES + 1
     with pytest.raises(FwlException) as caught:
       emitter.emit_bundle(
         analyzer.analyze(parser.parse(self._policy(count))))
@@ -231,7 +325,7 @@ class TestTailCallDepthLimit:
 
   def test_it_is_a_codegen_error_not_a_crash(self):
     """It must arrive as a reportable error, not a traceback."""
-    count = splitter.MAX_TIER1_RULES * 2
+    count = splitter.MAX_TIER1_RULES + 1
     with pytest.raises(FwlException) as caught:
       emitter.emit_bundle(
         analyzer.analyze(parser.parse(self._policy(count))))

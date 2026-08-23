@@ -245,6 +245,8 @@ target_link_libraries(libf-rules PUBLIC
 # ============================================================================
 add_library(libf-engine STATIC
   src/bpf_loader.cc
+  src/bundle_guard.cc
+  src/bundle_verify.cc
   src/config.cc
   src/engine.cc
   src/reload.cc

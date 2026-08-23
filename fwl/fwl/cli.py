@@ -10,6 +10,7 @@ Subcommands:
   version                  Print version.
 """
 from __future__ import annotations
+import subprocess
 import sys
 from pathlib import Path
 
@@ -17,7 +18,7 @@ import click
 
 from . import (
   __version__, analyzer, ast, emitter, interpreter, log_abi, parser,
-  pkt, rulemeta, runner
+  pkt, rulemeta, runner, splitter
 )
 from .errors import FwlException
 
@@ -316,6 +317,62 @@ def _manifest_zones(program: ast.Program) -> list[dict]:
   return zones
 
 
+_BRANCH_RANGE_ERROR = "Branch target out of insn range"
+
+
+def _compile_one(c_source: str, bundle_dir: Path, obj_name: str,
+                 isa: str) -> bool:
+  """Compile one generated C file into the bundle. True when it worked.
+
+  Raises `subprocess.CalledProcessError` only for the branch-range
+  failure, which the caller answers by rebuilding the whole bundle with
+  a wider jump. Every other compile failure returns False, because a
+  bundle with a missing object is already reported -- loudly, and by
+  the caller -- as one `fd` will refuse.
+  """
+  from . import bpf_runner
+  try:
+    result = bpf_runner.compile_c(
+      c_source, work_dir=bundle_dir, cpu=isa or None)
+  except bpf_runner.BpfUnavailable:
+    return False
+  except subprocess.CalledProcessError as exc:
+    stderr = (exc.stderr or b"")
+    if isinstance(stderr, bytes):
+      stderr = stderr.decode("utf-8", "replace")
+    if _BRANCH_RANGE_ERROR in stderr:
+      raise
+    return False
+  # compile_c writes fwl_prog.bpf.o; move it to the caller's name.
+  result.obj_path.replace(bundle_dir / obj_name)
+  return True
+
+
+def _compile_zone_objects(program: ast.Program, files: dict,
+                          bundle_dir: Path):
+  """Compile every zone object, widening the jump once if clang asks.
+
+  Returns `({zone: compiled}, isa_actually_used)`. The retry rebuilds
+  ALL of them rather than only the one that failed: the manifest states
+  one kernel floor for the bundle, so the objects have to agree about
+  which instruction set they were built for.
+  """
+  for attempt_isa in ("", "v4"):
+    compiled = {}
+    try:
+      for zp in program.programs:
+        compiled[zp.zone_name] = _compile_one(
+          files[f"{zp.zone_name}.bpf.c"], bundle_dir,
+          f"{zp.zone_name}.bpf.o", attempt_isa)
+    except subprocess.CalledProcessError:
+      # The branch-range failure, and only that one — `_compile_one`
+      # swallows every other compile error. Fall through to the wider
+      # instruction set.
+      continue
+    return compiled, attempt_isa
+  return {zp.zone_name: False for zp in program.programs}, ""
+
+
 def _emit_bundle_dir(program: ast.Program, bundle_dir: Path,
                      geoip_data: dict | None = None,
                      source: Path | None = None,
@@ -335,7 +392,6 @@ def _emit_bundle_dir(program: ast.Program, bundle_dir: Path,
   the source is unknown rather than naming a file it did not read.
   """
   import json
-  import subprocess
 
   from . import bpf_runner
 
@@ -346,19 +402,36 @@ def _emit_bundle_dir(program: ast.Program, bundle_dir: Path,
   for name, c_source in files.items():
     (bundle_dir / name).write_text(c_source, encoding="utf-8")
 
+  # One ISA for the whole bundle, decided by what clang actually does
+  # rather than by an estimate of what it will do.
+  #
+  # The default instruction set loads on every kernel this project
+  # supports and emits a signed 16-bit branch offset, which stops at
+  # about 32,767 instructions. `-mcpu=v4` adds `gotol` and removes the
+  # limit, at the price of needing kernel 6.6. So the default is tried
+  # first, always, and the wider jump is used only when clang says in
+  # so many words that it needs one.
+  #
+  # An estimate was tried here first and it was wrong in the expensive
+  # direction: a Tier 2 body of 1,200 branches ESTIMATES at 29,000
+  # instructions and clang emits 161, because it folds repeated
+  # comparisons into something far smaller than the source suggests.
+  # Choosing v4 from that estimate would have stamped a kernel-6.6
+  # floor onto bundles that load anywhere, i.e. refused them on boxes
+  # that could run them perfectly.
+  #
+  # Bundle-wide because the manifest carries ONE kernel floor: a bundle
+  # is loaded or refused whole, and a floor that applied to some of its
+  # objects and not others would be a refusal nobody could act on.
+  compiled_objects, isa = _compile_zone_objects(
+    program, files, bundle_dir)
+  min_kernel = bpf_runner.BPF_ISA_MIN_KERNEL.get(isa) if isa else None
+
   programs_meta = []
   for zp in program.programs:
     c_name = f"{zp.zone_name}.bpf.c"
     o_name = f"{zp.zone_name}.bpf.o"
-    try:
-      result = bpf_runner.compile_c(
-        files[c_name], work_dir=bundle_dir
-      )
-      # compile_c writes fwl_prog.bpf.o; move it to the zone name.
-      result.obj_path.replace(bundle_dir / o_name)
-      compiled = True
-    except (bpf_runner.BpfUnavailable, subprocess.CalledProcessError):
-      compiled = False
+    compiled = compiled_objects.get(zp.zone_name, False)
     programs_meta.append({
       "zone": zp.zone_name,
       "source": c_name,
@@ -389,12 +462,9 @@ def _emit_bundle_dir(program: ast.Program, bundle_dir: Path,
   e_src = emitter.EGRESS_TRACKER_SOURCE
   if e_src in files:
     e_obj = e_src.replace(".bpf.c", ".bpf.o")
-    try:
-      result = bpf_runner.compile_c(files[e_src], work_dir=bundle_dir)
-      result.obj_path.replace(bundle_dir / e_obj)
-      e_compiled = True
-    except (bpf_runner.BpfUnavailable, subprocess.CalledProcessError):
-      e_compiled = False
+    # Built with the bundle's ISA, whatever the zone objects settled
+    # on: one bundle, one kernel floor.
+    e_compiled = _compile_one(files[e_src], bundle_dir, e_obj, isa)
     egress_meta = {
       "source": e_src,
       "object": e_obj if e_compiled else None,
@@ -403,6 +473,14 @@ def _emit_bundle_dir(program: ast.Program, bundle_dir: Path,
 
   manifest = {
     "version": "0.4",
+    # The BPF ISA these objects were assembled for, and the kernel that
+    # implies. `null` is clang's default and loads anywhere; "v4" needs
+    # 6.6 for `gotol`, and on an older kernel the verifier rejects the
+    # opcode with a message that names an instruction rather than a
+    # cause. fd compares this against `uname -r` before the load, so an
+    # operator gets a sentence instead.
+    "bpf_isa": isa or None,
+    "min_kernel": min_kernel,
     # Declared zones AND the implicit zone of a simple `@xdp(eth0)`
     # unit. The daemon derives every interface it attaches to from
     # this array; a program entry naming a zone the array does not
@@ -459,11 +537,27 @@ def _emit_bundle_dir(program: ast.Program, bundle_dir: Path,
     f"wrote bundle: {built}/{total} zone program(s) compiled to "
     f"{bundle_dir}"
   )
+  if min_kernel:
+    click.echo(
+      f"note: built for BPF ISA {isa}, which needs kernel "
+      f"{min_kernel} or newer. A zone in this policy is too large to "
+      f"assemble with clang's default 16-bit branch offsets. `fd` "
+      f"refuses the bundle on an older kernel rather than letting the "
+      f"verifier reject an opcode it has never seen."
+    )
+  # What the rule count will cost, before it is paid. The compiler
+  # knows the number and the operator has no other way to find out
+  # short of measuring the box.
+  for zp in program.programs:
+    advice = splitter.advisory(zp)
+    if advice:
+      click.echo(f"note: zone {zp.zone_name!r}: {advice}", err=True)
   if built < total:
     missing = [p["zone"] for p in programs_meta if p["object"] is None]
     click.echo(
       f"warning: no compiled object for zone(s) "
-      f"{', '.join(missing)} — clang/bpftool unavailable. This "
+      f"{', '.join(missing)} — clang is unavailable, or refused the "
+      f"generated C even with the widest instruction set. This "
       f"bundle cannot be loaded; `fd` will refuse it.",
       err=True,
     )

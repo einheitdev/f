@@ -702,5 +702,122 @@ TEST_F(BpfLoaderResolverTest, ReconcileOnAnAbsentPinRootIsQuiet) {
   EXPECT_EQ(report.conntrack_swept, 0u);
 }
 
+
+// --- the kernel a bundle needs --------------------------------------
+//
+// `fwl compile` builds for clang's default BPF ISA, which loads
+// anywhere. A zone too large to assemble inside LLVM's signed 16-bit
+// branch offset is built with `-mcpu=v4` instead, whose `gotol` the
+// kernel gained in 6.6, and the manifest records the floor. Without
+// this check the failure on an older box is a verifier rejection
+// naming an opcode -- true, useless, and indistinguishable from a
+// policy the verifier disliked on its merits.
+
+TEST(KernelAtLeastTest, ComparesTheNumericPartsInOrder) {
+  EXPECT_TRUE(KernelAtLeast("6.6.0", "6.6"));
+  EXPECT_TRUE(KernelAtLeast("6.18.43", "6.6"));
+  EXPECT_TRUE(KernelAtLeast("7.0.0", "6.6"));
+  EXPECT_FALSE(KernelAtLeast("6.1.0", "6.6"));
+  EXPECT_FALSE(KernelAtLeast("5.15.0", "6.6"));
+  // 6.18 is not 6.1.8: the parts are numbers, not text.
+  EXPECT_TRUE(KernelAtLeast("6.18.0", "6.9"));
+}
+
+TEST(KernelAtLeastTest, VendorSuffixesAreNotPartOfTheVersion) {
+  // The rig runs 6.18.43-current-rockchip64 and the appliance images
+  // carry Debian's own decorations. None of it is a version component.
+  EXPECT_TRUE(KernelAtLeast("6.18.43-current-rockchip64", "6.6"));
+  EXPECT_TRUE(KernelAtLeast("6.12.94+deb13-amd64", "6.6"));
+  EXPECT_FALSE(KernelAtLeast("6.1.0-21-arm64", "6.6"));
+}
+
+TEST(KernelAtLeastTest, WhatItCannotReadIsNotARefusal) {
+  // Lenient on purpose. Refusing the operator's policy over a version
+  // string this function could not parse would turn a cosmetic problem
+  // into an outage, and the check exists to improve a message rather
+  // than to be a gate.
+  EXPECT_TRUE(KernelAtLeast("", "6.6"));
+  EXPECT_TRUE(KernelAtLeast("something-with-no-digits", "6.6"));
+  EXPECT_TRUE(KernelAtLeast("6.6.0", ""));
+}
+
+TEST(KernelAtLeastTest, TheRunningReleaseIsReadable) {
+  auto release = RunningKernelRelease();
+  EXPECT_FALSE(release.empty());
+  // Whatever this box runs, it is at least the version that gained the
+  // BPF features this project has depended on since v0.1.
+  EXPECT_TRUE(KernelAtLeast(release, "5.10"));
+}
+
+class BundleKernelFloorTest : public BpfLoaderResolverTest {
+ protected:
+  void WriteManifest(const std::string& floor) {
+    std::ofstream(scratch_ / "manifest.json")
+        << R"({"version":"0.4","bpf_isa":"v4","min_kernel":")" << floor
+        << R"(",)"
+           R"("zones":[{"name":"wan","interfaces":["lo"]}],)"
+           R"("programs":[{"zone":"wan","source":"wan.bpf.c",)"
+           R"("object":"wan.bpf.o"}]})";
+  }
+};
+
+TEST_F(BundleKernelFloorTest, ABundleFromTheFutureIsRefusedWithASentence) {
+  WriteManifest("99.0");
+  Touch(scratch_ / "wan.bpf.o");
+  auto res = LoadZoneBundle(scratch_.string(),
+                               (scratch_ / "pins").string());
+  ASSERT_FALSE(res.has_value());
+  const auto& m = res.error().message;
+  // Everything the operator needs to act, in the one line he gets.
+  EXPECT_NE(m.find("99.0"), std::string::npos) << m;
+  EXPECT_NE(m.find("v4"), std::string::npos) << m;
+  EXPECT_NE(m.find(RunningKernelRelease()), std::string::npos) << m;
+  EXPECT_NE(m.find("Recompile"), std::string::npos) << m;
+  // ...and it happened before anything was opened, which is why the
+  // scratch pin root was never created.
+  EXPECT_FALSE(fs::exists(scratch_ / "pins"));
+}
+
+TEST_F(BundleKernelFloorTest, APresentButNullFloorIsNotAFloor) {
+  // The shape `fwl compile` writes for every bundle built with the
+  // default instruction set, which is nearly all of them.
+  //
+  // This is a regression test with a body count. The check first read
+  // the key with nlohmann's `value()`, which THROWS on a
+  // present-but-null key instead of returning the default -- so fd
+  // died by std::terminate out of the middle of a load: no error
+  // return, no journal line, and to the anti-lockout guard
+  // indistinguishable from a board that had stopped being scheduled.
+  // Two starts of a perfectly good bundle and it would have been
+  // quarantined. tests/system/test_bundle_lockout.py caught it on the
+  // first run after the check was added.
+  std::ofstream(scratch_ / "manifest.json")
+      << R"({"version":"0.4","bpf_isa":null,"min_kernel":null,)"
+         R"("zones":[{"name":"wan","interfaces":["lo"]}],)"
+         R"("programs":[{"zone":"wan","source":"wan.bpf.c",)"
+         R"("object":"wan.bpf.o"}]})";
+  Touch(scratch_ / "wan.bpf.o");
+  auto res = LoadZoneBundle(scratch_.string(),
+                            (scratch_ / "pins").string());
+  ASSERT_FALSE(res.has_value());
+  EXPECT_EQ(res.error().message.find("needs kernel"), std::string::npos)
+      << res.error().message;
+}
+
+TEST_F(BundleKernelFloorTest, ABundleWithNoFloorIsNotChecked) {
+  // Every bundle compiled before this field existed. It must get past
+  // this check and fail, if it fails at all, for its own reasons.
+  std::ofstream(scratch_ / "manifest.json")
+      << R"({"version":"0.4",)"
+         R"("zones":[{"name":"wan","interfaces":["lo"]}],)"
+         R"("programs":[{"zone":"wan","source":"wan.bpf.c",)"
+         R"("object":"wan.bpf.o"}]})";
+  Touch(scratch_ / "wan.bpf.o");
+  auto res = LoadZoneBundle(scratch_.string(),
+                               (scratch_ / "pins").string());
+  ASSERT_FALSE(res.has_value());
+  EXPECT_EQ(res.error().message.find("needs kernel"), std::string::npos)
+      << res.error().message;
+}
 }  // namespace
 }  // namespace f

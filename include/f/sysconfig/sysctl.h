@@ -1,7 +1,13 @@
 /// @file sysctl.h
 /// @brief Kernel settings the appliance's own shape implies.
 ///
-/// One artifact, one setting, and it is not a detail: `net.ipv4.ip_forward`.
+/// One artifact, two settings, and they are the two facts about a box
+/// that has stopped doing its job: whether it forwards while it is not
+/// filtering, and whether anyone can get it back.
+///
+/// `kernel.sysrq` is the second. See the note above `PlanSysctlValues`
+/// for the deadlock that put it here and for why the value is a subset
+/// rather than 1.
 ///
 /// A frame that a policy sends from one zone to another leaves this box
 /// addressed to a next hop, which means this box routes. Linux refuses

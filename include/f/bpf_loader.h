@@ -179,6 +179,26 @@ struct ZoneBundleHandles {
   PolicySource policy_source;
 };
 
+/// The running kernel's release string, or empty when it cannot be read.
+auto RunningKernelRelease() -> std::string;
+
+/// True when `release` is at least `floor`, comparing numeric parts.
+///
+/// Used against the manifest's `min_kernel`, which a bundle carries
+/// when a zone was too large to assemble with clang's default 16-bit
+/// branch offsets and had to be built for BPF ISA v4 -- whose `gotol`
+/// the kernel gained in 6.6.
+///
+/// Deliberately lenient about what it cannot read. A release string it
+/// cannot parse -- an empty one, a vendor string with no digits --
+/// answers TRUE, because refusing to load the operator's policy over a
+/// version number this function could not understand would turn a
+/// cosmetic problem into an outage. The check exists to replace an
+/// unreadable verifier message ("unknown opcode") with a sentence, not
+/// to be a gate.
+auto KernelAtLeast(const std::string& release, const std::string& floor)
+    -> bool;
+
 /// Load every zone program in a `fwl compile --bundle` directory.
 ///
 /// Reads `<bundle_dir>/manifest.json` (zones, per-zone `<zone>.bpf.o`,

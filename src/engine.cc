@@ -554,18 +554,66 @@ auto EngineInit(Engine& e,
   // the operator has. Refusing here is the same rule the zero-attach
   // check applies one level down — the daemon does not come up unless
   // the configured policy is in the packet path.
-  std::string current_dir;
-  if (!bundle_dir.empty()) {
-    current_dir =
-        (std::filesystem::path(bundle_dir) / "current").string();
-  }
-  if (current_dir.empty()) {
+  if (bundle_dir.empty()) {
     return MakeError(EngineError::kInvalidConfig,
         "no bundle directory configured: fd loads its policy from "
         "<bundle-dir>/current and has nothing else to load. Set "
         "--bundle-dir (default /usr/share/f/compiled).");
   }
+
+  // The anti-lockout guard, and it runs BEFORE anything opens the
+  // bundle. `fd.service` restarts on failure, reads whatever `current`
+  // points at, and is ordered ahead of sshd, so a bundle that takes
+  // the board down while loading takes it down on every boot with
+  // nobody able to reach it. The guard's job is to make the second
+  // attempt the last one — see bundle_guard.h for why the evidence has
+  // to be written to disk before the load rather than reported after
+  // it.
+  e.guard.bundle_dir = std::string(bundle_dir);
+  auto guard = BundleGuardBegin(e.guard);
+  e.guard_status.current = CurrentVersion(e.guard.bundle_dir);
+  e.guard_status.last_known_good = LastKnownGood(e.guard.bundle_dir);
+  e.guard_status.record = guard.record;
+  e.guard_status.reason = guard.reason;
+  e.guard_status.degraded =
+      guard.verdict != GuardVerdict::kProceed || !guard.reason.empty();
+  if (guard.verdict == GuardVerdict::kRefuse) {
+    spdlog::critical("bundle guard: {}", guard.reason);
+    return MakeError(EngineError::kBpfLoadFailed, guard.reason);
+  }
+  if (guard.verdict == GuardVerdict::kFallback) {
+    // Loud, and repeated in `fctl status` for as long as it holds. A
+    // fallback the operator cannot see is a box quietly enforcing a
+    // policy nobody asked for, which is its own kind of silent
+    // failure.
+    spdlog::critical("bundle guard: {}", guard.reason);
+    // Move `current` too. The attempt record is what is holding the
+    // trap shut, and a record can be lost — a wiped /usr/share, a
+    // restored image, an operator tidying up. Leaving `current`
+    // pointing at the bundle that took the box down means the trap is
+    // one deleted file away from being armed again.
+    auto moved = PointCurrentAt(e.guard.bundle_dir, guard.version);
+    if (!moved) {
+      spdlog::error(
+          "bundle guard: could not repoint current at '{}' ({}). The "
+          "fallback is loaded, but `current` still names the bundle "
+          "that failed.",
+          guard.version, moved.error());
+    } else {
+      spdlog::warn("bundle guard: {}/current now points at '{}'.",
+                   e.guard.bundle_dir, guard.version);
+    }
+    e.guard_status.current = guard.version;
+  } else if (!guard.reason.empty()) {
+    spdlog::warn("bundle guard: {}", guard.reason);
+  }
+  const std::string guard_version = guard.version;
+  std::string current_dir = guard.load_dir;
+  e.guard_status.running = guard_version;
   if (!IsMultiZoneBundle(current_dir)) {
+    BundleGuardNoteFailure(
+        e.guard, guard_version,
+        std::format("{} is not a compiled bundle", current_dir));
     return MakeError(EngineError::kBpfLoadFailed,
         std::format(
             "{} is not a compiled bundle: no manifest.json, or one "
@@ -611,6 +659,14 @@ auto EngineInit(Engine& e,
     }
     auto zb = LoadZoneBundle(current_dir, e.pin_path);
     if (!zb) {
+      // Record WHY, so the operator who reads the attempt record after
+      // two failed boots gets the loader's sentence rather than only a
+      // count. The count itself was already written before the load —
+      // this call is the luxury case, where the daemon survived long
+      // enough to explain itself.
+      BundleGuardNoteFailure(
+          e.guard, guard_version,
+          std::format("LoadZoneBundle: {}", zb.error().message));
       return MakeError(EngineError::kBpfLoadFailed,
           std::format("LoadZoneBundle: {}", zb.error().message));
     }
@@ -661,6 +717,31 @@ auto EngineInit(Engine& e,
     spdlog::info("Multi-zone bundle loaded: {} zone program(s), "
                  "attached to {} interface(s).",
                  e.zone_bundle.programs.size(), e.ifaces.count);
+    // The datapath is up, so this bundle has now been OBSERVED to
+    // work on this box — which is the only evidence the guard trusts,
+    // and the reason the commit is here rather than after a successful
+    // open or a successful attach of the first program. A daemon that
+    // is merely still running was the state that produced every
+    // silent failure in this file's history.
+    if (e.ifaces.count > 0 && !guard_version.empty()) {
+      auto committed = BundleGuardCommit(e.guard, guard_version);
+      if (!committed) {
+        spdlog::warn(
+            "bundle guard: datapath is up on '{}' but the "
+            "last-known-good marker could not be written ({}). A "
+            "future bad bundle will have nothing to fall back to.",
+            guard_version, committed.error());
+      } else {
+        e.guard_status.last_known_good = guard_version;
+        spdlog::info(
+            "bundle guard: '{}' is attached and is now the "
+            "last-known-good.", guard_version);
+      }
+    } else if (e.ifaces.count == 0) {
+      BundleGuardNoteFailure(
+          e.guard, guard_version,
+          "the bundle loaded but attached to no interface");
+    }
     // After the interface list, never before it: the list is what
     // bounds the interfaces this daemon may ask the kernel to ARP on.
     AttachNeighMgr(e);
@@ -958,6 +1039,38 @@ auto GetFullState(const Engine& e) -> nlohmann::json {
   // — a box that filters perfectly and cannot resolve a name, with
   // every counter climbing and nothing anywhere saying why (l12_01).
   j["egress"] = e.egress.GetState();
+  // Which bundle is actually in the packet path, and whether it is the
+  // one `current` named when this daemon started. A box that fell back
+  // to its last-known-good is filtering, forwarding and green on every
+  // other field here — the only thing that distinguishes it from a box
+  // running the operator's policy is this section, so it is never
+  // omitted and `degraded` is never inferred from an absence.
+  {
+    json b;
+    b["current"] = e.guard_status.current;
+    b["last_known_good"] = e.guard_status.last_known_good;
+    b["running"] = e.guard_status.running;
+    b["degraded"] = e.guard_status.degraded;
+    b["reason"] = e.guard_status.reason;
+    b["failure_policy"] = GuardPolicyName(e.guard.policy);
+    b["max_attempts"] = e.guard.max_attempts;
+    // Read live rather than cached: an operator who has staged a new
+    // bundle wants to see the attempt record as it is now, not as it
+    // was when this process started.
+    auto record = ReadAttemptRecord(e.guard);
+    if (record.present) {
+      b["pending_attempt"] = {
+          {"version", record.version},
+          {"attempts", record.attempts},
+          {"first_s", record.first_s},
+          {"last_s", record.last_s},
+          {"last_error", record.last_error},
+      };
+    } else {
+      b["pending_attempt"] = nullptr;
+    }
+    j["bundle"] = b;
+  }
 
   return j;
 }

@@ -99,8 +99,25 @@ class CompileResult:
       self.owned_dir = None
 
 
-def compile_c(c_source: str, work_dir: Path | None = None) -> CompileResult:
+# BPF ISA v4 added `gotol`, a 32-bit unconditional jump, which is what
+# removes LLVM's signed 16-bit branch range. The kernel gained the
+# instruction in 6.6, so an object built this way will not load on
+# anything older -- the bundle records the floor and `fd` checks it.
+BPF_ISA_MIN_KERNEL = {"v4": "6.6"}
+
+
+def compile_c(c_source: str, work_dir: Path | None = None,
+              cpu: str | None = None) -> CompileResult:
   """Compile BPF C to a relocatable object via clang.
+
+  `cpu` is passed straight to `-mcpu=`. None means clang's default,
+  which is the widest kernel compatibility and a signed 16-bit branch
+  offset; "v4" buys a 32-bit jump at the price of needing kernel 6.6.
+  `fwl compile --bundle` asks for it only after clang has refused the
+  default with `Branch target out of insn range`, never from an
+  estimate: a Tier 2 body of 1,200 branches estimates at 29,000
+  instructions and assembles to 161, so an estimate would stamp a
+  kernel floor onto bundles that load anywhere.
 
   This runs in any environment with clang installed (no kernel
   privileges required), so it acts as a partial verification oracle
@@ -135,6 +152,10 @@ def compile_c(c_source: str, work_dir: Path | None = None) -> CompileResult:
     "-O2",
     "-g",
     "-target", "bpf",
+  ]
+  if cpu:
+    cmd.append(f"-mcpu={cpu}")
+  cmd += [
     "-c", str(src_path),
     "-o", str(obj_path),
   ]
@@ -155,14 +176,14 @@ def compile_c(c_source: str, work_dir: Path | None = None) -> CompileResult:
   )
 
 
-def check_compiles(c_source: str) -> None:
+def check_compiles(c_source: str, cpu: str | None = None) -> None:
   """Compile `c_source` and discard the object.
 
   For callers that use clang purely as an oracle — the object is never
   loaded, only the absence of an exception matters. Raises the same
   exceptions as `compile_c`.
   """
-  with compile_c(c_source):
+  with compile_c(c_source, cpu=cpu):
     pass
 
 

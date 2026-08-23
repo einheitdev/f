@@ -71,6 +71,13 @@ auto PointCurrentAt(const TempDir& dir, const std::string& name)
                                             ec);
 }
 
+auto PointLkgAt(const TempDir& dir, const std::string& name) -> void {
+  std::error_code ec;
+  std::filesystem::remove(dir.Sub("last-known-good"), ec);
+  std::filesystem::create_directory_symlink(
+      name, dir.Sub("last-known-good"), ec);
+}
+
 auto Exists(const TempDir& dir, const std::string& name) -> bool {
   std::error_code ec;
   return std::filesystem::exists(dir.Sub(name), ec);
@@ -131,6 +138,43 @@ TEST(RetentionTest, TheRunningPolicyIsNeverPruned) {
   EXPECT_TRUE(Exists(dir, "current"));
   EXPECT_TRUE(Exists(dir, "202608140010"));
   EXPECT_FALSE(Exists(dir, "202608140005"));
+}
+
+// The second bundle that must never be removed is the one the box
+// falls back to when `current` will not load. Retention ran on a
+// timestamp order that knew nothing about it, so the anti-lockout
+// fallback would have been deleted as housekeeping — weeks before the
+// boot that needed it, and silently.
+TEST(RetentionTest, TheLastKnownGoodIsNeverPruned) {
+  TempDir dir;
+  for (int i = 1; i <= 10; ++i) {
+    MakeBundle(dir, std::format("2026081400{:02d}", i), 50);
+  }
+  PointCurrentAt(dir, "202608140010");
+  // The fallback is old, because a fallback that has survived many
+  // recompiles is exactly the one worth keeping.
+  PointLkgAt(dir, "202608140002");
+
+  RetentionPolicy policy;
+  policy.compiled_dir = dir.Path();
+  policy.keep = 3;
+
+  auto plan = PlanRetention(policy);
+  for (const auto& b : plan.to_remove) {
+    EXPECT_NE(b.name, "202608140002");
+    EXPECT_NE(b.name, "202608140010");
+  }
+  bool marked = false;
+  for (const auto& b : plan.bundles) {
+    if (b.name == "202608140002") marked = b.is_last_known_good;
+  }
+  EXPECT_TRUE(marked);
+  ASSERT_TRUE(PruneBundles(policy).has_value());
+  EXPECT_TRUE(Exists(dir, "202608140002"));
+  EXPECT_TRUE(Exists(dir, "202608140010"));
+  // ...and the retention count still applies to everything else, so
+  // pinning the fallback does not quietly disable the bound.
+  EXPECT_FALSE(Exists(dir, "202608140004"));
 }
 
 TEST(RetentionTest, FewerBundlesThanTheLimitRemovesNothing) {

@@ -82,7 +82,7 @@ Untuned, this box forwards 955,429 pps. Tuned, 3,230,294. Every one of these was
 ### Before quoting any of this
 
 - **Always state the frame size.** 10 GbE is 14,880,952 pps at 64 bytes and 812,743 at 1518. The same box does 26% of line at one and 98% at the other, and a number without its frame size is not a measurement.
-- **Written as rules, a policy costs dearly; written as data, it costs nothing.** 1,000 rules drops forwarding to 994,638 pps and the ceiling is 2,048 rules, because rules compile to a code chain cut into 64-rule stages with a tail call between each. The same policy as one lookup against a **50,000-entry** trie runs at 99% of line in 227 instructions. Both measured: `f.planning/rig-evidence/ACL_SCALING_2026-08-23.md`.
+- **Written as rules, a policy costs dearly; written as data, it costs nothing.** 1,000 rules drops forwarding to 994,638 pps and 2,000 to 385,826, because every packet walks the whole chain at about a nanosecond a rule. The ceiling is **8,192 rules** — the verifier's jump-sequence limit, past which no arrangement of the policy loads — and the compiler warns above 2,048 that the throughput is what it is. The same policy as one lookup against a **50,000-entry** trie runs at 99% of line in 227 instructions. Both measured: `f.planning/rig-evidence/ACL_SCALING_2026-08-23.md`.
 
 Harness and full results, including how two earlier conclusions here turned out to be artifacts: `tests/system/hw/l13_02_rfc2544_throughput.py` and `f.planning/rig-evidence/RFC2544_10G_2026-08-23.md`.
 
