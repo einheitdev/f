@@ -98,6 +98,81 @@ TEST_F(GeoipParseTest, ParsesV4AndV6Prefixes) {
   EXPECT_EQ(v6[0].addr[3], 0xb8);
 }
 
+// TABLES.md phase 1 emits a named table's prefixes into this same
+// `tries` array, under the table's `fwl_tbl_<id>` map name. The claim
+// that phase 1 needs no daemon change is exactly the claim that THIS
+// function, unmodified, reads that payload -- so it is tested here
+// rather than asserted in a commit message.
+//
+// The JSON below is `fwl compile --bundle` output copied verbatim.
+// fwl/tests/unit/test_tables.py::TestTheDaemonReadsWhatTheCompiler
+// Writes holds the other end, so a drift on either side goes red.
+TEST_F(GeoipParseTest, ReadsATablePayloadTheCompilerEmitted) {
+  WriteGeoip(R"({
+  "tries": [
+    {
+      "map": "fwl_tbl_0",
+      "family": "ipv4",
+      "prefixes": [
+        "10.99.77.0/24",
+        "192.0.2.0/25"
+      ]
+    },
+    {
+      "map": "fwl_tbl_1",
+      "family": "ipv6",
+      "prefixes": [
+        "2001:db8::/32"
+      ]
+    }
+  ]
+})");
+  auto tries = ParseGeoipFile(scratch_.string());
+  ASSERT_TRUE(tries.has_value());
+  ASSERT_EQ(tries->size(), 2u);
+
+  // PopulateGeoipTrie looks the map up by this name in each loaded
+  // zone object and fills whatever LPM trie it finds. It neither
+  // knows nor cares that these prefixes came from a `table`
+  // declaration rather than from a country code.
+  const auto& v4 = tries->at("fwl_tbl_0");
+  ASSERT_EQ(v4.size(), 2u);
+  EXPECT_FALSE(v4[0].v6);
+  EXPECT_EQ(v4[0].prefixlen, 24u);
+  EXPECT_EQ(v4[0].addr[0], 10);
+  EXPECT_EQ(v4[0].addr[1], 99);
+  EXPECT_EQ(v4[0].addr[2], 77);
+  EXPECT_EQ(v4[0].addr[3], 0);
+  EXPECT_EQ(v4[1].prefixlen, 25u);
+
+  const auto& v6 = tries->at("fwl_tbl_1");
+  ASSERT_EQ(v6.size(), 1u);
+  EXPECT_TRUE(v6[0].v6);
+  EXPECT_EQ(v6[0].prefixlen, 32u);
+  EXPECT_EQ(v6[0].addr[0], 0x20);
+  EXPECT_EQ(v6[0].addr[1], 0x01);
+  EXPECT_EQ(v6[0].addr[2], 0x0d);
+  EXPECT_EQ(v6[0].addr[3], 0xb8);
+}
+
+// A bundle whose policy mixes a geoip() call with a named table puts
+// both tries in one array, and the loader must fill both: they are the
+// same map type under different names, and dropping either would leave
+// a rule matching against an empty trie.
+TEST_F(GeoipParseTest, ReadsAGeoipTrieAndATableTrieTogether) {
+  WriteGeoip(R"({"tries": [
+    {"map": "fwl_geoip_eth0_0", "family": "ipv4",
+     "prefixes": ["10.9.0.0/16"]},
+    {"map": "fwl_tbl_0", "family": "ipv4",
+     "prefixes": ["10.99.77.0/24"]}
+  ]})");
+  auto tries = ParseGeoipFile(scratch_.string());
+  ASSERT_TRUE(tries.has_value());
+  ASSERT_EQ(tries->size(), 2u);
+  EXPECT_EQ(tries->at("fwl_geoip_eth0_0").size(), 1u);
+  EXPECT_EQ(tries->at("fwl_tbl_0").size(), 1u);
+}
+
 TEST_F(GeoipParseTest, MalformedJsonIsAnError) {
   WriteGeoip("{not json");
   auto tries = ParseGeoipFile(scratch_.string());
