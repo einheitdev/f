@@ -16,6 +16,7 @@ import dataclasses
 import enum
 import re
 
+from . import analyzer
 from . import ast
 from . import log_abi
 from . import splitter
@@ -95,6 +96,28 @@ class MapLifetime(enum.Enum):
     are what `fd` may adopt across a policy change or a process
     restart, and dropping them drops established connections.
 
+  EXTERNAL — contents authored outside this compilation, key space
+    declared by the policy. A `table` is neither of the two above and
+    calling it either would be a lie in the registry that the registry
+    exists to prevent: its prefixes come from a file `fd` reads, not
+    from the compiler's analysis (so not POLICY), and its key space is
+    a `table` declaration rather than a wire fact like a 5-tuple (so
+    not FLOW). A policy edit does not invalidate a blocklist, and a
+    table erased by every policy edit is not a table — so these are
+    adopted across a reload, alongside the FLOW rows, whenever the
+    incoming bundle declares the same shape.
+
+    What makes that adoption safe without a name registry is that the
+    contents are disk-authoritative and reconciled at EVERY load: `fd`
+    diffs the map against the source file, so whatever it adopted
+    holds exactly the file's prefixes by the time the datapath is
+    armed. An id that shifted between compilations can therefore
+    re-use a map object, but it cannot carry one table's entries into
+    another's — the diff overwrites the difference. That stops being
+    true the moment an entry can exist that is not in the file, which
+    is why TABLES.md puts the allocated-id registry with the runtime
+    write path rather than here.
+
   There is no default, for the same reason MapScope has none: a map
   whose lifetime nobody declared would be adopted by whatever the
   daemon's fallback happens to be, and being wrong that way is silent.
@@ -104,6 +127,7 @@ class MapLifetime(enum.Enum):
   """
   POLICY = "policy"
   FLOW = "flow"
+  EXTERNAL = "external"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -384,17 +408,17 @@ _MAP_KINDS: tuple[_MapKind, ...] = (
     "zones' counter maps as one truncated `fwl_counters_in` -- and "
     "the manifest carries the id -> name mapping so the daemon reads "
     "it instead of re-deriving it",
-    lifetime=MapLifetime.POLICY,
+    lifetime=MapLifetime.EXTERNAL,
     lifetime_why=(
-      "phase 1 resolves a table's contents at compile time, so the "
-      "prefixes in a pin are the previous BUNDLE's prefixes and the "
-      "incoming bundle carries its own. Repopulating from the bundle "
-      "at every load is what makes that correct, and it is the same "
-      "ground the geoip trie sits on. This row is the one that moves "
-      "when contents stop coming from the compilation: TABLES.md's "
-      "MapLifetime.EXTERNAL is exactly 'authored outside this "
-      "compilation, key space declared by the policy', and a table "
-      "erased by every policy edit is not a table"
+      "the contents are a file on the appliance, not an output of "
+      "this compilation: the compiler never opens the feed and the "
+      "bundle never carries a prefix. A policy edit says nothing "
+      "about whether an address is still hostile, so discarding the "
+      "trie because the rules changed would throw away state this "
+      "compilation neither produced nor invalidated — and a table "
+      "erased by every policy edit is not a table. `fd` reconciles "
+      "it against `source` at every load by diff, so an adopted trie "
+      "holds exactly the file's prefixes before the datapath is armed"
     ),
   ),
   _MapKind(
@@ -434,7 +458,9 @@ def _map_kind(base_name: str) -> _MapKind | None:
 _LITERAL_NAME_RE = re.compile(r"\w+")
 
 
-def persistent_map_names() -> tuple[str, ...]:
+def persistent_map_names(
+  program: "ast.Program | None" = None,
+) -> tuple[str, ...]:
   """The pinned map names whose contents survive a policy change.
 
   Written into every bundle's manifest as `persistent_maps`. `fd`
@@ -450,9 +476,27 @@ def persistent_map_names() -> tuple[str, ...]:
   keyed by something a policy does not define in the first place. A row
   that breaks either rule is a contradiction in the registry, not a
   compile error in the user's policy, so it raises here.
+
+  EXTERNAL rows are the one case with a numbered name, and they are
+  resolved rather than exempted: a `table`'s map is `fwl_tbl_<id>`, so
+  the concrete names come from `program`'s declarations and go into
+  the manifest literally, exactly as the FLOW names do. `fd` still
+  compares a string against a string and re-derives nothing. Called
+  without a `program` — the shape older callers and the lifetime
+  suite use — the list is the FLOW rows alone, which is correct for a
+  unit that declares no tables.
   """
   names: list[str] = []
   for kind in _MAP_KINDS:
+    if kind.lifetime is MapLifetime.EXTERNAL:
+      if kind.scope is not MapScope.SHARED:
+        raise _codegen_error(
+          f"map '{kind.base}' is MapLifetime.EXTERNAL but "
+          f"MapScope.PRIVATE. Contents authored outside the "
+          f"compilation are the same set for every zone that reads "
+          f"them; a per-zone copy would be N copies of one feed."
+        )
+      continue
     if kind.lifetime is not MapLifetime.FLOW:
       continue
     if not _LITERAL_NAME_RE.fullmatch(kind.base):
@@ -471,7 +515,30 @@ def persistent_map_names() -> tuple[str, ...]:
         f"safe to share across zones; a per-zone map cannot qualify."
       )
     names.append(kind.base)
+  if program is not None:
+    for name in sorted(table_map_names(program)):
+      names.append(name)
   return tuple(names)
+
+
+def table_map_names(program: "ast.Program") -> list[str]:
+  """The `fwl_tbl_<id>` name of every table this unit REFERENCES.
+
+  Declared-but-unmatched tables are left out on purpose: no lookup
+  needs them, so the emitter declares no map for them, and a manifest
+  naming a map no object contains would have `fd` looking for a pin
+  that cannot exist.
+  """
+  ids = analyzer.table_map_id(program)
+  names = MapNames()
+  out: list[str] = []
+  seen: set[str] = set()
+  for ref in analyzer.table_refs(program):
+    name = names.table(ids[ref.resolved])
+    if name not in seen:
+      seen.add(name)
+      out.append(name)
+  return out
 
 
 def _codegen_error(message: str) -> FwlException:

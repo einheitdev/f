@@ -193,13 +193,6 @@ def compile(source: Path, output: Path | None, bundle_dir: Path | None,
     except FwlException as exc:
       click.echo(exc.error.format(), err=True)
       sys.exit(1)
-    except TableResolutionError as exc:
-      # A table whose contents cannot be resolved is a compile error
-      # for the same reason an undeclared one is: the alternative is a
-      # map that loads empty, and a rule that never matches is a hole
-      # nothing on the running box reports.
-      click.echo(f"error: {exc}", err=True)
-      sys.exit(1)
     return
 
   # A multi-zone unit has more than one program; a single C file cannot
@@ -294,23 +287,13 @@ def _build_geoip_bundle_file(
   return {"tries": [tries[k] for k in sorted(tries)]}
 
 
-class TableResolutionError(Exception):
-  """A `table` declaration whose contents could not be resolved.
-
-  Carries the sentence an operator reads. Raised rather than exited on
-  so that `_emit_bundle_dir`'s caller reports it through the same path
-  as every other compile error, and so the resolution is testable
-  without catching SystemExit.
-  """
-
-
 def _referenced_tables(program: ast.Program) -> list[ast.TableDecl]:
   """The declared tables some rule in this unit actually matches against.
 
   A table nobody references emits no map (the emitter declares only
-  what a lookup needs), so resolving its source would read a file for
-  a trie that does not exist. The analyzer already warns about the
-  declaration; this is the other half of the same decision.
+  what a lookup needs), so the manifest must not promise the daemon a
+  trie to fill. The analyzer already warns about the declaration; this
+  is the other half of the same decision.
   """
   by_name = {t.name: t for t in program.tables}
   out: list[ast.TableDecl] = []
@@ -323,142 +306,41 @@ def _referenced_tables(program: ast.Program) -> list[ast.TableDecl]:
   return out
 
 
-def _read_table_source(
-  decl: ast.TableDecl, base_dir: Path
-) -> list[str]:
-  """Read a table's source file into a list of prefix strings.
+def _manifest_tables(program: ast.Program) -> dict:
+  """The manifest's `tables` block: the declaration, and not the data.
 
-  One entry per line; `#` starts a comment; blank lines are ignored.
-  That is the shape a threat feed or a list under configuration
-  management already has, so a file can be used without a conversion
-  step that would be one more thing to get wrong.
+  TABLES.md is disk-authoritative: `source` names a path on the
+  APPLIANCE, and the file is read at load by `fd`. So the compiler
+  never opens it and the bundle never carries a prefix — what ships is
+  the declaration the daemon needs in order to go and read it: the
+  full name, the id its kernel map is named for, the key width, the
+  capacity the map was created with, and the path.
 
-  A relative `source` resolves against the directory holding the
-  policy file, so a policy and its feed travel together and a compile
-  does not depend on the working directory it was started from.
-  """
-  path = Path(decl.source)
-  if not path.is_absolute():
-    path = base_dir / path
-  if not path.is_file():
-    raise TableResolutionError(
-      f"{decl.span.line}:{decl.span.column}: table '{decl.name}' "
-      f"reads its contents from '{decl.source}', which does not "
-      f"exist (looked at {path}). A table that cannot be filled is a "
-      f"rule that never matches, so this is an error rather than an "
-      f"empty map."
-    )
-  entries: list[str] = []
-  for raw in path.read_text(encoding="utf-8").splitlines():
-    line = raw.split("#", 1)[0].strip()
-    if line:
-      entries.append(line)
-  return entries
-
-
-def _resolve_table_entries(
-  decl: ast.TableDecl, base_dir: Path
-) -> list[str]:
-  """A table's prefixes, validated against its `kind` and its `max`.
-
-  Every failure here is a compile error rather than a smaller table,
-  because every one of them is silent at runtime: a blocklist short of
-  the entries it was meant to hold forwards the traffic it was meant
-  to drop, and nothing about the running box says so.
-  """
-  import ipaddress
-  want_v4 = decl.kind == "cidr4"
-  raw = _read_table_source(decl, base_dir)
-  if not raw:
-    raise TableResolutionError(
-      f"{decl.span.line}:{decl.span.column}: table '{decl.name}' "
-      f"resolved to no entries from '{decl.source}'. An empty table "
-      f"never matches, which in a blocklist is an open firewall."
-    )
-  prefixes: list[str] = []
-  for lineno, item in enumerate(raw, 1):
-    try:
-      net = ipaddress.ip_network(item, strict=False)
-    except ValueError as exc:
-      raise TableResolutionError(
-        f"{decl.span.line}:{decl.span.column}: table "
-        f"'{decl.name}': '{decl.source}' line {lineno}: {exc}"
-      ) from None
-    is_v4 = isinstance(net, ipaddress.IPv4Network)
-    if is_v4 != want_v4:
-      raise TableResolutionError(
-        f"{decl.span.line}:{decl.span.column}: table "
-        f"'{decl.name}' is kind = {decl.kind}, but "
-        f"'{decl.source}' line {lineno} holds '{item}'"
-      )
-    prefixes.append(str(net))
-  # De-duplicate before the capacity check: the same prefix twice is
-  # one entry in an LPM trie, so counting it twice would refuse a file
-  # the map would have held.
-  unique = sorted(set(prefixes))
-  if len(unique) > decl.max_entries:
-    raise TableResolutionError(
-      f"{decl.span.line}:{decl.span.column}: table '{decl.name}' "
-      f"declares max = {decl.max_entries} but '{decl.source}' holds "
-      f"{len(unique)} distinct prefixes. Refused rather than "
-      f"truncated: a table quietly missing "
-      f"{len(unique) - decl.max_entries} of its entries fails open if "
-      f"it is a blocklist. Raise max, or shorten the file."
-    )
-  return unique
-
-
-def _build_table_bundle_tries(
-  program: ast.Program, base_dir: Path
-) -> list[dict]:
-  """Resolve every referenced table into a loader trie entry.
-
-  The payload rows are the same shape the geoip tries use — `map`,
-  `family`, `prefixes` — because the daemon's loader already fills any
-  named LPM trie from that shape and neither knows nor cares where the
-  prefixes came from. Emitting into it is what makes phase 1 need no
-  daemon change at all.
-  """
-  ids = analyzer.table_map_id(program)
-  tries: list[dict] = []
-  for decl in _referenced_tables(program):
-    tries.append({
-      "map": emitter.MapNames().table(ids[decl.name]),
-      "family": ast.TABLE_KIND_FAMILY[decl.kind],
-      "prefixes": _resolve_table_entries(decl, base_dir),
-    })
-  return tries
-
-
-def _manifest_tables(program: ast.Program, tries: list[dict]) -> dict:
-  """The manifest's `tables` block: full name -> what the kernel calls it.
-
-  TABLES.md: the writer names a table whatever reads well and never
-  types the id; the kernel is the only place with a limit. The mapping
-  ships with the bundle so `fd` reads it instead of re-deriving it
-  from the name -- a second implementation of the rule in another
-  language is how the same defect got in three times.
+  There is deliberately no entry count. The compiler does not know it
+  and cannot know it; a number here would be the build host's guess
+  about a file on another machine, and a stale guess about how much a
+  blocklist holds is worse than no answer. `table show` reports the
+  count from the live map, which is the only place it is true.
 
   Aliases are listed against the table they resolve to, so an operator
   reading a policy with a pasted block can answer "what is `badhosts`
   actually" without reading the whole file.
   """
   ids = analyzer.table_map_id(program)
-  by_map = {t["map"]: t for t in tries}
+  referenced = {t.name for t in _referenced_tables(program)}
   tables: dict[str, dict] = {}
   for decl in program.tables:
-    map_name = emitter.MapNames().table(ids[decl.name])
-    row = by_map.get(map_name)
     tables[decl.name] = {
       "id": ids[decl.name],
-      "map": map_name,
+      "map": emitter.MapNames().table(ids[decl.name]),
       "kind": decl.kind,
       "max": decl.max_entries,
       "source": decl.source,
-      # None, not 0, for a declared table nobody matches against: no
-      # map is emitted for it, so "how many entries does it hold" has
-      # no answer rather than the answer zero.
-      "entries": len(row["prefixes"]) if row is not None else None,
+      # Whether any rule reads it. `fd` fills only the tries that
+      # exist, and a declared-but-unmatched table has no map in any
+      # object — so this is the daemon's instruction not to go looking
+      # for a pin that was never created.
+      "referenced": decl.name in referenced,
     }
   aliases = {a.name: a.target for a in program.table_aliases}
   return {"tables": tables, "table_aliases": aliases}
@@ -521,26 +403,6 @@ def _emit_bundle_dir(program: ast.Program, bundle_dir: Path,
   from . import bpf_runner
 
   geoip_payload = _build_geoip_bundle_file(program, geoip_data)
-
-  # A relative `source =` resolves against the policy file's own
-  # directory, so a policy and the feed beside it travel together. With
-  # no policy file (a caller building a bundle straight from an AST)
-  # there is nothing to be relative to, so relative paths resolve
-  # against the working directory.
-  table_base = source.parent if source is not None else Path.cwd()
-  table_tries = _build_table_bundle_tries(program, table_base)
-  if table_tries:
-    # Into geoip.json's existing `tries` array rather than a file of
-    # its own: `ParseGeoipFile` returns {map_name: prefixes} and
-    # `PopulateGeoipTrie` fills any named LPM trie from it, knowing
-    # nothing about where the prefixes came from. Phase 1 therefore
-    # needs no daemon change, and the two mechanisms cannot drift
-    # apart in the loader.
-    if geoip_payload is None:
-      geoip_payload = {"tries": []}
-    geoip_payload["tries"] = sorted(
-      geoip_payload["tries"] + table_tries, key=lambda t: t["map"]
-    )
 
   bundle_dir.mkdir(parents=True, exist_ok=True)
   files = emitter.emit_bundle(program)
@@ -622,7 +484,7 @@ def _emit_bundle_dir(program: ast.Program, bundle_dir: Path,
     # under its pin root is left over from a previous compilation and
     # is removed before the load. Taken from _MAP_KINDS so the decision
     # lives in one place and reaches the daemon without being restated.
-    "persistent_maps": list(emitter.persistent_map_names()),
+    "persistent_maps": list(emitter.persistent_map_names(program)),
     # Present only when this policy reads conntrack at all. `fd`
     # attaches it to every interface the bundle attaches XDP to, and a
     # bundle that declares one and cannot attach it is a failed load —
@@ -636,7 +498,7 @@ def _emit_bundle_dir(program: ast.Program, bundle_dir: Path,
     # state, not a reason to invent a digest.
     # TABLES.md: full names in the language, a short mapped id in the
     # kernel, and the mapping carried here so `fd` never re-derives it.
-    **_manifest_tables(program, table_tries),
+    **_manifest_tables(program),
     "policy_source": (
       rulemeta.source_identity(str(source), source_text)
       if source is not None and source_text is not None else None),

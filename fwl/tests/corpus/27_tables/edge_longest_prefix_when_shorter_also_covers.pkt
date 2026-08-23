@@ -8,7 +8,7 @@ source_fw: |
   table badhosts {
     kind = cidr4
     max = 1000
-    source = "badhosts.txt"
+    source = "/var/lib/f/feeds/badhosts.txt"
   }
 
   @xdp(eth0)

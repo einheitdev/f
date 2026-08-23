@@ -3,7 +3,7 @@ source_fw: |
   table badhosts6 {
     kind = cidr6
     max = 1000
-    source = "badhosts6.txt"
+    source = "/var/lib/f/feeds/badhosts6.txt"
   }
 
   @xdp(eth0)

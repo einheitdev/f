@@ -6,6 +6,13 @@
 # it is one lookup against an LPM trie, and 50,000 prefixes cost what
 # 1,000 cost -- 99% of line rate, 227 instructions, flat.
 #
+# `source` is a path on the APPLIANCE, not on the machine that
+# compiles this. The compiler never opens it; `fd` reads it at load
+# and refuses to arm the datapath if it cannot. So the file has to be
+# installed on the box -- `feeds/blocklist.txt` beside this example is
+# a sample of the format to copy there, one prefix per line with `#`
+# comments.
+#
 # The alias exists so that the two `drop` rules below could have been
 # pasted from another box's policy, referring to `badhosts`
 # throughout, without editing a name through every rule that uses it.
@@ -13,7 +20,7 @@
 table corporate_blocklist {
   kind = cidr4
   max = 100000
-  source = "feeds/blocklist.txt"
+  source = "/var/lib/f/feeds/blocklist.txt"
 }
 
 table badhosts = corporate_blocklist
@@ -21,7 +28,7 @@ table badhosts = corporate_blocklist
 table corporate_blocklist6 {
   kind = cidr6
   max = 100000
-  source = "feeds/blocklist6.txt"
+  source = "/var/lib/f/feeds/blocklist6.txt"
 }
 
 @xdp(eth0)

@@ -3,13 +3,13 @@ source_fw: |
   table blocked {
     kind = cidr4
     max = 100
-    source = "blocked.txt"
+    source = "/var/lib/f/feeds/blocked.txt"
   }
 
   table trusted {
     kind = cidr4
     max = 100
-    source = "trusted.txt"
+    source = "/var/lib/f/feeds/trusted.txt"
   }
 
   @xdp(eth0)

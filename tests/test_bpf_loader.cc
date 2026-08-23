@@ -10,6 +10,8 @@
 #include <gtest/gtest.h>
 
 #include <arpa/inet.h>
+#include <bpf/bpf.h>
+#include <unistd.h>
 
 #include <cstdio>
 #include <filesystem>
@@ -184,6 +186,460 @@ TEST_F(GeoipParseTest, ReadsAGeoipTrieAndATableTrieTogether) {
   ASSERT_EQ(tries->size(), 2u);
   EXPECT_EQ(tries->at("fwl_geoip_eth0_0").size(), 1u);
   EXPECT_EQ(tries->at("fwl_tbl_0").size(), 1u);
+}
+
+// --- TABLES.md: the declaration ships, the data does not ------------
+
+class TableSpecTest : public BpfLoaderResolverTest {
+ protected:
+  void WriteManifest(const std::string& body) {
+    std::ofstream(scratch_ / "manifest.json") << body;
+  }
+
+  // A feed file inside the scratch dir, returned as an absolute path
+  // so a TableSpec can name it the way a real one names an appliance
+  // path.
+  auto WriteFeed(const std::string& name, const std::string& body)
+      -> std::string {
+    auto path = scratch_ / name;
+    std::ofstream(path) << body;
+    return path.string();
+  }
+
+  auto Spec(const std::string& source, uint32_t max = 1000,
+            bool v6 = false) -> TableSpec {
+    TableSpec spec;
+    spec.name = "badhosts";
+    spec.id = 0;
+    spec.map_name = "fwl_tbl_0";
+    spec.v6 = v6;
+    spec.max_entries = max;
+    spec.source = source;
+    return spec;
+  }
+};
+
+TEST_F(TableSpecTest, AbsentManifestYieldsNoTables) {
+  auto specs = ParseTableSpecs(scratch_.string());
+  ASSERT_TRUE(specs.has_value());
+  EXPECT_TRUE(specs->empty());
+}
+
+TEST_F(TableSpecTest, AbsentTablesBlockYieldsNoTables) {
+  // A bundle compiled before tables existed, or a policy with none.
+  WriteManifest(R"({"version": "0.4", "zones": []})");
+  auto specs = ParseTableSpecs(scratch_.string());
+  ASSERT_TRUE(specs.has_value());
+  EXPECT_TRUE(specs->empty());
+}
+
+TEST_F(TableSpecTest, ParsesTheDeclarationTheCompilerShips) {
+  // Copied from `fwl compile --bundle` output. The bundle carries the
+  // declaration and NOT a single prefix: the file lives on the
+  // appliance and this daemon is what reads it.
+  WriteManifest(R"({
+  "tables": {
+    "corporate_blocklist": {
+      "id": 0,
+      "map": "fwl_tbl_0",
+      "kind": "cidr4",
+      "max": 100000,
+      "source": "/var/lib/f/feeds/corp.txt",
+      "referenced": true
+    },
+    "v6_blocklist": {
+      "id": 1,
+      "map": "fwl_tbl_1",
+      "kind": "cidr6",
+      "max": 100,
+      "source": "/var/lib/f/feeds/corp6.txt",
+      "referenced": true
+    }
+  }
+})");
+  auto specs = ParseTableSpecs(scratch_.string());
+  ASSERT_TRUE(specs.has_value());
+  ASSERT_EQ(specs->size(), 2u);
+  const TableSpec* v4 = nullptr;
+  const TableSpec* v6 = nullptr;
+  for (const auto& s : *specs) {
+    if (s.name == "corporate_blocklist") v4 = &s;
+    if (s.name == "v6_blocklist") v6 = &s;
+  }
+  ASSERT_NE(v4, nullptr);
+  ASSERT_NE(v6, nullptr);
+  EXPECT_EQ(v4->map_name, "fwl_tbl_0");
+  EXPECT_FALSE(v4->v6);
+  EXPECT_EQ(v4->max_entries, 100000u);
+  EXPECT_EQ(v4->source, "/var/lib/f/feeds/corp.txt");
+  EXPECT_TRUE(v6->v6);
+  EXPECT_EQ(v6->max_entries, 100u);
+}
+
+TEST_F(TableSpecTest, ATableNoRuleMatchesIsRecordedButNotFilled) {
+  WriteManifest(R"({"tables": {"unused": {"id": 0, "referenced": false,
+    "kind": "cidr4", "max": 10, "source": "/nope"}}})");
+  auto specs = ParseTableSpecs(scratch_.string());
+  ASSERT_TRUE(specs.has_value());
+  ASSERT_EQ(specs->size(), 1u);
+  EXPECT_FALSE((*specs)[0].referenced);
+}
+
+TEST_F(TableSpecTest, ATableWithoutCapacityIsRefused) {
+  // Capacity is what makes "refuse rather than truncate" enforceable.
+  // Guessing one reinstates the behaviour the rule exists to prevent.
+  WriteManifest(R"({"tables": {"t": {"id": 0, "map": "fwl_tbl_0",
+    "kind": "cidr4", "source": "/f"}}})");
+  auto specs = ParseTableSpecs(scratch_.string());
+  EXPECT_FALSE(specs.has_value());
+}
+
+TEST_F(TableSpecTest, ATableWithoutASourceIsRefused) {
+  WriteManifest(R"({"tables": {"t": {"id": 0, "map": "fwl_tbl_0",
+    "kind": "cidr4", "max": 10}}})");
+  auto specs = ParseTableSpecs(scratch_.string());
+  EXPECT_FALSE(specs.has_value());
+}
+
+// --- Reading a feed: empty is a failure, never a state --------------
+
+class TableFeedTest : public TableSpecTest {};
+
+TEST_F(TableFeedTest, ReadsPrefixesCommentsAndBlanks) {
+  auto path = WriteFeed("feed.txt",
+      "# a threat feed\n"
+      "\n"
+      "10.99.77.0/24\n"
+      "  192.0.2.0/25   # trailing comment\n"
+      "\n");
+  auto entries = ReadTableFeed(Spec(path));
+  ASSERT_TRUE(entries.has_value()) << entries.error().message;
+  ASSERT_EQ(entries->size(), 2u);
+}
+
+TEST_F(TableFeedTest, ARepeatedPrefixCountsOnce) {
+  // One entry in an LPM trie, so counting it twice would refuse a feed
+  // the map would have held.
+  auto path = WriteFeed("feed.txt",
+      "10.0.0.0/8\n10.0.0.0/8\n192.168.0.0/16\n");
+  auto entries = ReadTableFeed(Spec(path, 2));
+  ASSERT_TRUE(entries.has_value()) << entries.error().message;
+  EXPECT_EQ(entries->size(), 2u);
+}
+
+TEST_F(TableFeedTest, AMissingFileIsAFeedFailureNotALoadFailure) {
+  // The distinction a bundle-health guard needs: the artifact is fine,
+  // its data is not. Counting this as a failed load would spend a good
+  // policy's attempts on an NFS blip.
+  auto entries = ReadTableFeed(Spec("/definitely/not/here.txt"));
+  ASSERT_FALSE(entries.has_value());
+  EXPECT_EQ(entries.error().code, BpfError::kFeedUnavailable);
+  EXPECT_NE(entries.error().message.find("badhosts"), std::string::npos);
+}
+
+TEST_F(TableFeedTest, ADirectoryWhereAFileShouldBeIsAFeedFailure) {
+  auto entries = ReadTableFeed(Spec(scratch_.string()));
+  ASSERT_FALSE(entries.has_value());
+  EXPECT_EQ(entries.error().code, BpfError::kFeedUnavailable);
+}
+
+TEST_F(TableFeedTest, AnEmptyFeedIsRefusedRatherThanApplied) {
+  // The safe reading of "the blocklist is now empty" is "the feeder is
+  // broken", not "nothing is dangerous any more". A query that failed,
+  // an API that returned 200 with no body, an expired credential --
+  // all of them produce this file.
+  auto path = WriteFeed("feed.txt", "# nothing but a comment\n\n");
+  auto entries = ReadTableFeed(Spec(path));
+  ASSERT_FALSE(entries.has_value());
+  EXPECT_EQ(entries.error().code, BpfError::kFeedUnavailable);
+  EXPECT_NE(entries.error().message.find("no prefixes"),
+            std::string::npos);
+}
+
+TEST_F(TableFeedTest, MorePrefixesThanCapacityIsRefusedNotTruncated) {
+  auto path = WriteFeed("feed.txt",
+      "10.0.0.0/8\n192.168.0.0/16\n172.16.0.0/12\n");
+  auto entries = ReadTableFeed(Spec(path, 2));
+  ASSERT_FALSE(entries.has_value());
+  EXPECT_EQ(entries.error().code, BpfError::kFeedUnavailable);
+  // The message says how many did not fit rather than leaving the
+  // operator to count.
+  EXPECT_NE(entries.error().message.find("1 entries"),
+            std::string::npos);
+}
+
+TEST_F(TableFeedTest, AV6PrefixInACidr4TableIsRefused) {
+  auto path = WriteFeed("feed.txt", "10.0.0.0/8\n2001:db8::/32\n");
+  auto entries = ReadTableFeed(Spec(path));
+  ASSERT_FALSE(entries.has_value());
+  EXPECT_EQ(entries.error().code, BpfError::kFeedUnavailable);
+  EXPECT_NE(entries.error().message.find(":2:"), std::string::npos);
+}
+
+TEST_F(TableFeedTest, AnAddressWithoutAPrefixLengthIsRefused) {
+  auto path = WriteFeed("feed.txt", "10.0.0.0\n");
+  auto entries = ReadTableFeed(Spec(path));
+  ASSERT_FALSE(entries.has_value());
+  EXPECT_EQ(entries.error().code, BpfError::kFeedUnavailable);
+}
+
+TEST_F(TableFeedTest, APrefixLengthPastTheKeyWidthIsRefused) {
+  auto path = WriteFeed("feed.txt", "10.0.0.0/33\n");
+  auto entries = ReadTableFeed(Spec(path));
+  ASSERT_FALSE(entries.has_value());
+  EXPECT_EQ(entries.error().code, BpfError::kFeedUnavailable);
+}
+
+TEST_F(TableFeedTest, AV6FeedReadsSixteenAddressBytes) {
+  auto path = WriteFeed("feed6.txt", "2001:db8::/32\n");
+  auto entries = ReadTableFeed(Spec(path, 100, /*v6=*/true));
+  ASSERT_TRUE(entries.has_value()) << entries.error().message;
+  ASSERT_EQ(entries->size(), 1u);
+  EXPECT_TRUE((*entries)[0].v6);
+  EXPECT_EQ((*entries)[0].prefixlen, 32u);
+  EXPECT_EQ((*entries)[0].addr[0], 0x20);
+  EXPECT_EQ((*entries)[0].addr[3], 0xb8);
+}
+
+TEST_F(TableFeedTest, AV4AddressInACidr6TableIsRefused) {
+  auto path = WriteFeed("feed6.txt", "10.0.0.0/8\n");
+  auto entries = ReadTableFeed(Spec(path, 100, /*v6=*/true));
+  ASSERT_FALSE(entries.has_value());
+  EXPECT_EQ(entries.error().code, BpfError::kFeedUnavailable);
+}
+
+// --- The ordering that keeps a transient from costing a policy ------
+
+class TableLoadOrderTest : public BpfLoaderResolverTest {
+ protected:
+  // A manifest that is otherwise loadable: one zone, one program, and
+  // a table whose feed is not there.
+  void WriteBundle(const std::string& source) {
+    std::ofstream(scratch_ / "manifest.json") << std::format(R"({{
+  "version": "0.4",
+  "zones": [{{"name": "wan", "interfaces": ["nonexistent0"]}}],
+  "programs": [{{"zone": "wan", "source": "wan.bpf.c",
+                "object": "wan.bpf.o"}}],
+  "persistent_maps": ["conntrack", "fwl_nat", "fwl_tbl_0"],
+  "tables": {{
+    "badhosts": {{"id": 0, "map": "fwl_tbl_0", "kind": "cidr4",
+                 "max": 1000, "source": "{}", "referenced": true}}
+  }}
+}})", source);
+  }
+};
+
+TEST_F(TableLoadOrderTest, AnUnreadableFeedFailsBeforeAnythingIsLoaded) {
+  // The property a bundle-health guard depends on. fd.service carries
+  // Restart=on-failure and a guard counts load attempts, so if an NFS
+  // blip or a feeder that has not written yet reported the same thing
+  // a broken artifact reports, a transient would spend a good
+  // policy's remaining attempts and quarantine it.
+  //
+  // Two halves, both asserted here: the code is kFeedUnavailable and
+  // not kLoadFailed, and the failure happens before the loader opens
+  // an object at all -- note that wan.bpf.o does not exist in the
+  // scratch dir, so reaching the object stage would give kLoadFailed
+  // instead. Failing first is what makes the attempt cost nothing.
+  WriteBundle("/definitely/not/here.txt");
+  auto handles = LoadZoneBundle(scratch_.string(),
+                                (scratch_ / "pins").string(), nullptr);
+  ASSERT_FALSE(handles.has_value());
+  EXPECT_EQ(handles.error().code, BpfError::kFeedUnavailable);
+  EXPECT_NE(handles.error().message.find("badhosts"),
+            std::string::npos);
+}
+
+TEST_F(TableLoadOrderTest, AnEmptyFeedFailsTheSameWay) {
+  auto feed = scratch_ / "empty.txt";
+  std::ofstream(feed) << "# the feeder ran and produced nothing\n";
+  WriteBundle(feed.string());
+  auto handles = LoadZoneBundle(scratch_.string(),
+                                (scratch_ / "pins").string(), nullptr);
+  ASSERT_FALSE(handles.has_value());
+  EXPECT_EQ(handles.error().code, BpfError::kFeedUnavailable);
+}
+
+TEST_F(TableLoadOrderTest, ABrokenBundleStillReportsALoadFailure) {
+  // The other side of the distinction, and the one that must NOT
+  // become kFeedUnavailable: a readable feed and a missing object is
+  // an artifact that will never work, and a guard should count it.
+  auto feed = scratch_ / "feed.txt";
+  std::ofstream(feed) << "10.0.0.0/8\n";
+  WriteBundle(feed.string());
+  auto handles = LoadZoneBundle(scratch_.string(),
+                                (scratch_ / "pins").string(), nullptr);
+  ASSERT_FALSE(handles.has_value());
+  EXPECT_NE(handles.error().code, BpfError::kFeedUnavailable);
+}
+
+TEST_F(TableLoadOrderTest, ATableNoRuleMatchesNeedsNoFeed) {
+  // A declared-but-unmatched table has no map in any object, so a
+  // missing feed for it must not fail the load -- refusing there
+  // would make an unused declaration able to take the box down.
+  std::ofstream(scratch_ / "manifest.json") << R"({
+  "version": "0.4",
+  "zones": [{"name": "wan", "interfaces": ["nonexistent0"]}],
+  "programs": [{"zone": "wan", "source": "wan.bpf.c",
+                "object": "wan.bpf.o"}],
+  "tables": {
+    "unused": {"id": 0, "kind": "cidr4", "max": 10,
+               "source": "/definitely/not/here.txt",
+               "referenced": false}
+  }
+})";
+  auto handles = LoadZoneBundle(scratch_.string(),
+                                (scratch_ / "pins").string(), nullptr);
+  ASSERT_FALSE(handles.has_value());
+  // It still fails -- wan.bpf.o is not there -- but for the bundle's
+  // own reason and not for the feed's.
+  EXPECT_NE(handles.error().code, BpfError::kFeedUnavailable);
+}
+
+// --- The diff: a table must never pass through empty -----------------
+//
+// This is the property the whole write path is shaped around. A
+// blocklist that is briefly empty is an open firewall, and with a
+// feeder on a timer that window recurs all day rather than once at
+// deploy. Clear-and-refill would be simpler and is refused for that
+// reason alone, so the refusal needs a test that a clear-and-refill
+// implementation fails.
+
+class TableSyncTest : public ::testing::Test {
+ protected:
+  void SetUp() override {
+    // BPF_F_NO_PREALLOC is mandatory for an LPM trie and is what the
+    // emitted map declares, so the test map is the same shape the
+    // datapath's is.
+    LIBBPF_OPTS(bpf_map_create_opts, opts,
+                .map_flags = BPF_F_NO_PREALLOC);
+    map_fd_ = bpf_map_create(BPF_MAP_TYPE_LPM_TRIE, "fwl_tbl_0",
+                             /*key_size=*/8, /*value_size=*/1,
+                             /*max_entries=*/1024, &opts);
+    if (map_fd_ < 0) {
+      GTEST_SKIP() << "bpf_map_create failed (needs CAP_BPF)";
+    }
+  }
+
+  void TearDown() override {
+    if (map_fd_ >= 0) ::close(map_fd_);
+  }
+
+  static auto V4(const char* cidr) -> GeoipTrieEntry {
+    std::string text(cidr);
+    auto slash = text.find('/');
+    GeoipTrieEntry e;
+    e.v6 = false;
+    e.prefixlen = static_cast<uint32_t>(
+        std::stoul(text.substr(slash + 1)));
+    inet_pton(AF_INET, text.substr(0, slash).c_str(), e.addr);
+    return e;
+  }
+
+  auto Contains(const char* cidr) -> bool {
+    auto e = V4(cidr);
+    uint8_t key[8] = {};
+    std::memcpy(key, &e.prefixlen, sizeof(e.prefixlen));
+    std::memcpy(key + 4, e.addr, 4);
+    uint8_t value = 0;
+    return bpf_map_lookup_elem(map_fd_, key, &value) == 0;
+  }
+
+  auto Count() -> uint32_t {
+    uint8_t key[8] = {};
+    uint8_t next[8] = {};
+    uint32_t n = 0;
+    bool have = false;
+    while (bpf_map_get_next_key(map_fd_, have ? key : nullptr, next) == 0) {
+      n++;
+      std::memcpy(key, next, sizeof(key));
+      have = true;
+    }
+    return n;
+  }
+
+  int map_fd_ = -1;
+};
+
+TEST_F(TableSyncTest, AFreshMapTakesEveryEntry) {
+  std::vector<GeoipTrieEntry> want = {
+      V4("10.0.0.0/8"), V4("192.168.0.0/16"), V4("203.0.113.0/24")};
+  auto report = SyncTableTrie(map_fd_, false, want);
+  ASSERT_TRUE(report.has_value()) << report.error().message;
+  EXPECT_EQ(report->added, 3u);
+  EXPECT_EQ(report->removed, 0u);
+  EXPECT_EQ(report->unchanged, 0u);
+  EXPECT_EQ(Count(), 3u);
+}
+
+TEST_F(TableSyncTest, ASecondSyncOfTheSameFeedTouchesNothing) {
+  // The steady state a feeder on a timer spends almost all its time
+  // in. If this reported three adds, every refresh would be rewriting
+  // the whole table for no reason.
+  std::vector<GeoipTrieEntry> want = {
+      V4("10.0.0.0/8"), V4("192.168.0.0/16"), V4("203.0.113.0/24")};
+  ASSERT_TRUE(SyncTableTrie(map_fd_, false, want).has_value());
+  auto report = SyncTableTrie(map_fd_, false, want);
+  ASSERT_TRUE(report.has_value()) << report.error().message;
+  EXPECT_EQ(report->added, 0u);
+  EXPECT_EQ(report->removed, 0u);
+  EXPECT_EQ(report->unchanged, 3u);
+  EXPECT_EQ(Count(), 3u);
+}
+
+TEST_F(TableSyncTest, AnEntryInBothFeedsIsNeverRemovedAndNeverReadded) {
+  // The refusal of clear-and-refill, stated as an assertion. An
+  // implementation that emptied the map first would report this entry
+  // as ADDED rather than unchanged, and for the interval between the
+  // clear and the refill the datapath would have forwarded traffic
+  // this table exists to drop.
+  std::vector<GeoipTrieEntry> before = {
+      V4("10.0.0.0/8"), V4("192.168.0.0/16")};
+  ASSERT_TRUE(SyncTableTrie(map_fd_, false, before).has_value());
+
+  std::vector<GeoipTrieEntry> after = {
+      V4("10.0.0.0/8"), V4("203.0.113.0/24")};
+  auto report = SyncTableTrie(map_fd_, false, after);
+  ASSERT_TRUE(report.has_value()) << report.error().message;
+  EXPECT_EQ(report->unchanged, 1u) << "10.0.0.0/8 was in both feeds";
+  EXPECT_EQ(report->added, 1u);
+  EXPECT_EQ(report->removed, 1u);
+
+  EXPECT_TRUE(Contains("10.0.0.0/8"));
+  EXPECT_TRUE(Contains("203.0.113.0/24"));
+  EXPECT_FALSE(Contains("192.168.0.0/16"));
+  EXPECT_EQ(Count(), 2u);
+}
+
+TEST_F(TableSyncTest, ShrinkingAFeedRemovesOnlyWhatLeftIt) {
+  std::vector<GeoipTrieEntry> before = {
+      V4("10.0.0.0/8"), V4("192.168.0.0/16"), V4("172.16.0.0/12")};
+  ASSERT_TRUE(SyncTableTrie(map_fd_, false, before).has_value());
+  std::vector<GeoipTrieEntry> after = {V4("10.0.0.0/8")};
+  auto report = SyncTableTrie(map_fd_, false, after);
+  ASSERT_TRUE(report.has_value()) << report.error().message;
+  EXPECT_EQ(report->removed, 2u);
+  EXPECT_EQ(report->unchanged, 1u);
+  EXPECT_EQ(report->added, 0u);
+  EXPECT_TRUE(Contains("10.0.0.0/8"));
+  EXPECT_EQ(Count(), 1u);
+}
+
+TEST_F(TableSyncTest, AnAdoptedMapIsReconciledToTheFileNotMerged) {
+  // What makes MapLifetime.EXTERNAL safe without an id registry. A
+  // pin carried across a reload holds the PREVIOUS contents; after
+  // the sync it holds exactly the file's, so a map object reused by a
+  // table that renumbered cannot carry the other table's entries into
+  // it.
+  std::vector<GeoipTrieEntry> stale = {
+      V4("198.51.100.0/24"), V4("198.51.100.7/32")};
+  ASSERT_TRUE(SyncTableTrie(map_fd_, false, stale).has_value());
+  std::vector<GeoipTrieEntry> file = {V4("10.0.0.0/8")};
+  ASSERT_TRUE(SyncTableTrie(map_fd_, false, file).has_value());
+  EXPECT_FALSE(Contains("198.51.100.0/24"));
+  EXPECT_FALSE(Contains("198.51.100.7/32"));
+  EXPECT_TRUE(Contains("10.0.0.0/8"));
+  EXPECT_EQ(Count(), 1u);
 }
 
 TEST_F(GeoipParseTest, MalformedJsonIsAnError) {

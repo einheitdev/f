@@ -147,34 +147,59 @@ class TestTheProgramDoesNotGrowWithTheTable:
     assert all(c > 10 for c in counts.values()), counts
     assert len(set(counts.values())) == 1, counts
 
-  def test_fifty_thousand_prefixes_do_not_change_the_program(
+  def test_the_bundle_does_not_depend_on_the_feed_at_all(
     self, tmp_path
   ):
-    # The contents half. The prefixes never enter the program at all --
-    # they are resolved into the bundle payload and loaded into the map
-    # -- so a table of 50,000 must emit the same object as one of 10.
-    sources = {}
-    for count in (10, 50000):
-      d = tmp_path / f"n{count}"
+    # Tables are disk-authoritative: `source` names a path on the
+    # APPLIANCE and `fd` reads it at load. So the compiler never opens
+    # it, and the artifact must be identical whether the build host
+    # happens to have that file, has a ten-line version of it, or has
+    # a fifty-thousand-line one. A compiler whose output moved with a
+    # file on the build machine would make `fwl compile` unreproducible
+    # and would put the wrong box's data in the bundle.
+    outputs = []
+    for name, feed in (
+      ("absent", None), ("small", 10), ("huge", 50000),
+    ):
+      d = tmp_path / name
       d.mkdir()
-      _feed(d / "feed.txt", count)
+      if feed is not None:
+        _feed(d / "feed.txt", feed)
       result, bundle = _compile_bundle(
-        d, _policy(100000), bundle_name="out"
+        d, _policy(100000, "feed.txt"), bundle_name="out"
       )
       assert result.exit_code == 0, result.output
-      sources[count] = (bundle / "eth0.bpf.c").read_text()
-      payload = json.loads((bundle / "geoip.json").read_text())
-      assert len(payload["tries"][0]["prefixes"]) == count
-    assert sources[10] == sources[50000]
+      outputs.append((
+        (bundle / "eth0.bpf.c").read_text(),
+        json.loads((bundle / "manifest.json").read_text())["tables"],
+      ))
+    assert outputs[0] == outputs[1] == outputs[2]
+
+  def test_no_prefix_reaches_the_bundle(self, tmp_path):
+    # The compiler must not be a second reader of the feed. Nothing in
+    # the bundle may carry a prefix, and geoip.json -- which used to
+    # carry them under the compile-time model -- must not exist for a
+    # policy whose only data is a table.
+    _feed(tmp_path / "feed.txt", 20)
+    result, bundle = _compile_bundle(tmp_path, _policy(1000))
+    assert result.exit_code == 0, result.output
+    assert not (bundle / "geoip.json").exists()
+    for path in sorted(bundle.iterdir()):
+      if path.is_file():
+        assert "10.0.0.0/24" not in path.read_text(errors="replace"), (
+          f"{path.name} carries a prefix from the feed"
+        )
 
 
 # --------------------------------------------------------------------
-class TestAnUnfillableTableRefusesToCompile:
-  """A silently empty table is a rule that never matches.
+class TestAnUnresolvableTableRefusesToCompile:
+  """The refusals the COMPILER still owns.
 
-  In a blocklist that is an open firewall, and nothing on the running
-  box reports it. Every way the contents can fall short of what the
-  policy asked for is therefore an error, not a smaller table.
+  A name is resolvable or it is not, and that is a property of the
+  policy text alone. Whether the feed behind a resolvable name can be
+  read is a property of the appliance at load time, so it is refused by
+  `fd` (tests/test_bpf_loader.cc) and not here -- the file is not
+  supposed to exist on the build host at all.
   """
 
   def test_undeclared_name_errors_with_the_name_and_the_line(self):
@@ -194,7 +219,7 @@ class TestAnUnfillableTableRefusesToCompile:
   def test_undeclared_name_lists_the_tables_that_do_exist(self):
     src = (
       "table badhosts {\n  kind = cidr4\n  max = 10\n"
-      '  source = "f.txt"\n}\n'
+      '  source = "/var/lib/f/feeds/b.txt"\n}\n'
       "@xdp(eth0)\n"
       "drop if pkt.src_ip in badhost\n"
       "default allow\n"
@@ -203,65 +228,23 @@ class TestAnUnfillableTableRefusesToCompile:
       _analyze(src)
     assert "badhosts" in exc.value.error.message
 
-  def test_missing_source_file_is_an_error(self, tmp_path):
-    result, _ = _compile_bundle(tmp_path, _policy(10, "nowhere.txt"))
-    assert result.exit_code == 1
-    assert "badhosts" in result.output
-    assert "nowhere.txt" in result.output
-
-  def test_a_source_file_of_only_comments_is_an_error(self, tmp_path):
-    (tmp_path / "feed.txt").write_text("# nothing\n\n   \n")
-    result, _ = _compile_bundle(tmp_path, _policy(10))
-    assert result.exit_code == 1
-    assert "never matches" in result.output
-
-  def test_more_prefixes_than_max_is_refused_not_truncated(
-    self, tmp_path
-  ):
-    # TABLES.md: refuse, never evict. A table quietly missing entries
-    # fails open if it is a blocklist, so the message says how many did
-    # not fit rather than leaving the operator to count.
-    _feed(tmp_path / "feed.txt", 12)
-    result, bundle = _compile_bundle(tmp_path, _policy(10))
-    assert result.exit_code == 1
-    assert "max = 10" in result.output
-    assert "12 distinct prefixes" in result.output
-    assert not (bundle / "geoip.json").exists()
-
-  def test_duplicate_prefixes_do_not_count_against_capacity(
-    self, tmp_path
-  ):
-    # The same prefix twice is one entry in an LPM trie, so counting it
-    # twice would refuse a file the map would have held.
-    (tmp_path / "feed.txt").write_text(
-      "10.0.0.0/8\n10.0.0.0/8\n192.168.0.0/16\n"
+  def test_a_missing_feed_is_not_a_compile_error(self, tmp_path):
+    # It cannot be. The path names a file on the appliance, and the
+    # build host is a different machine -- refusing here would make
+    # every cross-compiled bundle unbuildable.
+    result, bundle = _compile_bundle(
+      tmp_path, _policy(10, "/var/lib/f/feeds/not-on-this-host.txt")
     )
-    result, bundle = _compile_bundle(tmp_path, _policy(2))
     assert result.exit_code == 0, result.output
-    payload = json.loads((bundle / "geoip.json").read_text())
-    assert payload["tries"][0]["prefixes"] == [
-      "10.0.0.0/8", "192.168.0.0/16"
-    ]
-
-  def test_an_entry_of_the_wrong_family_is_an_error(self, tmp_path):
-    (tmp_path / "feed.txt").write_text("10.0.0.0/8\n2001:db8::/32\n")
-    result, _ = _compile_bundle(tmp_path, _policy(10))
-    assert result.exit_code == 1
-    assert "kind = cidr4" in result.output
-    assert "line 2" in result.output
-
-  def test_an_unparseable_line_is_an_error_with_its_line_number(
-    self, tmp_path
-  ):
-    (tmp_path / "feed.txt").write_text("10.0.0.0/8\nnot-an-address\n")
-    result, _ = _compile_bundle(tmp_path, _policy(10))
-    assert result.exit_code == 1
-    assert "line 2" in result.output
+    manifest = json.loads((bundle / "manifest.json").read_text())
+    assert manifest["tables"]["badhosts"]["source"] == (
+      "/var/lib/f/feeds/not-on-this-host.txt"
+    )
 
   def test_a_declared_but_unmatched_table_warns(self):
     program = _analyze(
       "table badhosts {\n  kind = cidr4\n  max = 10\n"
-      '  source = "f.txt"\n}\n'
+      '  source = "/var/lib/f/feeds/b.txt"\n}\n'
       "@xdp(eth0)\n"
       "default allow\n"
     )
@@ -270,156 +253,205 @@ class TestAnUnfillableTableRefusesToCompile:
 
 
 # --------------------------------------------------------------------
-class TestTheBundleTellsTheDaemonEverything:
-  """Phase 1 needs no daemon change, which is a claim about the payload.
+class TestTheBundleCarriesTheDeclarationNotTheData:
+  """What `fd` needs in order to go and read the feed itself."""
 
-  `ParseGeoipFile` returns {map_name: prefixes} and
-  `PopulateGeoipTrie` fills any named LPM trie from it. These tests
-  hold the compiler to the shape that loader already reads.
-  """
+  POLICY = (
+    "table corporate_blocklist {\n"
+    "  kind = cidr4\n"
+    "  max = 100000\n"
+    '  source = "/var/lib/f/feeds/corp.txt"\n'
+    "}\n"
+    "\n"
+    "table badhosts = corporate_blocklist\n"
+    "\n"
+    "table v6_blocklist {\n"
+    "  kind = cidr6\n"
+    "  max = 100\n"
+    '  source = "/var/lib/f/feeds/corp6.txt"\n'
+    "}\n"
+    "\n"
+    "zone wan = [eth0]\n"
+    "zone lan = [eth1]\n"
+    "\n"
+    "@xdp(wan)\n"
+    "drop if pkt.src_ip in badhosts\n"
+    "drop if pkt.src_ip6 in v6_blocklist\n"
+    "default allow\n"
+    "\n"
+    "@xdp(lan)\n"
+    "drop if pkt.dst_ip in corporate_blocklist\n"
+    "default allow\n"
+  )
 
   @pytest.fixture
-  def bundle(self, tmp_path):
-    _feed(tmp_path / "corp.txt", 5)
-    _feed(tmp_path / "corp6.txt", 3, v6=True)
-    policy = (
-      "table corporate_blocklist {\n"
-      "  kind = cidr4\n"
-      "  max = 100000\n"
-      '  source = "corp.txt"\n'
-      "}\n"
-      "\n"
-      "table badhosts = corporate_blocklist\n"
-      "\n"
-      "table v6_blocklist {\n"
-      "  kind = cidr6\n"
-      "  max = 100\n"
-      '  source = "corp6.txt"\n'
-      "}\n"
-      "\n"
-      "zone wan = [eth0]\n"
-      "zone lan = [eth1]\n"
-      "\n"
-      "@xdp(wan)\n"
-      "drop if pkt.src_ip in badhosts\n"
-      "drop if pkt.src_ip6 in v6_blocklist\n"
-      "default allow\n"
-      "\n"
-      "@xdp(lan)\n"
-      "drop if pkt.dst_ip in corporate_blocklist\n"
-      "default allow\n"
-    )
-    result, out = _compile_bundle(tmp_path, policy)
+  def manifest(self, tmp_path):
+    result, bundle = _compile_bundle(tmp_path, self.POLICY)
     assert result.exit_code == 0, result.output
-    return out
+    self._bundle = bundle
+    return json.loads((bundle / "manifest.json").read_text())
 
-  def test_the_payload_carries_every_prefix_under_the_map_name(
-    self, bundle
+  def test_the_manifest_maps_full_names_to_kernel_ids(self, manifest):
+    row = manifest["tables"]["corporate_blocklist"]
+    assert row["id"] == 0
+    assert row["map"] == "fwl_tbl_0"
+    assert row["kind"] == "cidr4"
+    assert row["max"] == 100000
+    assert row["source"] == "/var/lib/f/feeds/corp.txt"
+    assert manifest["tables"]["v6_blocklist"]["id"] == 1
+
+  def test_the_manifest_states_no_entry_count(self, manifest):
+    # The compiler does not know it and cannot know it: the file is on
+    # another machine. A number here would be the build host's guess
+    # about an appliance's blocklist, and a stale guess about how much
+    # a blocklist holds is worse than no answer. `table show` reports
+    # the count from the live map, which is the only place it is true.
+    for row in manifest["tables"].values():
+      assert "entries" not in row
+
+  def test_the_manifest_lists_aliases_against_their_table(
+    self, manifest
   ):
-    payload = json.loads((bundle / "geoip.json").read_text())
-    by_map = {t["map"]: t for t in payload["tries"]}
-    assert by_map["fwl_tbl_0"]["family"] == "ipv4"
-    assert len(by_map["fwl_tbl_0"]["prefixes"]) == 5
-    assert by_map["fwl_tbl_1"]["family"] == "ipv6"
-    assert len(by_map["fwl_tbl_1"]["prefixes"]) == 3
-
-  def test_the_manifest_maps_full_names_to_kernel_ids(self, bundle):
-    manifest = json.loads((bundle / "manifest.json").read_text())
-    tables = manifest["tables"]
-    assert tables["corporate_blocklist"]["id"] == 0
-    assert tables["corporate_blocklist"]["map"] == "fwl_tbl_0"
-    assert tables["corporate_blocklist"]["kind"] == "cidr4"
-    assert tables["corporate_blocklist"]["max"] == 100000
-    assert tables["corporate_blocklist"]["entries"] == 5
-    assert tables["v6_blocklist"]["id"] == 1
-
-  def test_the_manifest_lists_aliases_against_their_table(self, bundle):
-    manifest = json.loads((bundle / "manifest.json").read_text())
     assert manifest["table_aliases"] == {
       "badhosts": "corporate_blocklist"
     }
 
-  def test_an_alias_is_the_same_map_not_a_second_one(self, bundle):
-    payload = json.loads((bundle / "geoip.json").read_text())
-    # Two names, two rules, one trie: the alias allocates nothing.
-    assert len(payload["tries"]) == 2
-
-  def test_every_zone_declares_the_shared_table_pinned(self, bundle):
-    manifest = json.loads((bundle / "manifest.json").read_text())
-    assert "fwl_tbl_0" in manifest["shared_pinned_maps"]
-    for zone in ("wan", "lan"):
-      src = (bundle / f"{zone}.bpf.c").read_text()
-      decls = {
-        d.name: d for d in emitter._scan_map_decls(src)
-      }
-      assert decls["fwl_tbl_0"].pinned
-
-  def test_the_two_zones_declare_the_table_identically(self, bundle):
-    wan = {
-      d.name: d.attrs
-      for d in emitter._scan_map_decls((bundle / "wan.bpf.c").read_text())
+  def test_an_alias_allocates_no_second_table(self, manifest):
+    assert set(manifest["tables"]) == {
+      "corporate_blocklist", "v6_blocklist"
     }
-    lan = {
-      d.name: d.attrs
-      for d in emitter._scan_map_decls((bundle / "lan.bpf.c").read_text())
-    }
-    assert wan["fwl_tbl_0"] == lan["fwl_tbl_0"]
 
-  def test_the_rules_read_back_with_the_name_the_author_wrote(
-    self, bundle
-  ):
-    manifest = json.loads((bundle / "manifest.json").read_text())
-    wan = next(
-      p for p in manifest["programs"] if p["zone"] == "wan"
-    )
-    assert wan["rules"]["rules"][0]["match"] == (
-      "pkt.src_ip in badhosts"
-    )
-
-  def test_a_table_nobody_matches_reports_no_entry_count(
+  def test_a_table_nobody_matches_is_marked_unreferenced(
     self, tmp_path
   ):
-    _feed(tmp_path / "feed.txt", 3)
     policy = (
       "table unused {\n  kind = cidr4\n  max = 10\n"
-      '  source = "feed.txt"\n}\n'
+      '  source = "/var/lib/f/feeds/u.txt"\n}\n'
       "@xdp(eth0)\n"
       "default allow\n"
     )
     result, bundle = _compile_bundle(tmp_path, policy)
     assert result.exit_code == 0, result.output
     manifest = json.loads((bundle / "manifest.json").read_text())
-    # No map is emitted for it, so "how many entries" has no answer
-    # rather than the answer zero.
-    assert manifest["tables"]["unused"]["entries"] is None
-    assert not (bundle / "geoip.json").exists()
+    # No object declares its map, so this is the daemon's instruction
+    # not to go looking for a pin that was never created -- and, more
+    # to the point, not to fail the load because a feed nothing reads
+    # is missing.
+    assert manifest["tables"]["unused"]["referenced"] is False
+    assert "fwl_tbl_0" not in manifest["persistent_maps"]
+
+  def test_every_zone_declares_the_shared_table_pinned(self, manifest):
+    assert "fwl_tbl_0" in manifest["shared_pinned_maps"]
+    for zone in ("wan", "lan"):
+      src = (self._bundle / f"{zone}.bpf.c").read_text()
+      decls = {d.name: d for d in emitter._scan_map_decls(src)}
+      assert decls["fwl_tbl_0"].pinned
+
+  def test_the_two_zones_declare_the_table_identically(self, manifest):
+    wan = {
+      d.name: d.attrs for d in emitter._scan_map_decls(
+        (self._bundle / "wan.bpf.c").read_text())
+    }
+    lan = {
+      d.name: d.attrs for d in emitter._scan_map_decls(
+        (self._bundle / "lan.bpf.c").read_text())
+    }
+    assert wan["fwl_tbl_0"] == lan["fwl_tbl_0"]
+
+  def test_the_rules_read_back_with_the_name_the_author_wrote(
+    self, manifest
+  ):
+    wan = next(p for p in manifest["programs"] if p["zone"] == "wan")
+    assert wan["rules"]["rules"][0]["match"] == (
+      "pkt.src_ip in badhosts"
+    )
 
 
 # --------------------------------------------------------------------
-class TestTablesAndGeoipShareOnePayload:
-  """Both mechanisms are the same map; the loader must see both."""
+class TestATableSurvivesAPolicyEdit:
+  """MapLifetime.EXTERNAL, from the compiler's side.
 
-  def test_a_program_with_both_emits_both_tries(self, tmp_path):
-    _feed(tmp_path / "feed.txt", 4)
-    (tmp_path / "geo.json").write_text(json.dumps({"DE": ["10.9.0.0/16"]}))
-    src = tmp_path / "p.fw"
-    src.write_text(
-      "table badhosts {\n  kind = cidr4\n  max = 10\n"
-      '  source = "feed.txt"\n}\n'
+  A policy edit says nothing about whether an address is still
+  hostile. Discarding the trie because the rules changed would throw
+  away state this compilation neither produced nor invalidated, and a
+  table erased by every policy edit is not a table. `fd` decides what
+  to keep by reading `persistent_maps` out of the manifest and
+  re-derives nothing, so this is where that decision is made.
+  """
+
+  def test_the_row_is_external_and_shared(self):
+    kind = emitter._map_kind("fwl_tbl_0")
+    assert kind.lifetime is emitter.MapLifetime.EXTERNAL
+    assert kind.scope is emitter.MapScope.SHARED
+    assert kind.lifetime_why.strip()
+
+  def test_external_is_neither_of_the_other_two(self):
+    # The registry exists to stop a map's sharing being derived from a
+    # different question. A table is not POLICY (its contents are not
+    # this compilation's output) and not FLOW (its key space is a
+    # declaration, not a wire fact), and calling it either would be a
+    # lie in the one place that is supposed to prevent them.
+    assert emitter.MapLifetime.EXTERNAL not in (
+      emitter.MapLifetime.POLICY, emitter.MapLifetime.FLOW
+    )
+
+  def test_the_manifest_names_every_referenced_table_as_persistent(
+    self, tmp_path
+  ):
+    policy = (
+      "table a {\n  kind = cidr4\n  max = 10\n"
+      '  source = "/var/lib/f/feeds/a.txt"\n}\n'
+      "table b {\n  kind = cidr6\n  max = 10\n"
+      '  source = "/var/lib/f/feeds/b.txt"\n}\n'
       "@xdp(eth0)\n"
-      "drop if pkt.src_ip in badhosts\n"
-      "drop if pkt.src_ip in geoip(DE)\n"
+      "drop if pkt.src_ip in a\n"
+      "drop if pkt.src_ip6 in b\n"
       "default allow\n"
     )
-    bundle = tmp_path / "out"
-    result = CliRunner().invoke(cli.main, [
-      "compile", str(src), "--bundle", str(bundle),
-      "--geoip", str(tmp_path / "geo.json"),
-    ])
+    result, bundle = _compile_bundle(tmp_path, policy)
     assert result.exit_code == 0, result.output
-    payload = json.loads((bundle / "geoip.json").read_text())
-    maps = {t["map"] for t in payload["tries"]}
-    assert maps == {"fwl_geoip_eth0_0", "fwl_tbl_0"}
+    manifest = json.loads((bundle / "manifest.json").read_text())
+    persistent = manifest["persistent_maps"]
+    # The flow-keyed names are still there; the tables join them.
+    assert "fwl_tbl_0" in persistent
+    assert "fwl_tbl_1" in persistent
+
+  def test_a_unit_with_no_tables_persists_exactly_what_it_used_to(self):
+    # The EXTERNAL row must not widen the list for policies that
+    # declare no table. `fd` sweeps every pin not on this list, so a
+    # name added unconditionally would keep a map alive that nothing
+    # declares.
+    program = _analyze("@xdp(eth0)\ndefault allow\n")
+    assert emitter.persistent_map_names(program) == (
+      "conntrack", "fwl_nat"
+    )
+
+  def test_the_names_are_literal_so_the_daemon_compares_strings(self):
+    program = _analyze(
+      "table a {\n  kind = cidr4\n  max = 10\n"
+      '  source = "/var/lib/f/feeds/a.txt"\n}\n'
+      "@xdp(eth0)\n"
+      "drop if pkt.src_ip in a\n"
+      "default allow\n"
+    )
+    names = emitter.persistent_map_names(program)
+    assert "fwl_tbl_0" in names
+    # No patterns: fd compares a string against a pin's filename, and
+    # a regex crossing the language boundary is the second copy of a
+    # decision that this registry exists to prevent.
+    for name in names:
+      assert emitter._LITERAL_NAME_RE.fullmatch(name), name
+
+  def test_a_private_external_row_is_a_contradiction(self, monkeypatch):
+    rows = tuple(
+      dataclasses.replace(k, scope=emitter.MapScope.PRIVATE)
+      if k.lifetime is emitter.MapLifetime.EXTERNAL else k
+      for k in emitter._MAP_KINDS
+    )
+    monkeypatch.setattr(emitter, "_MAP_KINDS", rows)
+    with pytest.raises(FwlException) as exc:
+      emitter.persistent_map_names()
+    assert "EXTERNAL" in exc.value.error.message
 
 
 # The headline number from the rig: 50,000 prefixes at 99% of line
@@ -431,22 +463,35 @@ _BIG_TABLE_COUNT = 50000
 
 @pytest.fixture(scope="module")
 def big_table(tmp_path_factory):
-  """A compiled 50,000-prefix policy plus the map seed for its trie."""
+  """A compiled 50,000-prefix policy plus the map seed for its trie.
+
+  The prefixes come from the FEED FILE, which is where `fd` gets them:
+  the bundle carries only the declaration, and the manifest's `source`
+  is what says where to look. Reading the file here rather than the
+  bundle is the point -- it is the same path the daemon walks.
+  """
   if not bpf_runner._can_load_bpf():
     pytest.skip("kernel BPF load unavailable (needs root)")
   d = tmp_path_factory.mktemp("bigtable")
-  _feed(d / "feed.txt", _BIG_TABLE_COUNT)
-  result, bundle = _compile_bundle(d, _policy(_BIG_TABLE_COUNT))
+  feed = d / "feed.txt"
+  _feed(feed, _BIG_TABLE_COUNT)
+  policy = _policy(_BIG_TABLE_COUNT, str(feed))
+  result, bundle = _compile_bundle(d, policy)
   assert result.exit_code == 0, result.output
-  payload = json.loads((bundle / "geoip.json").read_text())
-  prefixes = payload["tries"][0]["prefixes"]
+  manifest = json.loads((bundle / "manifest.json").read_text())
+  assert manifest["tables"]["badhosts"]["source"] == str(feed)
+  prefixes = sorted(
+    line.split("#", 1)[0].strip()
+    for line in feed.read_text().splitlines()
+    if line.split("#", 1)[0].strip()
+  )
   assert len(prefixes) == _BIG_TABLE_COUNT
-  program = _analyze(_policy(_BIG_TABLE_COUNT))
+  program = _analyze(policy)
   map_init = fwl_runner._build_table_map_init(
     program, {"badhosts": prefixes}
   )
   assert len(map_init["fwl_tbl_0"]) == _BIG_TABLE_COUNT
-  return emitter.emit(program), map_init, sorted(prefixes)
+  return emitter.emit(program), map_init, prefixes
 
 
 # --------------------------------------------------------------------
@@ -507,49 +552,104 @@ class TestTheKernelHoldsTheWholeTable:
     # took a fraction of the file -- and the passing runs above would
     # be proving much less than they appear to.
     _, map_init, _ = big_table
-    small = emitter.emit(_analyze(_policy(1000)))
+    small = emitter.emit(_analyze(_policy(1000, "/var/lib/f/feeds/x")))
     with pytest.raises(OSError, match="bpf_map_update_elem"):
       bpf_runner.run(small, b"\x00" * 64, map_init)
 
 
 # --------------------------------------------------------------------
-class TestTheDaemonReadsWhatTheCompilerWrites:
-  """The "phase 1 needs no daemon change" claim, held from both ends.
+class TestTablesAndGeoipNoLongerShareAPayload:
+  """The same map type, and no longer the same data path.
 
-  tests/test_bpf_loader.cc::GeoipParseTest::
-  ReadsATablePayloadTheCompilerEmitted feeds the unmodified
-  `ParseGeoipFile` the exact JSON below and asserts the entries it
-  yields. This test asserts the compiler still produces it. Either
-  side drifting turns one of the two red.
+  geoip() prefixes come from the COMPILATION -- a country list the
+  build host resolved -- and ship in geoip.json. A table's prefixes
+  come from a file on the appliance and never enter the bundle.
+  Converging the two mechanisms is a real simplification and an open
+  question in TABLES.md; converging them by ACCIDENT, so that a table
+  quietly acquired a compile-time snapshot, is the failure mode.
+  """
+
+  def test_geoip_still_ships_its_prefixes_and_the_table_does_not(
+    self, tmp_path
+  ):
+    (tmp_path / "geo.json").write_text(
+      json.dumps({"DE": ["10.9.0.0/16"]}))
+    src = tmp_path / "p.fw"
+    src.write_text(
+      "table badhosts {\n  kind = cidr4\n  max = 10\n"
+      '  source = "/var/lib/f/feeds/b.txt"\n}\n'
+      "@xdp(eth0)\n"
+      "drop if pkt.src_ip in badhosts\n"
+      "drop if pkt.src_ip in geoip(DE)\n"
+      "default allow\n"
+    )
+    bundle = tmp_path / "out"
+    result = CliRunner().invoke(cli.main, [
+      "compile", str(src), "--bundle", str(bundle),
+      "--geoip", str(tmp_path / "geo.json"),
+    ])
+    assert result.exit_code == 0, result.output
+    payload = json.loads((bundle / "geoip.json").read_text())
+    assert {t["map"] for t in payload["tries"]} == {"fwl_geoip_eth0_0"}
+    manifest = json.loads((bundle / "manifest.json").read_text())
+    assert manifest["tables"]["badhosts"]["map"] == "fwl_tbl_0"
+
+  def test_the_two_tries_have_opposite_lifetimes(self):
+    # Same map type, opposite answers to "may these contents outlive
+    # this compilation". A geoip trie is repopulated from the bundle
+    # at every load and adopting one would answer for a country the
+    # new call site never asked about; a table's contents are not the
+    # compilation's to discard.
+    assert emitter._map_kind("fwl_geoip_0").lifetime is (
+      emitter.MapLifetime.POLICY)
+    assert emitter._map_kind("fwl_tbl_0").lifetime is (
+      emitter.MapLifetime.EXTERNAL)
+
+
+# --------------------------------------------------------------------
+class TestTheDaemonReadsWhatTheCompilerWrites:
+  """The compiler/daemon contract, held from both ends.
+
+  tests/test_bpf_loader.cc::TableSpecTest::
+  ParsesTheDeclarationTheCompilerShips feeds `ParseTableSpecs` the
+  exact JSON below and asserts the TableSpecs it yields. This asserts
+  the compiler still produces it. Either side drifting turns one of
+  the two red -- which matters more under the disk-authoritative model
+  than it did before, because this block is now the only thing the two
+  languages share about a file neither of them has seen.
   """
 
   # Byte-for-byte what tests/test_bpf_loader.cc has pasted into it.
-  EXPECTED_PAYLOAD = {
-    "tries": [
-      {
-        "map": "fwl_tbl_0",
-        "family": "ipv4",
-        "prefixes": ["10.99.77.0/24", "192.0.2.0/25"],
-      },
-      {
-        "map": "fwl_tbl_1",
-        "family": "ipv6",
-        "prefixes": ["2001:db8::/32"],
-      },
-    ]
+  EXPECTED_TABLES = {
+    "corporate_blocklist": {
+      "id": 0,
+      "map": "fwl_tbl_0",
+      "kind": "cidr4",
+      "max": 100000,
+      "source": "/var/lib/f/feeds/corp.txt",
+      "referenced": True,
+    },
+    "v6_blocklist": {
+      "id": 1,
+      "map": "fwl_tbl_1",
+      "kind": "cidr6",
+      "max": 100,
+      "source": "/var/lib/f/feeds/corp6.txt",
+      "referenced": True,
+    },
   }
 
   POLICY = (
     "table corporate_blocklist {\n"
     "  kind = cidr4\n"
     "  max = 100000\n"
-    '  source = "corp.txt"\n'
+    '  source = "/var/lib/f/feeds/corp.txt"\n'
     "}\n"
     "\n"
     "table v6_blocklist {\n"
     "  kind = cidr6\n"
     "  max = 100\n"
-    '  source = "corp6.txt"\n'
+    '  source = "/var/lib/f/feeds/corp6.txt"\n'
     "}\n"
     "\n"
     "@xdp(eth0)\n"
@@ -558,13 +658,13 @@ class TestTheDaemonReadsWhatTheCompilerWrites:
     "default allow\n"
   )
 
-  def test_the_payload_is_what_the_loader_test_pins(self, tmp_path):
-    (tmp_path / "corp.txt").write_text("10.99.77.0/24\n192.0.2.0/25\n")
-    (tmp_path / "corp6.txt").write_text("2001:db8::/32\n")
+  def test_the_manifest_block_is_what_the_loader_test_pins(
+    self, tmp_path
+  ):
     result, bundle = _compile_bundle(tmp_path, self.POLICY)
     assert result.exit_code == 0, result.output
-    payload = json.loads((bundle / "geoip.json").read_text())
-    assert payload == self.EXPECTED_PAYLOAD
+    manifest = json.loads((bundle / "manifest.json").read_text())
+    assert manifest["tables"] == self.EXPECTED_TABLES
 
 
 # --------------------------------------------------------------------
@@ -676,19 +776,43 @@ class TestTheShippedExample:
       program, packet.fields, table_data=table_data
     )
 
-  def test_it_compiles_to_a_bundle_with_the_feeds_loaded(
+  def test_it_compiles_on_a_host_that_has_none_of_the_feeds(
     self, tmp_path
   ):
+    # `source` names a path on the appliance. A build host does not
+    # have /var/lib/f/feeds, and must not need it: the bundle carries
+    # the declaration and `fd` reads the file.
+    assert not Path("/var/lib/f/feeds/blocklist.txt").exists()
     bundle = tmp_path / "out"
     result = CliRunner().invoke(cli.main, [
       "compile", str(self.EXAMPLES / "blocklist_table.fw"),
       "--bundle", str(bundle),
     ])
     assert result.exit_code == 0, result.output
-    payload = json.loads((bundle / "geoip.json").read_text())
-    by_map = {t["map"]: t["prefixes"] for t in payload["tries"]}
-    assert "198.51.100.77/32" in by_map["fwl_tbl_0"]
-    assert by_map["fwl_tbl_1"] == ["2001:db8::/32"]
+    manifest = json.loads((bundle / "manifest.json").read_text())
+    assert manifest["tables"]["corporate_blocklist"]["source"] == (
+      "/var/lib/f/feeds/blocklist.txt")
+    assert manifest["tables"]["corporate_blocklist6"]["map"] == (
+      "fwl_tbl_1")
+    assert not (bundle / "geoip.json").exists()
+
+  def test_the_sample_feeds_are_what_the_daemon_would_accept(self):
+    # The files beside the example are a sample of the format an
+    # operator copies onto the box, so they have to BE that format --
+    # a sample the daemon would refuse teaches the wrong thing. The
+    # authority is tests/test_bpf_loader.cc::TableFeedTest; this is
+    # the same rules applied to the shipped files.
+    import ipaddress
+    for name, want_v4 in (
+      ("blocklist.txt", True), ("blocklist6.txt", False),
+    ):
+      entries = self._feed(self.EXAMPLES / "feeds" / name)
+      assert entries, name
+      for item in entries:
+        assert "/" in item, f"{name}: {item} has no prefix length"
+        net = ipaddress.ip_network(item, strict=False)
+        assert isinstance(net, ipaddress.IPv4Network) is want_v4, (
+          f"{name}: {item} is the wrong family")
 
   def test_a_listed_v4_source_is_dropped(self, program, table_data):
     from fwl.interpreter import XdpAction

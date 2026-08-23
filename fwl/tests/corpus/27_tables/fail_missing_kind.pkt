@@ -5,7 +5,7 @@ name: "a table declaration without kind is refused"
 source_fw: |
   table badhosts {
     max = 10
-    source = "b.txt"
+    source = "/var/lib/f/feeds/b.txt"
   }
 
   @xdp(eth0)

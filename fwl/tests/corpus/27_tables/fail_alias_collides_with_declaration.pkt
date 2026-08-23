@@ -3,13 +3,13 @@ source_fw: |
   table badhosts {
     kind = cidr4
     max = 10
-    source = "a.txt"
+    source = "/var/lib/f/feeds/a.txt"
   }
 
   table other {
     kind = cidr4
     max = 10
-    source = "b.txt"
+    source = "/var/lib/f/feeds/b.txt"
   }
 
   table badhosts = other

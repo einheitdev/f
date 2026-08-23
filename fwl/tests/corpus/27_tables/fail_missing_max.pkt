@@ -2,7 +2,7 @@ name: "a table declaration without max is refused"
 source_fw: |
   table badhosts {
     kind = cidr4
-    source = "b.txt"
+    source = "/var/lib/f/feeds/b.txt"
   }
 
   @xdp(eth0)
