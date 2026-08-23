@@ -66,6 +66,14 @@ import time
 
 HERE = pathlib.Path(__file__).resolve().parent
 
+def _load_module(name, filename):
+  """Load a sibling harness by path, so its machinery is reused."""
+  import importlib.util
+  spec = importlib.util.spec_from_file_location(name, HERE / filename)
+  module = importlib.util.module_from_spec(spec)
+  spec.loader.exec_module(module)
+  return module
+
 def _load_rfc2544():
   """Reuse the throughput harness's generator, counters and honesty."""
   import importlib.util
@@ -171,6 +179,14 @@ def main():
   ap.add_argument("--decay-tolerance", type=float, default=0.03,
                   help="fractional throughput decay treated as failure")
   ap.add_argument("--rss-tolerance", type=float, default=0.05)
+  ap.add_argument("--watchdog", type=int, default=120,
+                  help="hardware watchdog timeout, seconds. A long run "
+                       "needs this MORE than a short one: the box is "
+                       "unattended for hours, and userspace recovery "
+                       "does not work on a box that cannot schedule "
+                       "anything. 0 disables it, which is how the "
+                       "first two-hour attempt ended in a power cycle.")
+  ap.add_argument("--watchdog-path", default="/usr/local/bin/f-hw-watchdog")
   ap.add_argument("--out", default="/tmp/endurance")
   args = ap.parse_args()
 
@@ -235,12 +251,29 @@ def main():
   for t in threads:
     t.start()
 
+  # Arm the board's own watchdog for the duration. A two-hour run left
+  # unattended on a box that stopped answering ARP is a power cycle and
+  # a lost afternoon; the SoC does not care whether userspace can be
+  # scheduled. Petted by the mgmt thread's own liveness -- if this
+  # process cannot run, the board resets itself.
+  acl = _load_module("aclscale", "l13_03_acl_scale.py")
+  guard = None
+  if args.watchdog:
+    if dut.sh(f"test -e {args.watchdog_path}").returncode != 0:
+      sys.exit(f"the DUT needs {args.watchdog_path}; running a long "
+               "load test without a watchdog is how the last one "
+               "ended")
+    guard = acl.Guard(dut, args.watchdog, args.watchdog_path)
+    guard.__enter__()
+
   gen.configure(rate)
   before = {d.rx: dut.counters(d.rx, d.tx) for d in directions}
   sent, elapsed = gen.run_for(seconds)
   after = {d.rx: dut.counters(d.rx, d.tx) for d in directions}
   stop.set()
   gen.cleanup()
+  if guard is not None:
+    guard.__exit__(None, None, None)
   time.sleep(3)
 
   sent_total = sum(sent.values())
