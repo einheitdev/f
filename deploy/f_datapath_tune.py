@@ -56,8 +56,10 @@ before assuming.
 import argparse
 import pathlib
 import re
+import shutil
 import subprocess
 import sys
+import yaml
 
 CPU_ROOT = pathlib.Path("/sys/devices/system/cpu")
 NET_ROOT = pathlib.Path("/sys/class/net")
@@ -284,6 +286,42 @@ def candidate_ifaces():
   return sorted(entry.name for entry in NET_ROOT.iterdir()
                 if (entry / "device").exists())
 
+# The three postures, worst-to-best for throughput and best-to-worst
+# for isolation, with the kernel parameter that selects each and the
+# group type it produces. Measured forwarding IMIX on RK3588, RFC 2544
+# at 0.01% loss, from a cold boot in each mode:
+#
+#   strict       1,392,633 pps   42.5% of 10 GbE line
+#   lazy         2,495,233 pps   76.2%
+#   passthrough  3,230,294 pps   98.7%
+#
+# The gap is not tuning noise. XDP_REDIRECT DMA-maps a frame on the
+# transmit device and unmaps it on completion, per packet, and strict
+# mode makes every unmap wait for an SMMU invalidation -- 37% of the
+# big cores on this board, in one function.
+IOMMU_MODES = {
+  "strict": {
+    "group_type": "DMA",
+    "cmdline": None,
+    "why": "kernel default. Every DMA unmap waits for an SMMU "
+           "invalidation, which on this workload is half the machine.",
+  },
+  "lazy": {
+    "group_type": "DMA-FQ",
+    "cmdline": "iommu.strict=0",
+    "why": "translation and isolation stay; invalidation is batched. "
+           "A just-unmapped buffer is reachable by the device for a "
+           "short window, and nothing else is.",
+  },
+  "passthrough": {
+    "group_type": "identity",
+    "cmdline": "iommu.passthrough=1",
+    "why": "no translation at all. The device addresses physical "
+           "memory directly. Fastest, and the only mode that gives up "
+           "DMA isolation outright.",
+  },
+}
+
 def iommu_mode(iface):
   """How the SMMU is translating DMA for this interface, or None.
 
@@ -298,37 +336,147 @@ def iommu_mode(iface):
   It also explains a difference that looked like a hardware property:
   dropping was 2.4x cheaper than forwarding, because dropping never
   maps anything for transmit. After this was fixed the two came out
-  within 5% of each other.
+  within 20% of each other.
   """
   group = NET_ROOT / iface / "device" / "iommu_group"
   if not group.exists():
     return None
   return read(group.resolve() / "type")
 
-def check_iommu(report, ifaces):
-  """Report the SMMU mode. Advisory: it is set on the kernel cmdline.
+def mode_of_group_type(group_type):
+  """Reverse IOMMU_MODES: a group type back to the mode that made it."""
+  for name, spec in IOMMU_MODES.items():
+    if spec["group_type"] == group_type:
+      return name
+  return None
 
-  This tool cannot fix it -- `iommu.passthrough` and `iommu.strict`
-  are boot parameters -- but a box in strict mode runs at half speed
-  for a reason nothing else reports, so it is named here rather than
-  left for whoever next wonders why the numbers do not match.
+def check_iommu(report, ifaces, want):
+  """Compare the running SMMU posture against the one asked for.
+
+  Report-only, and deliberately so. `iommu.strict` and
+  `iommu.passthrough` are kernel command-line parameters, so applying
+  one means editing a bootloader configuration and rebooting --
+  which is not something a unit that runs on every boot should do by
+  itself. `--apply-boot` is the explicit operator action; this is the
+  thing that tells them it is needed.
   """
-  strict = sorted(i for i in ifaces if iommu_mode(i) == "DMA")
-  if strict:
-    report.failed.append(
-      f"SMMU in strict mode for {', '.join(strict)}: every forwarded "
-      "packet pays a synchronous TLB invalidation, measured at ~2x "
-      "throughput on RK3588. Fix on the kernel cmdline: "
-      "iommu.strict=0 keeps DMA isolation and recovers most of it, "
-      "iommu.passthrough=1 removes translation entirely and recovers "
-      "all of it.")
-    return
+  seen = {}
   for iface in ifaces:
-    mode = iommu_mode(iface)
-    if mode in ("DMA-FQ", "identity"):
-      report.already.append(
-        f"{iface} SMMU {mode} "
-        f'({"lazy invalidation" if mode == "DMA-FQ" else "passthrough"})')
+    group_type = iommu_mode(iface)
+    if group_type is None:
+      continue
+    seen[iface] = mode_of_group_type(group_type) or group_type
+  if not seen:
+    report.skipped.append(
+      "SMMU: no IOMMU in the path for any interface, nothing to "
+      "choose")
+    return
+  wrong = sorted(i for i, mode in seen.items() if mode != want)
+  if not wrong:
+    report.already.append(
+      f"SMMU {want} for {', '.join(sorted(seen))} "
+      f"({IOMMU_MODES[want]['group_type']})")
+    return
+  have = ", ".join(f"{i}={seen[i]}" for i in wrong)
+  cmdline = IOMMU_MODES[want]["cmdline"] or "(no parameter; the default)"
+  report.failed.append(
+    f"SMMU is {have}, configured for {want}. Needs {cmdline} on the "
+    f"kernel command line and a reboot: run `f-datapath-tune "
+    f"--apply-boot`. Until then this box forwards at "
+    f"{'about half' if 'strict' in seen.values() else 'a different'} "
+    f"speed to its datasheet.")
+
+# Where each platform keeps the kernel command line, and the variable
+# on which the parameters live. Only bootloaders we have actually
+# written to are listed: guessing at one and being wrong does not
+# produce an error message, it produces a box that does not boot.
+BOOT_CONFIGS = (
+  ("/boot/armbianEnv.txt", "extraargs", "armbian"),
+  ("/etc/default/grub", "GRUB_CMDLINE_LINUX_DEFAULT", "grub"),
+)
+
+def find_boot_config():
+  """(path, variable, flavour) for this box, or None."""
+  for path, var, flavour in BOOT_CONFIGS:
+    if pathlib.Path(path).exists():
+      return path, var, flavour
+  return None
+
+def apply_boot(want, dry_run=False):
+  """Put the mode's kernel parameter on the command line.
+
+  Backs the file up first, edits exactly one line, removes any
+  parameter belonging to a *different* mode so the two cannot both be
+  present, and reads the result back. Prints what to do next rather
+  than rebooting: a tool that reboots a firewall because a config
+  value changed is a tool that reboots a firewall.
+  """
+  found = find_boot_config()
+  if not found:
+    print("cannot apply: no bootloader configuration recognised. "
+          "Looked for " + ", ".join(p for p, _, _ in BOOT_CONFIGS) +
+          ". Add the parameter by hand:")
+    manual = (IOMMU_MODES[want]["cmdline"]
+              or "(remove both iommu.* parameters)")
+    print(f"  {manual}")
+    return 1
+  path, var, flavour = found
+  wanted = IOMMU_MODES[want]["cmdline"]
+  others = [spec["cmdline"] for name, spec in IOMMU_MODES.items()
+            if name != want and spec["cmdline"]]
+
+  lines = pathlib.Path(path).read_text().splitlines()
+  out, touched = [], False
+  for line in lines:
+    stripped = line.strip()
+    if not stripped.startswith(f"{var}="):
+      out.append(line)
+      continue
+    head, _, value = stripped.partition("=")
+    # grub quotes its value; armbian does not.
+    quote = ""
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+      quote, value = value[0], value[1:-1]
+    params = [p for p in value.split() if p not in others]
+    if wanted and wanted not in params:
+      params.append(wanted)
+    out.append(f"{head}={quote}{' '.join(params)}{quote}")
+    touched = True
+  if not touched:
+    quote = '"' if flavour == "grub" else ""
+    out.append(f"{var}={quote}{wanted or ''}{quote}")
+
+  new = "\n".join(out) + "\n"
+  if dry_run:
+    print(f"would write {path}:")
+    for line in out:
+      if line.strip().startswith(f"{var}="):
+        print(f"  {line}")
+    return 0
+
+  backup = f"{path}.bak-f-datapath"
+  shutil.copy2(path, backup)
+  pathlib.Path(path).write_text(new)
+  after = [ln for ln in pathlib.Path(path).read_text().splitlines()
+           if ln.strip().startswith(f"{var}=")]
+  if wanted and not any(wanted in ln for ln in after):
+    shutil.copy2(backup, path)
+    print(f"write to {path} did not take; restored from {backup}")
+    return 1
+  print(f"{path} updated (backup at {backup}):")
+  for line in after:
+    print(f"  {line}")
+  if flavour == "grub":
+    rc = subprocess.run(["update-grub"], capture_output=True,
+                        text=True).returncode
+    if rc != 0:
+      print("update-grub failed; the box will boot the OLD command "
+            "line until it succeeds")
+      return 1
+    print("  update-grub ok")
+  print(f"\nreboot to take effect. Mode after reboot: {want} "
+        f"({IOMMU_MODES[want]['why']})")
+  return 0
 
 def tune_rss(report, iface, big_weight, little_weight):
   """Weight the RSS table toward the cores that are actually faster.
@@ -409,24 +557,84 @@ def tune_rss(report, iface, big_weight, little_weight):
     f'{iface} RSS weight {" ".join(str(w) for w in weights)} '
     f'({" ".join(description)})')
 
+CONFIG_PATH = "/etc/f/datapath.yaml"
+
+DEFAULTS = {
+  # Isolation posture. See IOMMU_MODES for what each costs and buys.
+  # `lazy` rather than `passthrough` is the default on purpose: it
+  # recovers most of the throughput without an appliance giving up
+  # DMA isolation by inheriting a value nobody chose. Boxes that want
+  # the rest have to say so.
+  "iommu": "lazy",
+  "governor": "performance",
+  "max_idle_latency_us": 50,
+  "rss_big_weight": 3,
+  "rss_little_weight": 1,
+  "interfaces": [],
+}
+
+def load_config(path):
+  """Merge `path` over the defaults. A missing file is not an error.
+
+  Returns (settings, note) where note is a line for the report -- the
+  operator should be able to see which posture is in force and where
+  it came from without going and looking.
+  """
+  settings = dict(DEFAULTS)
+  file = pathlib.Path(path)
+  if not file.exists():
+    return settings, f"config: {path} absent, using defaults"
+  try:
+    loaded = yaml.safe_load(file.read_text()) or {}
+  except yaml.YAMLError as exc:
+    return settings, f"config: {path} is not valid YAML ({exc}); " \
+                     "using defaults"
+  if not isinstance(loaded, dict):
+    return settings, f"config: {path} is not a mapping; using defaults"
+  unknown = sorted(set(loaded) - set(DEFAULTS))
+  settings.update({k: v for k, v in loaded.items() if k in DEFAULTS})
+  note = f"config: {path}"
+  if unknown:
+    note += f" (ignored unknown key(s): {', '.join(unknown)})"
+  return settings, note
+
 def main():
   ap = argparse.ArgumentParser(
     description="Apply the datapath tuning the throughput figures "
-                "were measured with.")
+                "were measured with, and report the parts of it that "
+                "only a reboot can change.")
   ap.add_argument("interfaces", nargs="*",
                   help="interfaces to weight; default is every "
-                       "physical interface that is up")
-  ap.add_argument("--max-idle-latency-us", type=int, default=50,
+                       "physical interface")
+  ap.add_argument("--config", default=CONFIG_PATH,
+                  help=f"settings file (default {CONFIG_PATH}). "
+                       "Absent is fine; the defaults are the shipped "
+                       "posture.")
+  ap.add_argument("--iommu", choices=sorted(IOMMU_MODES),
+                  help="override the configured isolation posture. "
+                       "strict is the kernel default and about half "
+                       "the speed; lazy keeps DMA isolation and "
+                       "recovers most of it; passthrough gives up "
+                       "isolation for the rest.")
+  ap.add_argument("--apply-boot", action="store_true",
+                  help="write the chosen posture's kernel parameter "
+                       "to this box's bootloader configuration and "
+                       "stop. Takes effect on the next boot; does "
+                       "not reboot anything.")
+  ap.add_argument("--dry-run", action="store_true",
+                  help="with --apply-boot, show the line that would "
+                       "be written and change nothing")
+  ap.add_argument("--max-idle-latency-us", type=int,
                   help="disable idle states slower to exit than this. "
                        "RK3588 cpu-sleep is 220 us, which is 300 "
                        "frames at 1.4 Mpps.")
-  ap.add_argument("--governor", default="performance")
-  ap.add_argument("--big-weight", type=int, default=3,
+  ap.add_argument("--governor")
+  ap.add_argument("--big-weight", type=int,
                   help="RSS weight for queues served by a core at the "
                        "highest available clock. Measured, not "
                        "derived: 3:1 beat everything else on RK3588, "
                        "where the clock ratio alone is 1.33:1.")
-  ap.add_argument("--little-weight", type=int, default=1)
+  ap.add_argument("--little-weight", type=int)
   ap.add_argument("--no-cpuidle", action="store_true",
                   help="leave idle states alone")
   ap.add_argument("--no-governor", action="store_true",
@@ -435,13 +643,31 @@ def main():
                   help="leave the indirection tables alone")
   args = ap.parse_args()
 
+  settings, note = load_config(args.config)
+  for key, value in (("iommu", args.iommu),
+                     ("governor", args.governor),
+                     ("max_idle_latency_us", args.max_idle_latency_us),
+                     ("rss_big_weight", args.big_weight),
+                     ("rss_little_weight", args.little_weight),
+                     ("interfaces", args.interfaces or None)):
+    if value is not None:
+      settings[key] = value
+      note += f", {key} overridden on the command line"
+  if settings["iommu"] not in IOMMU_MODES:
+    sys.exit(f"unknown iommu mode {settings['iommu']!r}; expected one "
+             f"of {', '.join(sorted(IOMMU_MODES))}")
+
+  if args.apply_boot:
+    return apply_boot(settings["iommu"], args.dry_run)
+
   report = Report()
+  report.already.append(note)
   if not args.no_cpuidle:
-    tune_cpuidle(report, args.max_idle_latency_us)
+    tune_cpuidle(report, settings["max_idle_latency_us"])
   if not args.no_governor:
-    tune_governor(report, args.governor)
-  ifaces = args.interfaces or candidate_ifaces()
-  check_iommu(report, ifaces)
+    tune_governor(report, settings["governor"])
+  ifaces = settings["interfaces"] or candidate_ifaces()
+  check_iommu(report, ifaces, settings["iommu"])
   if not args.no_rss:
     # A run that examined no interface at all is not a clean run. The
     # first version filtered them out and still printed "tuning
@@ -452,7 +678,8 @@ def main():
         "RSS: no physical interface found to examine. Either this "
         "box has none, or this ran before the drivers were bound.")
     for iface in ifaces:
-      tune_rss(report, iface, args.big_weight, args.little_weight)
+      tune_rss(report, iface, settings["rss_big_weight"],
+               settings["rss_little_weight"])
   return report.emit()
 
 if __name__ == "__main__":

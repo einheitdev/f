@@ -1,0 +1,85 @@
+# Datapath tuning. Read by `f-datapath-tune`, which runs before fd.
+#
+# Every setting here is a performance property, so a box that cannot
+# apply one still filters and still forwards. What it does not do is
+# match its own datasheet, and nothing else on the box would say so --
+# which is why these live in a file an operator can see rather than in
+# a script's defaults.
+#
+# Measured on RK3588 with a ConnectX at 10 GbE, RFC 2544 at 0.01%
+# loss. Untuned this board forwards 955,429 pps; with everything below
+# applied, 3,230,294 -- 98.7% of line rate at IMIX.
+
+# --- DMA isolation posture -------------------------------------------
+#
+# This is the one real decision in the file, because it trades a
+# security property for throughput rather than trading nothing at all.
+#
+# XDP_REDIRECT DMA-maps a frame on the transmit device and unmaps it
+# on completion, for every forwarded packet. What the IOMMU does about
+# that unmap decides roughly a factor of two:
+#
+#   strict       Kernel default. Every unmap waits for an SMMU
+#                invalidation. Full isolation, and on RK3588 it was
+#                37% of the big cores in one function.
+#                -> 1,392,633 pps, 42.5% of line
+#
+#   lazy         iommu.strict=0. Translation and isolation stay;
+#                invalidation is batched. A just-unmapped buffer stays
+#                reachable by the device for a short window -- a
+#                buffer it was legitimately handed moments ago, not
+#                arbitrary host memory.
+#                -> 2,495,233 pps, 76.2% of line     [the default]
+#
+#   passthrough  iommu.passthrough=1. No translation at all; the
+#                device addresses physical memory directly. Fastest,
+#                and the only mode that gives up DMA isolation
+#                outright. Defensible when the NICs are soldered and
+#                the box has no user-accessible PCIe or M.2 -- and
+#                only as a decision somebody made on purpose, which
+#                is what changing this line is.
+#                -> 3,230,294 pps, 98.7% of line
+#
+# `lazy` is the default because inheriting `passthrough` without
+# choosing it is exactly the failure this file exists to prevent. It
+# is set on the kernel command line, so changing it here does nothing
+# until `f-datapath-tune --apply-boot` and a reboot. The tool reports
+# the mismatch in the meantime.
+iommu: lazy
+
+# --- CPU latency -----------------------------------------------------
+#
+# Disable idle states slower to exit than this. RK3588's cpu-sleep is
+# 220 us, which at 1.4 Mpps is 300 frames arriving before the core
+# that has to poll them is executing again, against a 1024-entry ring.
+# Worth 31-43%, and it is what turned a loss threshold that moved 40%
+# between identical runs into one that does not.
+#
+# It costs a few watts at rest and a warmer idle. On a fanned box that
+# is a fair trade; on a sealed fanless one, measure before assuming.
+max_idle_latency_us: 50
+
+# Ramping costs latency at exactly the moment a burst arrives.
+governor: performance
+
+# --- RSS on big.LITTLE ------------------------------------------------
+#
+# A flat indirection table feeds 1.8 GHz cores exactly as hard as 2.4
+# GHz ones, so the little cores saturate while the big ones idle.
+#
+# 3:1 is measured, not derived: the clock ratio alone is 1.33:1, and
+# an A76 also retires far more per clock than an A55. A tool that
+# computed this from cpuinfo_max_freq would round to 1:1 and quietly
+# do nothing. Worth 25-32%, confirmed on igb and on mlx5.
+#
+# `f-datapath-tune` prints the queue-to-CPU map it inferred. Read it
+# on a new board rather than trusting these numbers.
+rss_big_weight: 3
+rss_little_weight: 1
+
+# --- Scope ------------------------------------------------------------
+#
+# Empty means every physical interface. Name interfaces here only to
+# leave others alone; the tool already skips single-queue NICs and any
+# queue it cannot trace to exactly one CPU.
+interfaces: []

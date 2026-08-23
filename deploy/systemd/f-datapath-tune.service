@@ -12,7 +12,7 @@ Wants=systemd-networkd.service
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/usr/local/bin/f-datapath-tune
+ExecStart=/usr/local/bin/f-datapath-tune --config /etc/f/datapath.yaml
 
 # Advisory, not required. Every setting here is a performance
 # property: a box that cannot apply them still filters and still

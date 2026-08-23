@@ -9,6 +9,7 @@ would run, and the only symptom is a throughput number nobody has a
 baseline for. So most of what follows is about the skip paths.
 """
 
+import pathlib
 import subprocess
 import pytest
 import f_datapath_tune as tune
@@ -305,29 +306,167 @@ def test_finding_no_interface_at_all_is_a_failure(tmp_path,
   assert tune.main() == 1
   assert "no physical interface found" in capsys.readouterr().out
 
-def test_strict_smmu_is_reported_with_the_fix(tmp_path, monkeypatch):
-  """Strict mode halves forwarding and nothing else reports it."""
-  _fake_net(tmp_path, monkeypatch,
-            {"enp1s0f0np0": (True, "up", "DMA")})
-  report = tune.Report()
-  tune.check_iommu(report, ["enp1s0f0np0"])
-  assert report.failed
-  assert "iommu.strict=0" in report.failed[0]
-  assert "iommu.passthrough=1" in report.failed[0]
 
-@pytest.mark.parametrize("mode", ["DMA-FQ", "identity"])
-def test_a_relaxed_smmu_passes(tmp_path, monkeypatch, mode):
-  _fake_net(tmp_path, monkeypatch,
-            {"enp1s0f0np0": (True, "up", mode)})
+# --- the isolation posture is a choice, so test it as one ------------
+
+@pytest.mark.parametrize("mode,group", [("strict", "DMA"),
+                                        ("lazy", "DMA-FQ"),
+                                        ("passthrough", "identity")])
+def test_the_configured_posture_is_the_one_that_passes(
+    tmp_path, monkeypatch, mode, group):
+  """Each mode is satisfied by its own group type and no other."""
+  _fake_net(tmp_path, monkeypatch, {"eth0": (True, "up", group)})
   report = tune.Report()
-  tune.check_iommu(report, ["enp1s0f0np0"])
+  tune.check_iommu(report, ["eth0"], mode)
   assert not report.failed
   assert any(mode in line for line in report.already)
 
-def test_no_iommu_in_the_path_is_not_a_failure(tmp_path, monkeypatch):
-  """An x86 box with the IOMMU off has nothing to report."""
-  _fake_net(tmp_path, monkeypatch,
-            {"enp1s0f0np0": (True, "up", None)})
+def test_a_box_not_in_the_configured_posture_says_which_and_how(
+    tmp_path, monkeypatch):
+  """The mismatch has to name the parameter, not just complain.
+
+  A box in strict mode forwards at half its datasheet and nothing
+  else on it reports that, so this message is the only place an
+  operator finds out.
+  """
+  _fake_net(tmp_path, monkeypatch, {"eth0": (True, "up", "DMA")})
   report = tune.Report()
-  tune.check_iommu(report, ["enp1s0f0np0"])
-  assert not report.failed and not report.already
+  tune.check_iommu(report, ["eth0"], "passthrough")
+  assert report.failed
+  assert "iommu.passthrough=1" in report.failed[0]
+  assert "--apply-boot" in report.failed[0]
+
+def test_choosing_strict_is_satisfied_by_the_kernel_default(
+    tmp_path, monkeypatch):
+  """An operator who wants full isolation should not be nagged."""
+  _fake_net(tmp_path, monkeypatch, {"eth0": (True, "up", "DMA")})
+  report = tune.Report()
+  tune.check_iommu(report, ["eth0"], "strict")
+  assert not report.failed
+
+def test_no_iommu_in_the_path_is_not_a_failure(tmp_path, monkeypatch):
+  """An x86 box with the IOMMU off has nothing to choose."""
+  _fake_net(tmp_path, monkeypatch, {"eth0": (True, "up", None)})
+  report = tune.Report()
+  tune.check_iommu(report, ["eth0"], "lazy")
+  assert not report.failed
+  assert any("nothing to choose" in line for line in report.skipped)
+
+# --- config ----------------------------------------------------------
+
+def test_a_missing_config_is_not_an_error(tmp_path):
+  settings, note = tune.load_config(tmp_path / "absent.yaml")
+  assert settings == tune.DEFAULTS
+  assert "absent" in note
+
+def test_the_shipped_default_keeps_dma_isolation():
+  """Inheriting `passthrough` unchosen is the failure to avoid.
+
+  The default has to be a posture that still isolates. Anything
+  faster is a decision, and a decision has to be made rather than
+  arrive.
+  """
+  assert tune.DEFAULTS["iommu"] == "lazy"
+  assert tune.IOMMU_MODES["lazy"]["cmdline"] == "iommu.strict=0"
+
+def test_config_overrides_defaults_and_reports_where_it_came_from(
+    tmp_path):
+  path = tmp_path / "datapath.yaml"
+  path.write_text("iommu: passthrough\nrss_big_weight: 5\n")
+  settings, note = tune.load_config(path)
+  assert settings["iommu"] == "passthrough"
+  assert settings["rss_big_weight"] == 5
+  assert settings["governor"] == tune.DEFAULTS["governor"]
+  assert str(path) in note
+
+def test_an_unknown_key_is_named_rather_than_silently_dropped(tmp_path):
+  path = tmp_path / "datapath.yaml"
+  path.write_text("iommu: lazy\nring_size: 8192\n")
+  settings, note = tune.load_config(path)
+  assert "ring_size" not in settings
+  assert "ring_size" in note
+
+def test_broken_yaml_falls_back_loudly(tmp_path):
+  path = tmp_path / "datapath.yaml"
+  path.write_text("iommu: [unclosed\n")
+  settings, note = tune.load_config(path)
+  assert settings == tune.DEFAULTS
+  assert "not valid YAML" in note
+
+# --- writing the kernel command line ---------------------------------
+
+def _boot(monkeypatch, tmp_path, flavour, content):
+  name = "armbianEnv.txt" if flavour == "armbian" else "grub"
+  var = ("extraargs" if flavour == "armbian"
+         else "GRUB_CMDLINE_LINUX_DEFAULT")
+  path = tmp_path / name
+  path.write_text(content)
+  monkeypatch.setattr(tune, "BOOT_CONFIGS",
+                      ((str(path), var, flavour),))
+  monkeypatch.setattr(tune.subprocess, "run",
+                      lambda *a, **k: subprocess.CompletedProcess(
+                        a[0], 0, "", ""))
+  return path
+
+def _value(path, var):
+  for line in path.read_text().splitlines():
+    if line.startswith(var + "="):
+      return line.split("=", 1)[1]
+  return None
+
+def test_switching_posture_replaces_the_other_parameter(tmp_path,
+                                                        monkeypatch):
+  """Both iommu parameters present at once is a box nobody can reason
+  about, so the one being replaced is removed rather than left."""
+  path = _boot(monkeypatch, tmp_path, "armbian",
+               "verbosity=1\nextraargs=cma=256M iommu.passthrough=1\n")
+  assert tune.apply_boot("lazy") == 0
+  assert _value(path, "extraargs") == "cma=256M iommu.strict=0"
+  assert "passthrough" not in path.read_text()
+
+def test_choosing_strict_removes_both_parameters(tmp_path, monkeypatch):
+  path = _boot(monkeypatch, tmp_path, "armbian",
+               "extraargs=cma=256M iommu.strict=0\n")
+  assert tune.apply_boot("strict") == 0
+  assert _value(path, "extraargs") == "cma=256M"
+
+def test_unrelated_kernel_parameters_survive(tmp_path, monkeypatch):
+  """Editing somebody else's boot line is how a box stops booting."""
+  path = _boot(monkeypatch, tmp_path, "grub",
+               'GRUB_TIMEOUT=5\n'
+               'GRUB_CMDLINE_LINUX_DEFAULT="quiet splash"\n')
+  assert tune.apply_boot("passthrough") == 0
+  want = '"quiet splash iommu.passthrough=1"'
+  assert _value(path, "GRUB_CMDLINE_LINUX_DEFAULT") == want
+  assert "GRUB_TIMEOUT=5" in path.read_text()
+
+def test_a_backup_is_left_behind(tmp_path, monkeypatch):
+  path = _boot(monkeypatch, tmp_path, "armbian", "extraargs=cma=256M\n")
+  tune.apply_boot("lazy")
+  backup = pathlib.Path(str(path) + ".bak-f-datapath")
+  assert backup.exists()
+  assert backup.read_text() == "extraargs=cma=256M\n"
+
+def test_applying_twice_changes_nothing_the_second_time(tmp_path,
+                                                        monkeypatch):
+  path = _boot(monkeypatch, tmp_path, "armbian", "extraargs=cma=256M\n")
+  tune.apply_boot("lazy")
+  first = path.read_text()
+  tune.apply_boot("lazy")
+  assert path.read_text() == first
+
+def test_dry_run_writes_nothing(tmp_path, monkeypatch, capsys):
+  path = _boot(monkeypatch, tmp_path, "armbian", "extraargs=cma=256M\n")
+  before = path.read_text()
+  assert tune.apply_boot("passthrough", dry_run=True) == 0
+  assert path.read_text() == before
+  assert "iommu.passthrough=1" in capsys.readouterr().out
+
+def test_an_unrecognised_bootloader_refuses_and_says_what_to_add(
+    monkeypatch, capsys):
+  """Guessing at a bootloader does not produce an error message, it
+  produces a box that does not boot."""
+  monkeypatch.setattr(tune, "BOOT_CONFIGS",
+                      (("/nonexistent/boot.conf", "x", "armbian"),))
+  assert tune.apply_boot("lazy") == 1
+  assert "iommu.strict=0" in capsys.readouterr().out

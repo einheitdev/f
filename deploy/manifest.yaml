@@ -325,6 +325,20 @@ components:
       The template firstboot copies to /etc/f/fd.yaml. Names the
       control socket, the pin path and the fwl binary fd compiles with.
 
+  - id: datapath-yaml
+    group: data
+    kind: file
+    source: deploy/datapath.yaml
+    dest: "{prefix}/share/f/datapath.yaml"
+    mode: "0644"
+    requirement: required
+    needed_by: f-datapath-tune.service
+    why: >-
+      The tuning settings, including the DMA isolation posture. The
+      tool falls back to its own defaults when /etc/f/datapath.yaml is
+      absent, so a box without it still runs -- but then nobody chose
+      the posture it is running.
+
   - id: system-yaml-example
     group: data
     kind: file
