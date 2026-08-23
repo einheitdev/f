@@ -107,6 +107,10 @@ def _format_operand(op: ast.Operand) -> str:
     return "[" + ", ".join(_format_operand(i) for i in op.items) + "]"
   if isinstance(op, ast.CidrListLiteral):
     return "[" + ", ".join(_format_operand(i) for i in op.items) + "]"
+  if isinstance(op, ast.GeoIp):
+    return f"geoip({', '.join(op.codes)})"
+  if isinstance(op, ast.TableRef):
+    return op.name
   return repr(op)
 
 

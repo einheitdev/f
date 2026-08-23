@@ -130,9 +130,15 @@ class TestOmission:
     # in place, which is what the registry is keyed on.
     sources = [
       emitter.emit(_analyze(
-        ZL
+        'table blocked {\n'
+        '  kind = cidr4\n'
+        '  max = 4096\n'
+        '  source = "blocked.txt"\n'
+        '}\n'
+        + ZL
         + "@xdp(a)\n"
           "count a_one\n"
+          "drop if pkt.src_ip in blocked\n"
           "log(sample=4) if pkt.proto == udp\n"
           "drop if pkt.src_ip in geoip(RU)\n"
           "drop limited by rate_limit(3, per=src_ip)\n"

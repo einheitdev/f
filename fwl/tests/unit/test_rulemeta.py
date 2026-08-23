@@ -420,6 +420,14 @@ _SAMPLE_OPERANDS = {
     "pkt.dst_ip6 in [2001:db8::/32, 2001:db9::/32]"),
   "RangeLiteral": _zone_src(_TCP + "pkt.dst_port in 1000..2000"),
   "GeoIp": _zone_src("pkt.src_ip in geoip(DE)"),
+  # A table reference renders as the name the author wrote. Resolving
+  # the alias here would print a name that is not in the policy, and
+  # `show policy` has to read back as the file does.
+  "TableRef": (
+    'table blocked {\n  kind = cidr4\n  max = 10\n'
+    '  source = "b.txt"\n}\n'
+    + _zone_src("pkt.src_ip in blocked")
+  ),
 }
 
 

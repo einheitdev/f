@@ -136,6 +136,22 @@ def _walk_cond(node):
       yield from _walk_cond(c)
 
 
+def _rule_table_refs(rule: ast.Rule) -> int:
+  """How many `in <table>` lookups a rule performs.
+
+  The same LPM trie lookup a geoip() call compiles to, so it carries
+  the same estimate. Counting it matters in the direction that hurts:
+  an under-estimate puts more rules in a stage than the stack and
+  instruction budgets allow, and the splitter's whole job is to keep
+  that from reaching the verifier.
+  """
+  return sum(
+    1 for node in _walk_cond(rule.condition)
+    if isinstance(node, ast.Comparison)
+    and isinstance(node.operand, ast.TableRef)
+  )
+
+
 def _rule_geoip_calls(rule: ast.Rule) -> int:
   n = 0
   for node in _walk_cond(rule.condition):
@@ -250,6 +266,7 @@ def estimate(zp: ast.ZoneProgram) -> Estimate:
     instr += NAT_INSTR
   for rule in zp.rules:
     instr += RULE_INSTR + GEOIP_INSTR * _rule_geoip_calls(rule)
+    instr += GEOIP_INSTR * _rule_table_refs(rule)
   if zp.function is not None:
     # A Tier 2 body's instruction cost tracks its statement/condition
     # count; approximate one "rule" per statement.
@@ -374,6 +391,7 @@ def _partition_rules(
       groups.append((start, i))
       start, acc = i, 0
     cost = RULE_INSTR + GEOIP_INSTR * _rule_geoip_calls(rule)
+    cost += GEOIP_INSTR * _rule_table_refs(rule)
     # Cut before the group would exceed the instruction budget OR the
     # per-stage rule cap (whichever binds first), so no stage grows into
     # the clang stack-spill regime.

@@ -373,6 +373,31 @@ _MAP_KINDS: tuple[_MapKind, ...] = (
     private_name=r"fwl_geoip_{zone}_\1",
   ),
   _MapKind(
+    r"fwl_tbl_(\d+)", MapScope.SHARED,
+    "one LPM trie per declared `table` (TABLES.md). Bundle-global by "
+    "declaration and not by accident: a table is named once for the "
+    "whole unit, every zone that matches against it means the SAME "
+    "set, and a shared blocklist that each zone held its own copy of "
+    "would be N copies to keep in step. The name carries the "
+    "allocated id rather than the table's own name because "
+    "BPF_OBJ_NAME_LEN is 16 -- `bpftool map list` already shows four "
+    "zones' counter maps as one truncated `fwl_counters_in` -- and "
+    "the manifest carries the id -> name mapping so the daemon reads "
+    "it instead of re-deriving it",
+    lifetime=MapLifetime.POLICY,
+    lifetime_why=(
+      "phase 1 resolves a table's contents at compile time, so the "
+      "prefixes in a pin are the previous BUNDLE's prefixes and the "
+      "incoming bundle carries its own. Repopulating from the bundle "
+      "at every load is what makes that correct, and it is the same "
+      "ground the geoip trie sits on. This row is the one that moves "
+      "when contents stop coming from the compilation: TABLES.md's "
+      "MapLifetime.EXTERNAL is exactly 'authored outside this "
+      "compilation, key space declared by the policy', and a table "
+      "erased by every policy edit is not a table"
+    ),
+  ),
+  _MapKind(
     r"fwl_scratch", MapScope.PRIVATE,
     "per-packet per-CPU parse metadata for THIS object's tail-call "
     "chain; never pinned, or two split zones would cross-wire their "
@@ -567,6 +592,15 @@ class MapNames:
   def geoip(self, call_index: int) -> str:
     """The LPM trie backing geoip call site `call_index`."""
     return self.qualified(f"fwl_geoip_{call_index}")
+
+  def table(self, table_id: int) -> str:
+    """The LPM trie backing the declared table with id `table_id`.
+
+    SHARED, so the name is the same in every zone object of a bundle
+    and the id needs no zone qualification — which is the point: two
+    zones matching `pkt.src_ip in badhosts` mean one set.
+    """
+    return self.qualified(f"fwl_tbl_{table_id}")
 
   def rate_limit(self, mod: ast.RateLimit, rule_idx: int) -> str:
     """The bucket map for a rate_limit rule (v0.4 § 6.7)."""
@@ -2731,6 +2765,8 @@ def _emit_ip_in(c_field: str, operand: ast.Operand) -> str:
     return "(" + " || ".join(parts) + ")"
   if isinstance(operand, ast.GeoIp):
     return f"fwl_geoip_{operand.call_index}_v4({c_field})"
+  if isinstance(operand, ast.TableRef):
+    return f"fwl_tbl_{operand.table_id}_v4({c_field})"
   raise NotImplementedError(
     f"emitter: ip 'in' operand {type(operand).__name__} not supported"
   )
@@ -2810,6 +2846,8 @@ def _emit_ip6_in(hi_var: str, lo_var: str, operand: ast.Operand) -> str:
     return "(" + " || ".join(parts) + ")"
   if isinstance(operand, ast.GeoIp):
     return f"fwl_geoip_{operand.call_index}_v6({hi_var}, {lo_var})"
+  if isinstance(operand, ast.TableRef):
+    return f"fwl_tbl_{operand.table_id}_v6({hi_var}, {lo_var})"
   raise NotImplementedError(
     f"emitter: ipv6 'in' operand {type(operand).__name__} not supported"
   )
@@ -3413,6 +3451,167 @@ static __always_inline int fwl_geoip_{call.call_index}_v6(
   return "\n".join(blocks)
 
 
+def _collect_table_refs(units: list[ast.ZoneProgram]) -> list[ast.TableRef]:
+  """Every TableRef in a zone body and the helpers it reaches.
+
+  `units` is the zone program plus one synthetic unit per reachable
+  helper (`_synth_unit`), so a table matched inside a shared `def`
+  gets its map declared into that zone's object. geoip() cannot be
+  used that way — its call sites are numbered inside a zone, so a body
+  duplicated across zones has no single index — but a table is named
+  once for the whole unit and composes.
+  """
+  out: list[ast.TableRef] = []
+  for unit in units:
+    for rule in unit.rules:
+      for n in _walk(rule.condition):
+        if isinstance(n, ast.Comparison) and isinstance(
+          n.operand, ast.TableRef
+        ):
+          out.append(n.operand)
+    if unit.function is not None:
+      out.extend(_collect_table_refs_in_stmts(unit.function.body))
+  return out
+
+
+def _collect_table_refs_in_stmts(stmts) -> list[ast.TableRef]:
+  """TableRefs reachable from a Tier 2 statement block, in order."""
+  out: list[ast.TableRef] = []
+  for stmt in stmts:
+    if isinstance(stmt, ast.AssignStmt):
+      exprs = [stmt.rhs]
+    elif isinstance(stmt, ast.IfStmt):
+      exprs = [stmt.cond]
+    else:
+      continue
+    for expr in exprs:
+      for n in _walk_with_compares(expr):
+        if isinstance(n, ast.Comparison) and isinstance(
+          n.operand, ast.TableRef
+        ):
+          out.append(n.operand)
+    if isinstance(stmt, ast.IfStmt):
+      out.extend(_collect_table_refs_in_stmts(stmt.body))
+      for cond, body in stmt.elif_branches:
+        for n in _walk_with_compares(cond):
+          if isinstance(n, ast.Comparison) and isinstance(
+            n.operand, ast.TableRef
+          ):
+            out.append(n.operand)
+        out.extend(_collect_table_refs_in_stmts(body))
+      if stmt.else_body is not None:
+        out.extend(_collect_table_refs_in_stmts(stmt.else_body))
+  return out
+
+
+def table_decls_by_name(
+  program: ast.Program,
+) -> dict[str, ast.TableDecl]:
+  """The unit's `table` declarations, keyed by their canonical name."""
+  return {t.name: t for t in getattr(program, "tables", ())}
+
+
+def _emit_table_maps_and_helpers(
+  units: list[ast.ZoneProgram],
+  names: MapNames,
+  decls: dict[str, ast.TableDecl],
+  pinned_shared: bool,
+) -> str:
+  """Emit one BPF_MAP_TYPE_LPM_TRIE + lookup helper per declared table.
+
+  Shape-identical to the geoip trie, which is the point: the datapath
+  cost measured on the rig — 227 instructions and 99% of line rate at
+  50,000 prefixes — is a property of this map type and this lookup,
+  not of what fills it. The program does not grow with the table
+  because the size lives in the map.
+
+  Two differences from geoip. `max_entries` comes from the
+  declaration's `max` rather than a constant, because capacity is
+  something the policy states; and the map is SHARED, so it pins by
+  name in a bundle and every zone that matches the table resolves to
+  one kernel map.
+
+  A table declared but never referenced emits nothing: there is no
+  lookup to serve, and a map with no reader is capacity spent on
+  nobody. The analyzer warns about it at the source level, where the
+  name is.
+  """
+  blocks: list[str] = []
+  seen: set[int] = set()
+  for ref in _collect_table_refs(units):
+    if ref.table_id in seen:
+      continue
+    seen.add(ref.table_id)
+    decl = decls.get(ref.resolved)
+    if decl is None:
+      raise AssertionError(
+        f"table reference '{ref.name}' reached the emitter unresolved; "
+        f"the analyzer should have bound it or refused the program"
+      )
+    trie = names.table(ref.table_id)
+    if decl.kind == "cidr4":
+      key_struct = f"""\
+struct {trie}_key {{
+  __u32 prefixlen;
+  __u32 ip;
+}};
+"""
+      map_decl = f"""\
+struct {{
+  __uint(type, BPF_MAP_TYPE_LPM_TRIE);
+  __type(key, struct {trie}_key);
+  __type(value, __u8);
+  __uint(max_entries, {decl.max_entries});
+  __uint(map_flags, BPF_F_NO_PREALLOC);
+}} {trie} SEC(".maps");
+"""
+      lookup = f"""\
+static __always_inline int fwl_tbl_{ref.table_id}_v4(__u32 ip) {{
+  struct {trie}_key key = {{
+    .prefixlen = 32,
+    .ip = bpf_htonl(ip),
+  }};
+  return bpf_map_lookup_elem(&{trie}, &key) != 0;
+}}
+"""
+    else:
+      key_struct = f"""\
+struct {trie}_key {{
+  __u32 prefixlen;
+  __u8  ip[16];
+}};
+"""
+      map_decl = f"""\
+struct {{
+  __uint(type, BPF_MAP_TYPE_LPM_TRIE);
+  __type(key, struct {trie}_key);
+  __type(value, __u8);
+  __uint(max_entries, {decl.max_entries});
+  __uint(map_flags, BPF_F_NO_PREALLOC);
+}} {trie} SEC(".maps");
+"""
+      lookup = f"""\
+static __always_inline int fwl_tbl_{ref.table_id}_v6(
+    __u64 hi, __u64 lo) {{
+  struct {trie}_key key = {{ .prefixlen = 128 }};
+  key.ip[0]  = (hi >> 56) & 0xff; key.ip[1]  = (hi >> 48) & 0xff;
+  key.ip[2]  = (hi >> 40) & 0xff; key.ip[3]  = (hi >> 32) & 0xff;
+  key.ip[4]  = (hi >> 24) & 0xff; key.ip[5]  = (hi >> 16) & 0xff;
+  key.ip[6]  = (hi >>  8) & 0xff; key.ip[7]  = (hi      ) & 0xff;
+  key.ip[8]  = (lo >> 56) & 0xff; key.ip[9]  = (lo >> 48) & 0xff;
+  key.ip[10] = (lo >> 40) & 0xff; key.ip[11] = (lo >> 32) & 0xff;
+  key.ip[12] = (lo >> 24) & 0xff; key.ip[13] = (lo >> 16) & 0xff;
+  key.ip[14] = (lo >>  8) & 0xff; key.ip[15] = (lo      ) & 0xff;
+  return bpf_map_lookup_elem(&{trie}, &key) != 0;
+}}
+"""
+    blocks.append(
+      key_struct + "\n" + _maybe_pin(map_decl, pinned_shared)
+      + "\n" + lookup
+    )
+  return "\n".join(blocks)
+
+
 def _collect_redirect_zones(
   zp: ast.ZoneProgram,
   helpers: list[ast.FunctionDef] | None = None,
@@ -3753,7 +3952,7 @@ def emit(program: ast.Program, *, split: bool | None = None) -> str:
   _check_zone_ids(program)
   return _emit_zone_source(
     program.programs[0], pinned_shared=False, helpers=program.helpers,
-    split=split,
+    split=split, tables=table_decls_by_name(program),
   )
 
 
@@ -3761,6 +3960,7 @@ def _emit_zone_source(
   zp: ast.ZoneProgram, *, pinned_shared: bool, force_nat: bool = False,
   helpers: list[ast.FunctionDef] | None = None,
   split: bool | None = None,
+  tables: dict[str, ast.TableDecl] | None = None,
 ) -> str:
   """Emit one zone's complete BPF C source.
 
@@ -3785,6 +3985,11 @@ def _emit_zone_source(
   forces a single program. When the plan splits, the object holds N
   `fwl_stage_i` programs chained through a prog_array + per-CPU scratch
   map instead of one `fwl_prog`.
+
+  `tables` are the unit's `table` declarations keyed by name
+  (TABLES.md). They are a property of the unit rather than of a zone
+  — a table is named once and every zone means the same set — so they
+  arrive here from the caller rather than off `zp`.
 
   Tier 1: prelude + per-rule blocks + final return.
   Tier 2: prelude + locals declaration + statement-by-statement body.
@@ -3828,6 +4033,9 @@ def _emit_zone_source(
   prelude = _emit_parse_prelude(zp)
   rl_maps = _emit_rl_maps(zp, names, pinned_shared)
   geoip_block = _emit_geoip_maps_and_helpers(zp, names)
+  table_block = _emit_table_maps_and_helpers(
+    units, names, tables or {}, pinned_shared
+  )
   uses_ct = any(_program_uses_conntrack(u) for u in units)
   # Redirect targets from the zone body and any reachable helper (a
   # helper may `redirect to <zone>`), de-duplicated in first-seen order.
@@ -3929,7 +4137,7 @@ def _emit_zone_source(
 
   maps_block = (
     f"{log_decl}{log_sample_decl}{counter_decl}{rl_maps}{geoip_block}"
-    f"{conntrack_decl}{nat_decl}{devmaps}{rl_t2_block}"
+    f"{table_block}{conntrack_decl}{nat_decl}{devmaps}{rl_t2_block}"
   )
 
   if plan.split:
@@ -4272,7 +4480,7 @@ def emit_bundle(program: ast.Program) -> dict[str, str]:
   for zp in program.programs:
     files[f"{zp.zone_name}.bpf.c"] = _emit_zone_source(
       zp, pinned_shared=True, force_nat=bundle_nat,
-      helpers=program.helpers,
+      helpers=program.helpers, tables=table_decls_by_name(program),
     )
   # The egress tracker is part of the bundle's map graph, not an extra
   # beside it: it declares the same pinned `conntrack`. Emitting it here
@@ -5144,7 +5352,7 @@ def _emit_tier2_comparison(cmp: ast.Comparison, ctx: _Tier2EmitCtx) -> str:
     ast.IntLiteral, ast.IPv4Literal, ast.Ipv6Literal, ast.ProtoLiteral,
     ast.CidrLiteral, ast.CidrListLiteral, ast.ListLiteral,
     ast.Ipv6CidrLiteral, ast.Ipv6CidrListLiteral, ast.RangeLiteral,
-    ast.GeoIp,
+    ast.GeoIp, ast.TableRef,
   )):
     # Reuse Tier 1 path.
     return _emit_comparison(cmp)
