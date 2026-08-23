@@ -1,0 +1,14 @@
+name: "an undeclared table name is a compile error, not an empty map"
+# The single most important refusal in the feature. A silently empty
+# table is a rule that never matches, and a rule in a blocklist that
+# never matches is a hole nothing on the running box reports.
+source_fw: |
+  @xdp(eth0)
+  drop if pkt.src_ip in mystery
+  default allow
+
+test_packet:
+  builder: tcp(src_ip="1.2.3.4")
+
+expected:
+  compiles: false

@@ -659,6 +659,30 @@ auto EngineInit(Engine& e,
     }
     auto zb = LoadZoneBundle(current_dir, e.pin_path);
     if (!zb) {
+      if (zb.error().code == BpfError::kFeedUnavailable) {
+        // A table's feed could not be read. That is a fact about the
+        // filesystem at this moment, not about the bundle — the same
+        // policy loaded yesterday and will load again when the file
+        // comes back. Counting it would let a transient NFS blip or a
+        // permissions mistake quarantine a bundle that has never
+        // failed, and quarantine is permanent.
+        //
+        // Safe because the feeds are read before a single bpf() call:
+        // reaching this branch means nothing was attached and nothing
+        // can have wedged the board, which is exactly the property the
+        // attempt count exists to detect.
+        auto rewound = BundleGuardAbandon(e.guard);
+        if (!rewound) {
+          spdlog::warn(
+              "bundle guard: could not rewind the attempt record after "
+              "a feed failure ({}). A repeat will count against '{}'.",
+              rewound.error(), guard_version);
+        }
+        spdlog::error("bundle load refused, attempt not counted: {}",
+                      zb.error().message);
+        return MakeError(EngineError::kBpfLoadFailed,
+            std::format("LoadZoneBundle: {}", zb.error().message));
+      }
       // Record WHY, so the operator who reads the attempt record after
       // two failed boots gets the loader's sentence rather than only a
       // count. The count itself was already written before the load —

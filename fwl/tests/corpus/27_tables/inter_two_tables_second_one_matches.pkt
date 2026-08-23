@@ -1,0 +1,29 @@
+name: "the same two tables: an address only the blocklist holds"
+source_fw: |
+  table blocked {
+    kind = cidr4
+    max = 100
+    source = "/var/lib/f/feeds/blocked.txt"
+  }
+
+  table trusted {
+    kind = cidr4
+    max = 100
+    source = "/var/lib/f/feeds/trusted.txt"
+  }
+
+  @xdp(eth0)
+  allow if pkt.src_ip in trusted
+  drop if pkt.src_ip in blocked
+  default allow
+
+table_data:
+  blocked: ["5.8.0.0/16"]
+  trusted: ["5.8.1.0/24"]
+
+test_packet:
+  builder: tcp(src_ip="5.8.2.1", dst_port=80)
+
+expected:
+  compiles: true
+  bpf_action: drop

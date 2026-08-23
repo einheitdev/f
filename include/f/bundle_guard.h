@@ -170,6 +170,22 @@ auto BundleGuardCommit(const GuardConfig& cfg,
 /// Record why an attempt failed, for the operator who reads the record
 /// later. Does not change the count — `BundleGuardBegin` already did
 /// that, on purpose, because this call may never happen.
+/// Discard this start's attempt record without marking the bundle
+/// good.
+///
+/// For failures that say nothing about the bundle. The count exists to
+/// catch a version that takes the board down; a feed file that could
+/// not be read is a fact about the filesystem at that moment, not
+/// about the policy, and counting it means a transient NFS blip or a
+/// permissions mistake quarantines a bundle that has never failed to
+/// load. Quarantine is permanent, so the cost of counting the wrong
+/// thing is much higher than the cost of not counting.
+///
+/// Deliberately does NOT write `last-known-good`: nothing was proven
+/// to work. It only rewinds a count that should not have advanced.
+auto BundleGuardAbandon(const GuardConfig& cfg)
+    -> std::expected<void, std::string>;
+
 auto BundleGuardNoteFailure(const GuardConfig& cfg,
                             const std::string& version,
                             const std::string& why) -> void;

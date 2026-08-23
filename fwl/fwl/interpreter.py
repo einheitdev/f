@@ -424,6 +424,7 @@ def evaluate(
   geoip_data: dict[str, list[str]] | None = None,
   conntrack: ConntrackTable | None = None,
   nat: "NatState | None" = None,
+  table_data: dict[str, list[str]] | None = None,
 ) -> XdpAction:
   """Run `program` against `packet` and return the resulting XDP action.
 
@@ -453,6 +454,13 @@ def evaluate(
   that exercise geoip programs pass the dict explicitly via the
   `.pkt` `geoip_data:` block.
 
+  `table_data` is the same arrangement for TABLES.md named tables: a
+  table name → list of CIDR strings, mirroring what the bundle's
+  payload holds for that table's LPM trie. A table absent from the
+  dict is empty, so every lookup against it misses — which is what the
+  corpus needs in order to plant an empty table and prove a passing
+  case is not passing on a program that drops unconditionally.
+
   After all rules, the explicit default (if present) fires; otherwise
   the implicit XDP_PASS per FWL_V01_SPEC.md:70 / :116.
 
@@ -463,7 +471,7 @@ def evaluate(
   no v6 parse path, so v6 frames hit the default action.
   """
   return evaluate_full(
-    program, packet, state, geoip_data, conntrack, nat
+    program, packet, state, geoip_data, conntrack, nat, table_data
   ).action
 
 
@@ -474,6 +482,7 @@ def evaluate_full(
   geoip_data: dict[str, list[str]] | None = None,
   conntrack: ConntrackTable | None = None,
   nat: "NatState | None" = None,
+  table_data: dict[str, list[str]] | None = None,
 ) -> EvalResult:
   """Run `program` against `packet` and return full results.
 
@@ -515,6 +524,7 @@ def evaluate_full(
     geoip_data=geoip_data, ct_state=ct_state, zone_name=zone_name,
     nat=nat,
     helpers={h.name: h for h in getattr(program, "helpers", [])},
+    table_data=table_data,
   )
   ctx.ct = ct
   # Seed the NAT working packet with the input header fields, then apply
@@ -852,6 +862,17 @@ def _ip_or_port_or_proto_in(cmp: ast.Comparison, lhs, ctx: "_Ctx") -> bool:
   field = cmp.field
   field_name = field.name if isinstance(field, ast.FieldRef) else None
   operand = cmp.operand
+  # A table's family comes from its declaration, so it settles the key
+  # width on its own — including when the LHS is a Tier 2 local, where
+  # there is no field name to dispatch on. Checked first for that
+  # reason: routed through the branches below, a `local in table`
+  # matched none of them and fell out as False, so the interpreter
+  # said allow where the compiled program dropped. The corpus caught
+  # it; a positive-only reading of either oracle would not have.
+  if isinstance(operand, ast.TableRef):
+    if operand.family == "ipv4":
+      return _ip_in_set(lhs, operand, ctx)
+    return _ip6_in_set(lhs, operand, ctx)
   if field_name in ast.IP_FIELDS or (
     isinstance(field, ast.LocalRead) and isinstance(operand, ast.GeoIp)
     and operand.family == "ipv4"
@@ -1397,10 +1418,12 @@ def _ipv4_str_to_int(addr: str) -> int:
 class _Ctx:
   """Per-evaluation context carrying ancillary data the v0.2 walks need.
 
-  Currently only `geoip_data` (the country-code → CIDR-list dict from
-  the .pkt's geoip_data block, mirroring the bundle's geoip.json). The
-  Ctx avoids threading more positional arguments through every node-
-  evaluation function.
+  `geoip_data` is the country-code → CIDR-list dict from the .pkt's
+  geoip_data block (mirroring the bundle's geoip.json) and
+  `table_data` the table-name → CIDR-list dict from its table_data
+  block (mirroring the same payload's table tries). The Ctx avoids
+  threading more positional arguments through every node-evaluation
+  function.
   """
   def __init__(
     self,
@@ -1410,8 +1433,14 @@ class _Ctx:
     zone_name: str | None = None,
     nat: "NatState | None" = None,
     helpers: dict[str, ast.FunctionDef] | None = None,
+    table_data: dict[str, list[str]] | None = None,
   ):
     self.geoip_data = geoip_data
+    # TABLES.md: canonical table name -> its CIDR strings, mirroring
+    # what the bundle's payload holds for `fwl_tbl_<id>`. Keyed by the
+    # resolved name rather than the id, because a .pkt names tables the
+    # way the policy does and the id is a kernel detail.
+    self.table_data = table_data or {}
     # Tier 2 rate_limit() bucket state and the counter dict its
     # overflow slot ticks. Set by evaluate_full before any statement
     # runs; empty defaults keep a directly-constructed _Ctx usable.
@@ -1931,6 +1960,8 @@ def _ip_in_set(ip_value: int, operand: ast.Operand, ctx: "_Ctx") -> bool:
     return False
   if isinstance(operand, ast.GeoIp):
     return _geoip_match_v4(ip_value, operand, ctx)
+  if isinstance(operand, ast.TableRef):
+    return _table_match(ip_value, operand, ctx, bits_width=32)
   raise TypeError(f"unexpected operand for ip in: {type(operand).__name__}")
 
 
@@ -1955,9 +1986,62 @@ def _ip6_in_set(ip_value: int, operand: ast.Operand, ctx: "_Ctx") -> bool:
     return False
   if isinstance(operand, ast.GeoIp):
     return _geoip_match_v6(ip_value, operand, ctx)
+  if isinstance(operand, ast.TableRef):
+    return _table_match(ip_value, operand, ctx, bits_width=128)
   raise TypeError(
     f"unexpected operand for ipv6 in: {type(operand).__name__}"
   )
+
+
+def _resolve_table(
+  node: ast.TableRef, ctx: "_Ctx", bits_width: int
+) -> list[tuple[int, int]]:
+  """Memoised resolution of a table to a list of (prefix, bits).
+
+  Looked up by the CANONICAL name, not the one the reference wrote, so
+  an alias and its target read the same set — which is what makes the
+  alias free rather than a second table.
+
+  Entries of the other family are dropped rather than refused: the
+  compiler already refuses a source file whose entries do not match
+  the declared `kind`, so anything reaching here of the wrong width
+  came from a .pkt seed, and the BPF oracle's map would not hold it
+  either. Silently agreeing with the map is the behaviour that keeps
+  the two oracles comparable.
+  """
+  key = ("tbl", node.resolved, bits_width)
+  cached = ctx._resolved.get(key)
+  if cached is not None:
+    return cached
+  want_v4 = bits_width == 32
+  prefixes: list[tuple[int, int]] = []
+  for cidr in ctx.table_data.get(node.resolved, ()):
+    net = ipaddress.ip_network(cidr, strict=False)
+    if isinstance(net, ipaddress.IPv4Network) != want_v4:
+      continue
+    prefixes.append((int(net.network_address), net.prefixlen))
+  ctx._resolved[key] = prefixes
+  return prefixes
+
+
+def _table_match(
+  ip_value: int, node: ast.TableRef, ctx: "_Ctx", bits_width: int
+) -> bool:
+  """LPM membership of `ip_value` in a table's prefix list.
+
+  A trie answers "is there any covering prefix", so any match wins and
+  the longest-prefix rule never changes the ANSWER here — only which
+  entry produced it, which nothing observes. Modelling it as an
+  any-match keeps the interpreter and the kernel trie in agreement on
+  the case where a shorter prefix also covers the address.
+  """
+  for prefix, bits in _resolve_table(node, ctx, bits_width):
+    if bits == 0:
+      return True
+    mask = ((1 << bits) - 1) << (bits_width - bits)
+    if (ip_value & mask) == (prefix & mask):
+      return True
+  return False
 
 
 def _resolve_geoip_v4(node: ast.GeoIp, ctx: "_Ctx") -> list[tuple[int, int]]:

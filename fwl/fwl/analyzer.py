@@ -91,11 +91,19 @@ def analyze(program: ast.Program) -> ast.Program:
 
   v0.2 mutation contract: GeoIp operand nodes have `call_index` and
   `family` written during this pass; RateLimitCall nodes have
-  `call_index` written. Every other AST node stays immutable.
+  `call_index` written; TableRef nodes have `table_id`, `resolved` and
+  `family` written. Every other AST node stays immutable.
   """
   program.warnings.clear()
   declared = _collect_declared_zones(program)
   _check_xdp_zone_bindings(program, declared)
+  # TABLES.md: tables are bundle-global, so they resolve once over the
+  # whole unit and before any per-zone pass — which is also what lets a
+  # reference from a shared helper resolve at all. The pass stamps each
+  # TableRef with its canonical name, its allocated id and the family
+  # its declaration fixed; the per-zone type-check then only has to
+  # confirm that family against the comparison's LHS.
+  _resolve_tables(program)
   # v0.4 § 6.5 multi-def: validate + type-check the shared helper defs
   # once, returning the set of callable names for the per-zone passes.
   helper_names = _analyze_helpers(program, declared)
@@ -1117,6 +1125,9 @@ def _check_in_operand(
   if lhs_type == ast.LocalType.IPV4:
     if isinstance(operand, ast.GeoIp):
       return
+    if isinstance(operand, ast.TableRef):
+      _check_table_family(operand, "ipv4", lhs_label, None)
+      return
     if isinstance(operand, (ast.CidrLiteral, ast.CidrListLiteral)):
       return
     if isinstance(operand, ast.ListLiteral):
@@ -1127,6 +1138,9 @@ def _check_in_operand(
     raise _type_error(lhs_label, "in", operand, getattr(operand, "span", None))
   if lhs_type == ast.LocalType.IPV6:
     if isinstance(operand, ast.GeoIp):
+      return
+    if isinstance(operand, ast.TableRef):
+      _check_table_family(operand, "ipv6", lhs_label, None)
       return
     if isinstance(operand, (ast.Ipv6CidrLiteral, ast.Ipv6CidrListLiteral)):
       return
@@ -1537,6 +1551,8 @@ def _operand_label(operand) -> str:
     return "integer range"
   if isinstance(operand, ast.ListLiteral):
     return "list"
+  if isinstance(operand, ast.TableRef):
+    return f"table '{operand.name}'"
   return type(operand).__name__
 
 
@@ -1660,6 +1676,8 @@ def _check_comparison_types(cmp: ast.Comparison) -> None:
     elif op == "in":
       if isinstance(operand, ast.GeoIp):
         _bind_geoip(operand, family="ipv4")
+      elif isinstance(operand, ast.TableRef):
+        _check_table_family(operand, "ipv4", field_label, span)
       elif not isinstance(
         operand, (ast.CidrLiteral, ast.CidrListLiteral, ast.ListLiteral)
       ):
@@ -1679,6 +1697,8 @@ def _check_comparison_types(cmp: ast.Comparison) -> None:
     elif op == "in":
       if isinstance(operand, ast.GeoIp):
         _bind_geoip(operand, family="ipv6")
+      elif isinstance(operand, ast.TableRef):
+        _check_table_family(operand, "ipv6", field_label, span)
       elif not isinstance(
         operand,
         (ast.Ipv6CidrLiteral, ast.Ipv6CidrListLiteral, ast.ListLiteral),
@@ -1855,6 +1875,183 @@ def _walk_comparisons(node):
   if isinstance(node, (ast.AndOp, ast.OrOp)):
     for child in node.operands:
       yield from _walk_comparisons(child)
+
+
+def _walk_operands_in_stmts(stmts):
+  """Yield every Operand reachable from a Tier 2 statement block."""
+  for stmt in stmts:
+    if isinstance(stmt, ast.AssignStmt):
+      yield from _walk_operands(stmt.rhs)
+    elif isinstance(stmt, ast.IfStmt):
+      yield from _walk_operands(stmt.cond)
+      yield from _walk_operands_in_stmts(stmt.body)
+      for cond, body in stmt.elif_branches:
+        yield from _walk_operands(cond)
+        yield from _walk_operands_in_stmts(body)
+      if stmt.else_body is not None:
+        yield from _walk_operands_in_stmts(stmt.else_body)
+
+
+def table_refs(program: ast.Program):
+  """Every TableRef in a unit, in source order.
+
+  Spans the Tier 1 rules and the Tier 2 body of every @xdp block plus
+  every top-level helper def, because a table is bundle-global: unlike
+  a geoip() call site, which is numbered inside one zone, a reference
+  is to the same table wherever it is written.
+  """
+  for zp in program.programs:
+    for rule in zp.rules:
+      for operand in _walk_operands(rule.condition):
+        if isinstance(operand, ast.TableRef):
+          yield operand
+    if zp.function is not None:
+      for operand in _walk_operands_in_stmts(zp.function.body):
+        if isinstance(operand, ast.TableRef):
+          yield operand
+  for helper in program.helpers:
+    for operand in _walk_operands_in_stmts(helper.body):
+      if isinstance(operand, ast.TableRef):
+        yield operand
+
+
+def table_map_id(program: ast.Program) -> dict[str, int]:
+  """Canonical table name -> the small integer its kernel map is named for.
+
+  TABLES.md: the writer names a table whatever reads well and never
+  sees this number; the kernel is the only place with a limit
+  (BPF_OBJ_NAME_LEN is 16, so a map name truncates at 15 characters),
+  so the emitted map is `fwl_tbl_<id>` and the manifest carries the
+  mapping. `fd` reads the mapping and never re-derives it — a second
+  implementation of the naming rule in another language is how the
+  same defect got in three times.
+
+  Allocation is by declaration order within the compilation. That is
+  enough while a table's contents are resolved at compile time and
+  nothing is adopted across a reload: an id names a map inside one
+  bundle and means nothing outside it. The moment table contents
+  outlive a policy edit (MapLifetime.EXTERNAL), the allocation has to
+  move out of the compiler and be passed in, so that a retired id is
+  never handed to an unrelated table -- TABLES.md's "never reuse an
+  id" rule, which only bites once a stale pin can be adopted.
+  """
+  return {t.name: i for i, t in enumerate(program.tables)}
+
+
+def _resolve_tables(program: ast.Program) -> None:
+  """Bind every `in <table>` reference to a declaration (TABLES.md).
+
+  Checks the declarations against each other (no duplicate name, no
+  alias onto a missing table, no alias colliding with a real
+  declaration), allocates each declared table its map id, and stamps
+  every reference with the canonical name, the id and the family its
+  `kind` fixes.
+
+  An unresolvable name is a hard error naming the table and the line.
+  It is deliberately not a warning and deliberately not an empty map:
+  a table that holds nothing is a rule that never matches, and a rule
+  in a blocklist that never matches is a hole nobody can see.
+  """
+  decls: dict[str, ast.TableDecl] = {}
+  for decl in program.tables:
+    if decl.name in decls:
+      raise FwlException(FwlError(
+        category="semantic",
+        message=(
+          f"duplicate table declaration '{decl.name}' (first declared "
+          f"on line {decls[decl.name].span.line})"
+        ),
+        span=decl.span,
+      ))
+    decls[decl.name] = decl
+
+  aliases: dict[str, str] = {}
+  for alias in program.table_aliases:
+    if alias.name in decls:
+      raise FwlException(FwlError(
+        category="semantic",
+        message=(
+          f"table alias '{alias.name}' collides with the table "
+          f"declared on line {decls[alias.name].span.line}; an alias "
+          f"names an existing table, it does not redeclare one"
+        ),
+        span=alias.span,
+      ))
+    if alias.name in aliases:
+      raise FwlException(FwlError(
+        category="semantic",
+        message=f"duplicate table alias '{alias.name}'",
+        span=alias.span,
+      ))
+    if alias.target not in decls:
+      raise FwlException(FwlError(
+        category="semantic",
+        message=(
+          f"table alias '{alias.name}' points at '{alias.target}', "
+          f"which is not a declared table"
+        ),
+        span=alias.span,
+      ))
+    aliases[alias.name] = alias.target
+
+  ids = table_map_id(program)
+  referenced: set[str] = set()
+  for ref in table_refs(program):
+    target = aliases.get(ref.name, ref.name)
+    decl = decls.get(target)
+    if decl is None:
+      known = sorted(set(decls) | set(aliases))
+      hint = (
+        f" (declared tables: {', '.join(known)})" if known
+        else " (this unit declares no tables)"
+      )
+      raise FwlException(FwlError(
+        category="semantic",
+        message=(
+          f"unknown table '{ref.name}'{hint}. Declare it with a "
+          f"`table {ref.name} {{ kind = ...  max = ...  source = "
+          f"\"...\" }}` block: an undeclared table cannot be given "
+          f"an empty map, because a rule that never matches is a hole"
+        ),
+        span=ref.span,
+      ))
+    ref.resolved = decl.name
+    ref.table_id = ids[decl.name]
+    ref.family = ast.TABLE_KIND_FAMILY[decl.kind]
+    referenced.add(decl.name)
+
+  for decl in program.tables:
+    if decl.name not in referenced:
+      program.warnings.append(FwlWarning(
+        message=(
+          f"table '{decl.name}' is declared but never matched against; "
+          f"its contents are loaded and read by nothing"
+        ),
+        span=decl.span,
+      ))
+
+
+def _check_table_family(
+  ref: ast.TableRef, want: str, field_label: str, span
+) -> None:
+  """Reject a table whose key width cannot hold the LHS field.
+
+  A table's family comes from its `kind` and exists before any packet
+  does, so this is a mismatch between two declared things rather than
+  an inference — and saying which is which is the whole content of the
+  message.
+  """
+  if ref.family == want:
+    return
+  raise FwlException(FwlError(
+    category="semantic",
+    message=(
+      f"table '{ref.resolved}' holds {ref.family} prefixes "
+      f"(kind = {'cidr4' if ref.family == 'ipv4' else 'cidr6'}) and "
+      f"cannot be matched against {field_label}"
+    ),
+    span=ref.span or span,
+  ))
 
 
 def _assign_geoip_call_indices(program: ast.Program) -> None:

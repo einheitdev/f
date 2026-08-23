@@ -37,6 +37,58 @@ drop if pkt.src_ip6 in 2001:db8::/32
 default drop
 ```
 
+## Long lists of addresses: tables
+
+A rule is code. Twenty of them is fine; two thousand is a chain of two thousand comparisons the box walks for every packet, and on the rig that is 12% of line rate against 99% for an empty policy. A **table** is the same intent as data: one lookup against a prefix trie, at a cost that does not depend on how many prefixes are in it. Measured, 50,000 prefixes cost what 1,000 cost, and both cost what none cost.
+
+```fwl
+table corporate_blocklist {
+  kind = cidr4
+  max = 100000
+  source = "/var/lib/f/feeds/blocklist.txt"
+}
+
+@xdp(eth0)
+drop if pkt.src_ip in corporate_blocklist
+default allow
+```
+
+The three attributes are all required.
+
+`kind` is `cidr4` or `cidr6` and fixes the key width. Everywhere else FWL infers what a value is; a table cannot, because the map is created before any entry exists and an empty table still has to have a key size.
+
+`max` is capacity. It lives in the policy rather than the config because it is a shape the map is created with, so it belongs beside the rules that depend on it. A source file with more prefixes than `max` is **refused, not truncated** — a blocklist quietly missing entries forwards exactly the traffic it was written to drop.
+
+`source` is a path **on the appliance**, and the file is one prefix per line with `#` comments. The compiler never opens it — it does not run on the box and has no business reading the box's data — so the bundle carries the declaration and `fd` reads the file when it loads the policy. Changing the list means writing the file and reloading, not recompiling.
+
+That also means a table's contents are not the policy's to throw away. Editing a rule says nothing about whether an address is still hostile, so a reload leaves the table alone; `fd` reconciles it against the file by adding and removing individual entries, never by emptying it first. A blocklist that is empty for even a moment is an open firewall, and once something refreshes the file on a timer that moment would come round all day.
+
+If the file is missing, unreadable, empty, or holds more prefixes than `max`, **the load is refused and the previous policy keeps running.** Silently arming a datapath whose blocklist is empty is the failure this is designed against: every rule that matches against the table stops matching, and the box reports perfect health while doing it.
+
+A feed from something real — a threat feed, an IPAM, a table in a database somebody already maintains — is a separate unprivileged process that writes this file. `fd` never learns what a database is: it reads a file of prefixes, and a feeder that cannot reach its server is a feeder that retries rather than a datapath that stalls.
+
+Matching is the ordinary `in`, so a table goes anywhere a CIDR does — under `not`, inside an `or`, in a `def` body, in a helper shared between zones. A table is named once for the whole file and every zone that matches against it means the same set.
+
+Nothing about a table is allowed to be quietly empty. An undeclared name, a `source` that does not exist, a file that resolves to nothing, an entry of the wrong family — each is a compile error naming the table and the line, because a rule that never matches is a hole that nothing on a running box reports.
+
+An alias gives one table a second name, which is what lets a block of policy pasted from somewhere else keep the vocabulary it was written with:
+
+```fwl
+table corporate_blocklist {
+  kind = cidr4
+  max = 100000
+  source = "/var/lib/f/feeds/blocklist.txt"
+}
+
+table badhosts = corporate_blocklist
+
+@xdp(eth0)
+drop if pkt.src_ip in badhosts
+default allow
+```
+
+`badhosts` and `corporate_blocklist` are one table with one set of contents. The alias sits with the pasted block and can be deleted with it.
+
 ## Ports and protocols
 
 `pkt.proto` takes `tcp`, `udp`, `icmp` or `icmp6`. `pkt.src_port` and `pkt.dst_port` are 16-bit and need a TCP-or-UDP guard.

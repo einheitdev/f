@@ -35,7 +35,14 @@
 // callable from any zone's body via a `call_stmt`. A `def` before the
 // first @xdp is a shared helper; a `def` inside an xdp_block (body_item)
 // is that zone's Tier 2 policy function.
-program       : zone_decl* function_def* xdp_block+
+program       : top_decl* function_def* xdp_block+
+
+// Zone and table declarations share the leading-declaration slot so a
+// file may interleave them in whatever order reads best. Both are
+// self-delimiting (each starts with its own reserved keyword), and the
+// `?` inlines this rule so `program`'s children stay the decl nodes
+// themselves.
+?top_decl     : zone_decl | table_decl | table_alias
 
 xdp_block     : hook_decl body_item*
 
@@ -43,6 +50,24 @@ xdp_block     : hook_decl body_item*
 // the grammar so the analyzer can report a typed "empty zone" error
 // rather than a bare syntax error.
 zone_decl     : ZONE IDENTIFIER "=" "[" (IDENTIFIER ("," IDENTIFIER)*)? "]"
+
+// TABLES.md: `table <name> { kind = ... max = ... source = "..." }`.
+// The attribute list is a brace block rather than a bracket list
+// because the three fields are named, not positional, and because the
+// set is expected to grow. Attribute NAMES are plain identifiers, not
+// reserved words, so `kind`/`max`/`source` stay usable as zone,
+// counter and interface names everywhere else; the parser validates
+// the set and reports an unknown one by name.
+table_decl    : TABLE IDENTIFIER "{" table_attr+ "}"
+
+// `table <alias> = <target>` — one table under a second name, so a
+// pasted policy block keeps its own vocabulary. Resolves at compile
+// time and allocates nothing.
+table_alias   : TABLE IDENTIFIER "=" IDENTIFIER
+
+table_attr    : IDENTIFIER "=" table_value
+
+?table_value  : IDENTIFIER | INTEGER | STRING
 
 body_item     : rule | default_rule | function_def | chain_decl
 
@@ -200,6 +225,12 @@ value_field   : IP_FIELD | PORT_FIELD | IP6_FIELD | PROTO_FIELD
 operand       : INTEGER | IPV4 | IPV6 | PROTO_KEYWORD
 
 set_or_range  : list | range | cidr | cidr_list | ipv6_cidr | ipv6_cidr_list | geoip_call
+              | table_ref
+
+// A bare identifier as the RHS of `in` is a named table. It is the
+// same surface `geoip_call` occupies, deliberately: the analyzer and
+// both oracles get set membership without a new expression form.
+table_ref     : IDENTIFIER
 
 list          : "[" operand ("," operand)* "]"
 
@@ -291,6 +322,10 @@ TO.10            : /to(?![a-z0-9_])/
 // v0.4 § 6.6 pipeline-split boundary keyword.
 CHAIN.10         : /chain(?![a-z0-9_])/
 
+// TABLES.md table declarations. Reserved (negative-lookahead so
+// `tables`, `table_of` still lex as IDENTIFIER).
+TABLE.10         : /table(?![a-z0-9_])/
+
 // Phase 5 NAT action keywords. Reserved words (negative-lookahead so
 // `masqueraded`, `snatted` still lex as IDENTIFIER).
 MASQUERADE.10    : /masquerade(?![a-z0-9_])/
@@ -331,6 +366,12 @@ IPV6.6        : /::ffff:\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}|(?:[0-9a-fA-F]{1,4}:)
 CIDR.5        : /\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\/\d{1,2}/
 IPV4.4        : /\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}/
 INTEGER       : /0x[0-9a-fA-F]+/ | /\d+/
+
+// A double-quoted, single-line string. Used only by a table
+// declaration's `source =` today; no escape processing, because a
+// filesystem path needs none and inventing escapes now would fix a
+// syntax nothing has asked for.
+STRING        : /"[^"\n]*"/
 
 IDENTIFIER    : /[a-z_][a-z0-9_]*/
 

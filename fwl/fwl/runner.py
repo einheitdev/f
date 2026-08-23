@@ -48,8 +48,13 @@ def _zone_program(program: ast.Program, ingress_zone: str | None):
       # Carry the unit's helper defs (v0.4 § 6.5): a per-zone body may
       # call a shared helper, so the emitter and interpreter both need
       # them even when we isolate one @xdp block.
+      # Tables come along for the same reason helpers do: they are a
+      # property of the unit, not of an @xdp block, and a zone
+      # isolated without them would emit no trie for a rule that
+      # matches against one.
       return ast.Program(
-        programs=[zp], zones=program.zones, helpers=program.helpers
+        programs=[zp], zones=program.zones, helpers=program.helpers,
+        tables=program.tables, table_aliases=program.table_aliases,
       )
   raise ValueError(
     f"ingress_zone {ingress_zone!r} matches no @xdp block"
@@ -136,6 +141,7 @@ def _interpreter_oracle(
     geoip_data=(case.geoip_data or None),
     conntrack=interpreter.ConntrackTable(case.conntrack_seed),
     nat=_build_nat_state(case),
+    table_data=(case.table_data or None),
   )
   if result.action != expected:
     return OracleResult(
@@ -201,6 +207,10 @@ def _bpf_oracle(
   map_init = _build_map_init(program, case.state)
   for name, entries in _build_geoip_map_init(
     program, case.geoip_data or {}
+  ).items():
+    map_init[name] = entries
+  for name, entries in _build_table_map_init(
+    program, case.table_data or {}
   ).items():
     map_init[name] = entries
   ct_seed = _build_conntrack_map_init(case.conntrack_seed)
@@ -333,6 +343,10 @@ def _bpf_map_init(program, case, c_source):
     program, case.geoip_data or {}
   ).items():
     map_init[name] = entries
+  for name, entries in _build_table_map_init(
+    program, case.table_data or {}
+  ).items():
+    map_init[name] = entries
   ct_seed = _build_conntrack_map_init(case.conntrack_seed)
   if ct_seed:
     map_init["conntrack"] = ct_seed
@@ -454,6 +468,7 @@ def _seq_interpreter_oracle(case: pkt.PktCase) -> OracleResult:
     res = interpreter.evaluate_full(
       program, step.packet.fields, rl_state,
       geoip_data=(case.geoip_data or None), conntrack=ct, nat=nat,
+      table_data=(case.table_data or None),
     )
     if res.action != want:
       return OracleResult(
@@ -513,6 +528,10 @@ def _seq_bpf_oracle(case: pkt.PktCase) -> OracleResult:
   map_init = _build_map_init(program, case.state)
   for name, entries in _build_geoip_map_init(
     program, case.geoip_data or {}
+  ).items():
+    map_init[name] = entries
+  for name, entries in _build_table_map_init(
+    program, case.table_data or {}
   ).items():
     map_init[name] = entries
   ct_seed = _build_conntrack_map_init(case.conntrack_seed)
@@ -1170,6 +1189,59 @@ def _build_geoip_map_init(
           entries[key] = b"\x01"
       if entries:
         result[map_name] = entries
+  return result
+
+
+def _build_table_map_init(
+  program: ast.Program,
+  table_data: dict[str, list[str]],
+) -> dict[str, dict[bytes, bytes]]:
+  """Translate a .pkt `table_data` block into LPM trie map entries.
+
+  Walks every table reference in `program`, looks the CANONICAL table
+  name up in `table_data`, and produces `{map_name: {key: value}}` for
+  `fwl_tbl_<id>`. Key layouts are the geoip ones, because the emitted
+  map is the geoip map: v4 is `{__u32 prefixlen; __u32 ip;}` with
+  prefixlen host-order and the address network-order (matching the
+  helper's `bpf_htonl`), v6 the same with 16 address bytes.
+
+  A table absent from `table_data` gets no entries and therefore no
+  map seed — the BPF map stays empty and every lookup misses, which is
+  the same answer the interpreter gives. That agreement is what lets a
+  vacuity check plant an empty table and expect the case to fail.
+
+  Entries of the other family are skipped rather than refused, for the
+  same reason as in the interpreter: the compiler already refuses a
+  source file whose entries do not match the declared `kind`, so a
+  mismatched seed can only come from a .pkt and both oracles must
+  ignore it identically.
+  """
+  if not table_data:
+    return {}
+  result: dict[str, dict[bytes, bytes]] = {}
+  seen: set[int] = set()
+  for ref in analyzer.table_refs(program):
+    if ref.table_id in seen:
+      continue
+    seen.add(ref.table_id)
+    # Base name, not zone-qualified: the BPF oracle emits a single
+    # object, and MapNames() with no zone gives the name that object
+    # declares. It is also the SHARED name a bundle uses, since a
+    # table is bundle-global.
+    map_name = emitter.MapNames().table(ref.table_id)
+    entries: dict[bytes, bytes] = {}
+    want_v4 = ref.family == "ipv4"
+    for cidr in table_data.get(ref.resolved, ()):
+      net = ipaddress.ip_network(cidr, strict=False)
+      if isinstance(net, ipaddress.IPv4Network) != want_v4:
+        continue
+      width = 4 if want_v4 else 16
+      key = struct.pack("<I", net.prefixlen) + int(
+        net.network_address
+      ).to_bytes(width, "big")
+      entries[key] = b"\x01"
+    if entries:
+      result[map_name] = entries
   return result
 
 

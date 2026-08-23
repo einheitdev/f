@@ -1,0 +1,27 @@
+name: "an alias reads the same set as the table it names"
+# TABLES.md: the alias resolves at compile time and allocates nothing,
+# so `pasted` and `badhosts` are one table with one id and one set of
+# contents. The .pkt seeds only the canonical name; a match through the
+# alias proves the two are not two tables.
+source_fw: |
+  table badhosts {
+    kind = cidr4
+    max = 1000
+    source = "/var/lib/f/feeds/badhosts.txt"
+  }
+
+  table pasted = badhosts
+
+  @xdp(eth0)
+  drop if pkt.src_ip in pasted
+  default allow
+
+table_data:
+  badhosts: ["5.8.0.0/16"]
+
+test_packet:
+  builder: tcp(src_ip="5.8.1.1", dst_port=80)
+
+expected:
+  compiles: true
+  bpf_action: drop

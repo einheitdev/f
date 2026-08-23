@@ -1,0 +1,17 @@
+name: "a cidr6 table cannot be matched against pkt.src_ip"
+source_fw: |
+  table badhosts6 {
+    kind = cidr6
+    max = 10
+    source = "/var/lib/f/feeds/b.txt"
+  }
+
+  @xdp(eth0)
+  drop if pkt.src_ip in badhosts6
+  default allow
+
+test_packet:
+  builder: tcp(src_ip="1.2.3.4")
+
+expected:
+  compiles: false

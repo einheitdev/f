@@ -1,0 +1,28 @@
+name: "the same Tier 2 local allows an address the table lacks"
+# `pkt.proto == tcp` establishes the L4 guard but not the IPv4 one, so
+# the v4 read is dominated by `pkt.src_ip in 0.0.0.0/0` -- the idiom
+# the rest of the suite uses for exactly this.
+source_fw: |
+  table badhosts {
+    kind = cidr4
+    max = 1000
+    source = "/var/lib/f/feeds/badhosts.txt"
+  }
+
+  @xdp(eth0)
+  def firewall(pkt):
+    if pkt.src_ip in 0.0.0.0/0:
+      who = pkt.src_ip
+      if who in badhosts:
+        drop
+    allow
+
+table_data:
+  badhosts: ["5.8.0.0/16"]
+
+test_packet:
+  builder: tcp(src_ip="9.9.9.9", dst_port=80)
+
+expected:
+  compiles: true
+  bpf_action: allow

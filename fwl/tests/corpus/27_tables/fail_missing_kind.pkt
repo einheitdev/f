@@ -1,0 +1,19 @@
+name: "a table declaration without kind is refused"
+# Everywhere else FWL infers element types. A table cannot: the map is
+# created before any element exists, so an empty table still has a key
+# width and somebody has to say what it is.
+source_fw: |
+  table badhosts {
+    max = 10
+    source = "/var/lib/f/feeds/b.txt"
+  }
+
+  @xdp(eth0)
+  drop if pkt.src_ip in badhosts
+  default allow
+
+test_packet:
+  builder: tcp(src_ip="1.2.3.4")
+
+expected:
+  compiles: false

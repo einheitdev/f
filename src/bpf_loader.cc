@@ -258,6 +258,251 @@ auto ParseGeoipFile(std::string_view bundle_dir)
 
 namespace {
 
+/// The kernel's LPM key for one entry: __u32 prefixlen (host order)
+/// followed by the address bytes. Written once, here, because the
+/// loader now builds this key in three places (geoip populate, table
+/// sync, table diff read-back) and three copies of a byte layout is
+/// how the layouts drift.
+auto TrieKeyBytes(const GeoipTrieEntry& e) -> std::vector<uint8_t> {
+  std::vector<uint8_t> key(e.v6 ? 20 : 8, 0);
+  std::memcpy(key.data(), &e.prefixlen, sizeof(e.prefixlen));
+  std::memcpy(key.data() + 4, e.addr, e.v6 ? 16 : 4);
+  return key;
+}
+
+}  // namespace
+
+auto ParseTableSpecs(std::string_view bundle_dir)
+    -> std::expected<std::vector<TableSpec>, Error<BpfError>> {
+  using nlohmann::json;
+  std::vector<TableSpec> specs;
+  std::ifstream mf(std::filesystem::path(bundle_dir) / "manifest.json");
+  if (!mf) {
+    return specs;
+  }
+  std::stringstream ss;
+  ss << mf.rdbuf();
+  json manifest;
+  try {
+    manifest = json::parse(ss.str());
+  } catch (const std::exception& e) {
+    return MakeError(BpfError::kLoadFailed,
+        std::format("parse manifest.json for tables: {}", e.what()));
+  }
+  if (!manifest.contains("tables")) {
+    // No tables in this policy, or a bundle compiled before they
+    // existed. Both are "nothing to fill".
+    return specs;
+  }
+  if (!manifest["tables"].is_object()) {
+    return MakeError(BpfError::kLoadFailed,
+        "manifest.json 'tables' is not an object");
+  }
+  for (const auto& [name, row] : manifest["tables"].items()) {
+    if (!row.is_object()) {
+      return MakeError(BpfError::kLoadFailed,
+          std::format("manifest table '{}' is not an object", name));
+    }
+    TableSpec spec;
+    spec.name = name;
+    spec.referenced = row.value("referenced", true);
+    if (!spec.referenced) {
+      // No rule reads it, so no object declares its map. Recorded so
+      // `show` can say the table is declared and unused, but never
+      // looked for in bpffs.
+      specs.push_back(spec);
+      continue;
+    }
+    if (!row.contains("map") || !row["map"].is_string()) {
+      return MakeError(BpfError::kLoadFailed,
+          std::format("manifest table '{}' has no map name", name));
+    }
+    spec.map_name = row["map"].get<std::string>();
+    spec.id = row.value("id", 0u);
+    std::string kind = row.value("kind", std::string("cidr4"));
+    if (kind != "cidr4" && kind != "cidr6") {
+      return MakeError(BpfError::kLoadFailed,
+          std::format("manifest table '{}' has unknown kind '{}'",
+                      name, kind));
+    }
+    spec.v6 = kind == "cidr6";
+    if (!row.contains("max") || !row["max"].is_number_unsigned()) {
+      // Capacity is what makes "refuse rather than truncate"
+      // enforceable. Guessing one would silently reinstate the
+      // behaviour the rule exists to prevent.
+      return MakeError(BpfError::kLoadFailed,
+          std::format("manifest table '{}' has no max (capacity)",
+                      name));
+    }
+    spec.max_entries = row["max"].get<uint32_t>();
+    if (!row.contains("source") || !row["source"].is_string() ||
+        row["source"].get<std::string>().empty()) {
+      return MakeError(BpfError::kLoadFailed,
+          std::format("manifest table '{}' names no source file",
+                      name));
+    }
+    spec.source = row["source"].get<std::string>();
+    specs.push_back(spec);
+  }
+  return specs;
+}
+
+auto ReadTableFeed(const TableSpec& spec)
+    -> std::expected<std::vector<GeoipTrieEntry>, Error<BpfError>> {
+  std::error_code ec;
+  if (!std::filesystem::is_regular_file(spec.source, ec) || ec) {
+    return MakeError(BpfError::kFeedUnavailable,
+        std::format("table '{}': source '{}' is not a readable file. "
+                    "The table would load empty and every rule "
+                    "matching against it would stop matching",
+                    spec.name, spec.source));
+  }
+  std::ifstream ff(spec.source);
+  if (!ff) {
+    return MakeError(BpfError::kFeedUnavailable,
+        std::format("table '{}': cannot open source '{}'",
+                    spec.name, spec.source));
+  }
+  // Keyed by the raw kernel key bytes so a prefix repeated in the file
+  // counts once -- it is one entry in the trie, and counting it twice
+  // would refuse a feed the map would have held.
+  std::map<std::vector<uint8_t>, GeoipTrieEntry> unique;
+  std::string line;
+  uint32_t lineno = 0;
+  while (std::getline(ff, line)) {
+    lineno++;
+    auto hash = line.find('#');
+    if (hash != std::string::npos) {
+      line.erase(hash);
+    }
+    auto begin = line.find_first_not_of(" \t\r");
+    if (begin == std::string::npos) {
+      continue;
+    }
+    auto end = line.find_last_not_of(" \t\r");
+    std::string item = line.substr(begin, end - begin + 1);
+
+    auto slash = item.find('/');
+    if (slash == std::string::npos) {
+      return MakeError(BpfError::kFeedUnavailable,
+          std::format("table '{}': {}:{}: '{}' has no /prefixlen",
+                      spec.name, spec.source, lineno, item));
+    }
+    std::string addr = item.substr(0, slash);
+    std::string len = item.substr(slash + 1);
+    if (len.empty() ||
+        len.find_first_not_of("0123456789") != std::string::npos) {
+      return MakeError(BpfError::kFeedUnavailable,
+          std::format("table '{}': {}:{}: '{}' has no prefix length",
+                      spec.name, spec.source, lineno, item));
+    }
+    GeoipTrieEntry entry;
+    entry.v6 = spec.v6;
+    entry.prefixlen = static_cast<uint32_t>(std::stoul(len));
+    uint32_t max_len = spec.v6 ? 128 : 32;
+    if (entry.prefixlen > max_len) {
+      return MakeError(BpfError::kFeedUnavailable,
+          std::format("table '{}': {}:{}: prefix length {} is out of "
+                      "range for kind = {}",
+                      spec.name, spec.source, lineno, entry.prefixlen,
+                      spec.v6 ? "cidr6" : "cidr4"));
+    }
+    int rc = spec.v6
+        ? inet_pton(AF_INET6, addr.c_str(), entry.addr)
+        : inet_pton(AF_INET, addr.c_str(), entry.addr);
+    if (rc != 1) {
+      // Includes the family mismatch: a v6 address in a cidr4 table
+      // fails inet_pton(AF_INET), which is the same refusal for the
+      // same reason -- the map cannot hold it.
+      return MakeError(BpfError::kFeedUnavailable,
+          std::format("table '{}': {}:{}: '{}' is not a {} address",
+                      spec.name, spec.source, lineno, addr,
+                      spec.v6 ? "cidr6" : "cidr4"));
+    }
+    unique.emplace(TrieKeyBytes(entry), entry);
+  }
+  if (unique.empty()) {
+    return MakeError(BpfError::kFeedUnavailable,
+        std::format("table '{}': source '{}' holds no prefixes. An "
+                    "empty table never matches, so this reads as a "
+                    "broken feeder rather than as an empty threat "
+                    "list", spec.name, spec.source));
+  }
+  if (unique.size() > spec.max_entries) {
+    return MakeError(BpfError::kFeedUnavailable,
+        std::format("table '{}': source '{}' holds {} distinct "
+                    "prefixes but the table was created with room for "
+                    "{}. Refused rather than truncated: {} entries "
+                    "would be missing and a blocklist short of its "
+                    "entries fails open",
+                    spec.name, spec.source, unique.size(),
+                    spec.max_entries,
+                    unique.size() - spec.max_entries));
+  }
+  std::vector<GeoipTrieEntry> out;
+  out.reserve(unique.size());
+  for (const auto& [key, entry] : unique) {
+    out.push_back(entry);
+  }
+  return out;
+}
+
+auto SyncTableTrie(int map_fd, bool v6,
+                   const std::vector<GeoipTrieEntry>& want)
+    -> std::expected<TableSyncReport, Error<BpfError>> {
+  TableSyncReport report;
+  const size_t key_size = v6 ? 20 : 8;
+
+  std::set<std::vector<uint8_t>> wanted;
+  for (const auto& e : want) {
+    wanted.insert(TrieKeyBytes(e));
+  }
+
+  // What the map holds now. On a fresh map this is empty and the diff
+  // degenerates to "insert everything", which is the cold-boot path.
+  std::set<std::vector<uint8_t>> present;
+  std::vector<uint8_t> key(key_size, 0);
+  std::vector<uint8_t> next(key_size, 0);
+  bool have_key = false;
+  while (bpf_map_get_next_key(map_fd, have_key ? key.data() : nullptr,
+                              next.data()) == 0) {
+    present.insert(next);
+    key = next;
+    have_key = true;
+  }
+
+  // Adds first, then deletes. At no instant is the table missing an
+  // entry that both the old contents and the new contents hold, so a
+  // packet arriving mid-sync is matched against a SUPERSET of the two
+  // rather than against a gap. Clear-and-refill would instead pass
+  // through empty, and an empty blocklist forwards everything.
+  uint8_t one = 1;
+  for (const auto& k : wanted) {
+    if (present.contains(k)) {
+      report.unchanged++;
+      continue;
+    }
+    if (bpf_map_update_elem(map_fd, k.data(), &one, BPF_ANY) != 0) {
+      int err = errno;
+      return MakeError(BpfError::kMapUpdateFailed,
+          std::format("table trie insert failed after {} entries: {}",
+                      report.added, std::strerror(err)));
+    }
+    report.added++;
+  }
+  for (const auto& k : present) {
+    if (wanted.contains(k)) {
+      continue;
+    }
+    if (bpf_map_delete_elem(map_fd, k.data()) == 0) {
+      report.removed++;
+    }
+  }
+  return report;
+}
+
+namespace {
+
 /// Insert one trie's entries into a loaded zone object's map. Pinned
 /// by-name maps are shared across zone objects, so `done` dedupes.
 auto PopulateGeoipTrie(struct bpf_object* obj,
@@ -883,6 +1128,42 @@ auto LoadZoneBundle(std::string_view bundle_dir,
   }
   std::set<std::string> geoip_done;
 
+  // TABLES.md: a table's contents are a file on this appliance, read
+  // here rather than compiled into the bundle. Both halves happen
+  // BEFORE anything is opened, loaded, pinned or attached, and that
+  // ordering is the whole design of this block.
+  //
+  // A feed that cannot be read must not look like a bundle that
+  // cannot be loaded. `fd.service` restarts on failure and a
+  // bundle-health guard counts attempts, so an NFS blip or a feeder
+  // that has not written yet would otherwise spend a good policy's
+  // remaining attempts and quarantine it. Failing here, before a
+  // single bpf() call, means the attempt cost the box nothing: the
+  // previously running policy is still attached, and the error says
+  // kFeedUnavailable rather than kLoadFailed so a caller can tell
+  // "this artifact will never work" from "this artifact could not
+  // reach its data just now".
+  auto table_specs = ParseTableSpecs(bundle_dir);
+  if (!table_specs) {
+    return std::unexpected(table_specs.error());
+  }
+  std::map<std::string, std::vector<GeoipTrieEntry>> table_entries;
+  for (const auto& spec : *table_specs) {
+    if (!spec.referenced) {
+      spdlog::info("table '{}' is declared but no rule matches "
+                   "against it; nothing to fill", spec.name);
+      continue;
+    }
+    auto entries = ReadTableFeed(spec);
+    if (!entries) {
+      return std::unexpected(entries.error());
+    }
+    spdlog::info("table '{}' ({}): {} prefixes from {}", spec.name,
+                 spec.map_name, entries->size(), spec.source);
+    table_entries[spec.map_name] = std::move(*entries);
+  }
+  std::set<std::string> table_done;
+
   std::ifstream mf(dir / "manifest.json");
   if (!mf) {
     return MakeError(BpfError::kLoadFailed,
@@ -1174,6 +1455,37 @@ auto LoadZoneBundle(std::string_view bundle_dir,
     // geoip.json (no-op for bundles without geoip() calls).
     for (const auto& [map_name, entries] : *geoip) {
       PopulateGeoipTrie(obj, map_name, entries, geoip_done);
+    }
+
+    // Reconcile this object's table tries against what their source
+    // files hold. A diff rather than a clear-and-refill, so a trie
+    // adopted from a pin never passes through empty on its way to the
+    // new contents -- see SyncTableTrie. On a cold boot the map is
+    // fresh and the diff is simply every insert.
+    //
+    // A failure here IS a load failure and not a feed failure: the
+    // file was read successfully in the preflight above, so anything
+    // going wrong now is the kernel refusing a write to a map this
+    // bundle declared.
+    for (const auto& [map_name, entries] : table_entries) {
+      if (table_done.contains(map_name)) {
+        continue;
+      }
+      int tfd = FindMap(obj, map_name.c_str());
+      if (tfd < 0) {
+        // This zone's object does not declare the trie -- normal, for
+        // a table only another zone matches against.
+        continue;
+      }
+      table_done.insert(map_name);
+      auto synced = SyncTableTrie(tfd, !entries.empty() && entries[0].v6,
+                                  entries);
+      if (!synced) {
+        return bail(BpfError::kMapUpdateFailed, synced.error().message);
+      }
+      spdlog::info(
+          "table trie '{}': {} added, {} removed, {} already present",
+          map_name, synced->added, synced->removed, synced->unchanged);
     }
 
     // Capture the shared NAT reply-mapping fd; `show nat` reads the

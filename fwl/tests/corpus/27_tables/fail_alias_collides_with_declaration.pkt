@@ -1,0 +1,25 @@
+name: "an alias whose name is already a table is refused"
+source_fw: |
+  table badhosts {
+    kind = cidr4
+    max = 10
+    source = "/var/lib/f/feeds/a.txt"
+  }
+
+  table other {
+    kind = cidr4
+    max = 10
+    source = "/var/lib/f/feeds/b.txt"
+  }
+
+  table badhosts = other
+
+  @xdp(eth0)
+  drop if pkt.src_ip in badhosts
+  default allow
+
+test_packet:
+  builder: tcp(src_ip="1.2.3.4")
+
+expected:
+  compiles: false

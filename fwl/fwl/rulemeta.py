@@ -118,6 +118,11 @@ def render_operand(op: ast.Operand) -> str:
     return f"[{inner}]"
   if isinstance(op, ast.GeoIp):
     return f"geoip({', '.join(op.codes)})"
+  if isinstance(op, ast.TableRef):
+    # The name the author wrote, alias and all: `show policy` has to
+    # read back as the policy text does, and resolving the alias here
+    # would print a name that is not in the file.
+    return op.name
   raise Unrenderable(op)
 
 

@@ -108,6 +108,10 @@ def _format_operand(op: ast.Operand) -> str:
     return "[" + ", ".join(_format_operand(i) for i in op.items) + "]"
   if isinstance(op, ast.CidrListLiteral):
     return "[" + ", ".join(_format_operand(i) for i in op.items) + "]"
+  if isinstance(op, ast.GeoIp):
+    return f"geoip({', '.join(op.codes)})"
+  if isinstance(op, ast.TableRef):
+    return op.name
   return repr(op)
 
 
@@ -282,6 +286,65 @@ def _build_geoip_bundle_file(
       "prefixes": sorted(prefixes),
     }
   return {"tries": [tries[k] for k in sorted(tries)]}
+
+
+def _referenced_tables(program: ast.Program) -> list[ast.TableDecl]:
+  """The declared tables some rule in this unit actually matches against.
+
+  A table nobody references emits no map (the emitter declares only
+  what a lookup needs), so the manifest must not promise the daemon a
+  trie to fill. The analyzer already warns about the declaration; this
+  is the other half of the same decision.
+  """
+  by_name = {t.name: t for t in program.tables}
+  out: list[ast.TableDecl] = []
+  seen: set[str] = set()
+  for ref in analyzer.table_refs(program):
+    if ref.resolved in seen:
+      continue
+    seen.add(ref.resolved)
+    out.append(by_name[ref.resolved])
+  return out
+
+
+def _manifest_tables(program: ast.Program) -> dict:
+  """The manifest's `tables` block: the declaration, and not the data.
+
+  TABLES.md is disk-authoritative: `source` names a path on the
+  APPLIANCE, and the file is read at load by `fd`. So the compiler
+  never opens it and the bundle never carries a prefix — what ships is
+  the declaration the daemon needs in order to go and read it: the
+  full name, the id its kernel map is named for, the key width, the
+  capacity the map was created with, and the path.
+
+  There is deliberately no entry count. The compiler does not know it
+  and cannot know it; a number here would be the build host's guess
+  about a file on another machine, and a stale guess about how much a
+  blocklist holds is worse than no answer. `table show` reports the
+  count from the live map, which is the only place it is true.
+
+  Aliases are listed against the table they resolve to, so an operator
+  reading a policy with a pasted block can answer "what is `badhosts`
+  actually" without reading the whole file.
+  """
+  ids = analyzer.table_map_id(program)
+  referenced = {t.name for t in _referenced_tables(program)}
+  tables: dict[str, dict] = {}
+  for decl in program.tables:
+    tables[decl.name] = {
+      "id": ids[decl.name],
+      "map": emitter.MapNames().table(ids[decl.name]),
+      "kind": decl.kind,
+      "max": decl.max_entries,
+      "source": decl.source,
+      # Whether any rule reads it. `fd` fills only the tries that
+      # exist, and a declared-but-unmatched table has no map in any
+      # object — so this is the daemon's instruction not to go looking
+      # for a pin that was never created.
+      "referenced": decl.name in referenced,
+    }
+  aliases = {a.name: a.target for a in program.table_aliases}
+  return {"tables": tables, "table_aliases": aliases}
 
 
 def _manifest_zones(program: ast.Program) -> list[dict]:
@@ -499,7 +562,7 @@ def _emit_bundle_dir(program: ast.Program, bundle_dir: Path,
     # under its pin root is left over from a previous compilation and
     # is removed before the load. Taken from _MAP_KINDS so the decision
     # lives in one place and reaches the daemon without being restated.
-    "persistent_maps": list(emitter.persistent_map_names()),
+    "persistent_maps": list(emitter.persistent_map_names(program)),
     # Present only when this policy reads conntrack at all. `fd`
     # attaches it to every interface the bundle attaches XDP to, and a
     # bundle that declares one and cannot attach it is a failed load —
@@ -511,6 +574,9 @@ def _emit_bundle_dir(program: ast.Program, bundle_dir: Path,
     # in the packet path. `null` when the caller built the bundle from
     # an AST and there is no file to name — an unknown source is a
     # state, not a reason to invent a digest.
+    # TABLES.md: full names in the language, a short mapped id in the
+    # kernel, and the mapping carried here so `fd` never re-derives it.
+    **_manifest_tables(program),
     "policy_source": (
       rulemeta.source_identity(str(source), source_text)
       if source is not None and source_text is not None else None),

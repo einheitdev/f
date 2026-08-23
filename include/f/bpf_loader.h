@@ -514,6 +514,82 @@ auto FirstZoneIpv4(const std::vector<std::string>& ifaces) -> uint32_t;
 auto ParseGeoipFile(std::string_view bundle_dir)
     -> std::expected<GeoipTries, Error<BpfError>>;
 
+/// One `table` declaration, as the manifest carries it (TABLES.md).
+///
+/// The bundle ships the DECLARATION and not the data: tables are
+/// disk-authoritative, `source` is a path on this appliance, and the
+/// compiler never opens it. Everything needed to go and read that file
+/// -- and to refuse if what is in it does not fit -- is here.
+struct TableSpec {
+  /// The full name the policy uses. Never shortened; this is what an
+  /// operator types and what every message says.
+  std::string name;
+  /// The small allocated id its kernel map is named for. Exists only
+  /// because BPF_OBJ_NAME_LEN is 16.
+  uint32_t id = 0;
+  /// `fwl_tbl_<id>`. Taken from the manifest, never re-derived here:
+  /// a second implementation of the naming rule in another language
+  /// is how the same defect got in three times.
+  std::string map_name;
+  /// kind = cidr6 rather than cidr4, so keys are 16 address bytes.
+  bool v6 = false;
+  /// The capacity the map was created with. A feed longer than this
+  /// is refused, never truncated.
+  uint32_t max_entries = 0;
+  /// Path on THIS box to the file of prefixes.
+  std::string source;
+  /// Whether any rule matches against it. A declared-but-unmatched
+  /// table has no map in any object, so there is nothing to fill.
+  bool referenced = true;
+};
+
+/// Parse the `tables` block of `<bundle_dir>/manifest.json`.
+///
+/// An absent block yields an empty vector: a bundle whose policy
+/// declares no tables, or one compiled before tables existed. A block
+/// that is present but malformed is an error, because the alternative
+/// is a policy whose blocklist rules match nothing.
+auto ParseTableSpecs(std::string_view bundle_dir)
+    -> std::expected<std::vector<TableSpec>, Error<BpfError>>;
+
+/// Read `spec.source` into trie entries.
+///
+/// One prefix per line; `#` starts a comment; blank lines are ignored.
+/// Fails with kFeedUnavailable -- never with an empty result -- when
+/// the file is missing, unreadable, holds nothing, holds an entry of
+/// the wrong family, holds an unparseable line, or holds more distinct
+/// prefixes than the table has room for.
+///
+/// Empty is a failure and not a state. `drop if pkt.src_ip in
+/// badhosts` against an empty table blocks nothing while reporting
+/// perfect health, so "the feed came back empty" has to read as "the
+/// feeder is broken", not as "nothing is dangerous any more".
+auto ReadTableFeed(const TableSpec& spec)
+    -> std::expected<std::vector<GeoipTrieEntry>, Error<BpfError>>;
+
+/// What one table's reconciliation did.
+struct TableSyncReport {
+  uint32_t added = 0;
+  uint32_t removed = 0;
+  uint32_t unchanged = 0;
+};
+
+/// Reconcile the LPM trie behind `map_fd` to hold exactly `want`.
+///
+/// A diff, never a clear-and-refill. Every bpf_map_update_elem and
+/// bpf_map_delete_elem is atomic on its own, so the datapath sees the
+/// table gain and lose entries but never sees it EMPTY -- and a
+/// blocklist that is briefly empty is an open firewall. With a feeder
+/// on a timer that window would recur all day rather than once at
+/// deploy, which is what makes the difference structural rather than
+/// stylistic.
+///
+/// Adds land before deletes for the same reason: at no point is the
+/// table a subset of both the old contents and the new.
+auto SyncTableTrie(int map_fd, bool v6,
+                   const std::vector<GeoipTrieEntry>& want)
+    -> std::expected<TableSyncReport, Error<BpfError>>;
+
 /// True when `<bundle_dir>/manifest.json` describes a multi-zone bundle
 /// (a non-empty "zones" array and a non-empty "programs" array). The
 /// cold-boot (EngineInit) and hot-reload (ApplyBundle) paths use this

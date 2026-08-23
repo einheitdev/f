@@ -4,7 +4,7 @@
 
 The language reference is [`docs/FWL_V04_SPEC.md`](../docs/FWL_V04_SPEC.md); the build methodology is [`docs/F_DEVELOPMENT_METHODOLOGY.md`](../docs/F_DEVELOPMENT_METHODOLOGY.md). For using the language rather than working on it, start at [`docs/fwl/`](../docs/fwl/).
 
-**Status: v0.4 surface complete.** 2120 unit tests and 1244 corpus cases pass. On a host with `CAP_BPF` (or root) every behavioral corpus case runs through `BPF_PROG_TEST_RUN`; unprivileged, the BPF oracle skips cleanly while spec, interpreter and clang-compile still gate regressions. That skip matters — see "Verification model".
+**Status: v0.4 surface complete.** 2238 unit tests and 1291 corpus cases pass. On a host with `CAP_BPF` (or root) every behavioral corpus case runs through `BPF_PROG_TEST_RUN`; unprivileged, the BPF oracle skips cleanly while spec, interpreter and clang-compile still gate regressions. That skip matters — see "Verification model".
 
 ## Install
 
@@ -49,6 +49,7 @@ fwl test tests/corpus/ # run the corpus
 - **Fields** — `pkt.proto`, `pkt.{src,dst}_ip`, `pkt.{src,dst}_ip6`, `pkt.{src,dst}_port`, all eight TCP flags, `pkt.icmp.{type,code}`, `pkt.icmp6.{type,code}`, VLAN, `pkt.zone`.
 - **Stateful** — `conntrack(pkt).state`, and `rate_limit(N, per=<field>[, scope=zone|global])` as a Tier 1 `limited by` modifier or a Tier 2 condition.
 - **`geoip(CC, ...)`** — country matching against a compiled LPM trie shipped in the bundle.
+- **Tables** — `table <name> { kind = cidr4|cidr6  max = <n>  source = "<path>" }`, matched with the ordinary `in`. One LPM lookup whatever the prefix count, so a 50,000-entry blocklist costs what an empty policy costs; the same list as rules is a linear chain that runs at 12% of line rate by 2,000 of them. `table <alias> = <target>` gives one table a second name so a pasted block keeps its own vocabulary. Disk-authoritative: `source` is a path on the **appliance**, the bundle carries the declaration and not one prefix, and `fd` reads the file at load — refusing the load rather than arming a datapath whose blocklist is empty. The map is `MapLifetime.EXTERNAL`, so a policy edit does not discard it, and every load reconciles it against the file by diff rather than by clear-and-refill.
 - **Tier 2** — a `def <name>(pkt):` body replacing the rule sequence, with locals, `if`/`elif`/`else` and early exit, plus helper `def`s callable from more than one zone as real BPF-to-BPF calls.
 
 A zone is *either* a Tier 1 rule sequence or a Tier 2 body, never both. Tier 3 raw-C `inline_c` is excluded by design, not merely unbuilt.
@@ -87,7 +88,7 @@ The corpus under `tests/corpus/` is organized by construct and by lifecycle:
 16_multidef  17_nat_lifecycle  18_conntrack_lifecycle
 19_rate_limit_lifecycle  20_zone_dispatch  21_truncation
 22_rate_limit_overflow  23_nat_edges  24_nat_conntrack  25_ethertype
-25_local_delivery  26_near_miss
+25_local_delivery  26_near_miss  27_tables
 ```
 
 The `*_lifecycle` groups are multi-packet sequences; `26_near_miss` holds cases that should *not* match, which is the half a corpus of positive examples never covers.
@@ -127,7 +128,7 @@ expected:
   bpf_action: drop
 ```
 
-Top-level keys: `name`, `source_fw`, `test_packet`, `expected`, `state`, `geoip_data`, `ingress_zone` (which `@xdp` block the packet arrives on), and `sequence` for a multi-packet case — mutually exclusive with the single `test_packet`/`expected` pair.
+Top-level keys: `name`, `source_fw`, `test_packet`, `expected`, `state`, `geoip_data`, `table_data` (a table name to its CIDR list, mirroring the bundle payload), `ingress_zone` (which `@xdp` block the packet arrives on), and `sequence` for a multi-packet case — mutually exclusive with the single `test_packet`/`expected` pair.
 
 `state:` carries `rate_limit` buckets, a `conntrack` seed, and `nat` (masquerade address plus pre-seeded reply mappings). `expected:` carries `compiles`, `bpf_action`, `counter_changes`, `log_events`, `redirect_zone`, `output_packet` (header fields after a NAT rewrite, checked by both oracles), and the load-time `loads`/`load_action`/`load_error_pattern`.
 
@@ -154,9 +155,10 @@ fwl/fwl/
   errors.py           Source-spanned error types
   grammar.lark        Grammar reference
 fwl/examples/         ssh_brute_force, web_server_ddos, internal_network,
-                      v6_internal, geoip_block, storm_shield, dogfood_v02,
-                      dogfood_v03
+                      v6_internal, geoip_block, blocklist_table,
+                      storm_shield, dogfood_v02, dogfood_v03
+  feeds/              Sample table source files the examples read
 fwl/tests/
-  corpus/             1244 .pkt cases
-  unit/               2120 pytest tests
+  corpus/             1291 .pkt cases
+  unit/               2238 pytest tests
 ```

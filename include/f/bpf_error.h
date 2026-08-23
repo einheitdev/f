@@ -22,6 +22,16 @@ enum class BpfError : uint8_t {
   kMapLookupFailed,
   kMapDeleteFailed,
   kMapIterFailed,
+  /// A `table`'s `source` file could not be read, or what it held was
+  /// not something the table could be filled from. Distinct from
+  /// kLoadFailed on purpose: the bundle is fine and the policy is
+  /// fine, and something upstream of the box -- an NFS blip, a feeder
+  /// that has not written yet, a permissions change -- is not. A
+  /// bundle-health guard that counts failed loads must be able to
+  /// tell "this artifact will never work" from "this artifact could
+  /// not reach its data just now", or a transient quarantines a good
+  /// policy.
+  kFeedUnavailable,
 };
 
 }  // namespace f

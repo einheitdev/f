@@ -277,11 +277,39 @@ class GeoIp:
   span: Span | None = None
 
 
+# TableRef is mutable for the same reason GeoIp is: `table_id`,
+# `resolved` and `family` are filled in by the analyzer once the
+# reference has been matched against the unit's `table` declarations.
+# The parser knows only the name the author wrote, which may be an
+# alias.
+@dataclass
+class TableRef:
+  """A named table as the RHS of `in` (TABLES.md).
+
+  `name` is exactly what the source said — possibly an alias. The
+  analyzer resolves it against the unit's `table` declarations and
+  stamps `resolved` (the canonical table name), `table_id` (the small
+  allocated integer the kernel map is named for) and `family`
+  ("ipv4"/"ipv6", taken from the declaration's `kind`, not from the
+  comparison's LHS: a table's key width exists before any packet
+  does). All three default to sentinels at parse time.
+
+  An unresolvable name is a compile error, never an empty map — a
+  table that silently holds nothing is a rule that never matches,
+  which in a blocklist is an open firewall.
+  """
+  name: str
+  table_id: int = -1
+  resolved: str = ""
+  family: str = ""
+  span: Span | None = None
+
+
 Operand = Union[
   ProtoLiteral, IntLiteral, IPv4Literal, CidrLiteral,
   Ipv6Literal, Ipv6CidrLiteral,
   ListLiteral, CidrListLiteral, Ipv6CidrListLiteral,
-  RangeLiteral, GeoIp,
+  RangeLiteral, GeoIp, TableRef,
 ]
 
 
@@ -652,6 +680,56 @@ class ZoneDecl:
   span: Span
 
 
+# TABLES.md: the kinds a `table` declaration may name. `cidr4` and
+# `cidr6` are LPM tries — the shape geoip() already proves end to end
+# on the rig. Exact-match (`addr4`/`addr6`) and port tables are a
+# different emission strategy (a hash on a scalar, not a prefix trie)
+# and are deliberately not admitted yet: an unimplemented kind that
+# parses is worse than one that does not.
+TABLE_KINDS: tuple[str, ...] = ("cidr4", "cidr6")
+
+# kind -> the address family its entries and its LHS field must have.
+TABLE_KIND_FAMILY: dict[str, str] = {
+  "cidr4": "ipv4",
+  "cidr6": "ipv6",
+}
+
+
+@dataclass(frozen=True)
+class TableDecl:
+  """A `table <name> { ... }` declaration (TABLES.md).
+
+  A named set whose contents come from outside the rule text. `kind`
+  fixes the key width, `max_entries` the capacity the BPF map is
+  created with, and `source` the file the contents are read from.
+
+  All three are explicit on purpose. Everywhere else FWL infers
+  element types; a table cannot, because the map must be created
+  before any element exists and an empty table still has a key size.
+  Capacity lives in the policy rather than the config so that it is
+  reviewable and diffable beside the rules that depend on it.
+  """
+  name: str
+  kind: str
+  max_entries: int
+  source: str
+  span: Span
+
+
+@dataclass(frozen=True)
+class TableAlias:
+  """A `table <alias> = <target>` declaration (TABLES.md).
+
+  One table under a second name so a block of policy pasted from
+  elsewhere keeps the vocabulary it was written with. The alias
+  resolves at compile time and allocates nothing: alias and target are
+  one table, one id, one set of contents.
+  """
+  name: str
+  target: str
+  span: Span
+
+
 @dataclass(frozen=True)
 class ZoneProgram:
   """One @xdp(<zone>) block — the policy for a single zone (v0.4 § 6.2).
@@ -692,6 +770,12 @@ class Program:
   """
   programs: list[ZoneProgram] = field(default_factory=list)
   zones: list[ZoneDecl] = field(default_factory=list)
+  # TABLES.md: the unit's `table` declarations and the aliases onto
+  # them. Bundle-global, not per-zone — a blocklist shared by every
+  # zone is the case the feature exists for — so they live on the unit
+  # rather than on a ZoneProgram.
+  tables: list[TableDecl] = field(default_factory=list)
+  table_aliases: list[TableAlias] = field(default_factory=list)
   # v0.4 § 6.5 multi-def: top-level helper `def`s shared across zones.
   # Each compiles to a `static __noinline` BPF function; zone bodies
   # invoke them via CallStmt. Empty in the v0.1-v0.3 shape.

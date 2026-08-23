@@ -1,0 +1,27 @@
+name: "the same table rule does not fire below its rate_limit threshold"
+source_fw: |
+  table badhosts {
+    kind = cidr4
+    max = 1000
+    source = "/var/lib/f/feeds/badhosts.txt"
+  }
+
+  @xdp(eth0)
+  drop if pkt.src_ip in badhosts
+       limited by rate_limit(5, per=src_ip)
+  default allow
+
+table_data:
+  badhosts: ["5.8.0.0/16"]
+
+state:
+  rate_limit:
+    0:
+      "5.8.1.1": 2
+
+test_packet:
+  builder: tcp(src_ip="5.8.1.1", dst_port=80)
+
+expected:
+  compiles: true
+  bpf_action: allow

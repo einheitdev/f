@@ -1,0 +1,19 @@
+name: "a kind the emitter has no strategy for is refused at parse"
+# Exact-match and port tables are a hash on a scalar, not a prefix
+# trie. Admitting the word without the emission would be worse than
+# refusing it.
+source_fw: |
+  table ports {
+    kind = port
+    max = 10
+    source = "/var/lib/f/feeds/p.txt"
+  }
+
+  @xdp(eth0)
+  allow
+
+test_packet:
+  builder: tcp(src_ip="1.2.3.4")
+
+expected:
+  compiles: false

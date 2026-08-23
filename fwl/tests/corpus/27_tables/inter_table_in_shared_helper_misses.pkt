@@ -1,0 +1,26 @@
+name: "the same shared helper allows an address the table lacks"
+source_fw: |
+  table badhosts {
+    kind = cidr4
+    max = 1000
+    source = "/var/lib/f/feeds/badhosts.txt"
+  }
+
+  def screen(pkt):
+    if pkt.src_ip in badhosts:
+      drop
+
+  @xdp(eth0)
+  def firewall(pkt):
+    screen(pkt)
+    allow
+
+table_data:
+  badhosts: ["5.8.0.0/16"]
+
+test_packet:
+  builder: tcp(src_ip="9.9.9.9", dst_port=80)
+
+expected:
+  compiles: true
+  bpf_action: allow

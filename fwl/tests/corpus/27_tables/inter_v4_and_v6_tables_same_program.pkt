@@ -1,0 +1,29 @@
+name: "a cidr4 and a cidr6 table coexist, each with its own key width"
+source_fw: |
+  table badhosts {
+    kind = cidr4
+    max = 1000
+    source = "/var/lib/f/feeds/badhosts.txt"
+  }
+
+  table badhosts6 {
+    kind = cidr6
+    max = 1000
+    source = "/var/lib/f/feeds/badhosts6.txt"
+  }
+
+  @xdp(eth0)
+  drop if pkt.src_ip in badhosts
+  drop if pkt.src_ip6 in badhosts6
+  default allow
+
+table_data:
+  badhosts: ["5.8.0.0/16"]
+  badhosts6: ["2a00:1370::/32"]
+
+test_packet:
+  builder: tcp6(src_ip="2a00:1370::1", dst_port=80)
+
+expected:
+  compiles: true
+  bpf_action: drop

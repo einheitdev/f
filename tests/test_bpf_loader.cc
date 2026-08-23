@@ -10,8 +10,13 @@
 #include <gtest/gtest.h>
 
 #include <arpa/inet.h>
+#include <bpf/bpf.h>
+#include <bpf/libbpf.h>
+#include <unistd.h>
 
+#include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -28,18 +33,30 @@ class BpfLoaderResolverTest : public ::testing::Test {
  protected:
   void SetUp() override {
     // Per-test scratch dir; cleared on TearDown.
-    auto base = fs::temp_directory_path()
-        / std::format("fwl-bpf-loader-{}", ::getpid());
+    //
+    // The prefix is `fwl-loader-`, NOT `fwl-bpf-loader-`. The Python
+    // harness asserts that `bpf_runner.compile_c` leaves nothing
+    // behind by globbing `fwl-bpf-*` in the temp directory, and this
+    // fixture used to land inside that glob -- so a stale dir from an
+    // old gtest run, swept by whatever tidies /tmp, made
+    // test_bpf_runner fail intermittently in a suite that never ran
+    // this binary. 620 of them had accumulated since August.
+    base_ = fs::temp_directory_path()
+        / std::format("fwl-loader-{}", ::getpid());
     auto suffix = ::testing::UnitTest::GetInstance()
                       ->current_test_info()
                       ->name();
-    scratch_ = base / suffix;
+    scratch_ = base_ / suffix;
     fs::create_directories(scratch_);
   }
 
   void TearDown() override {
     std::error_code ec;
     fs::remove_all(scratch_, ec);
+    // The per-pid parent too, once its last test is done with it.
+    // Removing only `scratch_` left one empty directory per test
+    // process in /tmp forever.
+    fs::remove(base_, ec);
   }
 
   // Drop a placeholder file at `path`, creating intermediate dirs.
@@ -48,6 +65,7 @@ class BpfLoaderResolverTest : public ::testing::Test {
     std::ofstream(path) << "placeholder";
   }
 
+  fs::path base_;
   fs::path scratch_;
 };
 
@@ -96,6 +114,535 @@ TEST_F(GeoipParseTest, ParsesV4AndV6Prefixes) {
   EXPECT_EQ(v6[0].addr[1], 0x01);
   EXPECT_EQ(v6[0].addr[2], 0x0d);
   EXPECT_EQ(v6[0].addr[3], 0xb8);
+}
+
+// TABLES.md phase 1 emits a named table's prefixes into this same
+// `tries` array, under the table's `fwl_tbl_<id>` map name. The claim
+// that phase 1 needs no daemon change is exactly the claim that THIS
+// function, unmodified, reads that payload -- so it is tested here
+// rather than asserted in a commit message.
+//
+// The JSON below is `fwl compile --bundle` output copied verbatim.
+// fwl/tests/unit/test_tables.py::TestTheDaemonReadsWhatTheCompiler
+// Writes holds the other end, so a drift on either side goes red.
+TEST_F(GeoipParseTest, ReadsATablePayloadTheCompilerEmitted) {
+  WriteGeoip(R"({
+  "tries": [
+    {
+      "map": "fwl_tbl_0",
+      "family": "ipv4",
+      "prefixes": [
+        "10.99.77.0/24",
+        "192.0.2.0/25"
+      ]
+    },
+    {
+      "map": "fwl_tbl_1",
+      "family": "ipv6",
+      "prefixes": [
+        "2001:db8::/32"
+      ]
+    }
+  ]
+})");
+  auto tries = ParseGeoipFile(scratch_.string());
+  ASSERT_TRUE(tries.has_value());
+  ASSERT_EQ(tries->size(), 2u);
+
+  // PopulateGeoipTrie looks the map up by this name in each loaded
+  // zone object and fills whatever LPM trie it finds. It neither
+  // knows nor cares that these prefixes came from a `table`
+  // declaration rather than from a country code.
+  const auto& v4 = tries->at("fwl_tbl_0");
+  ASSERT_EQ(v4.size(), 2u);
+  EXPECT_FALSE(v4[0].v6);
+  EXPECT_EQ(v4[0].prefixlen, 24u);
+  EXPECT_EQ(v4[0].addr[0], 10);
+  EXPECT_EQ(v4[0].addr[1], 99);
+  EXPECT_EQ(v4[0].addr[2], 77);
+  EXPECT_EQ(v4[0].addr[3], 0);
+  EXPECT_EQ(v4[1].prefixlen, 25u);
+
+  const auto& v6 = tries->at("fwl_tbl_1");
+  ASSERT_EQ(v6.size(), 1u);
+  EXPECT_TRUE(v6[0].v6);
+  EXPECT_EQ(v6[0].prefixlen, 32u);
+  EXPECT_EQ(v6[0].addr[0], 0x20);
+  EXPECT_EQ(v6[0].addr[1], 0x01);
+  EXPECT_EQ(v6[0].addr[2], 0x0d);
+  EXPECT_EQ(v6[0].addr[3], 0xb8);
+}
+
+// A bundle whose policy mixes a geoip() call with a named table puts
+// both tries in one array, and the loader must fill both: they are the
+// same map type under different names, and dropping either would leave
+// a rule matching against an empty trie.
+TEST_F(GeoipParseTest, ReadsAGeoipTrieAndATableTrieTogether) {
+  WriteGeoip(R"({"tries": [
+    {"map": "fwl_geoip_eth0_0", "family": "ipv4",
+     "prefixes": ["10.9.0.0/16"]},
+    {"map": "fwl_tbl_0", "family": "ipv4",
+     "prefixes": ["10.99.77.0/24"]}
+  ]})");
+  auto tries = ParseGeoipFile(scratch_.string());
+  ASSERT_TRUE(tries.has_value());
+  ASSERT_EQ(tries->size(), 2u);
+  EXPECT_EQ(tries->at("fwl_geoip_eth0_0").size(), 1u);
+  EXPECT_EQ(tries->at("fwl_tbl_0").size(), 1u);
+}
+
+// --- TABLES.md: the declaration ships, the data does not ------------
+
+class TableSpecTest : public BpfLoaderResolverTest {
+ protected:
+  void WriteManifest(const std::string& body) {
+    std::ofstream(scratch_ / "manifest.json") << body;
+  }
+
+  // A feed file inside the scratch dir, returned as an absolute path
+  // so a TableSpec can name it the way a real one names an appliance
+  // path.
+  auto WriteFeed(const std::string& name, const std::string& body)
+      -> std::string {
+    auto path = scratch_ / name;
+    std::ofstream(path) << body;
+    return path.string();
+  }
+
+  auto Spec(const std::string& source, uint32_t max = 1000,
+            bool v6 = false) -> TableSpec {
+    TableSpec spec;
+    spec.name = "badhosts";
+    spec.id = 0;
+    spec.map_name = "fwl_tbl_0";
+    spec.v6 = v6;
+    spec.max_entries = max;
+    spec.source = source;
+    return spec;
+  }
+};
+
+TEST_F(TableSpecTest, AbsentManifestYieldsNoTables) {
+  auto specs = ParseTableSpecs(scratch_.string());
+  ASSERT_TRUE(specs.has_value());
+  EXPECT_TRUE(specs->empty());
+}
+
+TEST_F(TableSpecTest, AbsentTablesBlockYieldsNoTables) {
+  // A bundle compiled before tables existed, or a policy with none.
+  WriteManifest(R"({"version": "0.4", "zones": []})");
+  auto specs = ParseTableSpecs(scratch_.string());
+  ASSERT_TRUE(specs.has_value());
+  EXPECT_TRUE(specs->empty());
+}
+
+TEST_F(TableSpecTest, ParsesTheDeclarationTheCompilerShips) {
+  // Copied from `fwl compile --bundle` output. The bundle carries the
+  // declaration and NOT a single prefix: the file lives on the
+  // appliance and this daemon is what reads it.
+  WriteManifest(R"({
+  "tables": {
+    "corporate_blocklist": {
+      "id": 0,
+      "map": "fwl_tbl_0",
+      "kind": "cidr4",
+      "max": 100000,
+      "source": "/var/lib/f/feeds/corp.txt",
+      "referenced": true
+    },
+    "v6_blocklist": {
+      "id": 1,
+      "map": "fwl_tbl_1",
+      "kind": "cidr6",
+      "max": 100,
+      "source": "/var/lib/f/feeds/corp6.txt",
+      "referenced": true
+    }
+  }
+})");
+  auto specs = ParseTableSpecs(scratch_.string());
+  ASSERT_TRUE(specs.has_value());
+  ASSERT_EQ(specs->size(), 2u);
+  const TableSpec* v4 = nullptr;
+  const TableSpec* v6 = nullptr;
+  for (const auto& s : *specs) {
+    if (s.name == "corporate_blocklist") v4 = &s;
+    if (s.name == "v6_blocklist") v6 = &s;
+  }
+  ASSERT_NE(v4, nullptr);
+  ASSERT_NE(v6, nullptr);
+  EXPECT_EQ(v4->map_name, "fwl_tbl_0");
+  EXPECT_FALSE(v4->v6);
+  EXPECT_EQ(v4->max_entries, 100000u);
+  EXPECT_EQ(v4->source, "/var/lib/f/feeds/corp.txt");
+  EXPECT_TRUE(v6->v6);
+  EXPECT_EQ(v6->max_entries, 100u);
+}
+
+TEST_F(TableSpecTest, ATableNoRuleMatchesIsRecordedButNotFilled) {
+  WriteManifest(R"({"tables": {"unused": {"id": 0, "referenced": false,
+    "kind": "cidr4", "max": 10, "source": "/nope"}}})");
+  auto specs = ParseTableSpecs(scratch_.string());
+  ASSERT_TRUE(specs.has_value());
+  ASSERT_EQ(specs->size(), 1u);
+  EXPECT_FALSE((*specs)[0].referenced);
+}
+
+TEST_F(TableSpecTest, ATableWithoutCapacityIsRefused) {
+  // Capacity is what makes "refuse rather than truncate" enforceable.
+  // Guessing one reinstates the behaviour the rule exists to prevent.
+  WriteManifest(R"({"tables": {"t": {"id": 0, "map": "fwl_tbl_0",
+    "kind": "cidr4", "source": "/f"}}})");
+  auto specs = ParseTableSpecs(scratch_.string());
+  EXPECT_FALSE(specs.has_value());
+}
+
+TEST_F(TableSpecTest, ATableWithoutASourceIsRefused) {
+  WriteManifest(R"({"tables": {"t": {"id": 0, "map": "fwl_tbl_0",
+    "kind": "cidr4", "max": 10}}})");
+  auto specs = ParseTableSpecs(scratch_.string());
+  EXPECT_FALSE(specs.has_value());
+}
+
+// --- Reading a feed: empty is a failure, never a state --------------
+
+class TableFeedTest : public TableSpecTest {};
+
+TEST_F(TableFeedTest, ReadsPrefixesCommentsAndBlanks) {
+  auto path = WriteFeed("feed.txt",
+      "# a threat feed\n"
+      "\n"
+      "10.99.77.0/24\n"
+      "  192.0.2.0/25   # trailing comment\n"
+      "\n");
+  auto entries = ReadTableFeed(Spec(path));
+  ASSERT_TRUE(entries.has_value()) << entries.error().message;
+  ASSERT_EQ(entries->size(), 2u);
+}
+
+TEST_F(TableFeedTest, ARepeatedPrefixCountsOnce) {
+  // One entry in an LPM trie, so counting it twice would refuse a feed
+  // the map would have held.
+  auto path = WriteFeed("feed.txt",
+      "10.0.0.0/8\n10.0.0.0/8\n192.168.0.0/16\n");
+  auto entries = ReadTableFeed(Spec(path, 2));
+  ASSERT_TRUE(entries.has_value()) << entries.error().message;
+  EXPECT_EQ(entries->size(), 2u);
+}
+
+TEST_F(TableFeedTest, AMissingFileIsAFeedFailureNotALoadFailure) {
+  // The distinction a bundle-health guard needs: the artifact is fine,
+  // its data is not. Counting this as a failed load would spend a good
+  // policy's attempts on an NFS blip.
+  auto entries = ReadTableFeed(Spec("/definitely/not/here.txt"));
+  ASSERT_FALSE(entries.has_value());
+  EXPECT_EQ(entries.error().code, BpfError::kFeedUnavailable);
+  EXPECT_NE(entries.error().message.find("badhosts"), std::string::npos);
+}
+
+TEST_F(TableFeedTest, ADirectoryWhereAFileShouldBeIsAFeedFailure) {
+  auto entries = ReadTableFeed(Spec(scratch_.string()));
+  ASSERT_FALSE(entries.has_value());
+  EXPECT_EQ(entries.error().code, BpfError::kFeedUnavailable);
+}
+
+TEST_F(TableFeedTest, AnEmptyFeedIsRefusedRatherThanApplied) {
+  // The safe reading of "the blocklist is now empty" is "the feeder is
+  // broken", not "nothing is dangerous any more". A query that failed,
+  // an API that returned 200 with no body, an expired credential --
+  // all of them produce this file.
+  auto path = WriteFeed("feed.txt", "# nothing but a comment\n\n");
+  auto entries = ReadTableFeed(Spec(path));
+  ASSERT_FALSE(entries.has_value());
+  EXPECT_EQ(entries.error().code, BpfError::kFeedUnavailable);
+  EXPECT_NE(entries.error().message.find("no prefixes"),
+            std::string::npos);
+}
+
+TEST_F(TableFeedTest, MorePrefixesThanCapacityIsRefusedNotTruncated) {
+  auto path = WriteFeed("feed.txt",
+      "10.0.0.0/8\n192.168.0.0/16\n172.16.0.0/12\n");
+  auto entries = ReadTableFeed(Spec(path, 2));
+  ASSERT_FALSE(entries.has_value());
+  EXPECT_EQ(entries.error().code, BpfError::kFeedUnavailable);
+  // The message says how many did not fit rather than leaving the
+  // operator to count.
+  EXPECT_NE(entries.error().message.find("1 entries"),
+            std::string::npos);
+}
+
+TEST_F(TableFeedTest, AV6PrefixInACidr4TableIsRefused) {
+  auto path = WriteFeed("feed.txt", "10.0.0.0/8\n2001:db8::/32\n");
+  auto entries = ReadTableFeed(Spec(path));
+  ASSERT_FALSE(entries.has_value());
+  EXPECT_EQ(entries.error().code, BpfError::kFeedUnavailable);
+  EXPECT_NE(entries.error().message.find(":2:"), std::string::npos);
+}
+
+TEST_F(TableFeedTest, AnAddressWithoutAPrefixLengthIsRefused) {
+  auto path = WriteFeed("feed.txt", "10.0.0.0\n");
+  auto entries = ReadTableFeed(Spec(path));
+  ASSERT_FALSE(entries.has_value());
+  EXPECT_EQ(entries.error().code, BpfError::kFeedUnavailable);
+}
+
+TEST_F(TableFeedTest, APrefixLengthPastTheKeyWidthIsRefused) {
+  auto path = WriteFeed("feed.txt", "10.0.0.0/33\n");
+  auto entries = ReadTableFeed(Spec(path));
+  ASSERT_FALSE(entries.has_value());
+  EXPECT_EQ(entries.error().code, BpfError::kFeedUnavailable);
+}
+
+TEST_F(TableFeedTest, AV6FeedReadsSixteenAddressBytes) {
+  auto path = WriteFeed("feed6.txt", "2001:db8::/32\n");
+  auto entries = ReadTableFeed(Spec(path, 100, /*v6=*/true));
+  ASSERT_TRUE(entries.has_value()) << entries.error().message;
+  ASSERT_EQ(entries->size(), 1u);
+  EXPECT_TRUE((*entries)[0].v6);
+  EXPECT_EQ((*entries)[0].prefixlen, 32u);
+  EXPECT_EQ((*entries)[0].addr[0], 0x20);
+  EXPECT_EQ((*entries)[0].addr[3], 0xb8);
+}
+
+TEST_F(TableFeedTest, AV4AddressInACidr6TableIsRefused) {
+  auto path = WriteFeed("feed6.txt", "10.0.0.0/8\n");
+  auto entries = ReadTableFeed(Spec(path, 100, /*v6=*/true));
+  ASSERT_FALSE(entries.has_value());
+  EXPECT_EQ(entries.error().code, BpfError::kFeedUnavailable);
+}
+
+// --- The ordering that keeps a transient from costing a policy ------
+
+class TableLoadOrderTest : public BpfLoaderResolverTest {
+ protected:
+  // A manifest that is otherwise loadable: one zone, one program, and
+  // a table whose feed is not there.
+  void WriteBundle(const std::string& source) {
+    std::ofstream(scratch_ / "manifest.json") << std::format(R"({{
+  "version": "0.4",
+  "zones": [{{"name": "wan", "interfaces": ["nonexistent0"]}}],
+  "programs": [{{"zone": "wan", "source": "wan.bpf.c",
+                "object": "wan.bpf.o"}}],
+  "persistent_maps": ["conntrack", "fwl_nat", "fwl_tbl_0"],
+  "tables": {{
+    "badhosts": {{"id": 0, "map": "fwl_tbl_0", "kind": "cidr4",
+                 "max": 1000, "source": "{}", "referenced": true}}
+  }}
+}})", source);
+  }
+};
+
+TEST_F(TableLoadOrderTest, AnUnreadableFeedFailsBeforeAnythingIsLoaded) {
+  // The property a bundle-health guard depends on. fd.service carries
+  // Restart=on-failure and a guard counts load attempts, so if an NFS
+  // blip or a feeder that has not written yet reported the same thing
+  // a broken artifact reports, a transient would spend a good
+  // policy's remaining attempts and quarantine it.
+  //
+  // Two halves, both asserted here: the code is kFeedUnavailable and
+  // not kLoadFailed, and the failure happens before the loader opens
+  // an object at all -- note that wan.bpf.o does not exist in the
+  // scratch dir, so reaching the object stage would give kLoadFailed
+  // instead. Failing first is what makes the attempt cost nothing.
+  WriteBundle("/definitely/not/here.txt");
+  auto handles = LoadZoneBundle(scratch_.string(),
+                                (scratch_ / "pins").string(), nullptr);
+  ASSERT_FALSE(handles.has_value());
+  EXPECT_EQ(handles.error().code, BpfError::kFeedUnavailable);
+  EXPECT_NE(handles.error().message.find("badhosts"),
+            std::string::npos);
+}
+
+TEST_F(TableLoadOrderTest, AnEmptyFeedFailsTheSameWay) {
+  auto feed = scratch_ / "empty.txt";
+  std::ofstream(feed) << "# the feeder ran and produced nothing\n";
+  WriteBundle(feed.string());
+  auto handles = LoadZoneBundle(scratch_.string(),
+                                (scratch_ / "pins").string(), nullptr);
+  ASSERT_FALSE(handles.has_value());
+  EXPECT_EQ(handles.error().code, BpfError::kFeedUnavailable);
+}
+
+TEST_F(TableLoadOrderTest, ABrokenBundleStillReportsALoadFailure) {
+  // The other side of the distinction, and the one that must NOT
+  // become kFeedUnavailable: a readable feed and a missing object is
+  // an artifact that will never work, and a guard should count it.
+  auto feed = scratch_ / "feed.txt";
+  std::ofstream(feed) << "10.0.0.0/8\n";
+  WriteBundle(feed.string());
+  auto handles = LoadZoneBundle(scratch_.string(),
+                                (scratch_ / "pins").string(), nullptr);
+  ASSERT_FALSE(handles.has_value());
+  EXPECT_NE(handles.error().code, BpfError::kFeedUnavailable);
+}
+
+TEST_F(TableLoadOrderTest, ATableNoRuleMatchesNeedsNoFeed) {
+  // A declared-but-unmatched table has no map in any object, so a
+  // missing feed for it must not fail the load -- refusing there
+  // would make an unused declaration able to take the box down.
+  std::ofstream(scratch_ / "manifest.json") << R"({
+  "version": "0.4",
+  "zones": [{"name": "wan", "interfaces": ["nonexistent0"]}],
+  "programs": [{"zone": "wan", "source": "wan.bpf.c",
+                "object": "wan.bpf.o"}],
+  "tables": {
+    "unused": {"id": 0, "kind": "cidr4", "max": 10,
+               "source": "/definitely/not/here.txt",
+               "referenced": false}
+  }
+})";
+  auto handles = LoadZoneBundle(scratch_.string(),
+                                (scratch_ / "pins").string(), nullptr);
+  ASSERT_FALSE(handles.has_value());
+  // It still fails -- wan.bpf.o is not there -- but for the bundle's
+  // own reason and not for the feed's.
+  EXPECT_NE(handles.error().code, BpfError::kFeedUnavailable);
+}
+
+// --- The diff: a table must never pass through empty -----------------
+//
+// This is the property the whole write path is shaped around. A
+// blocklist that is briefly empty is an open firewall, and with a
+// feeder on a timer that window recurs all day rather than once at
+// deploy. Clear-and-refill would be simpler and is refused for that
+// reason alone, so the refusal needs a test that a clear-and-refill
+// implementation fails.
+
+class TableSyncTest : public ::testing::Test {
+ protected:
+  void SetUp() override {
+    // BPF_F_NO_PREALLOC is mandatory for an LPM trie and is what the
+    // emitted map declares, so the test map is the same shape the
+    // datapath's is.
+    LIBBPF_OPTS(bpf_map_create_opts, opts,
+                .map_flags = BPF_F_NO_PREALLOC);
+    map_fd_ = bpf_map_create(BPF_MAP_TYPE_LPM_TRIE, "fwl_tbl_0",
+                             /*key_size=*/8, /*value_size=*/1,
+                             /*max_entries=*/1024, &opts);
+    if (map_fd_ < 0) {
+      GTEST_SKIP() << "bpf_map_create failed (needs CAP_BPF)";
+    }
+  }
+
+  void TearDown() override {
+    if (map_fd_ >= 0) ::close(map_fd_);
+  }
+
+  static auto V4(const char* cidr) -> GeoipTrieEntry {
+    std::string text(cidr);
+    auto slash = text.find('/');
+    GeoipTrieEntry e;
+    e.v6 = false;
+    e.prefixlen = static_cast<uint32_t>(
+        std::stoul(text.substr(slash + 1)));
+    inet_pton(AF_INET, text.substr(0, slash).c_str(), e.addr);
+    return e;
+  }
+
+  auto Contains(const char* cidr) -> bool {
+    auto e = V4(cidr);
+    uint8_t key[8] = {};
+    std::memcpy(key, &e.prefixlen, sizeof(e.prefixlen));
+    std::memcpy(key + 4, e.addr, 4);
+    uint8_t value = 0;
+    return bpf_map_lookup_elem(map_fd_, key, &value) == 0;
+  }
+
+  auto Count() -> uint32_t {
+    uint8_t key[8] = {};
+    uint8_t next[8] = {};
+    uint32_t n = 0;
+    bool have = false;
+    while (bpf_map_get_next_key(map_fd_, have ? key : nullptr, next) == 0) {
+      n++;
+      std::memcpy(key, next, sizeof(key));
+      have = true;
+    }
+    return n;
+  }
+
+  int map_fd_ = -1;
+};
+
+TEST_F(TableSyncTest, AFreshMapTakesEveryEntry) {
+  std::vector<GeoipTrieEntry> want = {
+      V4("10.0.0.0/8"), V4("192.168.0.0/16"), V4("203.0.113.0/24")};
+  auto report = SyncTableTrie(map_fd_, false, want);
+  ASSERT_TRUE(report.has_value()) << report.error().message;
+  EXPECT_EQ(report->added, 3u);
+  EXPECT_EQ(report->removed, 0u);
+  EXPECT_EQ(report->unchanged, 0u);
+  EXPECT_EQ(Count(), 3u);
+}
+
+TEST_F(TableSyncTest, ASecondSyncOfTheSameFeedTouchesNothing) {
+  // The steady state a feeder on a timer spends almost all its time
+  // in. If this reported three adds, every refresh would be rewriting
+  // the whole table for no reason.
+  std::vector<GeoipTrieEntry> want = {
+      V4("10.0.0.0/8"), V4("192.168.0.0/16"), V4("203.0.113.0/24")};
+  ASSERT_TRUE(SyncTableTrie(map_fd_, false, want).has_value());
+  auto report = SyncTableTrie(map_fd_, false, want);
+  ASSERT_TRUE(report.has_value()) << report.error().message;
+  EXPECT_EQ(report->added, 0u);
+  EXPECT_EQ(report->removed, 0u);
+  EXPECT_EQ(report->unchanged, 3u);
+  EXPECT_EQ(Count(), 3u);
+}
+
+TEST_F(TableSyncTest, AnEntryInBothFeedsIsNeverRemovedAndNeverReadded) {
+  // The refusal of clear-and-refill, stated as an assertion. An
+  // implementation that emptied the map first would report this entry
+  // as ADDED rather than unchanged, and for the interval between the
+  // clear and the refill the datapath would have forwarded traffic
+  // this table exists to drop.
+  std::vector<GeoipTrieEntry> before = {
+      V4("10.0.0.0/8"), V4("192.168.0.0/16")};
+  ASSERT_TRUE(SyncTableTrie(map_fd_, false, before).has_value());
+
+  std::vector<GeoipTrieEntry> after = {
+      V4("10.0.0.0/8"), V4("203.0.113.0/24")};
+  auto report = SyncTableTrie(map_fd_, false, after);
+  ASSERT_TRUE(report.has_value()) << report.error().message;
+  EXPECT_EQ(report->unchanged, 1u) << "10.0.0.0/8 was in both feeds";
+  EXPECT_EQ(report->added, 1u);
+  EXPECT_EQ(report->removed, 1u);
+
+  EXPECT_TRUE(Contains("10.0.0.0/8"));
+  EXPECT_TRUE(Contains("203.0.113.0/24"));
+  EXPECT_FALSE(Contains("192.168.0.0/16"));
+  EXPECT_EQ(Count(), 2u);
+}
+
+TEST_F(TableSyncTest, ShrinkingAFeedRemovesOnlyWhatLeftIt) {
+  std::vector<GeoipTrieEntry> before = {
+      V4("10.0.0.0/8"), V4("192.168.0.0/16"), V4("172.16.0.0/12")};
+  ASSERT_TRUE(SyncTableTrie(map_fd_, false, before).has_value());
+  std::vector<GeoipTrieEntry> after = {V4("10.0.0.0/8")};
+  auto report = SyncTableTrie(map_fd_, false, after);
+  ASSERT_TRUE(report.has_value()) << report.error().message;
+  EXPECT_EQ(report->removed, 2u);
+  EXPECT_EQ(report->unchanged, 1u);
+  EXPECT_EQ(report->added, 0u);
+  EXPECT_TRUE(Contains("10.0.0.0/8"));
+  EXPECT_EQ(Count(), 1u);
+}
+
+TEST_F(TableSyncTest, AnAdoptedMapIsReconciledToTheFileNotMerged) {
+  // What makes MapLifetime.EXTERNAL safe without an id registry. A
+  // pin carried across a reload holds the PREVIOUS contents; after
+  // the sync it holds exactly the file's, so a map object reused by a
+  // table that renumbered cannot carry the other table's entries into
+  // it.
+  std::vector<GeoipTrieEntry> stale = {
+      V4("198.51.100.0/24"), V4("198.51.100.7/32")};
+  ASSERT_TRUE(SyncTableTrie(map_fd_, false, stale).has_value());
+  std::vector<GeoipTrieEntry> file = {V4("10.0.0.0/8")};
+  ASSERT_TRUE(SyncTableTrie(map_fd_, false, file).has_value());
+  EXPECT_FALSE(Contains("198.51.100.0/24"));
+  EXPECT_FALSE(Contains("198.51.100.7/32"));
+  EXPECT_TRUE(Contains("10.0.0.0/8"));
+  EXPECT_EQ(Count(), 1u);
 }
 
 TEST_F(GeoipParseTest, MalformedJsonIsAnError) {
@@ -331,6 +878,308 @@ TEST(DecidePinFateTest, UndeclaredPersistentPinIsDroppedNotHoarded) {
   auto have = SomeShape();
   EXPECT_EQ(DecidePinFate("conntrack", kPersistent, nullptr, have,
                           PinPolicy::kColdBoot),
+            PinVerdict::kDiscard);
+}
+
+// --- The reload itself, on real bpffs with real entries ------------
+//
+// DecidePinFate above is the decision; this is the decision applied.
+// It runs the loop `fd` runs before every load, against a real pinned
+// LPM trie holding real prefixes, and asks the question the acceptance
+// criterion asks: after a policy edit that did not touch the table,
+// are the entries still there?
+
+class TablePinReloadTest : public ::testing::Test {
+ protected:
+  void SetUp() override {
+    // A per-test subdirectory of bpffs. Pinning needs a real bpffs;
+    // a tmpfs path makes bpf_obj_pin return -EINVAL.
+    root_ = std::filesystem::path("/sys/fs/bpf") /
+            std::format("fwl-tbl-{}", ::getpid());
+    std::error_code ec;
+    std::filesystem::create_directories(root_, ec);
+    if (ec) {
+      GTEST_SKIP() << "cannot create " << root_.string()
+                   << " (needs root and a mounted bpffs)";
+    }
+    LIBBPF_OPTS(bpf_map_create_opts, opts,
+                .map_flags = BPF_F_NO_PREALLOC);
+    trie_fd_ = bpf_map_create(BPF_MAP_TYPE_LPM_TRIE, "fwl_tbl_0", 8, 1,
+                              1000, &opts);
+    counters_fd_ = bpf_map_create(BPF_MAP_TYPE_PERCPU_ARRAY,
+                                  "fwl_counters_wan", 4, 8, 4, nullptr);
+    if (trie_fd_ < 0 || counters_fd_ < 0) {
+      GTEST_SKIP() << "bpf_map_create failed (needs CAP_BPF)";
+    }
+    if (bpf_obj_pin(trie_fd_, (root_ / "fwl_tbl_0").c_str()) != 0 ||
+        bpf_obj_pin(counters_fd_,
+                    (root_ / "fwl_counters_wan").c_str()) != 0) {
+      GTEST_SKIP() << "bpf_obj_pin failed";
+    }
+  }
+
+  void TearDown() override {
+    if (trie_fd_ >= 0) ::close(trie_fd_);
+    if (counters_fd_ >= 0) ::close(counters_fd_);
+    std::error_code ec;
+    std::filesystem::remove_all(root_, ec);
+  }
+
+  // A bundle whose zone object declares the trie and the counter map
+  // with the shapes created above. `persistent` is the manifest list
+  // the compiler wrote.
+  void WriteBundle(const std::string& persistent) {
+    std::ofstream(scratch_dir() / "manifest.json") << std::format(R"({{
+  "version": "0.4",
+  "zones": [{{"name": "wan", "interfaces": ["eth0"]}}],
+  "programs": [{{"zone": "wan", "source": "wan.bpf.c",
+                "object": "wan.bpf.o"}}],
+  "persistent_maps": [{}]
+}})", persistent);
+  }
+
+  /// Build `wan.bpf.o`, because BundlePinnedDeclarations learns a
+  /// bundle's declared shapes by opening the OBJECT with libbpf. A
+  /// hand-written .bpf.c would not be read, and a hand-written shape
+  /// struct would be this test agreeing with itself instead of with
+  /// what the emitter produces.
+  auto BuildObject() -> bool {
+    auto src = scratch_dir() / "wan.bpf.c";
+    std::ofstream(src) << R"(
+#include <linux/bpf.h>
+#include <bpf/bpf_helpers.h>
+
+struct fwl_tbl_0_key {
+  __u32 prefixlen;
+  __u32 ip;
+};
+
+struct {
+  __uint(type, BPF_MAP_TYPE_LPM_TRIE);
+  __type(key, struct fwl_tbl_0_key);
+  __type(value, __u8);
+  __uint(max_entries, 1000);
+  __uint(map_flags, BPF_F_NO_PREALLOC);
+  __uint(pinning, LIBBPF_PIN_BY_NAME);
+} fwl_tbl_0 SEC(".maps");
+
+struct {
+  __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+  __type(key, __u32);
+  __type(value, __u64);
+  __uint(max_entries, 4);
+  __uint(pinning, LIBBPF_PIN_BY_NAME);
+} fwl_counters_wan SEC(".maps");
+
+char _license[] SEC("license") = "GPL";
+)";
+    auto cmd = std::format(
+        "clang -O2 -g -target bpf "
+        "-I/usr/include/x86_64-linux-gnu -I/usr/include/aarch64-linux-gnu "
+        "-c {} -o {} 2>/dev/null",
+        src.string(), (scratch_dir() / "wan.bpf.o").string());
+    return std::system(cmd.c_str()) == 0;
+  }
+
+  auto scratch_dir() -> std::filesystem::path {
+    if (scratch_.empty()) {
+      scratch_ = std::filesystem::temp_directory_path() /
+                 std::format("fwl-tblbundle-{}", ::getpid());
+      std::filesystem::create_directories(scratch_);
+    }
+    return scratch_;
+  }
+
+  void Insert(const char* cidr) {
+    std::string text(cidr);
+    auto slash = text.find('/');
+    uint8_t key[8] = {};
+    uint32_t len = static_cast<uint32_t>(
+        std::stoul(text.substr(slash + 1)));
+    std::memcpy(key, &len, sizeof(len));
+    inet_pton(AF_INET, text.substr(0, slash).c_str(), key + 4);
+    uint8_t one = 1;
+    ASSERT_EQ(bpf_map_update_elem(trie_fd_, key, &one, BPF_ANY), 0);
+  }
+
+  auto CountVia(const std::filesystem::path& pin) -> int {
+    int fd = bpf_obj_get(pin.c_str());
+    if (fd < 0) return -1;
+    uint8_t key[8] = {};
+    uint8_t next[8] = {};
+    int n = 0;
+    bool have = false;
+    while (bpf_map_get_next_key(fd, have ? key : nullptr, next) == 0) {
+      n++;
+      std::memcpy(key, next, sizeof(key));
+      have = true;
+    }
+    ::close(fd);
+    return n;
+  }
+
+  std::filesystem::path root_;
+  std::filesystem::path scratch_;
+  int trie_fd_ = -1;
+  int counters_fd_ = -1;
+};
+
+TEST_F(TablePinReloadTest, APolicyEditLeavesTheTableIntact) {
+  if (!BuildObject()) GTEST_SKIP() << "clang unavailable";
+  // Write entries, "edit the policy", reload, read them back. The
+  // counter map is the control: it is MapLifetime.POLICY, its pin is
+  // NOT in persistent_maps, and it must be swept by the same pass
+  // that keeps the table -- otherwise the test would pass on a
+  // reconcile that simply kept everything.
+  Insert("10.0.0.0/8");
+  Insert("192.168.0.0/16");
+  Insert("203.0.113.0/24");
+  ASSERT_EQ(CountVia(root_ / "fwl_tbl_0"), 3);
+
+  WriteBundle(R"("conntrack", "fwl_nat", "fwl_tbl_0")");
+  auto report = ReconcilePinnedMaps(scratch_dir().string(),
+                                    root_.string(), PinPolicy::kReload,
+                                    /*conntrack_timeout_s=*/0);
+
+  EXPECT_NE(std::find(report.adopted.begin(), report.adopted.end(),
+                      "fwl_tbl_0"),
+            report.adopted.end())
+      << "the table was not adopted across the reload";
+  EXPECT_NE(std::find(report.discarded.begin(), report.discarded.end(),
+                      "fwl_counters_wan"),
+            report.discarded.end())
+      << "the control map survived, so this proves nothing";
+
+  // The pin is still there and still holds every prefix.
+  EXPECT_TRUE(std::filesystem::exists(root_ / "fwl_tbl_0"));
+  EXPECT_EQ(CountVia(root_ / "fwl_tbl_0"), 3);
+  EXPECT_FALSE(std::filesystem::exists(root_ / "fwl_counters_wan"));
+}
+
+TEST_F(TablePinReloadTest, ABundleThatDropsTheTableSweepsItsPin) {
+  if (!BuildObject()) GTEST_SKIP() << "clang unavailable";
+  // The policy stopped declaring the table. Its pin must not linger
+  // in bpffs holding a dead policy's blocklist.
+  Insert("10.0.0.0/8");
+  WriteBundle(R"("conntrack", "fwl_nat")");
+  auto report = ReconcilePinnedMaps(scratch_dir().string(),
+                                    root_.string(), PinPolicy::kReload,
+                                    0);
+  EXPECT_NE(std::find(report.discarded.begin(), report.discarded.end(),
+                      "fwl_tbl_0"),
+            report.discarded.end());
+  EXPECT_FALSE(std::filesystem::exists(root_ / "fwl_tbl_0"));
+}
+
+TEST_F(TablePinReloadTest, AnAdoptedTableIsStillReconciledToItsFile) {
+  if (!BuildObject()) GTEST_SKIP() << "clang unavailable";
+  // Adoption and disk authority together, which is the pair that
+  // makes the id allocation safe without a registry: the trie keeps
+  // its map object across the edit, and the sync then makes its
+  // contents exactly the feed's. An entry that was in the old
+  // contents and is not in the file does not survive.
+  Insert("198.51.100.0/24");
+  Insert("10.0.0.0/8");
+  WriteBundle(R"("conntrack", "fwl_nat", "fwl_tbl_0")");
+  ReconcilePinnedMaps(scratch_dir().string(), root_.string(),
+                      PinPolicy::kReload, 0);
+  ASSERT_TRUE(std::filesystem::exists(root_ / "fwl_tbl_0"));
+
+  GeoipTrieEntry keep;
+  keep.v6 = false;
+  keep.prefixlen = 8;
+  inet_pton(AF_INET, "10.0.0.0", keep.addr);
+  auto synced = SyncTableTrie(trie_fd_, false, {keep});
+  ASSERT_TRUE(synced.has_value()) << synced.error().message;
+  EXPECT_EQ(synced->unchanged, 1u) << "10.0.0.0/8 was already there";
+  EXPECT_EQ(synced->removed, 1u);
+  EXPECT_EQ(CountVia(root_ / "fwl_tbl_0"), 1);
+}
+
+// --- A table survives a policy edit (MapLifetime.EXTERNAL) ---------
+
+TEST(DecidePinFateTest, ATableTrieIsAdoptedAcrossAPolicyEdit) {
+  // The phase-2 property, at the decision that makes it true. A
+  // policy edit says nothing about whether an address is still
+  // hostile, so the trie is not this compilation's to discard -- and
+  // a table erased by every policy edit is not a table.
+  //
+  // The name is in `persistent` because the compiler put it there:
+  // persistent_map_names() resolves the EXTERNAL registry row into
+  // the literal fwl_tbl_<id> names the unit declares. fd compares
+  // strings and re-derives nothing.
+  const std::vector<std::string> persistent = {
+      "conntrack", "fwl_nat", "fwl_tbl_0", "fwl_tbl_1"};
+  PinnedMapShape trie;
+  trie.type = BPF_MAP_TYPE_LPM_TRIE;
+  trie.key_size = 8;
+  trie.value_size = 1;
+  trie.max_entries = 100000;
+  trie.map_flags = BPF_F_NO_PREALLOC;
+  for (auto policy : {PinPolicy::kColdBoot, PinPolicy::kReload}) {
+    EXPECT_EQ(DecidePinFate("fwl_tbl_0", persistent, &trie, trie,
+                            policy),
+              PinVerdict::kAdopt);
+  }
+}
+
+TEST(DecidePinFateTest, ATableTrieIsStillDroppedWhenCapacityMoves) {
+  // Adoption is not unconditional. `max` is part of the declaration
+  // an operator reviews, so raising it is a shape change libbpf will
+  // refuse to reuse -- the state is unreachable either way and all
+  // that is left to decide is who finds out. The contents are not
+  // lost by this: they are on disk, and the next load reads them.
+  const std::vector<std::string> persistent = {"fwl_tbl_0"};
+  PinnedMapShape have;
+  have.type = BPF_MAP_TYPE_LPM_TRIE;
+  have.key_size = 8;
+  have.value_size = 1;
+  have.max_entries = 1000;
+  have.map_flags = BPF_F_NO_PREALLOC;
+  PinnedMapShape want = have;
+  want.max_entries = 100000;
+  EXPECT_NE(DecidePinFate("fwl_tbl_0", persistent, &want, have,
+                          PinPolicy::kColdBoot),
+            PinVerdict::kAdopt);
+  EXPECT_NE(DecidePinFate("fwl_tbl_0", persistent, &want, have,
+                          PinPolicy::kReload),
+            PinVerdict::kAdopt);
+}
+
+TEST(DecidePinFateTest, ATablePinNoPolicyDeclaresIsSweptAway) {
+  // The table was deleted from the policy. Nothing will read it,
+  // nothing will reconcile it against a file, and it would sit in
+  // bpffs holding a dead policy's blocklist until something with the
+  // same id and shape adopted it. Dropping it is what makes an id
+  // that shifted between compilations safe.
+  const std::vector<std::string> persistent = {"fwl_tbl_0"};
+  PinnedMapShape have;
+  have.type = BPF_MAP_TYPE_LPM_TRIE;
+  have.key_size = 8;
+  have.value_size = 1;
+  have.max_entries = 1000;
+  have.map_flags = BPF_F_NO_PREALLOC;
+  for (auto policy : {PinPolicy::kColdBoot, PinPolicy::kReload}) {
+    EXPECT_EQ(DecidePinFate("fwl_tbl_0", persistent, nullptr, have,
+                            policy),
+              PinVerdict::kDiscard);
+  }
+}
+
+TEST(DecidePinFateTest, ATableIsSweptWhenTheManifestDoesNotNameIt) {
+  // A bundle compiled before tables existed, or one whose policy
+  // declares none, carries a persistent list without any fwl_tbl_
+  // name. The pin must go: `persistent` is the whole gate, and a
+  // prefix-shaped exception in the daemon would be the second copy of
+  // a decision this list exists to keep in one place.
+  PinnedMapShape have;
+  have.type = BPF_MAP_TYPE_LPM_TRIE;
+  have.key_size = 8;
+  have.value_size = 1;
+  have.max_entries = 1000;
+  have.map_flags = BPF_F_NO_PREALLOC;
+  EXPECT_EQ(DecidePinFate("fwl_tbl_0", kPersistent, &have, have,
+                          PinPolicy::kReload),
             PinVerdict::kDiscard);
 }
 

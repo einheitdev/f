@@ -262,6 +262,22 @@ def _walk_cond(node):
       yield from _walk_cond(c)
 
 
+def _rule_table_refs(rule: ast.Rule) -> int:
+  """How many `in <table>` lookups a rule performs.
+
+  The same LPM trie lookup a geoip() call compiles to, so it carries
+  the same estimate. Counting it matters in the direction that hurts:
+  an under-estimate puts more rules in a stage than the stack and
+  instruction budgets allow, and the splitter's whole job is to keep
+  that from reaching the verifier.
+  """
+  return sum(
+    1 for node in _walk_cond(rule.condition)
+    if isinstance(node, ast.Comparison)
+    and isinstance(node.operand, ast.TableRef)
+  )
+
+
 def _rule_geoip_calls(rule: ast.Rule) -> int:
   n = 0
   for node in _walk_cond(rule.condition):
@@ -301,6 +317,13 @@ def rule_cost(rule: ast.Rule, *, single: bool = False) -> int:
   per_rule = RULE_INSTR_SINGLE if single else RULE_INSTR
   return (per_rule
           + GEOIP_INSTR * _rule_geoip_calls(rule)
+          # A table reference is the same LPM trie lookup a geoip()
+          # call compiles to, so it carries the same estimate. It is
+          # counted here rather than at the two call sites because a
+          # second copy of this arithmetic is a second place for it to
+          # be wrong -- and the direction that hurts is under-counting,
+          # which puts more rules in a stage than its budgets allow.
+          + GEOIP_INSTR * _rule_table_refs(rule)
           + CIDR_ENTRY_INSTR * rule_list_entries(rule))
 
 

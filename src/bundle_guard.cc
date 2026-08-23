@@ -322,6 +322,21 @@ auto BundleGuardBegin(const GuardConfig& cfg) -> GuardDecision {
   return d;
 }
 
+auto BundleGuardAbandon(const GuardConfig& cfg)
+    -> std::expected<void, std::string> {
+  if (cfg.bundle_dir.empty()) {
+    return std::unexpected("no bundle directory");
+  }
+  std::error_code ec;
+  fs::remove(RecordPath(cfg), ec);
+  if (ec) {
+    return std::unexpected(
+        std::format("remove {}: {}", RecordPath(cfg).string(),
+                    ec.message()));
+  }
+  return {};
+}
+
 auto BundleGuardCommit(const GuardConfig& cfg,
                        const std::string& version)
     -> std::expected<void, std::string> {

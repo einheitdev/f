@@ -184,7 +184,7 @@ redirect to wan
 
 That is a working NAT gateway: the testnet on `lan0`/`lan1` reaches the internet through `wan0`, hidden behind its address, and nothing unsolicited comes back.
 
-**What v0.4 covers.** Actions `allow`, `drop`, `log`, `count <name>`, `redirect to <zone>`, `masquerade`, `snat to <ip>`, `dnat to <ip>:<port>`. All eight TCP flags, ICMP and ICMPv6 type/code, IPv4 and IPv6 addresses, ports, protocol, VLAN, and `pkt.zone`. `conntrack(pkt).state` and `rate_limit(N, per=<field>)` — the latter as a Tier 1 modifier or a Tier 2 condition, with `scope=zone|global`. `geoip(...)` against a compiled country trie. Tier 2 `def` bodies with locals and control flow, plus helper defs callable from several zones. Programs that would exceed the verifier's budget are split into a tail-call pipeline automatically, invisibly to the author.
+**What v0.4 covers.** Actions `allow`, `drop`, `log`, `count <name>`, `redirect to <zone>`, `masquerade`, `snat to <ip>`, `dnat to <ip>:<port>`. All eight TCP flags, ICMP and ICMPv6 type/code, IPv4 and IPv6 addresses, ports, protocol, VLAN, and `pkt.zone`. `conntrack(pkt).state` and `rate_limit(N, per=<field>)` — the latter as a Tier 1 modifier or a Tier 2 condition, with `scope=zone|global`. `geoip(...)` against a compiled country trie, and named `table`s — a declared prefix set matched with `in`, one LPM lookup whatever its size. Tier 2 `def` bodies with locals and control flow, plus helper defs callable from several zones. Programs that would exceed the verifier's budget are split into a tail-call pipeline automatically, invisibly to the author.
 
 Tier 3 raw-C `inline_c` is excluded by design, not merely unbuilt. The spec's "What Is Not in v0.4" section is the authoritative list of everything else.
 

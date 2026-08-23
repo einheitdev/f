@@ -1,0 +1,23 @@
+name: "a /96 v6 prefix constrains both halves of the key"
+# The emitted key is 16 bytes but the interpreter carries a 128-bit
+# integer, so a prefix past bit 64 is where a hi/lo split goes wrong.
+source_fw: |
+  table badhosts6 {
+    kind = cidr6
+    max = 1000
+    source = "/var/lib/f/feeds/badhosts6.txt"
+  }
+
+  @xdp(eth0)
+  drop if pkt.src_ip6 in badhosts6
+  default allow
+
+table_data:
+  badhosts6: ["2001:db8::/96"]
+
+test_packet:
+  builder: tcp6(src_ip="2001:db8::1:0:1", dst_port=22)
+
+expected:
+  compiles: true
+  bpf_action: allow
