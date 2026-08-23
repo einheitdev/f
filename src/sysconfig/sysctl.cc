@@ -40,7 +40,28 @@ auto PlanSysctlValues(const SystemConfig&)
   // guarantees is the state of the box in the window before fd has
   // spoken, and the state of a box on which fd never starts at all: a
   // box that is not filtering does not forward.
-  return {{"net.ipv4.ip_forward", "0"}};
+  //
+  // `kernel.sysrq` is the second one and it is here for the opposite
+  // reason: it is what an operator needs when the box has stopped
+  // working. When the rig deadlocked in `finit_module` on 2026-08-23,
+  // two udev workers spinning on two of eight CPUs, `systemctl --force
+  // --force reboot` did NOT recover it -- it is documented as
+  // bypassing PID 1 and it did not get far enough to matter -- and
+  // `echo b > /proc/sysrq-trigger` reset the board immediately. The
+  // recovery path cannot depend on someone having remembered to turn
+  // this on while the box is already broken.
+  //
+  // 184, not 1, and the difference is the point:
+  //   8   dumps (`w` blocked tasks, `l` CPU backtraces) -- the two
+  //       commands that named the deadlock rather than only ending it
+  //   16  sync
+  //   32  remount read-only
+  //   128 reboot / poweroff
+  // Left out: 4 (keyboard control), 64 (signalling processes -- an
+  // appliance does not need a keystroke that SIGKILLs everything), and
+  // 256 (renicing RT tasks). What is enabled is a recovery kit, not
+  // the whole surface.
+  return {{"net.ipv4.ip_forward", "0"}, {"kernel.sysrq", "184"}};
 }
 
 auto PlanSysctl(const SystemConfig& cfg, const SysctlOptions& opts)
@@ -62,6 +83,15 @@ auto PlanSysctl(const SystemConfig& cfg, const SysctlOptions& opts)
   o << "# traffic. fd put it where it is, and it says why:\n";
   o << "#   einheit-f show status      (the `forwarding` row)\n";
   o << "#   journalctl -u fd -g forwarding\n";
+  o << "#\n";
+  o << "# kernel.sysrq is the recovery kit, and it is here because\n";
+  o << "# `systemctl --force --force reboot` is not one. On 2026-08-23\n";
+  o << "# this box's reference rig deadlocked in the module loader;\n";
+  o << "# every systemctl verb hung on PID 1 and sysrq reset it at\n";
+  o << "# once. Sync first, then reset:\n";
+  o << "#   echo s > /proc/sysrq-trigger\n";
+  o << "#   echo b > /proc/sysrq-trigger\n";
+  o << "# and before that, `echo w` and `echo l` name what is stuck.\n";
   o << "\n";
   for (const auto& [k, v] : PlanSysctlValues(cfg)) {
     o << k << " = " << v << "\n";

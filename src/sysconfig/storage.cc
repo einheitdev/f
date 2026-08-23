@@ -71,12 +71,19 @@ auto PlanRetention(const RetentionPolicy& policy) -> RetentionPlan {
   // Where `current` points, resolved once. A bundle is never removed
   // just because it is old: deleting the running policy to save disk
   // space would be an outage caused by tidying up.
-  std::string current;
-  auto link = root / "current";
-  if (std::filesystem::is_symlink(link, ec)) {
+  // Both of them, and for the same reason. `last-known-good` is the
+  // bundle `fd` falls back to when `current` has been shown not to
+  // load (see bundle_guard.h); pruning it away turns the anti-lockout
+  // fallback into a dangling symlink at exactly the moment it is
+  // needed, and does it silently, weeks earlier, as housekeeping.
+  auto resolve = [&](const char* name) -> std::string {
+    auto link = root / name;
+    if (!std::filesystem::is_symlink(link, ec)) return {};
     auto target = std::filesystem::read_symlink(link, ec);
-    if (!ec) current = target.filename().string();
-  }
+    return ec ? std::string{} : target.filename().string();
+  };
+  const std::string current = resolve("current");
+  const std::string keep_lkg = resolve("last-known-good");
 
   std::vector<BundleEntry> entries;
   for (const auto& e :
@@ -88,6 +95,7 @@ auto PlanRetention(const RetentionPolicy& policy) -> RetentionPlan {
     b.name = e.path().filename().string();
     b.path = e.path().string();
     b.is_current = (b.name == current);
+    b.is_last_known_good = !keep_lkg.empty() && b.name == keep_lkg;
     b.bytes = DirectoryBytes(e.path());
     auto t = std::filesystem::last_write_time(e.path(), ec);
     if (!ec) {
@@ -111,9 +119,10 @@ auto PlanRetention(const RetentionPolicy& policy) -> RetentionPlan {
   std::size_t kept = 0;
   for (auto& b : entries) {
     plan.total_bytes += b.bytes;
-    bool keep = b.is_current || kept < policy.keep;
+    const bool pinned = b.is_current || b.is_last_known_good;
+    bool keep = pinned || kept < policy.keep;
     if (keep) {
-      if (!b.is_current || kept < policy.keep) ++kept;
+      if (!pinned || kept < policy.keep) ++kept;
     } else {
       plan.reclaimable_bytes += b.bytes;
       plan.to_remove.push_back(b);

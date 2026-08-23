@@ -53,6 +53,10 @@ struct BundleEntry {
   std::int64_t mtime = 0;
   /// True when `current` points here. Never pruned.
   bool is_current = false;
+  /// True when `last-known-good` points here. Also never pruned: it is
+  /// the bundle `fd` falls back to when `current` will not load, and a
+  /// fallback that housekeeping deleted is not a fallback.
+  bool is_last_known_good = false;
 };
 
 /// What a prune would do, before it does it.

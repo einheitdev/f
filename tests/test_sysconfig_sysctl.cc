@@ -90,9 +90,32 @@ class SysctlTest : public ::testing::Test {
 /// fault; a box that forwards unfiltered is an invisible one.
 TEST_F(SysctlTest, TheBootTimeFloorIsClosed) {
   auto values = PlanSysctlValues(cfg_);
-  ASSERT_EQ(values.size(), 1U);
+  ASSERT_EQ(values.size(), 2U);
   EXPECT_EQ(values[0].first, "net.ipv4.ip_forward");
   EXPECT_EQ(values[0].second, "0");
+}
+
+/// The other half of the same idea, from the other direction: what an
+/// operator needs when the box has stopped working. Measured on
+/// 2026-08-23 -- `systemctl --force --force reboot` did not recover a
+/// box deadlocked in `finit_module` and sysrq did, so a shipped box
+/// has it on before it is needed rather than after.
+TEST_F(SysctlTest, TheRecoveryKeysAreOnBeforeTheyAreNeeded) {
+  auto values = PlanSysctlValues(cfg_);
+  ASSERT_EQ(values.size(), 2U);
+  EXPECT_EQ(values[1].first, "kernel.sysrq");
+  const int mask = std::stoi(values[1].second);
+  // Sync, remount-ro and reboot are the recovery path; the dumps are
+  // what named the deadlock instead of only ending it.
+  EXPECT_TRUE(mask & 16) << "sync";
+  EXPECT_TRUE(mask & 32) << "remount read-only";
+  EXPECT_TRUE(mask & 128) << "reboot";
+  EXPECT_TRUE(mask & 8) << "task and CPU dumps";
+  // ...and it is a recovery kit rather than the whole surface. A
+  // keystroke that SIGKILLs every process is not something an
+  // appliance in a cabinet needs to offer.
+  EXPECT_FALSE(mask & 64) << "signalling processes stays off";
+  EXPECT_FALSE(mask & 4) << "keyboard control stays off";
 }
 
 /// Still not derived from the zone count — that derivation was
@@ -109,7 +132,7 @@ TEST_F(SysctlTest, TheFloorIsNotConditionalOnTheZoneCount) {
       "    zone: wan\n");
   ASSERT_TRUE(bare.has_value());
   auto values = PlanSysctlValues(*bare);
-  ASSERT_EQ(values.size(), 1U);
+  ASSERT_EQ(values.size(), 2U);
   EXPECT_EQ(values[0].second, "0");
 }
 

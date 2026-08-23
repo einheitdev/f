@@ -23,3 +23,32 @@ watch:
   source: /etc/f/rules.fw
   compiled_dir: /usr/share/f/compiled
   fwl: /usr/local/bin/fwl
+
+# What to do when the staged bundle will not load.
+#
+# fd reads `<compiled_dir>/current` once, at start, and fd.service is
+# ordered before sshd with Restart=on-failure — so a bundle that takes
+# the box down while loading takes it down on every boot, before anyone
+# can reach it. fd records each start of a version before it loads it
+# and clears the record once XDP is attached; a version that has been
+# started `max_load_attempts` times without the datapath ever coming up
+# is quarantined and not tried again.
+#
+# on_load_failure decides what happens next:
+#
+#   fallback     load the last bundle THIS box was observed to attach,
+#                repoint `current` at it, and say so — in the journal
+#                at critical, and in `einheit-f show status` for as
+#                long as it holds. The box keeps filtering, with a
+#                policy that is not the one last asked for.
+#
+#   fail-closed  do not start. fd lowers net.ipv4.ip_forward on its way
+#                out, so the box is reachable and stops routing. Nothing
+#                is enforced because nothing is forwarded.
+#
+# Both are defensible. `fallback` keeps a remote site working and
+# accepts that the running policy is stale; `fail-closed` never enforces
+# a rule set nobody chose and accepts an outage to guarantee it.
+bundle:
+  on_load_failure: fallback
+  max_load_attempts: 2

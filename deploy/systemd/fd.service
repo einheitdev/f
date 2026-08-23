@@ -6,6 +6,24 @@ Before=network.target
 Wants=sys-fs-bpf.mount network-pre.target
 ConditionPathIsMountPoint=/sys/fs/bpf
 
+# The restart loop has to terminate, and here is why it is not just
+# tidiness. This unit is ordered Before=network.target, i.e. before
+# sshd, and Restart=on-failure. A bundle that cannot be loaded therefore
+# blocks the box's own management access for as long as fd keeps trying
+# — and `Restart=` on its own tries forever. With these two, three
+# failed starts inside five minutes put the unit in `failed`, systemd
+# releases network.target, and the box comes up reachable and (because
+# fd lowers ip_forward on its way out, and ExecStopPost does it again)
+# not routing.
+#
+# The other half of the same guarantee is in fd itself: see
+# bundle_guard.h. This bounds the case where fd EXITS; the guard bounds
+# the case where fd never gets to exit because the load took the board
+# down, which is the one that cost three power cycles on 2026-08-23 and
+# which no systemd setting can see.
+StartLimitIntervalSec=300
+StartLimitBurst=3
+
 [Service]
 # Readiness is signalled by fd itself once XDP is attached, so
 # systemd holds network.target until the datapath is actually armed
@@ -64,6 +82,19 @@ LimitMEMLOCK=infinity
 Restart=on-failure
 RestartSec=2s
 TimeoutStopSec=10s
+
+# A start that hangs must fail rather than hold the boot open. Type=notify
+# means systemd waits for fd to report the datapath armed, and everything
+# ordered after network.target — sshd included — waits with it. Without a
+# bound, a bundle whose verifier pass never finishes is an unbootable box
+# rather than a slow one.
+#
+# 90s is chosen against measurement, not taste: on the reference rig a
+# 2,500-rule policy verified in 3.0s and a 10,000-rule one never
+# completed at all. Anything in between is a policy that has left the
+# range this box can run, and the answer is to say so and let the
+# operator in, not to keep waiting.
+TimeoutStartSec=90
 
 StandardOutput=journal
 StandardError=journal
